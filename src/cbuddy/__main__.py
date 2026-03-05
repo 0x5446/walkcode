@@ -3,7 +3,10 @@
 import argparse
 import json
 import logging
+import os
+import subprocess
 import sys
+import urllib.request
 from pathlib import Path
 
 
@@ -26,34 +29,97 @@ def cmd_serve(_args):
     uvicorn.run(app, host="127.0.0.1", port=cfg.port, log_level="warning")
 
 
-def cmd_install_hooks(_args):
-    from .config import Config
+def _detect_tty() -> str:
+    """Detect TTY from process tree (stdin is piped in hook context)."""
+    # Walk up process tree to find a real terminal
+    pid = str(os.getppid())
+    for _ in range(5):
+        try:
+            r = subprocess.run(
+                ["ps", "-o", "tty=", "-p", pid],
+                capture_output=True, text=True, timeout=2,
+            )
+            t = r.stdout.strip()
+            if t and t != "??":
+                return f"/dev/{t}"
+            r = subprocess.run(
+                ["ps", "-o", "ppid=", "-p", pid],
+                capture_output=True, text=True, timeout=2,
+            )
+            pid = r.stdout.strip()
+            if not pid:
+                break
+        except Exception:
+            break
+    return ""
 
-    cfg = Config.load()
+
+def cmd_hook(args):
+    """Handle a Claude Code hook event: read stdin, POST to server."""
+    # Read hook data from stdin (Claude Code pipes JSON)
+    try:
+        hook_data = json.load(sys.stdin)
+    except (json.JSONDecodeError, ValueError):
+        hook_data = {}
+
+    tty = os.environ.get("TTY", "") or _detect_tty()
+    cwd = os.getcwd()
+    session_id = hook_data.get("session_id", "")
+
+    # Extract message content
+    message = hook_data.get("message", "")
+    if not message and args.hook_type == "stop":
+        # Stop hook: try to get last assistant message from transcript
+        transcript = hook_data.get("transcript", [])
+        if isinstance(transcript, list):
+            for entry in reversed(transcript):
+                if isinstance(entry, dict) and entry.get("role") == "assistant":
+                    message = entry.get("message", "")[:500]
+                    break
+        if not message:
+            message = hook_data.get("transcript_summary", "")[:500]
+
+    matcher = os.environ.get("CLAUDE_NOTIFICATION_TYPE", "")
+
+    port = int(os.environ.get("CBUDDY_PORT", os.environ.get("PORT", "3000")))
+    payload = json.dumps({
+        "type": args.hook_type,
+        "tty": tty,
+        "cwd": cwd,
+        "session_id": session_id,
+        "message": message,
+        "matcher": matcher,
+    }).encode()
+
+    try:
+        req = urllib.request.Request(
+            f"http://localhost:{port}/hook",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+        )
+        urllib.request.urlopen(req, timeout=5)
+    except Exception:
+        pass  # server may be down
+
+
+def cmd_install_hooks(_args):
     settings_path = Path.home() / ".claude" / "settings.json"
     if not settings_path.exists():
         print(f"Error: {settings_path} not found")
         sys.exit(1)
 
     settings = json.loads(settings_path.read_text())
-    url = f"http://localhost:{cfg.port}/hook"
 
-    tty = 'TTY=$(tty 2>/dev/null || ps -o tty= -p $PPID 2>/dev/null | tr -d " " | sed "s|^|/dev/|")'
-    cwd = "CWD=$(pwd)"
-
-    def hook_cmd(hook_type, extra=""):
-        return (
-            f'{tty}; {cwd}; '
-            f'afplay /System/Library/Sounds/{"Hero" if hook_type == "stop" else "Ping"}.aiff & '
-            f'curl -s -X POST {url} '
-            f'-H "Content-Type: application/json" '
-            f"""-d '{{"type":"{hook_type}","tty":"'"'"'"$TTY"'"'"'","cwd":"'"'"'"$CWD"'"'"'"{extra}}}' """
-            f'>/dev/null 2>&1'
-        )
+    def hook_cmd(hook_type: str, sound: str) -> str:
+        return f"afplay /System/Library/Sounds/{sound}.aiff & cbuddy hook {hook_type}"
 
     settings["hooks"] = {
-        "Stop": [{"matcher": "", "hooks": [{"type": "command", "command": hook_cmd("stop")}]}],
-        "Notification": [{"matcher": "", "hooks": [{"type": "command", "command": hook_cmd("notification", ',"matcher":"\'"\'"\'$CLAUDE_NOTIFICATION_TYPE\'"\'"\'"')}]}],
+        "Stop": [{"matcher": "", "hooks": [
+            {"type": "command", "command": hook_cmd("stop", "Hero")}
+        ]}],
+        "Notification": [{"matcher": "", "hooks": [
+            {"type": "command", "command": hook_cmd("notification", "Ping")}
+        ]}],
     }
 
     settings_path.write_text(json.dumps(settings, indent=2, ensure_ascii=False) + "\n")
@@ -79,6 +145,10 @@ def main():
     sub = parser.add_subparsers(dest="command")
 
     sub.add_parser("serve", help="Start CBuddy server")
+
+    hp = sub.add_parser("hook", help="Handle a Claude Code hook event (reads stdin)")
+    hp.add_argument("hook_type", choices=["stop", "notification"], help="Hook event type")
+
     sub.add_parser("install-hooks", help="Install Claude Code hooks")
 
     p = sub.add_parser("test-inject", help="Test terminal injection")
@@ -87,7 +157,12 @@ def main():
     p.add_argument("--no-enter", action="store_true", help="Don't press Enter")
 
     args = parser.parse_args()
-    cmds = {"serve": cmd_serve, "install-hooks": cmd_install_hooks, "test-inject": cmd_test_inject}
+    cmds = {
+        "serve": cmd_serve,
+        "hook": cmd_hook,
+        "install-hooks": cmd_install_hooks,
+        "test-inject": cmd_test_inject,
+    }
     fn = cmds.get(args.command)
     if fn:
         fn(args)

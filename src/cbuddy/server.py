@@ -22,7 +22,7 @@ from .tty import inject, validate_tty
 
 logger = logging.getLogger("cbuddy")
 
-app = FastAPI(title="CBuddy", version="0.1.0")
+app = FastAPI(title="CBuddy", version="0.2.0")
 
 # --- State ---
 
@@ -31,20 +31,25 @@ lark_client: lark.Client = None  # type: ignore
 
 
 @dataclass
-class TTYMapping:
+class Session:
     tty: str
     cwd: str
+    root_msg_id: str | None = None
     created_at: float = field(default_factory=time.time)
 
 
-mappings: dict[str, TTYMapping] = {}
+sessions: dict[str, Session] = {}        # session_id -> Session
+root_to_session: dict[str, str] = {}     # root_msg_id -> session_id
 _TTL = 86400  # 24h
 
 
 def _cleanup():
     now = time.time()
-    for k in [k for k, v in mappings.items() if now - v.created_at > _TTL]:
-        del mappings[k]
+    expired = [sid for sid, s in sessions.items() if now - s.created_at > _TTL]
+    for sid in expired:
+        s = sessions.pop(sid)
+        if s.root_msg_id:
+            root_to_session.pop(s.root_msg_id, None)
 
 
 # --- Feishu helpers ---
@@ -56,10 +61,16 @@ _LABELS = {
 }
 
 
-def _make_message(hook_type: str, matcher: str, cwd: str) -> str:
+def _make_message(hook_type: str, matcher: str, cwd: str, message: str) -> str:
     project = basename(cwd) if cwd else "unknown"
     label = _LABELS.get(matcher) or _LABELS.get(hook_type, hook_type)
-    return f"[{project}] {label}"
+    text = f"[{project}] {label}"
+    if message:
+        content = message[:300]
+        if len(message) > 300:
+            content += "..."
+        text += f"\n> {content}"
+    return text
 
 
 def _send(text: str) -> str | None:
@@ -79,7 +90,7 @@ def _send(text: str) -> str | None:
     return resp.data.message_id
 
 
-def _reply(message_id: str, text: str):
+def _reply(message_id: str, text: str) -> str | None:
     body = ReplyMessageRequestBody.builder() \
         .msg_type("text") \
         .content(json.dumps({"text": text})) \
@@ -91,6 +102,8 @@ def _reply(message_id: str, text: str):
     resp = lark_client.im.v1.message.reply(req)
     if not resp.success():
         logger.error(f"Reply failed: {resp.code} {resp.msg}")
+        return None
+    return resp.data.message_id
 
 
 # --- Feishu WebSocket event handler ---
@@ -103,8 +116,12 @@ def _on_message(data: P2ImMessageReceiveV1):
     if not parent_id:
         return
 
-    mapping = mappings.get(parent_id)
-    if not mapping:
+    session_id = root_to_session.get(parent_id)
+    if not session_id:
+        return
+
+    session = sessions.get(session_id)
+    if not session:
         return
 
     if msg.message_type != "text":
@@ -119,16 +136,16 @@ def _on_message(data: P2ImMessageReceiveV1):
     if not reply_text:
         return
 
-    tty_error = validate_tty(mapping.tty)
+    tty_error = validate_tty(session.tty)
     if tty_error:
         _reply(message_id, f"❌ {tty_error}")
         return
 
     try:
-        inject(mapping.tty, reply_text)
-        project = basename(mapping.cwd) if mapping.cwd else "?"
-        logger.info(f"Injected '{reply_text}' -> {mapping.tty} ({project})")
-        _reply(message_id, f"✅ 已发送到 {mapping.tty}")
+        inject(session.tty, reply_text)
+        project = basename(session.cwd) if session.cwd else "?"
+        logger.info(f"Injected '{reply_text}' -> {session.tty} ({project})")
+        _reply(message_id, f"✅ 已发送到 {session.tty}")
     except Exception as e:
         logger.error(f"Inject failed: {e}")
         _reply(message_id, f"❌ 注入失败: {e}")
@@ -143,24 +160,41 @@ async def receive_hook(request: Request):
     tty = body.get("tty", "")
     cwd = body.get("cwd", "")
     matcher = body.get("matcher", "")
+    session_id = body.get("session_id", "")
+    message = body.get("message", "")
 
     if not tty:
         return {"ok": False, "error": "missing tty"}
 
-    text = _make_message(hook_type, matcher, cwd)
-    logger.info(f"Hook: {text} | tty={tty}")
+    text = _make_message(hook_type, matcher, cwd, message)
+    logger.info(f"Hook: {text} | tty={tty} session={session_id[:8] if session_id else '-'}")
 
-    msg_id = _send(text)
-    if msg_id:
-        mappings[msg_id] = TTYMapping(tty=tty, cwd=cwd)
-        _cleanup()
-        return {"ok": True, "msg_id": msg_id}
+    session = sessions.get(session_id) if session_id else None
+
+    if session and session.root_msg_id:
+        # Existing session: reply to thread root
+        session.tty = tty  # update in case TTY changed
+        session.cwd = cwd
+        msg_id = _reply(session.root_msg_id, text)
+        if msg_id:
+            return {"ok": True, "msg_id": msg_id, "thread": session.root_msg_id}
+    else:
+        # New session: send standalone message (becomes thread root)
+        msg_id = _send(text)
+        if msg_id and session_id:
+            sessions[session_id] = Session(tty=tty, cwd=cwd, root_msg_id=msg_id)
+            root_to_session[msg_id] = session_id
+            _cleanup()
+            return {"ok": True, "msg_id": msg_id}
+        elif msg_id:
+            return {"ok": True, "msg_id": msg_id}
+
     return {"ok": False, "error": "send failed"}
 
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "mappings": len(mappings)}
+    return {"status": "ok", "sessions": len(sessions)}
 
 
 # --- Init ---
