@@ -114,21 +114,18 @@ class HealthTests(_Base):
 # =========================================================================
 
 class HookNewSessionTests(_Base):
-    def test_new_session_sends_text_root_and_card_reply(self):
+    def test_new_session_sends_text_root_only(self):
         resp = self._post_hook()
         self.assertEqual(resp.status_code, 200)
         body = resp.json()
         self.assertTrue(body["ok"])
         self.assertEqual(body["msg_id"], "root-1")
 
-        # Text root sent, card replied to root
+        # Non-interactive: text root only, no card reply
         self.assertEqual(len(self.sent), 1)
-        self.assertEqual(len(self.replied), 1)
+        self.assertEqual(len(self.replied), 0)
         _, text = self.sent[0]
         self.assertIsInstance(text, str)
-        parent_id, card = self.replied[0]
-        self.assertEqual(parent_id, "root-1")
-        self.assertIsInstance(card, dict)
 
         session = server.session_store.get("session-1")
         self.assertIsNotNone(session)
@@ -136,15 +133,19 @@ class HookNewSessionTests(_Base):
         self.assertEqual(session.root_msg_id, "root-1")
         self.assertEqual(session.tty_pid, 1234)
 
-    def test_new_session_card_has_correct_title_and_color(self):
+    def test_new_session_text_root_contains_project_info(self):
         self._post_hook(hook_type="stop", matcher="", cwd="/tmp/myproject")
-        # Card is in the reply (first reply to text root)
-        _, card = self.replied[0]
-        self.assertIn("myproject", card["header"]["title"]["content"])
-        self.assertEqual(card["header"]["template"], "green")
+        # Non-interactive: only text root, no card
+        self.assertEqual(len(self.sent), 1)
+        self.assertEqual(len(self.replied), 0)
+        _, text = self.sent[0]
+        self.assertIn("myproject", text)
 
-    def test_permission_prompt_card_has_buttons(self):
+    def test_permission_prompt_sends_text_root_and_card_reply(self):
         self._post_hook(matcher="permission_prompt", hook_type="notification")
+        # Interactive: text root + card reply with buttons
+        self.assertEqual(len(self.sent), 1)
+        self.assertEqual(len(self.replied), 1)
         _, card = self.replied[0]
         self.assertEqual(card["header"]["template"], "red")
         action_elements = [e for e in card["elements"] if e["tag"] == "action"]
@@ -176,11 +177,11 @@ class HookNewSessionTests(_Base):
 # =========================================================================
 
 class HookExistingSessionTests(_Base):
-    def test_second_hook_replies_to_thread_root(self):
+    def test_second_hook_replies_text_to_thread_root(self):
         self._post_hook()
         self.assertEqual(len(self.sent), 1)
-        # First hook: text root (sent) + card reply
-        self.assertEqual(len(self.replied), 1)
+        # First hook (non-interactive): text root only, no card
+        self.assertEqual(len(self.replied), 0)
 
         resp = self._post_hook(message="second event")
         body = resp.json()
@@ -188,11 +189,12 @@ class HookExistingSessionTests(_Base):
         self.assertIn("thread", body)
         self.assertEqual(body["thread"], "root-1")
 
-        # sent once (first hook text root), replied twice (first hook card + second hook card)
+        # sent once (first hook text root), replied once (second hook text reply)
         self.assertEqual(len(self.sent), 1)
-        self.assertEqual(len(self.replied), 2)
-        parent_msg_id, _ = self.replied[1]
+        self.assertEqual(len(self.replied), 1)
+        parent_msg_id, content = self.replied[0]
         self.assertEqual(parent_msg_id, "root-1")
+        self.assertIsInstance(content, str)  # text, not card
 
     def test_second_hook_updates_tty(self):
         self._post_hook(tty="/dev/ttys001")

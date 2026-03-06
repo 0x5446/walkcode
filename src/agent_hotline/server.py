@@ -403,7 +403,8 @@ async def receive_hook(request: Request):
 
     _tag_terminal(tty, cwd, session_id)
 
-    card = _build_card(hook_type, matcher, cwd, message, tty=tty, session_id=session_id)
+    effective_type = matcher or hook_type
+    needs_card = effective_type == "permission_prompt"
     text = _make_message(hook_type, matcher, cwd, message, tty=tty, session_id=session_id)
     logger.info(f"Hook: {text} | tty={tty} session={session_id[:8] if session_id else '-'}")
 
@@ -418,11 +419,15 @@ async def receive_hook(request: Request):
             tty_pid=tty_pid,
             tty_pid_started_at=tty_pid_started_at,
         )
-        msg_id = _reply(session.root_msg_id, card=card)
+        if needs_card:
+            card = _build_card(hook_type, matcher, cwd, message, tty=tty, session_id=session_id)
+            msg_id = _reply(session.root_msg_id, card=card)
+        else:
+            msg_id = _reply(session.root_msg_id, text=text)
         if msg_id:
             return {"ok": True, "msg_id": msg_id, "thread": session.root_msg_id}
     else:
-        # New session: text root (visible in chat list) + card as first reply
+        # New session: text root as thread anchor
         msg_id = _send(text=text)
         if msg_id and session_id:
             session_store.upsert(
@@ -433,10 +438,15 @@ async def receive_hook(request: Request):
                 tty_pid=tty_pid,
                 tty_pid_started_at=tty_pid_started_at,
             )
-            _reply(msg_id, card=card)
+            # Only add card reply for interactive types (buttons)
+            if needs_card:
+                card = _build_card(hook_type, matcher, cwd, message, tty=tty, session_id=session_id)
+                _reply(msg_id, card=card)
             return {"ok": True, "msg_id": msg_id}
         elif msg_id:
-            _reply(msg_id, card=card)
+            if needs_card:
+                card = _build_card(hook_type, matcher, cwd, message, tty=tty, session_id=session_id)
+                _reply(msg_id, card=card)
             return {"ok": True, "msg_id": msg_id}
 
     return {"ok": False, "error": "send failed"}

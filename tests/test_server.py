@@ -89,7 +89,6 @@ class ServerReplySessionTests(unittest.TestCase):
         with (
             mock.patch("agent_hotline.server._tag_terminal") as tag_terminal,
             mock.patch("agent_hotline.server._send", return_value="msg-1"),
-            mock.patch("agent_hotline.server._reply", return_value="reply-1"),
         ):
             response = asyncio.run(server.receive_hook(FakeRequest()))
 
