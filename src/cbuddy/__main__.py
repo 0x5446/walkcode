@@ -4,10 +4,17 @@ import argparse
 import json
 import logging
 import os
+import signal
 import subprocess
 import sys
 import urllib.request
 from pathlib import Path
+
+from .tty import detect_terminal_binding
+
+_RUNTIME_DIR = Path.home() / ".cbuddy"
+_PID_FILE = _RUNTIME_DIR / "cbuddy.pid"
+_DEFAULT_LOG = _RUNTIME_DIR / "cbuddy.log"
 
 
 def cmd_serve(_args):
@@ -29,29 +36,101 @@ def cmd_serve(_args):
     uvicorn.run(app, host="127.0.0.1", port=cfg.port, log_level="warning")
 
 
-def _detect_tty() -> str:
-    """Detect TTY from process tree (stdin is piped in hook context)."""
-    # Walk up process tree to find a real terminal
-    pid = str(os.getppid())
-    for _ in range(5):
+# --- Daemon management ---
+
+def _read_pid() -> int | None:
+    if not _PID_FILE.exists():
+        return None
+    try:
+        pid = int(_PID_FILE.read_text().strip())
+        os.kill(pid, 0)  # check alive
+        return pid
+    except (ValueError, OSError):
+        _PID_FILE.unlink(missing_ok=True)
+        return None
+
+
+def _wait_exit(pid: int, timeout: float = 5.0) -> bool:
+    import time
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
         try:
-            r = subprocess.run(
-                ["ps", "-o", "tty=", "-p", pid],
-                capture_output=True, text=True, timeout=2,
-            )
-            t = r.stdout.strip()
-            if t and t != "??":
-                return f"/dev/{t}"
-            r = subprocess.run(
-                ["ps", "-o", "ppid=", "-p", pid],
-                capture_output=True, text=True, timeout=2,
-            )
-            pid = r.stdout.strip()
-            if not pid:
-                break
-        except Exception:
-            break
-    return ""
+            os.kill(pid, 0)
+        except OSError:
+            return True
+        time.sleep(0.1)
+    return False
+
+
+def cmd_start(args):
+    pid = _read_pid()
+    if pid:
+        print(f"CBuddy already running (pid {pid})")
+        sys.exit(1)
+
+    log_path = Path(args.log) if args.log != "-" else None
+    _RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Build command: use the same Python + module to run serve
+    cmd = [sys.executable, "-m", "cbuddy", "serve"]
+
+    if log_path:
+        log_file = open(log_path, "a")
+        stdout = stderr = log_file
+    else:
+        stdout = stderr = subprocess.DEVNULL
+
+    proc = subprocess.Popen(
+        cmd,
+        stdout=stdout,
+        stderr=stderr,
+        stdin=subprocess.DEVNULL,
+        start_new_session=True,
+        cwd=os.getcwd(),
+    )
+
+    _PID_FILE.write_text(str(proc.pid))
+    msg = f"CBuddy started (pid {proc.pid})"
+    if log_path:
+        msg += f", log: {log_path}"
+    print(msg)
+
+
+def cmd_stop(_args):
+    pid = _read_pid()
+    if not pid:
+        print("CBuddy is not running")
+        sys.exit(1)
+
+    os.kill(pid, signal.SIGTERM)
+    if _wait_exit(pid):
+        _PID_FILE.unlink(missing_ok=True)
+        print(f"CBuddy stopped (pid {pid})")
+    else:
+        os.kill(pid, signal.SIGKILL)
+        _PID_FILE.unlink(missing_ok=True)
+        print(f"CBuddy killed (pid {pid})")
+
+
+def cmd_restart(args):
+    pid = _read_pid()
+    if pid:
+        os.kill(pid, signal.SIGTERM)
+        if not _wait_exit(pid):
+            os.kill(pid, signal.SIGKILL)
+        _PID_FILE.unlink(missing_ok=True)
+        print(f"CBuddy stopped (pid {pid})")
+
+    cmd_start(args)
+
+
+def cmd_status(_args):
+    pid = _read_pid()
+    if pid:
+        print(f"CBuddy is running (pid {pid})")
+    else:
+        print("CBuddy is not running")
+        sys.exit(1)
 
 
 def cmd_hook(args):
@@ -62,40 +141,21 @@ def cmd_hook(args):
     except (json.JSONDecodeError, ValueError):
         hook_data = {}
 
-    tty = os.environ.get("TTY", "") or _detect_tty()
+    detected_tty, tty_pid, tty_pid_started_at = detect_terminal_binding()
+    tty = os.environ.get("TTY", "") or detected_tty
     cwd = os.getcwd()
     session_id = hook_data.get("session_id", "")
 
-    # Extract message: read last assistant message from transcript file
-    message = ""
-    transcript_path = hook_data.get("transcript_path", "")
-    if transcript_path:
-        try:
-            last_assistant = ""
-            with open(transcript_path, "r") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    entry = json.loads(line)
-                    if entry.get("type") == "assistant":
-                        msg = entry.get("message", {})
-                        if isinstance(msg, dict):
-                            texts = [
-                                b.get("text", "")
-                                for b in msg.get("content", [])
-                                if isinstance(b, dict) and b.get("type") == "text"
-                            ]
-                            if texts:
-                                last_assistant = " ".join(texts)
-            if last_assistant:
-                message = last_assistant
-        except Exception:
-            pass
+    # Extract message from hook input (Stop hook provides last_assistant_message)
+    message = hook_data.get("last_assistant_message", "")
+    # Filter out non-useful messages
+    _SKIP = {"no response requested.", ""}
+    if message.strip().lower() in _SKIP:
+        message = ""
 
     matcher = os.environ.get("CLAUDE_NOTIFICATION_TYPE", "")
 
-    port = int(os.environ.get("CBUDDY_PORT", os.environ.get("PORT", "3000")))
+    port = int(os.environ.get("CBUDDY_PORT", os.environ.get("PORT", "3001")))
     payload = json.dumps({
         "type": args.hook_type,
         "tty": tty,
@@ -103,6 +163,8 @@ def cmd_hook(args):
         "session_id": session_id,
         "message": message,
         "matcher": matcher,
+        "tty_pid": tty_pid,
+        "tty_pid_started_at": tty_pid_started_at,
     }).encode()
 
     try:
@@ -158,7 +220,17 @@ def main():
     parser = argparse.ArgumentParser(prog="cbuddy", description="Drive your terminal Claude Code from Feishu")
     sub = parser.add_subparsers(dest="command")
 
-    sub.add_parser("serve", help="Start CBuddy server")
+    sub.add_parser("serve", help="Start server (foreground)")
+
+    sp = sub.add_parser("start", help="Start server (background)")
+    sp.add_argument("--log", default=str(_DEFAULT_LOG), help=f"Log file path, '-' for none (default: {_DEFAULT_LOG})")
+
+    sub.add_parser("stop", help="Stop background server")
+
+    rp = sub.add_parser("restart", help="Restart background server")
+    rp.add_argument("--log", default=str(_DEFAULT_LOG), help=f"Log file path, '-' for none (default: {_DEFAULT_LOG})")
+
+    sub.add_parser("status", help="Check if server is running")
 
     hp = sub.add_parser("hook", help="Handle a Claude Code hook event (reads stdin)")
     hp.add_argument("hook_type", choices=["stop", "notification"], help="Hook event type")
@@ -173,6 +245,10 @@ def main():
     args = parser.parse_args()
     cmds = {
         "serve": cmd_serve,
+        "start": cmd_start,
+        "stop": cmd_stop,
+        "restart": cmd_restart,
+        "status": cmd_status,
         "hook": cmd_hook,
         "install-hooks": cmd_install_hooks,
         "test-inject": cmd_test_inject,
