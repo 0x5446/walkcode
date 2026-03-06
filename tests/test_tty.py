@@ -1,7 +1,7 @@
 import unittest
 from unittest import mock
 
-from cbuddy import tty
+from agent_hotline import tty
 
 
 class TTYProcessTests(unittest.TestCase):
@@ -12,10 +12,10 @@ class TTYProcessTests(unittest.TestCase):
         )
 
         self.assertIn("辅助功能", message)
-        self.assertIn("cbuddy serve", message)
+        self.assertIn("agent-hotline serve", message)
 
     def test_inspect_tty_owner_returns_live_tty(self):
-        with mock.patch("cbuddy.tty._ps_field", side_effect=[
+        with mock.patch("agent_hotline.tty._ps_field", side_effect=[
             "Fri  6 Mar 13:00:10 2026",
             "ttys009",
         ]):
@@ -25,14 +25,14 @@ class TTYProcessTests(unittest.TestCase):
         self.assertEqual(live_tty, "/dev/ttys009")
 
     def test_inspect_tty_owner_detects_pid_reuse(self):
-        with mock.patch("cbuddy.tty._ps_field", return_value="Fri Mar  6 13:05:00 2026"):
+        with mock.patch("agent_hotline.tty._ps_field", return_value="Fri Mar  6 13:05:00 2026"):
             status, live_tty = tty.inspect_tty_owner(1234, "Fri Mar  6 13:00:10 2026")
 
         self.assertEqual(status, "process_reused")
         self.assertIsNone(live_tty)
 
     def test_detect_terminal_binding_walks_parent_chain(self):
-        with mock.patch("cbuddy.tty._ps_field", side_effect=[
+        with mock.patch("agent_hotline.tty._ps_field", side_effect=[
             "??",
             "200",
             "ttys004",
@@ -70,7 +70,7 @@ class TTYProcessTests(unittest.TestCase):
         mock_file = mock.mock_open()
 
         with (
-            mock.patch("cbuddy.tty.validate_tty", return_value=None),
+            mock.patch("agent_hotline.tty.validate_tty", return_value=None),
             mock.patch("builtins.open", mock_file),
         ):
             tty.set_terminal_title("/dev/ttys001", "plaudclaw ttys001 9079ba57")

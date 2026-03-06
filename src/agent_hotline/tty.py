@@ -38,8 +38,8 @@ def _friendly_applescript_error(stderr: str) -> str:
     if "not allowed to send keystrokes" in stderr or "(1002)" in stderr:
         return (
             "macOS 拒绝键盘注入：请在 系统设置 > 隐私与安全性 > 辅助功能 中，"
-            "给启动 cbuddy serve 的宿主应用授权（例如 Terminal.app、iTerm、Codex），"
-            "然后重启该应用和 cbuddy serve"
+            "给启动 agent-hotline serve 的宿主应用授权（例如 Terminal.app、iTerm、Codex），"
+            "然后重启该应用和 agent-hotline serve"
         )
     return f"AppleScript failed: {stderr.strip()}"
 

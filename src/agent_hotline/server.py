@@ -1,4 +1,4 @@
-"""CBuddy server: FastAPI for hooks + Feishu WebSocket for events."""
+"""Agent Hotline server: FastAPI for hooks + Feishu WebSocket for events."""
 
 import json
 import logging
@@ -28,9 +28,9 @@ from .config import Config
 from .state import Session, SessionStore
 from .tty import inject, inspect_tty_owner, set_terminal_title, validate_tty
 
-logger = logging.getLogger("cbuddy")
+logger = logging.getLogger("agent_hotline")
 
-app = FastAPI(title="CBuddy", version="0.2.0")
+app = FastAPI(title="Agent Hotline", version="0.2.0")
 
 # --- State ---
 

@@ -9,8 +9,8 @@ from unittest import mock
 
 from fastapi.testclient import TestClient
 
-from cbuddy import server
-from cbuddy.state import SessionStore
+from agent_hotline import server
+from agent_hotline.state import SessionStore
 
 
 class _Base(unittest.TestCase):
@@ -29,9 +29,9 @@ class _Base(unittest.TestCase):
         self.client = TestClient(server.app)
 
         self._patches = [
-            mock.patch("cbuddy.server._send", side_effect=self._fake_send),
-            mock.patch("cbuddy.server._reply", side_effect=self._fake_reply),
-            mock.patch("cbuddy.server._tag_terminal"),
+            mock.patch("agent_hotline.server._send", side_effect=self._fake_send),
+            mock.patch("agent_hotline.server._reply", side_effect=self._fake_reply),
+            mock.patch("agent_hotline.server._tag_terminal"),
         ]
         for p in self._patches:
             p.start()
@@ -213,9 +213,9 @@ class MessageReplyTests(_Base):
 
     def test_reply_injects_text_and_confirms(self):
         self._setup_session()
-        with mock.patch("cbuddy.server.inspect_tty_owner", return_value=("ok", "/dev/ttys001")), \
-             mock.patch("cbuddy.server.validate_tty", return_value=None), \
-             mock.patch("cbuddy.server.inject", return_value=True) as inj:
+        with mock.patch("agent_hotline.server.inspect_tty_owner", return_value=("ok", "/dev/ttys001")), \
+             mock.patch("agent_hotline.server.validate_tty", return_value=None), \
+             mock.patch("agent_hotline.server.inject", return_value=True) as inj:
             server._on_message(self._msg_event(
                 root_id="root-1", parent_id="root-1",
                 message_id="user-1", text="continue",
@@ -225,9 +225,9 @@ class MessageReplyTests(_Base):
 
     def test_reply_inject_exception_returns_error(self):
         self._setup_session()
-        with mock.patch("cbuddy.server.inspect_tty_owner", return_value=("ok", "/dev/ttys001")), \
-             mock.patch("cbuddy.server.validate_tty", return_value=None), \
-             mock.patch("cbuddy.server.inject", side_effect=RuntimeError("boom")):
+        with mock.patch("agent_hotline.server.inspect_tty_owner", return_value=("ok", "/dev/ttys001")), \
+             mock.patch("agent_hotline.server.validate_tty", return_value=None), \
+             mock.patch("agent_hotline.server.inject", side_effect=RuntimeError("boom")):
             server._on_message(self._msg_event(
                 root_id="root-1", parent_id="root-1",
                 message_id="user-1", text="hello",
@@ -251,7 +251,7 @@ class MessageReplyTests(_Base):
 
     def test_non_text_message_rejected(self):
         self._setup_session()
-        with mock.patch("cbuddy.server.inspect_tty_owner", return_value=("ok", "/dev/ttys001")):
+        with mock.patch("agent_hotline.server.inspect_tty_owner", return_value=("ok", "/dev/ttys001")):
             server._on_message(self._msg_event(
                 root_id="root-1", parent_id="root-1",
                 message_id="user-1", text="", message_type="image",
@@ -261,7 +261,7 @@ class MessageReplyTests(_Base):
 
     def test_empty_text_reply_is_ignored(self):
         self._setup_session()
-        with mock.patch("cbuddy.server.inspect_tty_owner", return_value=("ok", "/dev/ttys001")):
+        with mock.patch("agent_hotline.server.inspect_tty_owner", return_value=("ok", "/dev/ttys001")):
             server._on_message(self._msg_event(
                 root_id="root-1", parent_id="root-1",
                 message_id="user-1", text="   ",
@@ -270,8 +270,8 @@ class MessageReplyTests(_Base):
 
     def test_reply_with_invalid_tty_returns_error(self):
         self._setup_session()
-        with mock.patch("cbuddy.server.inspect_tty_owner", return_value=("ok", "/dev/ttys001")), \
-             mock.patch("cbuddy.server.validate_tty", return_value="TTY does not exist"):
+        with mock.patch("agent_hotline.server.inspect_tty_owner", return_value=("ok", "/dev/ttys001")), \
+             mock.patch("agent_hotline.server.validate_tty", return_value="TTY does not exist"):
             server._on_message(self._msg_event(
                 root_id="root-1", parent_id="root-1",
                 message_id="user-1", text="hello",
@@ -280,7 +280,7 @@ class MessageReplyTests(_Base):
 
     def test_reply_with_stale_session_returns_warning(self):
         self._setup_session()
-        with mock.patch("cbuddy.server.inspect_tty_owner", return_value=("process_missing", None)):
+        with mock.patch("agent_hotline.server.inspect_tty_owner", return_value=("process_missing", None)):
             server._on_message(self._msg_event(
                 root_id="root-1", parent_id="root-1",
                 message_id="user-1", text="hello",
@@ -289,9 +289,9 @@ class MessageReplyTests(_Base):
 
     def test_reply_refreshes_tty_from_live_pid(self):
         self._setup_session()
-        with mock.patch("cbuddy.server.inspect_tty_owner", return_value=("ok", "/dev/ttys009")), \
-             mock.patch("cbuddy.server.validate_tty", return_value=None), \
-             mock.patch("cbuddy.server.inject", return_value=True) as inj:
+        with mock.patch("agent_hotline.server.inspect_tty_owner", return_value=("ok", "/dev/ttys009")), \
+             mock.patch("agent_hotline.server.validate_tty", return_value=None), \
+             mock.patch("agent_hotline.server.inject", return_value=True) as inj:
             server._on_message(self._msg_event(
                 root_id="root-1", parent_id="root-1",
                 message_id="user-1", text="go",
@@ -310,9 +310,9 @@ class CardActionTests(_Base):
 
     def test_card_action_injects_and_returns_success(self):
         self._setup_session()
-        with mock.patch("cbuddy.server.inspect_tty_owner", return_value=("ok", "/dev/ttys001")), \
-             mock.patch("cbuddy.server.validate_tty", return_value=None), \
-             mock.patch("cbuddy.server.inject", return_value=True) as inj:
+        with mock.patch("agent_hotline.server.inspect_tty_owner", return_value=("ok", "/dev/ttys001")), \
+             mock.patch("agent_hotline.server.validate_tty", return_value=None), \
+             mock.patch("agent_hotline.server.inject", return_value=True) as inj:
             resp = server._on_card_action(self._card_event(cmd="y", sid="session-1"))
         inj.assert_called_once_with("/dev/ttys001", "y")
         self.assertEqual(resp.toast.type, "success")
@@ -322,9 +322,9 @@ class CardActionTests(_Base):
 
     def test_card_action_inject_failure_returns_error(self):
         self._setup_session()
-        with mock.patch("cbuddy.server.inspect_tty_owner", return_value=("ok", "/dev/ttys001")), \
-             mock.patch("cbuddy.server.validate_tty", return_value=None), \
-             mock.patch("cbuddy.server.inject", side_effect=RuntimeError("no tab")):
+        with mock.patch("agent_hotline.server.inspect_tty_owner", return_value=("ok", "/dev/ttys001")), \
+             mock.patch("agent_hotline.server.validate_tty", return_value=None), \
+             mock.patch("agent_hotline.server.inject", side_effect=RuntimeError("no tab")):
             resp = server._on_card_action(self._card_event(cmd="y", sid="session-1"))
         self.assertEqual(resp.toast.type, "error")
         self.assertIn("注入失败", resp.toast.content)
@@ -350,14 +350,14 @@ class CardActionTests(_Base):
 
     def test_card_action_stale_pid_returns_error(self):
         self._setup_session()
-        with mock.patch("cbuddy.server.inspect_tty_owner", return_value=("process_missing", None)):
+        with mock.patch("agent_hotline.server.inspect_tty_owner", return_value=("process_missing", None)):
             resp = server._on_card_action(self._card_event(cmd="y", sid="session-1"))
         self.assertEqual(resp.toast.type, "error")
 
     def test_card_action_invalid_tty_returns_error(self):
         self._setup_session()
-        with mock.patch("cbuddy.server.inspect_tty_owner", return_value=("ok", "/dev/ttys001")), \
-             mock.patch("cbuddy.server.validate_tty", return_value="TTY gone"):
+        with mock.patch("agent_hotline.server.inspect_tty_owner", return_value=("ok", "/dev/ttys001")), \
+             mock.patch("agent_hotline.server.validate_tty", return_value="TTY gone"):
             resp = server._on_card_action(self._card_event(cmd="y", sid="session-1"))
         self.assertEqual(resp.toast.type, "error")
         self.assertIn("终端不可用", resp.toast.content)
@@ -379,9 +379,9 @@ class MultiSessionTests(_Base):
             injected_targets.append((tty, text))
             return True
 
-        with mock.patch("cbuddy.server.inspect_tty_owner", return_value=("ok", "/dev/ttys001")), \
-             mock.patch("cbuddy.server.validate_tty", return_value=None), \
-             mock.patch("cbuddy.server.inject", side_effect=fake_inject):
+        with mock.patch("agent_hotline.server.inspect_tty_owner", return_value=("ok", "/dev/ttys001")), \
+             mock.patch("agent_hotline.server.validate_tty", return_value=None), \
+             mock.patch("agent_hotline.server.inject", side_effect=fake_inject):
             server._on_message(self._msg_event(
                 root_id="root-1", parent_id="root-1",
                 message_id="u1", text="for proj-a",
@@ -390,9 +390,9 @@ class MultiSessionTests(_Base):
         self.assertEqual(injected_targets, [("/dev/ttys001", "for proj-a")])
 
         injected_targets.clear()
-        with mock.patch("cbuddy.server.inspect_tty_owner", return_value=("ok", "/dev/ttys002")), \
-             mock.patch("cbuddy.server.validate_tty", return_value=None), \
-             mock.patch("cbuddy.server.inject", side_effect=fake_inject):
+        with mock.patch("agent_hotline.server.inspect_tty_owner", return_value=("ok", "/dev/ttys002")), \
+             mock.patch("agent_hotline.server.validate_tty", return_value=None), \
+             mock.patch("agent_hotline.server.inject", side_effect=fake_inject):
             server._on_message(self._msg_event(
                 root_id="root-2", parent_id="root-2",
                 message_id="u2", text="for proj-b",

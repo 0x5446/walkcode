@@ -4,8 +4,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from cbuddy import server
-from cbuddy.state import SessionStore
+from agent_hotline import server
+from agent_hotline.state import SessionStore
 
 
 class ServerReplySessionTests(unittest.TestCase):
@@ -28,7 +28,7 @@ class ServerReplySessionTests(unittest.TestCase):
             tty_pid_started_at="Fri Mar  6 13:00:10 2026",
         )
 
-        with mock.patch("cbuddy.server.inspect_tty_owner", return_value=("ok", "/dev/ttys009")):
+        with mock.patch("agent_hotline.server.inspect_tty_owner", return_value=("ok", "/dev/ttys009")):
             session, error = server._load_reply_session("session-1")
 
         self.assertIsNone(error)
@@ -46,7 +46,7 @@ class ServerReplySessionTests(unittest.TestCase):
             tty_pid_started_at="Fri Mar  6 13:00:10 2026",
         )
 
-        with mock.patch("cbuddy.server.inspect_tty_owner", return_value=("process_missing", None)):
+        with mock.patch("agent_hotline.server.inspect_tty_owner", return_value=("process_missing", None)):
             session, error = server._load_reply_session("session-1")
 
         self.assertIsNone(session)
@@ -87,9 +87,9 @@ class ServerReplySessionTests(unittest.TestCase):
                 }
 
         with (
-            mock.patch("cbuddy.server._tag_terminal") as tag_terminal,
-            mock.patch("cbuddy.server._send", return_value="msg-1"),
-            mock.patch("cbuddy.server._reply", return_value="reply-1"),
+            mock.patch("agent_hotline.server._tag_terminal") as tag_terminal,
+            mock.patch("agent_hotline.server._send", return_value="msg-1"),
+            mock.patch("agent_hotline.server._reply", return_value="reply-1"),
         ):
             response = asyncio.run(server.receive_hook(FakeRequest()))
 

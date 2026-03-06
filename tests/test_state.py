@@ -4,7 +4,7 @@ import time
 import unittest
 from pathlib import Path
 
-from cbuddy.state import SessionStore
+from agent_hotline.state import SessionStore
 
 
 class SessionStoreTests(unittest.TestCase):

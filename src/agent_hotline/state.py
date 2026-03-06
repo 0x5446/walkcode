@@ -1,4 +1,4 @@
-"""Persistent session storage for CBuddy."""
+"""Persistent session storage for Agent Hotline."""
 
 import json
 import logging
@@ -8,7 +8,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-logger = logging.getLogger("cbuddy.state")
+logger = logging.getLogger("agent_hotline.state")
 
 
 @dataclass
