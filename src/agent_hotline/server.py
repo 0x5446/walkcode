@@ -119,7 +119,7 @@ _SUCCESS_EMOJIS = [
 ]
 _FAILURE_EMOJIS = [
     "FACEPALM", "CRY", "SOB", "CrossMark", "FROWN", "Sigh",
-    "SKULL", "SWEAT", "WRONGED", "TERROR",
+    "SWEAT", "WRONGED", "TERROR",
 ]
 
 _MENTION_RE = re.compile(r"@_user_\d+\s*")
@@ -442,9 +442,9 @@ async def receive_hook(request: Request):
         )
         if needs_card:
             card = _build_card(message, session_id)
-            msg_id = _reply(session.root_msg_id, card=card)
+            msg_id = _reply(session.root_msg_id, card=card, reply_in_thread=True)
         else:
-            msg_id = _reply(session.root_msg_id, text=message or effective_type)
+            msg_id = _reply(session.root_msg_id, text=message or effective_type, reply_in_thread=True)
         if msg_id:
             return {"ok": True, "msg_id": msg_id, "thread": session.root_msg_id}
     else:
