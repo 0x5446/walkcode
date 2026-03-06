@@ -10,7 +10,8 @@ class Config:
     feishu_receive_id: str
     feishu_receive_id_type: str  # "open_id" or "chat_id"
     feishu_verification_token: str
-    port: int = 3000
+    port: int = 3001
+    state_path: Path = Path.home() / ".cbuddy" / "state.json"
 
     @classmethod
     def load(cls) -> "Config":
@@ -38,5 +39,11 @@ class Config:
             feishu_receive_id=os.environ["FEISHU_RECEIVE_ID"],
             feishu_receive_id_type=os.environ.get("FEISHU_RECEIVE_ID_TYPE", "open_id"),
             feishu_verification_token=os.environ.get("FEISHU_VERIFICATION_TOKEN", ""),
-            port=int(os.environ.get("PORT", "3000")),
+            port=int(os.environ.get("PORT", "3001")),
+            state_path=Path(
+                os.environ.get(
+                    "CBUDDY_STATE_PATH",
+                    str(Path.home() / ".cbuddy" / "state.json"),
+                )
+            ).expanduser(),
         )
