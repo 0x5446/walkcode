@@ -6,7 +6,6 @@ import random
 import re
 import threading
 from os.path import basename
-from pathlib import Path
 
 import lark_oapi as lark
 from lark_oapi.api.im.v1 import (
@@ -31,11 +30,11 @@ from fastapi import FastAPI, Request
 
 from .config import Config
 from .state import Session, SessionStore
-from .tty import inject, inspect_tty_owner, set_terminal_title, validate_tty
+from .tty import inject, validate_target
 
 logger = logging.getLogger("agent_hotline")
 
-app = FastAPI(title="Agent Hotline", version="0.2.0")
+app = FastAPI(title="Agent Hotline", version="0.3.0")
 
 # --- State ---
 
@@ -43,7 +42,7 @@ config: Config = None  # type: ignore
 lark_client: lark.Client = None  # type: ignore
 session_store: SessionStore = None  # type: ignore
 _TTL = 86400  # 24h
-_STALE_SESSION_MESSAGE = "⚠️ 终端映射已失效，请等待 Claude 的下一条通知刷新会话"
+_STALE_SESSION_MESSAGE = "⚠️ tmux 会话已失效，请等待 Claude 的下一条通知刷新会话"
 
 
 def _resolve_session_id(msg) -> str | None:
@@ -53,39 +52,15 @@ def _resolve_session_id(msg) -> str | None:
     )
 
 
-def _thread_reply(message_id: str, text: str) -> str | None:
-    return _reply(message_id, text)
-
-
 def _load_reply_session(session_id: str) -> tuple[Session | None, str | None]:
     session = session_store.get(session_id)
     if not session:
         return None, None
 
-    if session.tty_pid and session.tty_pid_started_at:
-        status, live_tty = inspect_tty_owner(session.tty_pid, session.tty_pid_started_at)
-        if status != "ok" or not live_tty:
-            logger.warning(
-                "Session %s tty owner invalid: %s pid=%s",
-                session_id[:8],
-                status,
-                session.tty_pid,
-            )
-            return None, _STALE_SESSION_MESSAGE
-        if live_tty != session.tty:
-            logger.info(
-                "Refreshing tty for session %s: %s -> %s",
-                session_id[:8],
-                session.tty,
-                live_tty,
-            )
-            return session_store.upsert(
-                session_id,
-                tty=live_tty,
-                cwd=session.cwd,
-                tty_pid=session.tty_pid,
-                tty_pid_started_at=session.tty_pid_started_at,
-            ), None
+    error = validate_target(session.tty)
+    if error:
+        logger.warning("Session %s target invalid: %s", session_id[:8], error)
+        return None, _STALE_SESSION_MESSAGE
 
     return session_store.touch(session_id), None
 
@@ -97,13 +72,6 @@ _LABELS = {
     "permission_prompt": "🔐 需要权限确认",
     "idle_prompt": "⏳ 等待你的输入",
     "elicitation_dialog": "📋 请选择",
-}
-
-_CARD_COLORS = {
-    "stop": "green",
-    "permission_prompt": "red",
-    "idle_prompt": "blue",
-    "elicitation_dialog": "blue",
 }
 
 _PERMISSION_BUTTONS = [
@@ -165,24 +133,6 @@ def _build_result_card(title: str, color: str, status_text: str) -> dict:
     }
 
 
-def _make_message(
-    hook_type: str,
-    matcher: str,
-    cwd: str,
-    message: str,
-    tty: str = "",
-    session_id: str = "",
-) -> str:
-    project = basename(cwd) if cwd else "unknown"
-    label = _LABELS.get(matcher) or _LABELS.get(hook_type, hook_type)
-    tty_label = Path(tty).name if tty else "tty?"
-    session_label = session_id[:8] if session_id else "session?"
-    text = f"[{project} {tty_label} {session_label}] {label}"
-    if message:
-        text += f"\n> {message}"
-    return text
-
-
 def _make_title(cwd: str, message: str = "") -> str:
     project = basename(cwd) if cwd else "unknown"
     if not message:
@@ -190,23 +140,6 @@ def _make_title(cwd: str, message: str = "") -> str:
     snippet = message[:5].rstrip()
     ellipsis = "..." if len(message) > 5 else ""
     return f"{project} | {snippet}{ellipsis}"
-
-
-def _terminal_label(cwd: str, tty: str, session_id: str) -> str:
-    project = basename(cwd) if cwd else "unknown"
-    tty_label = Path(tty).name if tty else "tty?"
-    session_label = session_id[:8] if session_id else "session?"
-    return f"{project} {tty_label} {session_label}"
-
-
-def _tag_terminal(tty: str, cwd: str, session_id: str):
-    if not tty:
-        return
-
-    try:
-        set_terminal_title(tty, _terminal_label(cwd, tty, session_id))
-    except Exception as e:
-        logger.warning("Set terminal title failed for %s: %s", tty, e)
 
 
 def _send(text: str = "", card: dict | None = None) -> str | None:
@@ -308,15 +241,6 @@ def _on_card_action(data: P2CardActionTrigger) -> P2CardActionTriggerResponse:
         resp.toast = toast
         return resp
 
-    tty_error = validate_tty(session.tty)
-    if tty_error:
-        resp = P2CardActionTriggerResponse()
-        toast = CallBackToast()
-        toast.type = "error"
-        toast.content = f"终端不可用: {tty_error}"
-        resp.toast = toast
-        return resp
-
     try:
         inject(session.tty, cmd)
         project = basename(session.cwd) if session.cwd else "?"
@@ -375,7 +299,7 @@ def _on_message(data: P2ImMessageReceiveV1):
         return
 
     if msg.message_type != "text":
-        _thread_reply(message_id, "⚠️ 只支持文本回复")
+        _reply(message_id, "⚠️ 只支持文本回复")
         return
 
     try:
@@ -387,11 +311,6 @@ def _on_message(data: P2ImMessageReceiveV1):
     reply_text = _MENTION_RE.sub("", reply_text).strip()
 
     if not reply_text:
-        return
-
-    tty_error = validate_tty(session.tty)
-    if tty_error:
-        _add_reaction(message_id, random.choice(_FAILURE_EMOJIS))
         return
 
     project = basename(session.cwd) if session.cwd else "?"
@@ -416,30 +335,20 @@ async def receive_hook(request: Request):
     matcher = body.get("matcher", "")
     session_id = body.get("session_id", "")
     message = body.get("message", "")
-    tty_pid = body.get("tty_pid")
-    tty_pid_started_at = body.get("tty_pid_started_at")
 
     if not tty:
-        return {"ok": False, "error": "missing tty"}
-
-    _tag_terminal(tty, cwd, session_id)
+        return {"ok": False, "error": "missing tty (not in tmux?)"}
 
     effective_type = matcher or hook_type
     needs_card = effective_type == "permission_prompt"
-    text = _make_message(hook_type, matcher, cwd, message, tty=tty, session_id=session_id)
-    logger.info(f"Hook: {text} | tty={tty} session={session_id[:8] if session_id else '-'}")
+    project = basename(cwd) if cwd else "unknown"
+    logger.info(f"Hook: [{project}] {effective_type} | tmux={tty} session={session_id[:8] if session_id else '-'}")
 
     session = session_store.get(session_id) if session_id else None
 
     if session and session.root_msg_id:
         # Existing session: reply to thread root
-        session_store.upsert(
-            session_id,
-            tty=tty,
-            cwd=cwd,
-            tty_pid=tty_pid,
-            tty_pid_started_at=tty_pid_started_at,
-        )
+        session_store.upsert(session_id, tty=tty, cwd=cwd)
         if needs_card:
             card = _build_card(message, session_id)
             msg_id = _reply(session.root_msg_id, card=card, reply_in_thread=True)
@@ -453,14 +362,7 @@ async def receive_hook(request: Request):
         root_id = _send(text=title)
         if root_id:
             if session_id:
-                session_store.upsert(
-                    session_id,
-                    tty=tty,
-                    cwd=cwd,
-                    root_msg_id=root_id,
-                    tty_pid=tty_pid,
-                    tty_pid_started_at=tty_pid_started_at,
-                )
+                session_store.upsert(session_id, tty=tty, cwd=cwd, root_msg_id=root_id)
             # Reply with content to create thread (reply_in_thread=True)
             if needs_card:
                 card = _build_card(message, session_id)

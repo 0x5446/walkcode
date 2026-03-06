@@ -13,25 +13,18 @@ logger = logging.getLogger("agent_hotline.state")
 
 @dataclass
 class Session:
-    tty: str
+    tty: str  # tmux session name
     cwd: str
     root_msg_id: str | None = None
-    tty_pid: int | None = None
-    tty_pid_started_at: str | None = None
     created_at: float = field(default_factory=time.time)
 
     @classmethod
     def from_dict(cls, data: dict) -> "Session":
         root_msg_id = data.get("root_msg_id")
-        tty_pid = data.get("tty_pid")
-        tty_pid_started_at = data.get("tty_pid_started_at")
-        parsed_tty_pid = int(tty_pid) if tty_pid not in (None, "") else None
         return cls(
             tty=str(data.get("tty", "")),
             cwd=str(data.get("cwd", "")),
             root_msg_id=str(root_msg_id) if root_msg_id else None,
-            tty_pid=parsed_tty_pid,
-            tty_pid_started_at=str(tty_pid_started_at) if tty_pid_started_at else None,
             created_at=float(data.get("created_at", time.time())),
         )
 
@@ -40,8 +33,6 @@ class Session:
             "tty": self.tty,
             "cwd": self.cwd,
             "root_msg_id": self.root_msg_id,
-            "tty_pid": self.tty_pid,
-            "tty_pid_started_at": self.tty_pid_started_at,
             "created_at": self.created_at,
         }
 
@@ -116,8 +107,6 @@ class SessionStore:
         tty: str,
         cwd: str,
         root_msg_id: str | None = None,
-        tty_pid: int | None = None,
-        tty_pid_started_at: str | None = None,
     ) -> Session:
         with self._lock:
             session = self._sessions.get(session_id)
@@ -126,8 +115,6 @@ class SessionStore:
                     tty=tty,
                     cwd=cwd,
                     root_msg_id=root_msg_id,
-                    tty_pid=tty_pid,
-                    tty_pid_started_at=tty_pid_started_at,
                 )
                 self._sessions[session_id] = session
             else:
@@ -136,10 +123,6 @@ class SessionStore:
                 session.created_at = time.time()
                 if root_msg_id is not None:
                     session.root_msg_id = root_msg_id
-                if tty_pid is not None:
-                    session.tty_pid = tty_pid
-                if tty_pid_started_at is not None:
-                    session.tty_pid_started_at = tty_pid_started_at
 
             self._sync_locked()
             return Session(**session.to_dict())

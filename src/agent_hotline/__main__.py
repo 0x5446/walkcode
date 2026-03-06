@@ -10,7 +10,7 @@ import sys
 import urllib.request
 from pathlib import Path
 
-from .tty import detect_terminal_binding
+from .tty import detect_tmux_session
 
 _RUNTIME_DIR = Path.home() / ".agent-hotline"
 _PID_FILE = _RUNTIME_DIR / "agent-hotline.pid"
@@ -141,8 +141,11 @@ def cmd_hook(args):
     except (json.JSONDecodeError, ValueError):
         hook_data = {}
 
-    detected_tty, tty_pid, tty_pid_started_at = detect_terminal_binding()
-    tty = os.environ.get("TTY", "") or detected_tty
+    tmux_session = detect_tmux_session()
+    if not tmux_session:
+        print("[agent-hotline] not in tmux, skipping hook", file=sys.stderr)
+        return
+
     cwd = os.getcwd()
     session_id = hook_data.get("session_id", "")
 
@@ -158,13 +161,11 @@ def cmd_hook(args):
     port = int(os.environ.get("AGENT_HOTLINE_PORT", os.environ.get("PORT", "3001")))
     payload = json.dumps({
         "type": args.hook_type,
-        "tty": tty,
+        "tty": tmux_session,
         "cwd": cwd,
         "session_id": session_id,
         "message": message,
         "matcher": matcher,
-        "tty_pid": tty_pid,
-        "tty_pid_started_at": tty_pid_started_at,
     }).encode()
 
     try:
@@ -204,16 +205,16 @@ def cmd_install_hooks(_args):
 
 
 def cmd_test_inject(args):
-    from .tty import inject, validate_tty
+    from .tty import inject, validate_target
 
-    error = validate_tty(args.tty)
+    error = validate_target(args.session)
     if error:
         print(f"Error: {error}")
         sys.exit(1)
 
-    inject(args.tty, args.text, enter=not args.no_enter)
+    inject(args.session, args.text, enter=not args.no_enter)
     suffix = " (no enter)" if args.no_enter else " + Enter"
-    print(f"Injected '{args.text}'{suffix} -> {args.tty}")
+    print(f"Injected '{args.text}'{suffix} -> tmux:{args.session}")
 
 
 def main():
@@ -237,8 +238,8 @@ def main():
 
     sub.add_parser("install-hooks", help="Install Claude Code hooks")
 
-    p = sub.add_parser("test-inject", help="Test terminal injection")
-    p.add_argument("tty", help="TTY path, e.g. /dev/ttys003")
+    p = sub.add_parser("test-inject", help="Test tmux injection")
+    p.add_argument("session", help="tmux session name")
     p.add_argument("text", help="Text to inject")
     p.add_argument("--no-enter", action="store_true", help="Don't press Enter")
 

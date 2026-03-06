@@ -4,84 +4,93 @@ from unittest import mock
 from agent_hotline import tty
 
 
-class TTYProcessTests(unittest.TestCase):
-    def test_friendly_applescript_error_for_accessibility_denial(self):
-        message = tty._friendly_applescript_error(
-            "369:383: execution error: System Events got an error: "
-            "osascript is not allowed to send keystrokes. (1002)"
-        )
+class TmuxDetectionTests(unittest.TestCase):
+    def test_detect_tmux_session_returns_name_when_in_tmux(self):
+        with mock.patch.dict("os.environ", {"TMUX": "/tmp/tmux-501/default,12345,0"}), \
+             mock.patch("agent_hotline.tty.subprocess.run") as mock_run:
+            mock_run.return_value = mock.Mock(returncode=0, stdout="claude-myproject-99\n")
+            session = tty.detect_tmux_session()
 
-        self.assertIn("辅助功能", message)
-        self.assertIn("agent-hotline serve", message)
+        self.assertEqual(session, "claude-myproject-99")
 
-    def test_inspect_tty_owner_returns_live_tty(self):
-        with mock.patch("agent_hotline.tty._ps_field", side_effect=[
-            "Fri  6 Mar 13:00:10 2026",
-            "ttys009",
-        ]):
-            status, live_tty = tty.inspect_tty_owner(1234, "Fri Mar  6 13:00:10 2026")
+    def test_detect_tmux_session_returns_empty_when_not_in_tmux(self):
+        with mock.patch.dict("os.environ", {}, clear=True):
+            session = tty.detect_tmux_session()
 
-        self.assertEqual(status, "ok")
-        self.assertEqual(live_tty, "/dev/ttys009")
+        self.assertEqual(session, "")
 
-    def test_inspect_tty_owner_detects_pid_reuse(self):
-        with mock.patch("agent_hotline.tty._ps_field", return_value="Fri Mar  6 13:05:00 2026"):
-            status, live_tty = tty.inspect_tty_owner(1234, "Fri Mar  6 13:00:10 2026")
+    def test_detect_tmux_session_returns_empty_on_command_failure(self):
+        with mock.patch.dict("os.environ", {"TMUX": "/tmp/tmux-501/default,12345,0"}), \
+             mock.patch("agent_hotline.tty.subprocess.run") as mock_run:
+            mock_run.return_value = mock.Mock(returncode=1, stdout="")
+            session = tty.detect_tmux_session()
 
-        self.assertEqual(status, "process_reused")
-        self.assertIsNone(live_tty)
+        self.assertEqual(session, "")
 
-    def test_detect_terminal_binding_walks_parent_chain(self):
-        with mock.patch("agent_hotline.tty._ps_field", side_effect=[
-            "??",
-            "200",
-            "ttys004",
-            "Fri Mar  6 13:00:10 2026",
-            "300",
-            "ttys004",
-            "Fri Mar  6 13:00:10 2026",
-            "",
-        ]):
-            tty_path, pid, started_at = tty.detect_terminal_binding(start_pid=100, max_depth=3)
 
-        self.assertEqual(tty_path, "/dev/ttys004")
-        self.assertEqual(pid, 300)
-        self.assertEqual(started_at, "2026-03-06 13:00:10")
+class ValidateTargetTests(unittest.TestCase):
+    def test_validate_target_returns_none_when_session_exists(self):
+        with mock.patch("agent_hotline.tty.subprocess.run") as mock_run:
+            mock_run.return_value = mock.Mock(returncode=0)
+            error = tty.validate_target("claude-proj-123")
 
-    def test_normalize_lstart_accepts_both_orders(self):
-        self.assertEqual(
-            tty._normalize_lstart("Fri Mar  6 13:00:10 2026"),
-            "2026-03-06 13:00:10",
-        )
-        self.assertEqual(
-            tty._normalize_lstart("Fri  6 Mar 13:00:10 2026"),
-            "2026-03-06 13:00:10",
-        )
+        self.assertIsNone(error)
 
-    def test_title_escape_sequence_sanitizes_control_chars(self):
-        sequence = tty._title_escape_sequence("plaudclaw\x1b\x07 ttys001")
+    def test_validate_target_returns_error_when_session_missing(self):
+        with mock.patch("agent_hotline.tty.subprocess.run") as mock_run:
+            mock_run.return_value = mock.Mock(returncode=1)
+            error = tty.validate_target("dead-session")
 
-        self.assertEqual(
-            sequence,
-            "\033]0;plaudclaw ttys001\007\033]1;plaudclaw ttys001\007\033]2;plaudclaw ttys001\007",
-        )
+        self.assertIn("not found", error)
 
-    def test_set_terminal_title_writes_osc_sequences(self):
-        mock_file = mock.mock_open()
+    def test_validate_target_returns_error_for_empty_name(self):
+        error = tty.validate_target("")
+        self.assertIn("No tmux session", error)
 
-        with (
-            mock.patch("agent_hotline.tty.validate_tty", return_value=None),
-            mock.patch("builtins.open", mock_file),
-        ):
-            tty.set_terminal_title("/dev/ttys001", "plaudclaw ttys001 9079ba57")
+    def test_validate_target_returns_error_when_tmux_not_installed(self):
+        with mock.patch("agent_hotline.tty.subprocess.run", side_effect=FileNotFoundError):
+            error = tty.validate_target("some-session")
 
-        handle = mock_file()
-        handle.write.assert_called_once_with(
-            "\033]0;plaudclaw ttys001 9079ba57\007"
-            "\033]1;plaudclaw ttys001 9079ba57\007"
-            "\033]2;plaudclaw ttys001 9079ba57\007"
-        )
-        handle.flush.assert_called_once_with()
+        self.assertIn("not installed", error)
+
+
+class InjectTests(unittest.TestCase):
+    def test_inject_sends_text_and_enter(self):
+        with mock.patch("agent_hotline.tty.validate_target", return_value=None), \
+             mock.patch("agent_hotline.tty.subprocess.run") as mock_run:
+            mock_run.return_value = mock.Mock(returncode=0)
+            result = tty.inject("claude-proj-123", "hello world")
+
+        self.assertTrue(result)
+        self.assertEqual(mock_run.call_count, 2)
+        # First call: send-keys -l "hello world"
+        args1 = mock_run.call_args_list[0][0][0]
+        self.assertEqual(args1, ["tmux", "send-keys", "-t", "claude-proj-123", "-l", "hello world"])
+        # Second call: send-keys Enter
+        args2 = mock_run.call_args_list[1][0][0]
+        self.assertEqual(args2, ["tmux", "send-keys", "-t", "claude-proj-123", "Enter"])
+
+    def test_inject_single_key_no_enter(self):
+        with mock.patch("agent_hotline.tty.validate_target", return_value=None), \
+             mock.patch("agent_hotline.tty.subprocess.run") as mock_run:
+            mock_run.return_value = mock.Mock(returncode=0)
+            tty.inject("claude-proj-123", "y")
+
+        # Only one call (no Enter)
+        self.assertEqual(mock_run.call_count, 1)
+
+    def test_inject_raises_on_invalid_target(self):
+        with mock.patch("agent_hotline.tty.validate_target", return_value="session not found"):
+            with self.assertRaises(RuntimeError):
+                tty.inject("dead-session", "hello")
+
+    def test_inject_raises_on_send_keys_failure(self):
+        with mock.patch("agent_hotline.tty.validate_target", return_value=None), \
+             mock.patch("agent_hotline.tty.subprocess.run") as mock_run:
+            mock_run.return_value = mock.Mock(returncode=1, stderr="session not found")
+            with self.assertRaises(RuntimeError) as ctx:
+                tty.inject("claude-proj-123", "hello")
+            self.assertIn("send-keys failed", str(ctx.exception))
 
 
 if __name__ == "__main__":

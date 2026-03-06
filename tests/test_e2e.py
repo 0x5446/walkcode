@@ -33,7 +33,6 @@ class _Base(unittest.TestCase):
             mock.patch("agent_hotline.server._send", side_effect=self._fake_send),
             mock.patch("agent_hotline.server._reply", side_effect=self._fake_reply),
             mock.patch("agent_hotline.server._add_reaction", side_effect=self._fake_add_reaction),
-            mock.patch("agent_hotline.server._tag_terminal"),
         ]
         for p in self._patches:
             p.start()
@@ -60,10 +59,9 @@ class _Base(unittest.TestCase):
 
     # -- helpers --
 
-    def _post_hook(self, session_id="session-1", tty="/dev/ttys001",
+    def _post_hook(self, session_id="session-1", tty="claude-project-123",
                    cwd="/tmp/project", hook_type="stop", matcher="",
-                   message="done", tty_pid=1234,
-                   tty_pid_started_at="Fri Mar  6 13:00:10 2026"):
+                   message="done"):
         return self.client.post("/hook", json={
             "type": hook_type,
             "tty": tty,
@@ -71,8 +69,6 @@ class _Base(unittest.TestCase):
             "session_id": session_id,
             "message": message,
             "matcher": matcher,
-            "tty_pid": tty_pid,
-            "tty_pid_started_at": tty_pid_started_at,
         })
 
     def _msg_event(self, *, root_id="", parent_id="", message_id="msg-1",
@@ -109,7 +105,7 @@ class HealthTests(_Base):
 
     def test_health_reports_session_count(self):
         self._post_hook(session_id="s1")
-        self._post_hook(session_id="s2", tty="/dev/ttys002")
+        self._post_hook(session_id="s2", tty="claude-other-456")
         resp = self.client.get("/health")
         self.assertEqual(resp.json()["sessions"], 2)
 
@@ -131,16 +127,14 @@ class HookNewSessionTests(_Base):
         self.assertEqual(len(self.replied), 1)
         _, title = self.sent[0]
         self.assertIsInstance(title, str)
-        self.assertNotIn("> ", title)  # Title only, no message content
         parent_id, content = self.replied[0]
         self.assertEqual(parent_id, "root-1")
         self.assertEqual(content, "done")
 
         session = server.session_store.get("session-1")
         self.assertIsNotNone(session)
-        self.assertEqual(session.tty, "/dev/ttys001")
+        self.assertEqual(session.tty, "claude-project-123")
         self.assertEqual(session.root_msg_id, "root-1")
-        self.assertEqual(session.tty_pid, 1234)
 
     def test_new_session_title_contains_project_and_snippet(self):
         self._post_hook(hook_type="stop", matcher="", cwd="/tmp/myproject", message="hello world")
@@ -175,7 +169,7 @@ class HookNewSessionTests(_Base):
 
     def test_hook_without_session_id_sends_but_no_session_stored(self):
         resp = self.client.post("/hook", json={
-            "type": "stop", "tty": "/dev/ttys001", "cwd": "/tmp",
+            "type": "stop", "tty": "claude-project-123", "cwd": "/tmp",
             "session_id": "", "message": "done", "matcher": "",
         })
         self.assertTrue(resp.json()["ok"])
@@ -190,7 +184,6 @@ class HookExistingSessionTests(_Base):
     def test_second_hook_replies_text_to_thread_root(self):
         self._post_hook()
         self.assertEqual(len(self.sent), 1)
-        # First hook: title root + content reply (thread creation)
         self.assertEqual(len(self.replied), 1)
 
         resp = self._post_hook(message="second event")
@@ -199,18 +192,17 @@ class HookExistingSessionTests(_Base):
         self.assertIn("thread", body)
         self.assertEqual(body["thread"], "root-1")
 
-        # sent once (first hook title root), replied twice (first content + second text reply)
         self.assertEqual(len(self.sent), 1)
         self.assertEqual(len(self.replied), 2)
         parent_msg_id, content = self.replied[1]
         self.assertEqual(parent_msg_id, "root-1")
-        self.assertIsInstance(content, str)  # text, not card
+        self.assertIsInstance(content, str)
 
     def test_second_hook_updates_tty(self):
-        self._post_hook(tty="/dev/ttys001")
-        self._post_hook(tty="/dev/ttys005")
+        self._post_hook(tty="claude-project-123")
+        self._post_hook(tty="claude-project-456")
         session = server.session_store.get("session-1")
-        self.assertEqual(session.tty, "/dev/ttys005")
+        self.assertEqual(session.tty, "claude-project-456")
 
 
 # =========================================================================
@@ -220,27 +212,24 @@ class HookExistingSessionTests(_Base):
 class MessageReplyTests(_Base):
     def _setup_session(self):
         self._post_hook()
-        # Clear tracking from hook
         self.replied.clear()
 
     def test_reply_injects_text_and_reacts_success(self):
         self._setup_session()
-        with mock.patch("agent_hotline.server.inspect_tty_owner", return_value=("ok", "/dev/ttys001")), \
-             mock.patch("agent_hotline.server.validate_tty", return_value=None), \
+        with mock.patch("agent_hotline.server.validate_target", return_value=None), \
              mock.patch("agent_hotline.server.inject", return_value=True) as inj:
             server._on_message(self._msg_event(
                 root_id="root-1", parent_id="root-1",
                 message_id="user-1", text="continue",
             ))
-        inj.assert_called_once_with("/dev/ttys001", "continue")
+        inj.assert_called_once_with("claude-project-123", "continue")
         self.assertEqual(len(self.reactions), 1)
         self.assertEqual(self.reactions[0][0], "user-1")
         self.assertIn(self.reactions[0][1], server._SUCCESS_EMOJIS)
 
     def test_reply_inject_exception_reacts_failure(self):
         self._setup_session()
-        with mock.patch("agent_hotline.server.inspect_tty_owner", return_value=("ok", "/dev/ttys001")), \
-             mock.patch("agent_hotline.server.validate_tty", return_value=None), \
+        with mock.patch("agent_hotline.server.validate_target", return_value=None), \
              mock.patch("agent_hotline.server.inject", side_effect=RuntimeError("boom")):
             server._on_message(self._msg_event(
                 root_id="root-1", parent_id="root-1",
@@ -267,7 +256,7 @@ class MessageReplyTests(_Base):
 
     def test_non_text_message_rejected(self):
         self._setup_session()
-        with mock.patch("agent_hotline.server.inspect_tty_owner", return_value=("ok", "/dev/ttys001")):
+        with mock.patch("agent_hotline.server.validate_target", return_value=None):
             server._on_message(self._msg_event(
                 root_id="root-1", parent_id="root-1",
                 message_id="user-1", text="", message_type="image",
@@ -277,61 +266,35 @@ class MessageReplyTests(_Base):
 
     def test_empty_text_reply_is_ignored(self):
         self._setup_session()
-        with mock.patch("agent_hotline.server.inspect_tty_owner", return_value=("ok", "/dev/ttys001")):
+        with mock.patch("agent_hotline.server.validate_target", return_value=None):
             server._on_message(self._msg_event(
                 root_id="root-1", parent_id="root-1",
                 message_id="user-1", text="   ",
             ))
         self.assertEqual(len(self.replied), 0)
 
-    def test_reply_with_invalid_tty_reacts_failure(self):
+    def test_reply_with_dead_tmux_session_returns_warning(self):
         self._setup_session()
-        with mock.patch("agent_hotline.server.inspect_tty_owner", return_value=("ok", "/dev/ttys001")), \
-             mock.patch("agent_hotline.server.validate_tty", return_value="TTY does not exist"):
+        with mock.patch("agent_hotline.server.validate_target", return_value="session not found"):
             server._on_message(self._msg_event(
                 root_id="root-1", parent_id="root-1",
                 message_id="user-1", text="hello",
             ))
-        self.assertEqual(len(self.reactions), 1)
-        self.assertIn(self.reactions[0][1], server._FAILURE_EMOJIS)
-
-    def test_reply_with_stale_session_returns_warning(self):
-        self._setup_session()
-        with mock.patch("agent_hotline.server.inspect_tty_owner", return_value=("process_missing", None)):
-            server._on_message(self._msg_event(
-                root_id="root-1", parent_id="root-1",
-                message_id="user-1", text="hello",
-            ))
-        self.assertIn("终端映射已失效", self.replied[0][1])
-
-    def test_reply_refreshes_tty_from_live_pid(self):
-        self._setup_session()
-        with mock.patch("agent_hotline.server.inspect_tty_owner", return_value=("ok", "/dev/ttys009")), \
-             mock.patch("agent_hotline.server.validate_tty", return_value=None), \
-             mock.patch("agent_hotline.server.inject", return_value=True) as inj:
-            server._on_message(self._msg_event(
-                root_id="root-1", parent_id="root-1",
-                message_id="user-1", text="go",
-            ))
-        inj.assert_called_once_with("/dev/ttys009", "go")
-        self.assertEqual(server.session_store.get("session-1").tty, "/dev/ttys009")
-        self.assertEqual(len(self.reactions), 1)
-        self.assertIn(self.reactions[0][1], server._SUCCESS_EMOJIS)
+        self.assertIn("tmux", self.replied[0][1])
 
     def test_reply_strips_mention_before_inject(self):
         self._setup_session()
-        with mock.patch("agent_hotline.server.inspect_tty_owner", return_value=("ok", "/dev/ttys001")), \
-             mock.patch("agent_hotline.server.validate_tty", return_value=None), \
+        with mock.patch("agent_hotline.server.validate_target", return_value=None), \
              mock.patch("agent_hotline.server.inject", return_value=True) as inj:
             server._on_message(self._msg_event(
                 root_id="root-1", parent_id="root-1",
                 message_id="user-1", text="@_user_1 continue working",
             ))
-        inj.assert_called_once_with("/dev/ttys001", "continue working")
+        inj.assert_called_once_with("claude-project-123", "continue working")
 
     def test_reply_mention_only_is_ignored(self):
         self._setup_session()
-        with mock.patch("agent_hotline.server.inspect_tty_owner", return_value=("ok", "/dev/ttys001")):
+        with mock.patch("agent_hotline.server.validate_target", return_value=None):
             server._on_message(self._msg_event(
                 root_id="root-1", parent_id="root-1",
                 message_id="user-1", text="@_user_1 ",
@@ -349,20 +312,17 @@ class CardActionTests(_Base):
 
     def test_card_action_injects_and_returns_success(self):
         self._setup_session()
-        with mock.patch("agent_hotline.server.inspect_tty_owner", return_value=("ok", "/dev/ttys001")), \
-             mock.patch("agent_hotline.server.validate_tty", return_value=None), \
+        with mock.patch("agent_hotline.server.validate_target", return_value=None), \
              mock.patch("agent_hotline.server.inject", return_value=True) as inj:
             resp = server._on_card_action(self._card_event(cmd="y", sid="session-1"))
-        inj.assert_called_once_with("/dev/ttys001", "y")
+        inj.assert_called_once_with("claude-project-123", "y")
         self.assertEqual(resp.toast.type, "success")
         self.assertIn("已送达", resp.toast.content)
         self.assertEqual(resp.card.data["header"]["template"], "green")
-        self.assertEqual(resp.card.data["header"]["title"]["content"], "🔐 权限确认 → y")
 
     def test_card_action_inject_failure_returns_error(self):
         self._setup_session()
-        with mock.patch("agent_hotline.server.inspect_tty_owner", return_value=("ok", "/dev/ttys001")), \
-             mock.patch("agent_hotline.server.validate_tty", return_value=None), \
+        with mock.patch("agent_hotline.server.validate_target", return_value=None), \
              mock.patch("agent_hotline.server.inject", side_effect=RuntimeError("no tab")):
             resp = server._on_card_action(self._card_event(cmd="y", sid="session-1"))
         self.assertEqual(resp.toast.type, "error")
@@ -387,19 +347,11 @@ class CardActionTests(_Base):
         self.assertEqual(resp.toast.type, "error")
         self.assertIn("会话已过期", resp.toast.content)
 
-    def test_card_action_stale_pid_returns_error(self):
+    def test_card_action_dead_tmux_session_returns_error(self):
         self._setup_session()
-        with mock.patch("agent_hotline.server.inspect_tty_owner", return_value=("process_missing", None)):
+        with mock.patch("agent_hotline.server.validate_target", return_value="session not found"):
             resp = server._on_card_action(self._card_event(cmd="y", sid="session-1"))
         self.assertEqual(resp.toast.type, "error")
-
-    def test_card_action_invalid_tty_returns_error(self):
-        self._setup_session()
-        with mock.patch("agent_hotline.server.inspect_tty_owner", return_value=("ok", "/dev/ttys001")), \
-             mock.patch("agent_hotline.server.validate_tty", return_value="TTY gone"):
-            resp = server._on_card_action(self._card_event(cmd="y", sid="session-1"))
-        self.assertEqual(resp.toast.type, "error")
-        self.assertIn("终端不可用", resp.toast.content)
 
 
 # =========================================================================
@@ -408,39 +360,37 @@ class CardActionTests(_Base):
 
 class MultiSessionTests(_Base):
     def test_two_sessions_route_replies_to_correct_terminals(self):
-        self._post_hook(session_id="s1", tty="/dev/ttys001", cwd="/tmp/proj-a")
-        self._post_hook(session_id="s2", tty="/dev/ttys002", cwd="/tmp/proj-b")
+        self._post_hook(session_id="s1", tty="claude-proj-a-111", cwd="/tmp/proj-a")
+        self._post_hook(session_id="s2", tty="claude-proj-b-222", cwd="/tmp/proj-b")
         self.replied.clear()
 
         injected_targets = []
 
-        def fake_inject(tty, text):
-            injected_targets.append((tty, text))
+        def fake_inject(session_name, text):
+            injected_targets.append((session_name, text))
             return True
 
-        with mock.patch("agent_hotline.server.inspect_tty_owner", return_value=("ok", "/dev/ttys001")), \
-             mock.patch("agent_hotline.server.validate_tty", return_value=None), \
+        with mock.patch("agent_hotline.server.validate_target", return_value=None), \
              mock.patch("agent_hotline.server.inject", side_effect=fake_inject):
             server._on_message(self._msg_event(
                 root_id="root-1", parent_id="root-1",
                 message_id="u1", text="for proj-a",
             ))
 
-        self.assertEqual(injected_targets, [("/dev/ttys001", "for proj-a")])
+        self.assertEqual(injected_targets, [("claude-proj-a-111", "for proj-a")])
 
         injected_targets.clear()
-        with mock.patch("agent_hotline.server.inspect_tty_owner", return_value=("ok", "/dev/ttys002")), \
-             mock.patch("agent_hotline.server.validate_tty", return_value=None), \
+        with mock.patch("agent_hotline.server.validate_target", return_value=None), \
              mock.patch("agent_hotline.server.inject", side_effect=fake_inject):
             server._on_message(self._msg_event(
                 root_id="root-2", parent_id="root-2",
                 message_id="u2", text="for proj-b",
             ))
 
-        self.assertEqual(injected_targets, [("/dev/ttys002", "for proj-b")])
+        self.assertEqual(injected_targets, [("claude-proj-b-222", "for proj-b")])
 
     def test_reply_to_wrong_thread_does_not_cross_inject(self):
-        self._post_hook(session_id="s1", tty="/dev/ttys001")
+        self._post_hook(session_id="s1", tty="claude-proj-123")
         self.replied.clear()
 
         server._on_message(self._msg_event(
@@ -456,7 +406,7 @@ class MultiSessionTests(_Base):
 
 class PersistenceTests(_Base):
     def test_session_survives_store_reload(self):
-        self._post_hook(session_id="s1", tty="/dev/ttys001")
+        self._post_hook(session_id="s1", tty="claude-proj-123")
 
         # Simulate restart
         server.session_store = SessionStore(self.state_path)
@@ -464,7 +414,7 @@ class PersistenceTests(_Base):
 
         session = server.session_store.get("s1")
         self.assertIsNotNone(session)
-        self.assertEqual(session.tty, "/dev/ttys001")
+        self.assertEqual(session.tty, "claude-proj-123")
         self.assertEqual(session.root_msg_id, "root-1")
 
         # Can still resolve thread mapping
