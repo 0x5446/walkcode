@@ -193,7 +193,6 @@ walkcode test-inject <tmux-session> "hi"  # Test injection
 | `FEISHU_APP_ID` | Yes | Feishu app ID |
 | `FEISHU_APP_SECRET` | Yes | Feishu app secret |
 | `FEISHU_RECEIVE_ID` | Yes | Your open_id or chat_id |
-| `FEISHU_VERIFICATION_TOKEN` | Yes | Feishu verification token |
 | `FEISHU_RECEIVE_ID_TYPE` | No | `open_id` (default) or `chat_id` |
 | `WALKCODE_STATE_PATH` | No | Custom state file path |
 | `WALKCODE_CWD` | No | Default cwd for remote-started sessions |

@@ -9,7 +9,6 @@ class Config:
     feishu_app_secret: str
     feishu_receive_id: str
     feishu_receive_id_type: str  # "open_id" or "chat_id"
-    feishu_verification_token: str
     port: int = 3001
     state_path: Path = Path.home() / ".walkcode" / "state.json"
     default_cwd: str = str(Path.home())
@@ -28,7 +27,7 @@ class Config:
                     os.environ.setdefault(key.strip(), value.strip())
 
         missing = []
-        for key in ["FEISHU_APP_ID", "FEISHU_APP_SECRET", "FEISHU_RECEIVE_ID", "FEISHU_VERIFICATION_TOKEN"]:
+        for key in ["FEISHU_APP_ID", "FEISHU_APP_SECRET", "FEISHU_RECEIVE_ID"]:
             if not os.environ.get(key):
                 missing.append(key)
         if missing:
@@ -39,7 +38,6 @@ class Config:
             feishu_app_secret=os.environ["FEISHU_APP_SECRET"],
             feishu_receive_id=os.environ["FEISHU_RECEIVE_ID"],
             feishu_receive_id_type=os.environ.get("FEISHU_RECEIVE_ID_TYPE", "open_id"),
-            feishu_verification_token=os.environ.get("FEISHU_VERIFICATION_TOKEN", ""),
             port=int(os.environ.get("PORT", "3001")),
             state_path=Path(
                 os.environ.get(

@@ -452,7 +452,7 @@ def init(cfg: Config):
 
 def start_ws_client(cfg: Config):
     handler = lark.EventDispatcherHandler.builder(
-        cfg.feishu_verification_token, ""
+        "", ""
     ).register_p2_im_message_receive_v1(
         _on_message
     ).register_p2_card_action_trigger(

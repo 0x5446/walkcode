@@ -197,7 +197,6 @@ walkcode test-inject <tmux-session> "hi"  # 测试注入
 | `FEISHU_APP_ID` | 是 | 飞书应用 ID |
 | `FEISHU_APP_SECRET` | 是 | 飞书应用密钥 |
 | `FEISHU_RECEIVE_ID` | 是 | 你的 open_id 或 chat_id |
-| `FEISHU_VERIFICATION_TOKEN` | 是 | 飞书验证令牌 |
 | `FEISHU_RECEIVE_ID_TYPE` | 否 | `open_id`（默认）或 `chat_id` |
 | `WALKCODE_STATE_PATH` | 否 | 自定义状态文件路径 |
 | `WALKCODE_CWD` | 否 | 远程启动会话的默认工作目录 |
