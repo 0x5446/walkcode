@@ -11,7 +11,7 @@ class Config:
     feishu_receive_id_type: str  # "open_id" or "chat_id"
     port: int = 3001
     state_path: Path = Path.home() / ".walkcode" / "state.json"
-    default_cwd: str = str(Path.home())
+    default_cwd: str = str(Path.home() / ".walkcode" / "workspace")
 
     @classmethod
     def load(cls) -> "Config":
@@ -45,5 +45,5 @@ class Config:
                     str(Path.home() / ".walkcode" / "state.json"),
                 )
             ).expanduser(),
-            default_cwd=os.environ.get("WALKCODE_CWD", str(Path.home())),
+            default_cwd=os.environ.get("WALKCODE_CWD", str(Path.home() / ".walkcode" / "workspace")),
         )

@@ -16,7 +16,7 @@ class SessionStoreTests(unittest.TestCase):
         self.tmpdir.cleanup()
 
     def test_reload_restores_session_and_root_mapping(self):
-        store = SessionStore(self.state_path, ttl=86400)
+        store = SessionStore(self.state_path)
         store.load()
         store.upsert(
             "session-1",
@@ -25,7 +25,7 @@ class SessionStoreTests(unittest.TestCase):
             root_msg_id="root-1",
         )
 
-        reloaded = SessionStore(self.state_path, ttl=86400)
+        reloaded = SessionStore(self.state_path)
         reloaded.load()
 
         self.assertEqual(reloaded.resolve(root_id="root-1"), "session-1")
@@ -36,35 +36,34 @@ class SessionStoreTests(unittest.TestCase):
         self.assertEqual(session.root_msg_id, "root-1")
 
     def test_parent_id_fallback_uses_same_root_mapping(self):
-        store = SessionStore(self.state_path, ttl=86400)
+        store = SessionStore(self.state_path)
         store.load()
         store.upsert("session-1", tty="claude-project-123", cwd="/tmp/project", root_msg_id="root-1")
 
         self.assertEqual(store.resolve(parent_id="root-1"), "session-1")
 
-    def test_expired_sessions_are_pruned_on_load(self):
+    def test_sessions_are_never_expired(self):
+        """Sessions should persist indefinitely (no TTL)."""
         payload = {
             "sessions": {
                 "session-1": {
                     "tty": "claude-project-123",
                     "cwd": "/tmp/project",
                     "root_msg_id": "root-1",
-                    "created_at": time.time() - 120,
+                    "created_at": time.time() - 86400 * 30,  # 30 days old
                 }
             }
         }
         self.state_path.write_text(json.dumps(payload), encoding="utf-8")
 
-        store = SessionStore(self.state_path, ttl=60)
+        store = SessionStore(self.state_path)
         store.load()
 
-        self.assertEqual(store.count(), 0)
-        self.assertIsNone(store.resolve(root_id="root-1"))
-        saved = json.loads(self.state_path.read_text(encoding="utf-8"))
-        self.assertEqual(saved, {"sessions": {}})
+        self.assertEqual(store.count(), 1)
+        self.assertEqual(store.resolve(root_id="root-1"), "session-1")
 
     def test_touch_persists_updated_timestamp(self):
-        store = SessionStore(self.state_path, ttl=86400)
+        store = SessionStore(self.state_path)
         store.load()
         first = store.upsert("session-1", tty="claude-project-123", cwd="/tmp/project", root_msg_id="root-1")
 
@@ -74,7 +73,7 @@ class SessionStoreTests(unittest.TestCase):
         self.assertIsNotNone(touched)
         self.assertGreater(touched.created_at, first.created_at)
 
-        reloaded = SessionStore(self.state_path, ttl=86400)
+        reloaded = SessionStore(self.state_path)
         reloaded.load()
         session = reloaded.get("session-1")
         self.assertIsNotNone(session)
@@ -96,12 +95,23 @@ class SessionStoreTests(unittest.TestCase):
         }
         self.state_path.write_text(json.dumps(payload), encoding="utf-8")
 
-        store = SessionStore(self.state_path, ttl=86400)
+        store = SessionStore(self.state_path)
         store.load()
 
         session = store.get("session-1")
         self.assertIsNotNone(session)
         self.assertEqual(session.tty, "claude-project-123")
+
+    def test_items_returns_all_sessions(self):
+        store = SessionStore(self.state_path)
+        store.load()
+        store.upsert("s1", tty="tty-1", cwd="/a")
+        store.upsert("s2", tty="tty-2", cwd="/b")
+
+        items = store.items()
+        self.assertEqual(len(items), 2)
+        ids = {sid for sid, _ in items}
+        self.assertEqual(ids, {"s1", "s2"})
 
 
 if __name__ == "__main__":

@@ -41,6 +41,32 @@ def validate_target(session_name: str) -> str | None:
     return None
 
 
+def get_session_activity(session_name: str) -> float | None:
+    """Return the epoch timestamp of last activity in a tmux session."""
+    try:
+        result = subprocess.run(
+            ["tmux", "display-message", "-t", session_name, "-p", "#{session_activity}"],
+            capture_output=True, text=True, timeout=2,
+        )
+        if result.returncode == 0:
+            return float(result.stdout.strip())
+    except Exception:
+        pass
+    return None
+
+
+def kill_session(session_name: str) -> bool:
+    """Kill a tmux session. Returns True on success."""
+    try:
+        result = subprocess.run(
+            ["tmux", "kill-session", "-t", session_name],
+            capture_output=True, text=True, timeout=5,
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
 def inject(session_name: str, text: str, enter: bool | None = None) -> bool:
     """Inject text into a tmux session via send-keys.
 

@@ -38,9 +38,8 @@ class Session:
 
 
 class SessionStore:
-    def __init__(self, path: Path, ttl: int = 86400):
+    def __init__(self, path: Path):
         self.path = Path(path).expanduser()
-        self.ttl = ttl
         self._lock = threading.RLock()
         self._sessions: dict[str, Session] = {}
         self._root_to_session: dict[str, str] = {}
@@ -66,26 +65,27 @@ class SessionStore:
                         except (TypeError, ValueError) as e:
                             logger.warning("Skipping invalid session %s: %s", session_id, e)
 
-            self._cleanup_locked()
             self._rebuild_index_locked()
             self._save_locked()
 
     def count(self) -> int:
         with self._lock:
-            self._prune_locked()
             return len(self._sessions)
 
     def get(self, session_id: str) -> Session | None:
         with self._lock:
-            self._prune_locked()
             session = self._sessions.get(session_id)
             if not session:
                 return None
             return Session(**session.to_dict())
 
+    def items(self) -> list[tuple[str, Session]]:
+        """Return a snapshot of all (session_id, Session) pairs."""
+        with self._lock:
+            return [(sid, Session(**s.to_dict())) for sid, s in self._sessions.items()]
+
     def resolve(self, *, root_id: str = "", parent_id: str = "") -> str | None:
         with self._lock:
-            self._prune_locked()
             if root_id:
                 return self._root_to_session.get(root_id)
             if parent_id:
@@ -128,21 +128,8 @@ class SessionStore:
             return Session(**session.to_dict())
 
     def _sync_locked(self):
-        self._cleanup_locked()
         self._rebuild_index_locked()
         self._save_locked()
-
-    def _prune_locked(self):
-        if self._cleanup_locked():
-            self._rebuild_index_locked()
-            self._save_locked()
-
-    def _cleanup_locked(self) -> bool:
-        now = time.time()
-        expired = [sid for sid, session in self._sessions.items() if now - session.created_at > self.ttl]
-        for session_id in expired:
-            self._sessions.pop(session_id, None)
-        return bool(expired)
 
     def _rebuild_index_locked(self):
         self._root_to_session = {

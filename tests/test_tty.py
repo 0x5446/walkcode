@@ -54,6 +54,54 @@ class ValidateTargetTests(unittest.TestCase):
         self.assertIn("not installed", error)
 
 
+class GetSessionActivityTests(unittest.TestCase):
+    def test_returns_epoch_timestamp(self):
+        with mock.patch("walkcode.tty.subprocess.run") as mock_run:
+            mock_run.return_value = mock.Mock(returncode=0, stdout="1709876543\n")
+            result = tty.get_session_activity("walkcode-123")
+
+        self.assertEqual(result, 1709876543.0)
+
+    def test_returns_none_when_session_missing(self):
+        with mock.patch("walkcode.tty.subprocess.run") as mock_run:
+            mock_run.return_value = mock.Mock(returncode=1, stdout="")
+            result = tty.get_session_activity("dead-session")
+
+        self.assertIsNone(result)
+
+    def test_returns_none_on_exception(self):
+        with mock.patch("walkcode.tty.subprocess.run", side_effect=FileNotFoundError):
+            result = tty.get_session_activity("some-session")
+
+        self.assertIsNone(result)
+
+
+class KillSessionTests(unittest.TestCase):
+    def test_returns_true_on_success(self):
+        with mock.patch("walkcode.tty.subprocess.run") as mock_run:
+            mock_run.return_value = mock.Mock(returncode=0)
+            result = tty.kill_session("walkcode-123")
+
+        self.assertTrue(result)
+        mock_run.assert_called_once_with(
+            ["tmux", "kill-session", "-t", "walkcode-123"],
+            capture_output=True, text=True, timeout=5,
+        )
+
+    def test_returns_false_on_failure(self):
+        with mock.patch("walkcode.tty.subprocess.run") as mock_run:
+            mock_run.return_value = mock.Mock(returncode=1)
+            result = tty.kill_session("dead-session")
+
+        self.assertFalse(result)
+
+    def test_returns_false_on_exception(self):
+        with mock.patch("walkcode.tty.subprocess.run", side_effect=FileNotFoundError):
+            result = tty.kill_session("some-session")
+
+        self.assertFalse(result)
+
+
 class InjectTests(unittest.TestCase):
     def test_inject_sends_text_and_enter(self):
         with mock.patch("walkcode.tty.validate_target", return_value=None), \

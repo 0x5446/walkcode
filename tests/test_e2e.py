@@ -24,9 +24,13 @@ class _Base(unittest.TestCase):
         self.sent = []       # [(msg_id, text_or_card)]
         self.replied = []    # [(parent_msg_id, text_or_card)]
         self.reactions = []  # [(message_id, emoji_type)]
+        self.edited = []     # [(message_id, text)]
 
         server.session_store = SessionStore(self.state_path)
         server.session_store.load()
+        server._pending_roots.clear()
+        server._pending_msg_to_tty.clear()
+        server._pending_reply_ids.clear()
         self.client = TestClient(server.app)
 
         self.started_claudes = []  # [(prompt, message_id)]
@@ -35,6 +39,7 @@ class _Base(unittest.TestCase):
             mock.patch("walkcode.server._send", side_effect=self._fake_send),
             mock.patch("walkcode.server._reply", side_effect=self._fake_reply),
             mock.patch("walkcode.server._add_reaction", side_effect=self._fake_add_reaction),
+            mock.patch("walkcode.server._edit_message", side_effect=self._fake_edit_message),
             mock.patch("walkcode.server._start_claude", side_effect=self._fake_start_claude),
         ]
         for p in self._patches:
@@ -59,6 +64,9 @@ class _Base(unittest.TestCase):
 
     def _fake_add_reaction(self, message_id, emoji_type):
         self.reactions.append((message_id, emoji_type))
+
+    def _fake_edit_message(self, message_id, text):
+        self.edited.append((message_id, text))
 
     def _fake_start_claude(self, prompt, message_id):
         self.started_claudes.append((prompt, message_id))
@@ -144,13 +152,15 @@ class HookNewSessionTests(_Base):
         self.assertEqual(session.tty, "claude-project-123")
         self.assertEqual(session.root_msg_id, "root-1")
 
-    def test_new_session_title_contains_project_and_snippet(self):
-        self._post_hook(hook_type="stop", matcher="", cwd="/tmp/myproject", message="hello world")
+    def test_new_session_title_contains_project_session_and_snippet(self):
+        self._post_hook(hook_type="stop", matcher="", cwd="/tmp/myproject",
+                        session_id="abcdef1234567890", message="hello world")
         self.assertEqual(len(self.sent), 1)
         self.assertEqual(len(self.replied), 1)
         _, title = self.sent[0]
         self.assertIn("myproject", title)
-        self.assertIn("hello", title)
+        self.assertIn("abcdef12", title)  # session_id[:8]
+        self.assertIn("hello worl", title)
         self.assertIn("...", title)
 
     def test_permission_prompt_sends_text_root_and_card_reply(self):
@@ -308,14 +318,21 @@ class MessageReplyTests(_Base):
             ))
         self.assertEqual(len(self.replied), 0)
 
-    def test_reply_with_dead_tmux_session_returns_warning(self):
+    def test_reply_with_dead_tmux_triggers_resume(self):
+        """When tmux is dead but session exists, _resume_claude should be called."""
         self._setup_session()
-        with mock.patch("walkcode.server.validate_target", return_value="session not found"):
+        with mock.patch("walkcode.server.validate_target", return_value="session not found"), \
+             mock.patch("walkcode.server._resume_claude") as mock_resume:
             server._on_message(self._msg_event(
                 root_id="root-1", parent_id="root-1",
-                message_id="user-1", text="hello",
+                message_id="user-1", text="continue please",
             ))
-        self.assertIn("tmux", self.replied[0][1])
+        mock_resume.assert_called_once()
+        args = mock_resume.call_args[0]
+        self.assertEqual(args[0], "session-1")  # session_id
+        self.assertEqual(args[1].tty, "claude-project-123")  # old session data
+        self.assertEqual(args[2], "continue please")  # reply text
+        self.assertEqual(args[3], "user-1")  # message_id
 
     def test_reply_strips_mention_before_inject(self):
         self._setup_session()
@@ -501,6 +518,22 @@ class FeishuInitiatedTests(_Base):
         # pending_roots should be consumed
         self.assertNotIn("walkcode-12345", server._pending_roots)
 
+    def test_pending_root_edits_launch_reply_with_session_id(self):
+        """When pending root matches, the launch reply should be updated with session_id."""
+        server._pending_roots["walkcode-12345"] = "feishu-msg-100"
+        server._pending_reply_ids["walkcode-12345"] = "reply-launch-1"
+
+        self._post_hook(
+            session_id="s1", tty="walkcode-12345",
+            cwd="/tmp/project", message="started",
+        )
+
+        self.assertEqual(len(self.edited), 1)
+        msg_id, text = self.edited[0]
+        self.assertEqual(msg_id, "reply-launch-1")
+        self.assertIn("s1"[:8], text)
+        self.assertIn("walkcode-12345", text)
+
     def test_pending_root_not_consumed_by_wrong_tty(self):
         """pending_roots entry should only match by tmux session name."""
         server._pending_roots["walkcode-12345"] = "feishu-msg-100"
@@ -536,6 +569,46 @@ class FeishuInitiatedTests(_Base):
         self.assertEqual(body["thread"], "feishu-msg-100")
         self.assertEqual(len(self.replied), 1)
         self.assertEqual(self.replied[0][0], "feishu-msg-100")
+
+
+# =========================================================================
+# 9. Idle reaper
+# =========================================================================
+
+class IdleReaperTests(_Base):
+    def test_reap_kills_idle_session_and_notifies(self):
+        self._post_hook(session_id="s1", tty="walkcode-old")
+        import time
+        idle_time = time.time() - server._IDLE_TIMEOUT - 100  # well past timeout
+
+        with mock.patch("walkcode.server.get_session_activity", return_value=idle_time), \
+             mock.patch("walkcode.server.kill_session") as mock_kill:
+            # Unpatch _reply to use our fake
+            server._reap_idle_sessions()
+
+        mock_kill.assert_called_once_with("walkcode-old")
+        # Should have notified in the thread
+        notify_replies = [r for r in self.replied if "无活动已关闭" in str(r[1])]
+        self.assertEqual(len(notify_replies), 1)
+
+    def test_reap_skips_active_session(self):
+        self._post_hook(session_id="s1", tty="walkcode-active")
+        import time
+
+        with mock.patch("walkcode.server.get_session_activity", return_value=time.time()), \
+             mock.patch("walkcode.server.kill_session") as mock_kill:
+            server._reap_idle_sessions()
+
+        mock_kill.assert_not_called()
+
+    def test_reap_skips_dead_session(self):
+        self._post_hook(session_id="s1", tty="walkcode-dead")
+
+        with mock.patch("walkcode.server.get_session_activity", return_value=None), \
+             mock.patch("walkcode.server.kill_session") as mock_kill:
+            server._reap_idle_sessions()
+
+        mock_kill.assert_not_called()
 
 
 if __name__ == "__main__":

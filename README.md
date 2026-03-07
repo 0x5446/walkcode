@@ -27,6 +27,8 @@ Your agent hits a permission prompt while you're away. Without WalkCode, it bloc
 - **One-tap permissions** — interactive cards with Allow / Deny / Always buttons
 - **Text replies** — reply in a thread to type directly into the agent's terminal
 - **Remote start** — send a message to start a new agent session from your phone
+- **Session resume** — reply in an expired thread to automatically resume the conversation
+- **Auto-cleanup** — idle tmux sessions are killed after 2 hours and you get notified
 
 **Also:**
 - **Multi-session** — multiple agents, one instance, auto-routing
@@ -224,7 +226,7 @@ uv run walkcode install-hooks
 1. Shell wrapper starts the agent inside a tmux session
 2. Agent [Hooks](https://docs.anthropic.com/en/docs/claude-code/hooks) fire on stop / permission / input needed
 3. `walkcode hook` detects tmux session name and POSTs to local server
-4. WalkCode creates a **chat thread** (project name as title, content as first reply)
+4. WalkCode creates a **chat thread** (`project | session_id | prompt` as title, content as first reply)
 5. You tap a button or reply with text — real-time via WebSocket
 6. `tmux send-keys` injects your response — no GUI required
 
@@ -235,6 +237,7 @@ uv run walkcode install-hooks
 | Permission prompt | Card with buttons | Tap **Allow** / **Deny** / **Always** |
 | Waiting for input | Text in thread | Reply with text |
 | Task complete | Text in thread | Reply to continue, or ignore |
+| Session expired | Reply in old thread | Agent resumes automatically via `--resume` |
 | Remote start | Send a message in chat | Agent starts in new tmux session |
 
 ## CLI
@@ -260,7 +263,7 @@ walkcode test-inject <tmux-session> "hi"  # Test injection
 | `FEISHU_RECEIVE_ID` | Yes | Your open_id or chat_id |
 | `FEISHU_RECEIVE_ID_TYPE` | No | `open_id` (default) or `chat_id` |
 | `WALKCODE_STATE_PATH` | No | Custom state file path |
-| `WALKCODE_CWD` | No | Default cwd for remote-started sessions |
+| `WALKCODE_CWD` | No | Default cwd for remote-started sessions (default: `~/.walkcode/workspace`) |
 
 ## Roadmap
 
@@ -278,6 +281,12 @@ WalkCode's goal: **connect any coding agent to any chat platform.**
 | [Copilot CLI](https://githubnext.com/projects/copilot-cli) | Planned |
 | [Goose](https://github.com/block/goose) | Planned |
 | [Amp](https://ampcode.com) | Planned |
+
+### Features
+
+| Feature | Status |
+|---------|--------|
+| Multi-modal messages (image, rich text, forwarded messages) | Planned |
 
 ### Chat Platforms
 

@@ -33,7 +33,8 @@ class ServerReplySessionTests(unittest.TestCase):
         self.assertIsNotNone(session)
         self.assertEqual(session.tty, "claude-project-123")
 
-    def test_load_reply_session_rejects_dead_tmux_session(self):
+    def test_load_reply_session_returns_session_data_when_tmux_dead(self):
+        """When tmux is dead, session data should still be returned for resume."""
         self.store.upsert(
             "session-1",
             tty="claude-project-123",
@@ -44,20 +45,31 @@ class ServerReplySessionTests(unittest.TestCase):
         with mock.patch("walkcode.server.validate_target", return_value="session not found"):
             session, error = server._load_reply_session("session-1")
 
-        self.assertIsNone(session)
-        self.assertEqual(error, server._STALE_SESSION_MESSAGE)
+        self.assertIsNotNone(session)
+        self.assertEqual(session.tty, "claude-project-123")
+        self.assertEqual(session.cwd, "/tmp/project")
+        self.assertIsNotNone(error)
+        self.assertIn("not found", error)
 
     def test_make_title_project_with_snippet(self):
-        title = server._make_title("/tmp/myproject", "hello world")
-        self.assertEqual(title, "myproject | hello...")
+        title = server._make_title("/tmp/myproject", message="hello world")
+        self.assertEqual(title, "myproject | hello worl...")
+
+    def test_make_title_with_session_id(self):
+        title = server._make_title("/tmp/myproject", session_id="abcdef1234567890", message="fix bug")
+        self.assertEqual(title, "myproject | abcdef12 | fix bug")
 
     def test_make_title_short_message_no_ellipsis(self):
-        title = server._make_title("/tmp/myproject", "done")
+        title = server._make_title("/tmp/myproject", message="done")
         self.assertEqual(title, "myproject | done")
 
     def test_make_title_no_message(self):
         title = server._make_title("/tmp/myproject")
         self.assertEqual(title, "myproject")
+
+    def test_make_title_session_id_only(self):
+        title = server._make_title("/tmp/myproject", session_id="abcdef1234567890")
+        self.assertEqual(title, "myproject | abcdef12")
 
     def test_mention_regex_strips_at_user(self):
         text = "@_user_1 continue working"

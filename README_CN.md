@@ -31,6 +31,8 @@ Coding Agent (tmux) ──Hook──> WalkCode ──API──> 聊天（话题 
 - **一键授权** —— 权限确认以交互卡片展示，支持 允许 / 拒绝 / 始终允许
 - **文字回复** —— 在话题中回复文字，直接输入到对应终端
 - **远程启动** —— 在聊天中发条消息，就能远程启动一个新的 Coding Agent
+- **会话恢复** —— 话题中的 tmux 会话过期后，回复任意消息自动恢复
+- **自动回收** —— 闲置超过 2 小时的 tmux 会话自动关闭并通知
 
 **其他：**
 - **多会话** —— 多个 Coding Agent，一个实例，自动路由
@@ -228,7 +230,7 @@ uv run walkcode install-hooks
 1. Shell wrapper 将 Coding Agent 启动在 tmux 会话中
 2. Coding Agent [Hooks](https://docs.anthropic.com/en/docs/claude-code/hooks) 在任务完成 / 需要权限 / 等待输入时触发
 3. `walkcode hook` 检测当前 tmux 会话名并 POST 到本地服务器
-4. WalkCode 在聊天中创建**话题消息**（项目名作为标题，内容作为首条回复）
+4. WalkCode 在聊天中创建**话题消息**（`项目名 | session_id | prompt` 作为标题，内容作为首条回复）
 5. 你点击按钮或回复文字 —— 通过 WebSocket 实时送达
 6. `tmux send-keys` 将你的回复注入到对应会话 —— 无需 GUI
 
@@ -239,6 +241,7 @@ uv run walkcode install-hooks
 | 权限确认 | 带按钮的交互卡片 | 点击 **允许** / **拒绝** / **始终允许** |
 | 等待输入 | 话题中的文字消息 | 回复文字 |
 | 任务完成 | 话题中的文字消息 | 回复以继续，或忽略 |
+| 会话过期 | 在旧话题中回复 | 自动通过 `--resume` 恢复会话 |
 | 远程启动 | 在聊天中发一条消息 | Coding Agent 在新 tmux 会话中启动 |
 
 ## 命令行
@@ -264,7 +267,7 @@ walkcode test-inject <tmux-session> "hi"  # 测试注入
 | `FEISHU_RECEIVE_ID` | 是 | 你的 open_id 或 chat_id |
 | `FEISHU_RECEIVE_ID_TYPE` | 否 | `open_id`（默认）或 `chat_id` |
 | `WALKCODE_STATE_PATH` | 否 | 自定义状态文件路径 |
-| `WALKCODE_CWD` | 否 | 远程启动会话的默认工作目录 |
+| `WALKCODE_CWD` | 否 | 远程启动会话的默认工作目录（默认 `~/.walkcode/workspace`） |
 
 ## 路线图
 
@@ -282,6 +285,12 @@ WalkCode 的目标：**连接任意 Coding Agent 到任意聊天平台。**
 | [Copilot CLI](https://githubnext.com/projects/copilot-cli) | 计划中 |
 | [Goose](https://github.com/block/goose) | 计划中 |
 | [Amp](https://ampcode.com) | 计划中 |
+
+### 功能
+
+| 功能 | 状态 |
+|------|------|
+| 多模态消息（图片、富文本、合并转发） | 计划中 |
 
 ### 聊天平台
 
