@@ -302,6 +302,8 @@ def _start_claude(prompt: str, message_id: str):
 
 
 def _on_message(data: P2ImMessageReceiveV1):
+    sender_id = data.event.sender.sender_id
+    logger.info("Message from open_id=%s", sender_id.open_id)
     msg = data.event.message
     parent_id = msg.parent_id
     root_id = msg.root_id
