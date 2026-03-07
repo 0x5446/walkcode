@@ -16,17 +16,15 @@ class Config:
     @classmethod
     def load(cls) -> "Config":
         """Load config from .env file and environment variables."""
-        env_file = Path.cwd() / ".env"
-        if not env_file.exists():
-            env_file = Path.home() / ".walkcode" / ".env"
-        if env_file.exists():
-            for line in env_file.read_text().splitlines():
-                line = line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                key, _, value = line.partition("=")
-                if key and value:
-                    os.environ.setdefault(key.strip(), value.strip())
+        for env_file in [Path.cwd() / ".env", Path.home() / ".walkcode" / ".env"]:
+            if env_file.exists():
+                for line in env_file.read_text().splitlines():
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    key, _, value = line.partition("=")
+                    if key and value:
+                        os.environ.setdefault(key.strip(), value.strip())
 
         missing = []
         for key in ["FEISHU_APP_ID", "FEISHU_APP_SECRET", "FEISHU_RECEIVE_ID"]:
