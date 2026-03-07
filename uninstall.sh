@@ -67,6 +67,27 @@ remove_shell_wrapper() {
   fi
 }
 
+# --- Remove tmux config ---
+remove_tmux_config() {
+  local tmux_conf="$HOME/.tmux.conf"
+  local marker_start="# >>> walkcode tmux config >>>"
+  local marker_end="# <<< walkcode tmux config <<<"
+
+  if [ -f "$tmux_conf" ] && grep -q "$marker_start" "$tmux_conf" 2>/dev/null; then
+    info "Removing tmux config from $tmux_conf..."
+    sed -i.walkcode-bak "/$marker_start/,/$marker_end/d" "$tmux_conf"
+    rm -f "${tmux_conf}.walkcode-bak"
+    # Remove file if empty (only whitespace left)
+    if [ ! -s "$tmux_conf" ] || ! grep -q '[^[:space:]]' "$tmux_conf" 2>/dev/null; then
+      rm -f "$tmux_conf"
+      info "Removed empty $tmux_conf"
+    fi
+    tmux source-file "$tmux_conf" 2>/dev/null || true
+  else
+    info "No WalkCode tmux config found, skipping"
+  fi
+}
+
 # --- Remove Claude Code hooks ---
 remove_hooks() {
   local settings="$HOME/.claude/settings.json"
@@ -153,9 +174,10 @@ main() {
   echo "This will remove:"
   echo "  1. WalkCode daemon (if running)"
   echo "  2. Shell wrapper from all rc files (.zshrc, .bashrc, .profile, etc.)"
-  echo "  3. Claude Code hooks from ~/.claude/settings.json"
-  echo "  4. Runtime directory ($RUNTIME_DIR)"
-  echo "  5. Install directory ($INSTALL_DIR)"
+  echo "  3. tmux config from ~/.tmux.conf"
+  echo "  4. Claude Code hooks from ~/.claude/settings.json"
+  echo "  5. Runtime directory ($RUNTIME_DIR)"
+  echo "  6. Install directory ($INSTALL_DIR)"
   echo ""
   printf "Continue? [y/N] "
   read -r answer
@@ -167,6 +189,7 @@ main() {
   echo ""
   stop_daemon
   remove_shell_wrapper
+  remove_tmux_config
   remove_hooks
   remove_runtime
   remove_install_dir

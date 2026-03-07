@@ -73,7 +73,7 @@ WalkCode 的核心设计：**1 个聊天话题 = 1 个 tmux 会话 = 1 个 Codin
 curl -fsSL https://raw.githubusercontent.com/0x5446/walkcode/main/install.sh | bash
 ```
 
-自动完成：安装 tmux/uv → 克隆仓库 → `uv sync` → 创建 `.env` → 注入 Shell Wrapper → 安装 Hooks。运行前可先[查看脚本内容](install.sh)。
+自动完成：安装 tmux/uv → 克隆仓库 → `uv sync` → 创建 `.env` → 注入 Shell Wrapper → 配置 tmux 滚动历史 → 安装 Hooks。运行前可先[查看脚本内容](install.sh)。
 
 ### 一键卸载
 
@@ -81,7 +81,7 @@ curl -fsSL https://raw.githubusercontent.com/0x5446/walkcode/main/install.sh | b
 bash ~/walkcode/uninstall.sh
 ```
 
-清理守护进程、Shell Wrapper、Claude Code Hooks、运行时数据和安装目录。运行前可先[查看脚本内容](uninstall.sh)。
+清理守护进程、Shell Wrapper、tmux 配置、Claude Code Hooks、运行时数据和安装目录。运行前可先[查看脚本内容](uninstall.sh)。
 
 ### 手动安装
 
@@ -138,7 +138,18 @@ claude() {
 
 然后：`source ~/.zshrc`
 
-#### 5. 安装 Hooks
+#### 5. 配置 tmux 滚动历史
+
+添加到 `~/.tmux.conf`：
+
+```bash
+# 禁用备用屏幕切换，使 TUI 输出（如 Claude Code）保留在滚动历史中
+set-option -ga terminal-overrides ',*:smcup@:rmcup@'
+```
+
+然后：`tmux source-file ~/.tmux.conf`（如果 tmux 正在运行）
+
+#### 6. 安装 Hooks
 
 ```bash
 uv run walkcode install-hooks

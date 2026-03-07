@@ -114,6 +114,31 @@ WRAPPER
   info "Shell wrapper installed. Run: source $SHELL_RC"
 }
 
+# --- Configure tmux ---
+configure_tmux() {
+  local tmux_conf="$HOME/.tmux.conf"
+  local marker="# >>> walkcode tmux config >>>"
+
+  if grep -q "$marker" "$tmux_conf" 2>/dev/null; then
+    info "tmux config already present in $tmux_conf"
+    return
+  fi
+
+  info "Adding tmux scrollback config to $tmux_conf..."
+  cat >> "$tmux_conf" << 'TMUXCFG'
+
+# >>> walkcode tmux config >>>
+# Disable alternate screen so TUI output (e.g. Claude Code) stays in scrollback
+# Use Ctrl-b [ to scroll back through history
+set-option -ga terminal-overrides ',*:smcup@:rmcup@'
+# <<< walkcode tmux config <<<
+TMUXCFG
+
+  # Hot-reload if tmux server is running
+  tmux source-file "$tmux_conf" 2>/dev/null || true
+  info "tmux config installed"
+}
+
 # --- Install Claude Code hooks ---
 install_hooks() {
   local settings="$HOME/.claude/settings.json"
@@ -142,6 +167,7 @@ main() {
   install_package
   setup_env
   install_wrapper
+  configure_tmux
   install_hooks
 
   echo ""

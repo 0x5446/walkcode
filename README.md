@@ -69,7 +69,7 @@ You can start an agent directly from chat — no terminal needed:
 curl -fsSL https://raw.githubusercontent.com/0x5446/walkcode/main/install.sh | bash
 ```
 
-This installs tmux/uv if missing, clones the repo, runs `uv sync`, creates `.env`, adds a shell wrapper to `~/.zshrc`, and installs Claude Code hooks. [Review the script](install.sh) before running if you prefer.
+This installs tmux/uv if missing, clones the repo, runs `uv sync`, creates `.env`, adds a shell wrapper, configures tmux scrollback, and installs Claude Code hooks. [Review the script](install.sh) before running if you prefer.
 
 ### Uninstall
 
@@ -77,7 +77,7 @@ This installs tmux/uv if missing, clones the repo, runs `uv sync`, creates `.env
 bash ~/walkcode/uninstall.sh
 ```
 
-Removes the daemon, shell wrapper, Claude Code hooks, runtime data, and install directory. [Review the script](uninstall.sh) before running if you prefer.
+Removes the daemon, shell wrapper, tmux config, Claude Code hooks, runtime data, and install directory. [Review the script](uninstall.sh) before running if you prefer.
 
 ### Manual Install
 
@@ -134,7 +134,18 @@ claude() {
 
 Then: `source ~/.zshrc`
 
-#### 5. Install Hooks
+#### 5. Configure tmux Scrollback
+
+Add to `~/.tmux.conf`:
+
+```bash
+# Disable alternate screen so TUI output (e.g. Claude Code) stays in scrollback
+set-option -ga terminal-overrides ',*:smcup@:rmcup@'
+```
+
+Then: `tmux source-file ~/.tmux.conf` (if tmux is running)
+
+#### 6. Install Hooks
 
 ```bash
 uv run walkcode install-hooks
