@@ -57,6 +57,29 @@ WalkCode 的核心设计：**1 个聊天话题 = 1 个 tmux 会话 = 1 个 Codin
 5. 当 Coding Agent 的 hooks 首次触发时，WalkCode 匹配 tmux 名称，将此会话关联到该话题
 6. 此后，该 Coding Agent 的所有事件都回复到同一话题 —— 1:1:1 关联建立完成
 
+### 安全设计：远程启动的权限控制
+
+通过聊天远程启动 Coding Agent 时，WalkCode 使用 `--permission-mode dontAsk` 启动 Claude Code。这是一个刻意的安全设计：
+
+| | `dontAsk` 模式（WalkCode 采用） | `dangerouslySkipPermissions` |
+|---|---|---|
+| 目录信任对话框 | 跳过 | 跳过 |
+| `permissions.allow` 中的工具 | 自动通过 | 自动通过 |
+| **不在** `permissions.allow` 中的工具 | **自动拒绝（安全）** | **自动通过（危险）** |
+
+远程启动的会话会遵守 `~/.claude/settings.json` 中的权限规则 —— 你允许的工具（如 `Bash(*)`、`Read(*)`、`Edit(*)`）自动通过，其余工具会被自动拒绝，不会卡住等待一个永远不会来的审批。
+
+要自定义允许的工具列表，编辑 `~/.claude/settings.json`：
+
+```json
+{
+  "permissions": {
+    "allow": ["Bash(*)", "Read(*)", "Write(*)", "Edit(*)", "Glob(*)", "Grep(*)"],
+    "deny": ["Bash(rm -rf /*)"]
+  }
+}
+```
+
 ## 快速开始
 
 ### 前置条件

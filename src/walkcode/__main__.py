@@ -146,17 +146,24 @@ def cmd_hook(args):
         print("[walkcode] not in tmux, skipping hook", file=sys.stderr)
         return
 
-    cwd = os.getcwd()
+    cwd = hook_data.get("cwd", "") or os.getcwd()
     session_id = hook_data.get("session_id", "")
 
-    # Extract message from hook input (Stop hook provides last_assistant_message)
-    message = hook_data.get("last_assistant_message", "")
-    # Filter out non-useful messages
-    _SKIP = {"no response requested.", ""}
-    if message.strip().lower() in _SKIP:
-        message = ""
-
-    matcher = os.environ.get("CLAUDE_NOTIFICATION_TYPE", "")
+    if args.hook_type == "notification":
+        # Notification hook: message, title, notification_type
+        message = hook_data.get("message", "")
+        title = hook_data.get("title", "")
+        # Prefer JSON field, fall back to env var (env var may be missing per known bug)
+        matcher = hook_data.get("notification_type", "") or os.environ.get("CLAUDE_NOTIFICATION_TYPE", "")
+    else:
+        # Stop hook: last_assistant_message
+        message = hook_data.get("last_assistant_message", "")
+        title = ""
+        matcher = ""
+        # Filter out non-useful stop messages
+        _SKIP = {"no response requested.", ""}
+        if message.strip().lower() in _SKIP:
+            message = ""
 
     port = int(os.environ.get("WALKCODE_PORT", os.environ.get("PORT", "3001")))
     payload = json.dumps({
@@ -165,6 +172,7 @@ def cmd_hook(args):
         "cwd": cwd,
         "session_id": session_id,
         "message": message,
+        "title": title,
         "matcher": matcher,
     }).encode()
 

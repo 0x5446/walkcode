@@ -53,6 +53,29 @@ You can start an agent directly from chat — no terminal needed:
 5. When the agent's hooks fire for the first time, WalkCode matches the tmux name and links the session to that thread
 6. From now on, all events from this agent reply to the same thread — the 1:1:1 link is established
 
+### Security: Remote Start Permissions
+
+When you start an agent from chat, WalkCode launches Claude Code with `--permission-mode dontAsk`. This is a deliberate security design:
+
+| | `dontAsk` mode (WalkCode) | `dangerouslySkipPermissions` |
+|---|---|---|
+| Trust dialog | Skipped | Skipped |
+| Tools in `permissions.allow` | Auto-approved | Auto-approved |
+| Tools NOT in `permissions.allow` | **Auto-denied (safe)** | **Auto-approved (unsafe)** |
+
+This means remote-started sessions respect your `~/.claude/settings.json` permission rules — tools you've allowed (like `Bash(*)`, `Read(*)`, `Edit(*)`) work automatically, while anything else is denied rather than left hanging for approval that will never come.
+
+To customize which tools are allowed, edit your `~/.claude/settings.json`:
+
+```json
+{
+  "permissions": {
+    "allow": ["Bash(*)", "Read(*)", "Write(*)", "Edit(*)", "Glob(*)", "Grep(*)"],
+    "deny": ["Bash(rm -rf /*)"]
+  }
+}
+```
+
 ## Quick Start
 
 ### Before You Start

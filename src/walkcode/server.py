@@ -46,6 +46,7 @@ session_store: SessionStore = None  # type: ignore
 _TTL = 86400  # 24h
 _STALE_SESSION_MESSAGE = "⚠️ tmux 会话已失效，请等待 Claude 的下一条通知刷新会话"
 _pending_roots: dict[str, str] = {}  # tmux_session_name → root_msg_id
+_pending_msg_to_tty: dict[str, str] = {}  # root_msg_id → tmux_session_name
 
 
 def _resolve_session_id(msg) -> str | None:
@@ -96,8 +97,16 @@ _FAILURE_EMOJIS = [
 _MENTION_RE = re.compile(r"@_user_\d+\s*")
 
 
-def _build_card(message: str, session_id: str = "") -> dict:
+def _build_card(message: str, session_id: str = "", title: str = "") -> dict:
     """Build a Feishu interactive card with content and permission buttons."""
+    card: dict = {"config": {"wide_screen_mode": True}}
+
+    if title:
+        card["header"] = {
+            "title": {"tag": "plain_text", "content": title},
+            "template": "orange",
+        }
+
     elements = []
     if message:
         elements.append({
@@ -116,10 +125,8 @@ def _build_card(message: str, session_id: str = "") -> dict:
             })
         elements.append({"tag": "action", "actions": actions})
 
-    return {
-        "config": {"wide_screen_mode": True},
-        "elements": elements or [{"tag": "div", "text": {"tag": "plain_text", "content": " "}}],
-    }
+    card["elements"] = elements or [{"tag": "div", "text": {"tag": "plain_text", "content": " "}}]
+    return card
 
 
 def _build_result_card(title: str, color: str, status_text: str) -> dict:
@@ -280,7 +287,7 @@ def _start_claude(prompt: str, message_id: str):
     cwd = config.default_cwd
     tmux_name = f"walkcode-{int(time.time())}"
     escaped = prompt.replace("'", "'\\''")
-    cmd = f"cd '{cwd}' && claude '{escaped}'"
+    cmd = f"cd '{cwd}' && claude --permission-mode dontAsk '{escaped}'"
 
     try:
         result = subprocess.run(
@@ -297,6 +304,7 @@ def _start_claude(prompt: str, message_id: str):
         return
 
     _pending_roots[tmux_name] = message_id
+    _pending_msg_to_tty[message_id] = tmux_name
     _reply(message_id, f"🚀 已启动 Claude Code\ntmux attach -t {tmux_name}", reply_in_thread=True)
     logger.info(f"Started Claude Code: tmux={tmux_name} cwd={cwd} prompt={prompt[:50]}")
 
@@ -324,20 +332,36 @@ def _on_message(data: P2ImMessageReceiveV1):
         return
 
     session_id = _resolve_session_id(msg)
-    if not session_id:
-        logger.warning(
-            "Reply to unknown thread message root=%s parent=%s (mapping lost or reply target never registered)",
-            root_id or "-",
-            parent_id or "-",
-        )
-        _reply(message_id, "⚠️ 找不到对应会话，请等待下一条通知后再回复")
-        return
+    tty = None
+    project = "?"
 
-    session, session_error = _load_reply_session(session_id)
-    if not session:
-        if session_error:
-            _reply(message_id, session_error)
-        return
+    if session_id:
+        session, session_error = _load_reply_session(session_id)
+        if not session:
+            if session_error:
+                _reply(message_id, session_error)
+            return
+        tty = session.tty
+        project = basename(session.cwd) if session.cwd else "?"
+    else:
+        # Check pending Feishu-initiated sessions (hook not yet received)
+        _root = root_id or parent_id
+        _tmux = _pending_msg_to_tty.get(_root) if _root else None
+        if _tmux:
+            error = validate_target(_tmux)
+            if error:
+                _reply(message_id, _STALE_SESSION_MESSAGE)
+                return
+            tty = _tmux
+            project = basename(config.default_cwd) if config.default_cwd else "?"
+        else:
+            logger.warning(
+                "Reply to unknown thread message root=%s parent=%s (mapping lost or reply target never registered)",
+                root_id or "-",
+                parent_id or "-",
+            )
+            _reply(message_id, "⚠️ 找不到对应会话，请等待下一条通知后再回复")
+            return
 
     if msg.message_type != "text":
         _reply(message_id, "⚠️ 只支持文本回复")
@@ -354,11 +378,9 @@ def _on_message(data: P2ImMessageReceiveV1):
     if not reply_text:
         return
 
-    project = basename(session.cwd) if session.cwd else "?"
-
     try:
-        inject(session.tty, reply_text)
-        logger.info(f"Injected '{reply_text}' -> {session.tty} ({project})")
+        inject(tty, reply_text)
+        logger.info(f"Injected '{reply_text}' -> {tty} ({project})")
         _add_reaction(message_id, random.choice(_SUCCESS_EMOJIS))
     except Exception as e:
         logger.error(f"Inject failed: {e}")
@@ -376,12 +398,20 @@ async def receive_hook(request: Request):
     matcher = body.get("matcher", "")
     session_id = body.get("session_id", "")
     message = body.get("message", "")
+    title = body.get("title", "")
 
     if not tty:
         return {"ok": False, "error": "missing tty (not in tmux?)"}
 
     effective_type = matcher or hook_type
     needs_card = effective_type == "permission_prompt"
+    # Card title: use notification title, fall back to _LABELS
+    card_title = title or _LABELS.get(effective_type, "")
+    # Text display: combine title + message for non-card text replies
+    if title and message:
+        display_message = f"**{title}**\n{message}"
+    else:
+        display_message = message
     project = basename(cwd) if cwd else "unknown"
     logger.info(f"Hook: [{project}] {effective_type} | tmux={tty} session={session_id[:8] if session_id else '-'}")
 
@@ -391,40 +421,41 @@ async def receive_hook(request: Request):
         # Existing session: reply to thread root
         session_store.upsert(session_id, tty=tty, cwd=cwd)
         if needs_card:
-            card = _build_card(message, session_id)
+            card = _build_card(message, session_id, title=card_title)
             msg_id = _reply(session.root_msg_id, card=card, reply_in_thread=True)
         else:
-            msg_id = _reply(session.root_msg_id, text=message or effective_type, reply_in_thread=True)
+            msg_id = _reply(session.root_msg_id, text=display_message or effective_type, reply_in_thread=True)
         if msg_id:
             return {"ok": True, "msg_id": msg_id, "thread": session.root_msg_id}
     else:
         # New session: check if Feishu-initiated (pending root exists)
         pending_root = _pending_roots.pop(tty, None)
         if pending_root:
+            _pending_msg_to_tty.pop(pending_root, None)
             # Feishu-initiated: reuse existing thread
             root_id = pending_root
             if session_id:
                 session_store.upsert(session_id, tty=tty, cwd=cwd, root_msg_id=root_id)
             if needs_card:
-                card = _build_card(message, session_id)
+                card = _build_card(message, session_id, title=card_title)
                 _reply(root_id, card=card, reply_in_thread=True)
-            elif message:
-                _reply(root_id, text=message, reply_in_thread=True)
+            elif display_message:
+                _reply(root_id, text=display_message, reply_in_thread=True)
             else:
                 _reply(root_id, text=effective_type, reply_in_thread=True)
             return {"ok": True, "msg_id": root_id}
 
         # User-initiated: send title as thread root, reply with content
-        title = _make_title(cwd, message)
-        root_id = _send(text=title)
+        thread_title = _make_title(cwd, message)
+        root_id = _send(text=thread_title)
         if root_id:
             if session_id:
                 session_store.upsert(session_id, tty=tty, cwd=cwd, root_msg_id=root_id)
             if needs_card:
-                card = _build_card(message, session_id)
+                card = _build_card(message, session_id, title=card_title)
                 _reply(root_id, card=card, reply_in_thread=True)
-            elif message:
-                _reply(root_id, text=message, reply_in_thread=True)
+            elif display_message:
+                _reply(root_id, text=display_message, reply_in_thread=True)
             else:
                 _reply(root_id, text=effective_type, reply_in_thread=True)
             return {"ok": True, "msg_id": root_id}

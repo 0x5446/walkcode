@@ -80,16 +80,18 @@ class _Base(unittest.TestCase):
     def _msg_event(self, *, root_id="", parent_id="", message_id="msg-1",
                    text="hello", message_type="text"):
         content = json.dumps({"text": text}) if message_type == "text" else "{}"
-        return SimpleNamespace(event=SimpleNamespace(message=SimpleNamespace(
-            root_id=root_id,
-            parent_id=parent_id,
-            message_id=message_id,
-            message_type=message_type,
-            content=content,
+        return SimpleNamespace(event=SimpleNamespace(
             sender=SimpleNamespace(
                 sender_id=SimpleNamespace(open_id="ou_test"),
             ),
-        )))
+            message=SimpleNamespace(
+                root_id=root_id,
+                parent_id=parent_id,
+                message_id=message_id,
+                message_type=message_type,
+                content=content,
+            ),
+        ))
 
     def _card_event(self, cmd="y", sid="session-1"):
         return SimpleNamespace(event=SimpleNamespace(
@@ -157,7 +159,8 @@ class HookNewSessionTests(_Base):
         self.assertEqual(len(self.sent), 1)
         self.assertEqual(len(self.replied), 1)
         _, card = self.replied[0]
-        self.assertNotIn("header", card)  # No decorative header
+        self.assertIn("header", card)
+        self.assertEqual(card["header"]["title"]["content"], "🔐 需要权限确认")
         action_elements = [e for e in card["elements"] if e["tag"] == "action"]
         self.assertEqual(len(action_elements), 1)
         buttons = action_elements[0]["actions"]
