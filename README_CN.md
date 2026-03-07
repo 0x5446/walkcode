@@ -81,7 +81,7 @@ curl -fsSL https://raw.githubusercontent.com/0x5446/walkcode/main/install.sh | b
 curl -fsSL https://raw.githubusercontent.com/0x5446/walkcode/main/uninstall.sh | bash
 ```
 
-清理守护进程、Shell Wrapper、tmux 配置、Claude Code Hooks、运行时数据和安装目录。如果自定义了安装路径，加 `WALKCODE_DIR=/your/path` 前缀即可。运行前可先[查看脚本内容](uninstall.sh)。
+清理守护进程、Shell Wrapper、tmux 配置、Claude Code Hooks 和 `~/.walkcode` 目录。如果自定义了安装路径，加 `WALKCODE_DIR=/your/path` 前缀即可。运行前可先[查看脚本内容](uninstall.sh)。
 
 ### 配置与运行
 
@@ -99,7 +99,7 @@ curl -fsSL https://raw.githubusercontent.com/0x5446/walkcode/main/uninstall.sh |
 #### 2. 编辑 `.env`
 
 ```bash
-vim ~/walkcode/.env
+vim ~/.walkcode/.env
 ```
 
 填入飞书应用的 `FEISHU_APP_ID` 和 `FEISHU_APP_SECRET`。
@@ -142,8 +142,8 @@ walkcode start
 brew install tmux
 curl -LsSf https://astral.sh/uv/install.sh | sh
 
-git clone https://github.com/0x5446/walkcode.git
-cd walkcode
+git clone https://github.com/0x5446/walkcode.git ~/.walkcode
+cd ~/.walkcode
 uv sync
 cp .env.example .env
 ```

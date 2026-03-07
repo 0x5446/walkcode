@@ -77,7 +77,7 @@ This installs tmux/uv if missing, clones the repo, runs `uv sync`, creates `.env
 curl -fsSL https://raw.githubusercontent.com/0x5446/walkcode/main/uninstall.sh | bash
 ```
 
-Removes the daemon, shell wrapper, tmux config, Claude Code hooks, runtime data, and install directory. If you customized the install path, prefix with `WALKCODE_DIR=/your/path`. [Review the script](uninstall.sh) before running if you prefer.
+Removes the daemon, shell wrapper, tmux config, Claude Code hooks, and the `~/.walkcode` directory. If you customized the install path, prefix with `WALKCODE_DIR=/your/path`. [Review the script](uninstall.sh) before running if you prefer.
 
 ### Configure & Run
 
@@ -95,7 +95,7 @@ Removes the daemon, shell wrapper, tmux config, Claude Code hooks, runtime data,
 #### 2. Edit `.env`
 
 ```bash
-vim ~/walkcode/.env
+vim ~/.walkcode/.env
 ```
 
 Fill in `FEISHU_APP_ID` and `FEISHU_APP_SECRET` from your Feishu app dashboard.
@@ -138,8 +138,8 @@ That's it. Type `claude` and go for a walk.
 brew install tmux
 curl -LsSf https://astral.sh/uv/install.sh | sh
 
-git clone https://github.com/0x5446/walkcode.git
-cd walkcode
+git clone https://github.com/0x5446/walkcode.git ~/.walkcode
+cd ~/.walkcode
 uv sync
 cp .env.example .env
 ```

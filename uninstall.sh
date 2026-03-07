@@ -5,8 +5,7 @@ set -euo pipefail
 # Usage: bash uninstall.sh
 #   or:  curl -fsSL https://raw.githubusercontent.com/0x5446/walkcode/main/uninstall.sh | bash
 
-INSTALL_DIR="${WALKCODE_DIR:-$HOME/walkcode}"
-RUNTIME_DIR="$HOME/.walkcode"
+INSTALL_DIR="${WALKCODE_DIR:-$HOME/.walkcode}"
 
 # All candidate shell rc files (same strategy as rustup/nvm/uv)
 RC_CANDIDATES=(
@@ -31,7 +30,7 @@ error() { echo -e "${RED}[walkcode]${NC} $*" >&2; }
 
 # --- Stop daemon if running ---
 stop_daemon() {
-  local pid_file="$RUNTIME_DIR/walkcode.pid"
+  local pid_file="$INSTALL_DIR/walkcode.pid"
   if [ -f "$pid_file" ]; then
     local pid
     pid=$(cat "$pid_file" 2>/dev/null || true)
@@ -142,15 +141,6 @@ else:
   fi
 }
 
-# --- Remove runtime directory ---
-remove_runtime() {
-  if [ -d "$RUNTIME_DIR" ]; then
-    info "Removing runtime directory $RUNTIME_DIR..."
-    rm -rf "$RUNTIME_DIR"
-    info "Runtime directory removed"
-  fi
-}
-
 # --- Remove install directory ---
 remove_install_dir() {
   if [ -d "$INSTALL_DIR" ]; then
@@ -176,8 +166,7 @@ main() {
   echo "  2. Shell wrapper from all rc files (.zshrc, .bashrc, .profile, etc.)"
   echo "  3. tmux config from ~/.tmux.conf"
   echo "  4. Claude Code hooks from ~/.claude/settings.json"
-  echo "  5. Runtime directory ($RUNTIME_DIR)"
-  echo "  6. Install directory ($INSTALL_DIR)"
+  echo "  5. Install directory ($INSTALL_DIR)"
   echo ""
   printf "Continue? [y/N] "
   read -r answer </dev/tty
@@ -191,7 +180,6 @@ main() {
   remove_shell_wrapper
   remove_tmux_config
   remove_hooks
-  remove_runtime
   remove_install_dir
 
   echo ""

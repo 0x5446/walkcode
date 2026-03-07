@@ -5,7 +5,7 @@ set -euo pipefail
 # Usage: curl -fsSL https://raw.githubusercontent.com/0x5446/walkcode/main/install.sh | bash
 
 REPO="https://github.com/0x5446/walkcode.git"
-INSTALL_DIR="${WALKCODE_DIR:-$HOME/walkcode}"
+INSTALL_DIR="${WALKCODE_DIR:-$HOME/.walkcode}"
 SHELL_RC=""
 
 # --- Colors ---
