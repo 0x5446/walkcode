@@ -37,6 +37,8 @@ Your agent hits a permission prompt while you're away. Without WalkCode, it bloc
 
 ## Architecture: 1:1:1 Mapping
 
+> For a deep dive into the internal design — session mapping, lifecycle, resume flow, hook protocol, and state persistence — see [ARCHITECTURE.md](ARCHITECTURE.md).
+
 WalkCode uses a strict 1:1:1 mapping: **one chat thread, one tmux session, one agent process.** This avoids cross-talk, keeps context localized, and makes message routing stateless.
 
 ```

@@ -41,6 +41,8 @@ Coding Agent (tmux) ──Hook──> WalkCode ──API──> 聊天（话题 
 
 ## 架构设计：1:1:1 映射
 
+> 想深入了解内部设计——会话映射、生命周期、恢复流程、Hook 协议、状态持久化——请参阅 [ARCHITECTURE.md](ARCHITECTURE.md)（英文）。
+
 WalkCode 的核心设计：**1 个聊天话题 = 1 个 tmux 会话 = 1 个 Coding Agent 进程。** 零串扰，上下文天然隔离，消息路由无状态。
 
 ```
