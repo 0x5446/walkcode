@@ -146,6 +146,18 @@ walkcode start
 
 搞定。输入 `claude`，然后出门散步。
 
+#### 5. （推荐）防止 macOS 系统休眠
+
+WalkCode 依赖持续的网络连接来接收飞书消息。如果 Mac 在接外部电源时进入系统休眠，网络会被挂起——休眠期间发送的消息直到唤醒后才会被收到，期间无法远程操控电脑。
+
+接外电时，建议禁止系统休眠和磁盘休眠（屏幕仍可正常关闭）：
+
+```bash
+sudo pmset -c sleep 0 && sudo pmset -c disksleep 0 && sudo pmset -c standby 0 && sudo pmset -c hibernatemode 0
+```
+
+此设置仅影响接外电时的行为，电池模式不受影响。
+
 ### 手动安装
 
 <details>

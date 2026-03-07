@@ -142,6 +142,18 @@ walkcode start
 
 That's it. Type `claude` and go for a walk.
 
+#### 5. (Recommended) Prevent macOS from Sleeping
+
+WalkCode depends on a persistent network connection to receive Feishu messages. If your Mac goes to sleep while on AC power, the network is suspended — messages sent while it sleeps will not be received until it wakes up.
+
+When plugged in, configure macOS to never sleep the system or disk (the display can still turn off):
+
+```bash
+sudo pmset -c sleep 0 && sudo pmset -c disksleep 0 && sudo pmset -c standby 0 && sudo pmset -c hibernatemode 0
+```
+
+This only affects AC power behavior. Battery settings are unchanged.
+
 ### Manual Install
 
 <details>

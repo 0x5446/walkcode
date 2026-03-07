@@ -190,6 +190,12 @@ main() {
   echo "  4. Send a message to your Feishu bot to get your open_id"
   echo "  5. Add open_id to .env, restart, and go for a walk"
   echo ""
+  echo "  Recommended: prevent macOS from sleeping on AC power so the network"
+  echo "  stays up while you're away (display can still turn off):"
+  echo ""
+  echo "    sudo pmset -c sleep 0 && sudo pmset -c disksleep 0 \\"
+  echo "         && sudo pmset -c standby 0 && sudo pmset -c hibernatemode 0"
+  echo ""
 }
 
 main "$@"
