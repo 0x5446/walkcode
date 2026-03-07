@@ -79,6 +79,43 @@ curl -fsSL https://raw.githubusercontent.com/0x5446/walkcode/main/uninstall.sh |
 
 Removes the daemon, shell wrapper, tmux config, Claude Code hooks, runtime data, and install directory. If you customized the install path, prefix with `WALKCODE_DIR=/your/path`. [Review the script](uninstall.sh) before running if you prefer.
 
+### Configure & Run
+
+#### 1. Create a Feishu App
+
+1. Go to [Feishu Open Platform](https://open.feishu.cn/app) and create an enterprise app
+2. **Add capability** > Bot
+3. **Permissions** > Enable:
+   - `im:message` — Read messages
+   - `im:message:send_as_bot` — Send messages
+   - `im:message.reactions:write_only` — Add emoji reactions
+4. **Events & Callbacks** > Long connection mode > Add event `im.message.receive_v1`
+5. **Version Management** > Create version > Publish
+
+#### 2. Edit `.env`
+
+```bash
+vim ~/walkcode/.env
+```
+
+Fill in `FEISHU_APP_ID` and `FEISHU_APP_SECRET` from your Feishu app dashboard.
+
+#### 3. Get Your open_id
+
+```bash
+walkcode serve
+```
+
+Send any message to your bot in Feishu, check logs for `open_id`, add it to `FEISHU_RECEIVE_ID` in `.env`, then Ctrl+C to stop.
+
+#### 4. Start the Daemon
+
+```bash
+walkcode start
+```
+
+That's it. Type `claude` and go for a walk.
+
 ### Manual Install
 
 <details>
@@ -107,7 +144,7 @@ uv sync
 cp .env.example .env
 ```
 
-Edit `.env` with your Feishu App ID, Secret, and Verification Token.
+Edit `.env` with your Feishu App ID and Secret.
 
 #### 3. Get Your open_id
 
@@ -152,8 +189,6 @@ uv run walkcode install-hooks
 ```
 
 </details>
-
-That's it. Type `claude` and go for a walk.
 
 ## How It Works
 

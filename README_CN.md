@@ -83,6 +83,43 @@ curl -fsSL https://raw.githubusercontent.com/0x5446/walkcode/main/uninstall.sh |
 
 清理守护进程、Shell Wrapper、tmux 配置、Claude Code Hooks、运行时数据和安装目录。如果自定义了安装路径，加 `WALKCODE_DIR=/your/path` 前缀即可。运行前可先[查看脚本内容](uninstall.sh)。
 
+### 配置与运行
+
+#### 1. 创建飞书应用
+
+1. 前往[飞书开放平台](https://open.feishu.cn/app)创建企业自建应用
+2. **添加应用能力** > 机器人
+3. **权限管理** > 开通以下权限：
+   - `im:message` — 读取消息
+   - `im:message:send_as_bot` — 以机器人身份发送消息
+   - `im:message.reactions:write_only` — 添加表情回复
+4. **事件与回调** > 长连接模式 > 添加事件 `im.message.receive_v1`
+5. **版本管理与发布** > 创建版本 > 发布上线
+
+#### 2. 编辑 `.env`
+
+```bash
+vim ~/walkcode/.env
+```
+
+填入飞书应用的 `FEISHU_APP_ID` 和 `FEISHU_APP_SECRET`。
+
+#### 3. 获取 open_id
+
+```bash
+walkcode serve
+```
+
+在飞书中给机器人发任意消息，查看日志中的 `open_id`，填入 `.env` 的 `FEISHU_RECEIVE_ID`，然后 Ctrl+C 停止。
+
+#### 4. 启动守护进程
+
+```bash
+walkcode start
+```
+
+搞定。输入 `claude`，然后出门散步。
+
 ### 手动安装
 
 <details>
@@ -111,7 +148,7 @@ uv sync
 cp .env.example .env
 ```
 
-编辑 `.env`，填入飞书应用的 App ID、App Secret 和 Verification Token。
+编辑 `.env`，填入飞书应用的 App ID 和 App Secret。
 
 #### 3. 获取 open_id
 
@@ -156,8 +193,6 @@ uv run walkcode install-hooks
 ```
 
 </details>
-
-搞定。输入 `claude`，然后出门散步。
 
 ## 工作原理
 
