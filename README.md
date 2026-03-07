@@ -2,28 +2,39 @@
 
 [**中文文档**](README_CN.md)
 
-**Let your AI agent call you when it needs help.**
+> **Code is cheap. Show me your talk.**
 
-> Human-in-the-loop for [Claude Code](https://docs.anthropic.com/en/docs/claude-code) via [Feishu / Lark](https://www.feishu.cn/) — vibe coding anytime, anywhere.
+Being chained to your desk isn't vibe coding. **Anytime, anywhere** — that's vibe coding.
 
-When Claude Code needs confirmation, context, or permission, it normally blocks and waits. WalkCode bridges that gap: it sends you a Feishu message, you reply from your phone, and Claude keeps going — even when your screen is locked.
+WalkCode turns your IM into a remote control for AI coding agents. Your agent codes, you walk. When it needs help, it pings your phone. You reply with a tap or a sentence. It keeps going. You keep walking.
+
+**Yap to code. Code while you walk. That's WalkCode.**
 
 ```
-Claude Code (tmux) ──Hook──> WalkCode ──API──> Feishu (thread + buttons)
-                    <──tmux send-keys──  <──WS── (tap / reply)
+Coding Agent (tmux) ──Hook──> WalkCode ──API──> IM (thread + buttons)
+                     <──tmux send-keys──  <──WS── (tap / reply)
 ```
+
+## Why WalkCode?
+
+You're on a walk. Your AI agent hits a permission prompt. It needs a "yes" to continue.
+
+**Without WalkCode:** It blocks. You come back 30 minutes later. Momentum lost.
+
+**With WalkCode:** Your phone buzzes. You tap "Allow". Agent keeps shipping. You keep walking.
+
+This is **Yap Coding** — you talk, it codes. No keyboard, no screen, no desk. Just you and your phone.
 
 ## Features
 
-- **Works with screen locked** — Uses `tmux send-keys` instead of GUI automation, so injection works even when macOS is locked or you're away
-- **Threaded conversations** — Each Claude Code session maps to a Feishu thread, keeping context organized
-- **One-tap permissions** — Interactive cards with Allow / Deny / Always buttons for permission prompts
-- **Text replies** — Reply in any thread to type directly into the correct terminal
-- **Remote start** — Send a message in your Feishu chat to start a new Claude Code instance remotely
+- **Works with screen locked** — `tmux send-keys` injection, no GUI dependency
+- **Threaded conversations** — Each agent session maps to an IM thread
+- **One-tap permissions** — Interactive cards with Allow / Deny / Always buttons
+- **Text replies** — Reply in a thread to type directly into the agent's terminal
+- **Remote start** — Send a message to start a new coding agent session from your phone
 - **Emoji receipts** — Random emoji reactions confirm delivery at a glance
-- **Multi-session** — Run multiple Claude Code instances; replies route to the right terminal automatically
-- **Session persistence** — Survives server restarts; sessions resume with their Feishu threads intact
-- **Transparent** — A shell wrapper auto-creates tmux sessions; you just type `claude` as normal
+- **Multi-session** — Multiple agents, one instance, auto-routing
+- **Session persistence** — Survives server restarts
 
 ## Quick Start
 
@@ -41,10 +52,7 @@ Claude Code (tmux) ──Hook──> WalkCode ──API──> Feishu (thread + 
 ### 2. Install
 
 ```bash
-# Prerequisites
 brew install tmux
-
-# Install uv if needed
 curl -LsSf https://astral.sh/uv/install.sh | sh
 
 git clone https://github.com/0x5446/agent-hotline.git
@@ -57,17 +65,15 @@ Edit `.env` with your Feishu App ID, Secret, and Verification Token.
 
 ### 3. Get Your open_id
 
-Start the service, then send any message to your bot in Feishu:
-
 ```bash
 uv run walkcode serve
 ```
 
-Check the logs for your `open_id`, add it to `FEISHU_RECEIVE_ID` in `.env`, then restart.
+Send any message to your bot in Feishu, check logs for `open_id`, add to `FEISHU_RECEIVE_ID` in `.env`, restart.
 
 ### 4. Add Shell Wrapper
 
-Add this to your `~/.zshrc` (or `~/.bashrc`):
+Add to `~/.zshrc` (or `~/.bashrc`):
 
 ```bash
 claude() {
@@ -80,58 +86,41 @@ claude() {
 }
 ```
 
-Then reload: `source ~/.zshrc`
+Then: `source ~/.zshrc`
 
-This transparently wraps Claude Code in a tmux session. You still just type `claude` — the wrapper handles the rest.
-
-### 5. Install Claude Code Hooks
+### 5. Install Hooks
 
 ```bash
 uv run walkcode install-hooks
 ```
 
-Restart your Claude Code session to activate.
-
-That's it. Type `claude`, and you'll get Feishu notifications that work even when your Mac is locked.
+That's it. Type `claude` and go for a walk.
 
 ## How It Works
 
-1. The shell wrapper starts Claude Code inside a tmux session
-2. Claude Code [Hooks](https://docs.anthropic.com/en/docs/claude-code/hooks) fire on task stop / permission prompt / input needed
-3. `walkcode hook` detects the tmux session name and POSTs it to the local server
-4. WalkCode creates a **Feishu thread** (project name as title, content as first reply)
-5. You tap a button or reply with text — delivered in real-time via Feishu WebSocket
-6. `tmux send-keys` injects your response into the correct session — no GUI required
+1. Shell wrapper starts the agent inside a tmux session
+2. Agent [Hooks](https://docs.anthropic.com/en/docs/claude-code/hooks) fire on stop / permission / input needed
+3. `walkcode hook` detects tmux session name and POSTs to local server
+4. WalkCode creates an **IM thread** (project name as title, content as first reply)
+5. You tap a button or reply with text — real-time via WebSocket
+6. `tmux send-keys` injects your response — no GUI required
 
 ### Remote Start
 
-You can also start a Claude Code instance directly from Feishu by sending a non-reply message to the bot. WalkCode will:
+Send a message in your IM chat to start a new agent session remotely:
 
-1. Create a new tmux session with `claude "<your message>"`
-2. Reply in a thread confirming the session started
-3. When Claude's hooks fire, they automatically link to the same Feishu thread
+1. WalkCode creates a tmux session with `claude "<your message>"`
+2. Replies in thread confirming session started
+3. Subsequent hooks auto-link to the same thread
 
 ## Usage
 
 | Scenario | What You See | What You Do |
 |----------|-------------|-------------|
 | Permission prompt | Card with buttons | Tap **Allow** / **Deny** / **Always** |
-| Waiting for input | Text message in thread | Reply with text |
-| Task complete | Text message in thread | Reply to continue, or ignore |
-| Start remotely | Send a message | Claude Code starts in a new tmux session |
-
-Delivery status is shown as an emoji reaction on your message.
-
-## Multiple Sessions
-
-Each Claude Code session auto-threads in Feishu. Reply to any message in a thread to inject into the correct terminal:
-
-```
-tmux: claude-project-a-12345  <-->  Feishu Thread "project-a | refact..."
-tmux: claude-project-b-67890  <-->  Feishu Thread "project-b | add ne..."
-```
-
-One `walkcode` instance handles all sessions.
+| Waiting for input | Text in thread | Reply with text |
+| Task complete | Text in thread | Reply to continue, or ignore |
+| Remote start | Send a message | Agent starts in new tmux session |
 
 ## CLI
 
@@ -142,21 +131,11 @@ walkcode stop                             # Stop daemon
 walkcode restart                          # Restart daemon
 walkcode status                           # Check if running
 walkcode serve                            # Foreground (debug)
-walkcode install-hooks                    # Install Claude Code hooks
-walkcode test-inject <tmux-session> "hi"  # Test tmux injection
+walkcode install-hooks                    # Install hooks
+walkcode test-inject <tmux-session> "hi"  # Test injection
 ```
 
-Runtime files in `~/.walkcode/`:
-
-| File | Purpose |
-|------|---------|
-| `walkcode.pid` | Daemon PID |
-| `walkcode.log` | Service log |
-| `state.json` | Session persistence |
-
 ## Configuration
-
-Environment variables (set in `.env`):
 
 | Variable | Required | Description |
 |----------|----------|-------------|
@@ -168,6 +147,40 @@ Environment variables (set in `.env`):
 | `WALKCODE_STATE_PATH` | No | Custom state file path |
 | `WALKCODE_CWD` | No | Default cwd for remote-started sessions |
 
+## Roadmap
+
+WalkCode's goal: **connect any coding agent to any IM.**
+
+### Coding Agents
+
+| Agent | Status |
+|-------|--------|
+| [Claude Code](https://docs.anthropic.com/en/docs/claude-code) | Supported |
+| [Codex CLI](https://github.com/openai/codex) | Planned |
+| [Gemini CLI](https://github.com/google-gemini/gemini-cli) | Planned |
+| [Cline](https://github.com/cline/cline) | Planned |
+| [Aider](https://github.com/Aider-AI/aider) | Planned |
+| [Copilot CLI](https://githubnext.com/projects/copilot-cli) | Planned |
+| [Goose](https://github.com/block/goose) | Planned |
+| [Amp](https://ampcode.com) | Planned |
+
+### IM Platforms
+
+| Platform | Status |
+|----------|--------|
+| [Feishu / Lark](https://www.feishu.cn/) | Supported |
+| [Slack](https://slack.com/) | Planned |
+| [Telegram](https://telegram.org/) | Planned |
+| [Discord](https://discord.com/) | Planned |
+| [WhatsApp](https://www.whatsapp.com/) | Planned |
+
+## Community
+
+- [GitHub Issues](https://github.com/0x5446/agent-hotline/issues) — Bug reports & feature requests
+- [GitHub Discussions](https://github.com/0x5446/agent-hotline/discussions) — Q&A & ideas
+
+<!-- TODO: Add Discord/Telegram community link -->
+
 ## Requirements
 
 - macOS
@@ -177,11 +190,11 @@ Environment variables (set in `.env`):
 
 ## Contributing
 
-Issues and PRs are welcome. Please run `uv run pytest` before submitting.
+Issues and PRs welcome. Run `uv run pytest` before submitting.
 
 ## Disclaimer
 
-This project is not affiliated with Anthropic. Claude is a trademark of Anthropic.
+Not affiliated with Anthropic. Claude is a trademark of Anthropic.
 
 ## License
 
