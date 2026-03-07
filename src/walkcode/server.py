@@ -155,8 +155,8 @@ def _make_title(cwd: str, session_id: str = "", message: str = "") -> str:
     if session_id:
         parts.append(session_id[:8])
     if message:
-        snippet = message[:10].rstrip()
-        ellipsis = "..." if len(message) > 10 else ""
+        snippet = message[:22].rstrip()
+        ellipsis = "..." if len(message) > 22 else ""
         parts.append(f"{snippet}{ellipsis}")
     return " | ".join(parts)
 
