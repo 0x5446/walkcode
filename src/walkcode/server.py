@@ -23,12 +23,6 @@ from lark_oapi.api.im.v1 import (
     P2ImMessageReceiveV1,
 )
 from lark_oapi.api.im.v1.model.emoji import Emoji
-from lark_oapi.event.callback.model.p2_card_action_trigger import (
-    P2CardActionTrigger,
-    P2CardActionTriggerResponse,
-    CallBackToast,
-    CallBackCard,
-)
 from fastapi import FastAPI, Request
 
 from .config import Config
@@ -82,12 +76,6 @@ _LABELS = {
     "elicitation_dialog": "📋 请选择",
 }
 
-_PERMISSION_BUTTONS = [
-    {"label": "✅ 允许 (y)", "cmd": "y", "type": "primary"},
-    {"label": "❌ 拒绝 (n)", "cmd": "n", "type": "default"},
-    {"label": "🔓 始终允许 (a)", "cmd": "a", "type": "default"},
-]
-
 _SUCCESS_EMOJIS = [
     "THUMBSUP", "OK", "JIAYI", "MUSCLE", "DONE", "YEAH", "APPLAUSE",
     "Fire", "LGTM", "CheckMark", "Hundred", "SMILE", "Get", "OnIt",
@@ -99,52 +87,6 @@ _FAILURE_EMOJIS = [
 ]
 
 _MENTION_RE = re.compile(r"@_user_\d+\s*")
-
-
-def _build_card(message: str, session_id: str = "", title: str = "") -> dict:
-    """Build a Feishu interactive card with content and permission buttons."""
-    card: dict = {"config": {"wide_screen_mode": True}}
-
-    if title:
-        card["header"] = {
-            "title": {"tag": "plain_text", "content": title},
-            "template": "orange",
-        }
-
-    elements = []
-    if message:
-        elements.append({
-            "tag": "div",
-            "text": {"tag": "lark_md", "content": message},
-        })
-
-    if session_id:
-        actions = []
-        for btn in _PERMISSION_BUTTONS:
-            actions.append({
-                "tag": "button",
-                "text": {"tag": "plain_text", "content": btn["label"]},
-                "type": btn["type"],
-                "value": {"cmd": btn["cmd"], "sid": session_id},
-            })
-        elements.append({"tag": "action", "actions": actions})
-
-    card["elements"] = elements or [{"tag": "div", "text": {"tag": "plain_text", "content": " "}}]
-    return card
-
-
-def _build_result_card(title: str, color: str, status_text: str) -> dict:
-    """Build a card showing action result (buttons removed)."""
-    return {
-        "config": {"wide_screen_mode": True},
-        "header": {
-            "title": {"tag": "plain_text", "content": title},
-            "template": color,
-        },
-        "elements": [
-            {"tag": "div", "text": {"tag": "lark_md", "content": status_text}},
-        ],
-    }
 
 
 def _make_title(cwd: str, session_id: str = "", message: str = "") -> str:
@@ -159,13 +101,9 @@ def _make_title(cwd: str, session_id: str = "", message: str = "") -> str:
     return " | ".join(parts)
 
 
-def _send(text: str = "", card: dict | None = None) -> str | None:
-    if card:
-        msg_type = "interactive"
-        content = json.dumps(card)
-    else:
-        msg_type = "text"
-        content = json.dumps({"text": text})
+def _send(text: str) -> str | None:
+    msg_type = "text"
+    content = json.dumps({"text": text})
     body = CreateMessageRequestBody.builder() \
         .receive_id(config.feishu_receive_id) \
         .msg_type(msg_type) \
@@ -182,13 +120,9 @@ def _send(text: str = "", card: dict | None = None) -> str | None:
     return resp.data.message_id
 
 
-def _reply(message_id: str, text: str = "", card: dict | None = None, reply_in_thread: bool = False) -> str | None:
-    if card:
-        msg_type = "interactive"
-        content = json.dumps(card)
-    else:
-        msg_type = "text"
-        content = json.dumps({"text": text})
+def _reply(message_id: str, text: str, reply_in_thread: bool = False) -> str | None:
+    msg_type = "text"
+    content = json.dumps({"text": text})
     builder = ReplyMessageRequestBody.builder() \
         .msg_type(msg_type) \
         .content(content)
@@ -232,62 +166,6 @@ def _add_reaction(message_id: str, emoji_type: str):
 
 
 # --- Feishu WebSocket event handlers ---
-
-def _on_card_action(data: P2CardActionTrigger) -> P2CardActionTriggerResponse:
-    """Handle Feishu card button clicks (e.g. permission y/n/a)."""
-    action = data.event.action
-    value = action.value or {}
-    cmd = value.get("cmd", "")
-    session_id = value.get("sid", "")
-
-    if not cmd or not session_id:
-        logger.warning("Card action missing cmd or sid: %s", value)
-        resp = P2CardActionTriggerResponse()
-        toast = CallBackToast()
-        toast.type = "error"
-        toast.content = "无效的按钮操作"
-        resp.toast = toast
-        return resp
-
-    session, session_error = _load_reply_session(session_id)
-    if session_error or not session:
-        resp = P2CardActionTriggerResponse()
-        toast = CallBackToast()
-        toast.type = "error"
-        toast.content = session_error or "会话已过期"
-        resp.toast = toast
-        return resp
-
-    try:
-        inject(session.tty, cmd)
-        project = basename(session.cwd) if session.cwd else "?"
-        logger.info(f"Card action '{cmd}' -> {session.tty} ({project})")
-        status = f"✅ 已送达 {session.tty}"
-        toast_type = "success"
-        color = "green"
-    except Exception as e:
-        logger.error(f"Card action inject failed: {e}")
-        status = f"❌ 注入失败: {e}"
-        toast_type = "error"
-        color = "orange"
-
-    resp = P2CardActionTriggerResponse()
-    toast = CallBackToast()
-    toast.type = toast_type
-    toast.content = status
-    resp.toast = toast
-
-    card = CallBackCard()
-    card.type = "raw"
-    card.data = _build_result_card(
-        title=f"🔐 权限确认 → {cmd}",
-        color=color,
-        status_text=status,
-    )
-    resp.card = card
-
-    return resp
-
 
 def _start_claude(prompt: str, message_id: str):
     """Start a Claude Code instance in a tmux session, triggered from Feishu."""
@@ -446,14 +324,13 @@ async def receive_hook(request: Request):
         return {"ok": False, "error": "missing tty (not in tmux?)"}
 
     effective_type = matcher or hook_type
-    needs_card = effective_type == "permission_prompt"
-    # Card title: use notification title, fall back to _LABELS
-    card_title = title or _LABELS.get(effective_type, "")
-    # Text display: combine title + message for non-card text replies
+    label = _LABELS.get(effective_type, "")
     if title and message:
         display_message = f"**{title}**\n{message}"
+    elif label and message:
+        display_message = f"{label}\n{message}"
     else:
-        display_message = message
+        display_message = message or label or effective_type
     project = basename(cwd) if cwd else "unknown"
     logger.info(f"Hook: [{project}] {effective_type} | tmux={tty} session={session_id[:8] if session_id else '-'}")
 
@@ -462,11 +339,7 @@ async def receive_hook(request: Request):
     if session and session.root_msg_id:
         # Existing session: reply to thread root
         session_store.upsert(session_id, tty=tty, cwd=cwd)
-        if needs_card:
-            card = _build_card(message, session_id, title=card_title)
-            msg_id = _reply(session.root_msg_id, card=card, reply_in_thread=True)
-        else:
-            msg_id = _reply(session.root_msg_id, text=display_message or effective_type, reply_in_thread=True)
+        msg_id = _reply(session.root_msg_id, text=display_message, reply_in_thread=True)
         if msg_id:
             return {"ok": True, "msg_id": msg_id, "thread": session.root_msg_id}
     else:
@@ -480,13 +353,7 @@ async def receive_hook(request: Request):
                 # Update the launch reply with session info
                 if reply_id:
                     _edit_message(reply_id, f"🚀 Claude Code | {session_id[:8]}\ntmux attach -t {tty}")
-            if needs_card:
-                card = _build_card(message, session_id, title=card_title)
-                _reply(root_id, card=card, reply_in_thread=True)
-            elif display_message:
-                _reply(root_id, text=display_message, reply_in_thread=True)
-            else:
-                _reply(root_id, text=effective_type, reply_in_thread=True)
+            _reply(root_id, text=display_message, reply_in_thread=True)
             return {"ok": True, "msg_id": root_id}
 
         # User-initiated: send title as thread root, reply with content
@@ -495,13 +362,7 @@ async def receive_hook(request: Request):
         if root_id:
             if session_id:
                 session_store.upsert(session_id, tty=tty, cwd=cwd, root_msg_id=root_id)
-            if needs_card:
-                card = _build_card(message, session_id, title=card_title)
-                _reply(root_id, card=card, reply_in_thread=True)
-            elif display_message:
-                _reply(root_id, text=display_message, reply_in_thread=True)
-            else:
-                _reply(root_id, text=effective_type, reply_in_thread=True)
+            _reply(root_id, text=display_message, reply_in_thread=True)
             return {"ok": True, "msg_id": root_id}
 
     return {"ok": False, "error": "send failed"}
@@ -583,8 +444,6 @@ def start_ws_client(cfg: Config):
         "", ""
     ).register_p2_im_message_receive_v1(
         _on_message
-    ).register_p2_card_action_trigger(
-        _on_card_action
     ).build()
 
     cli = lark.ws.Client(

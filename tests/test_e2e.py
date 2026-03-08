@@ -47,16 +47,16 @@ class _Base(unittest.TestCase):
             p.stop()
         self.tmpdir.cleanup()
 
-    def _fake_send(self, text="", card=None):
+    def _fake_send(self, text=""):
         msg_id = f"root-{self._next_send_id}"
         self._next_send_id += 1
-        self.sent.append((msg_id, card or text))
+        self.sent.append((msg_id, text))
         return msg_id
 
-    def _fake_reply(self, message_id, text="", card=None, reply_in_thread=False):
+    def _fake_reply(self, message_id, text="", reply_in_thread=False):
         reply_id = f"reply-{self._next_reply_id}"
         self._next_reply_id += 1
-        self.replied.append((message_id, card or text))
+        self.replied.append((message_id, text))
         return reply_id
 
     def _fake_add_reaction(self, message_id, emoji_type):
@@ -98,10 +98,6 @@ class _Base(unittest.TestCase):
             ),
         ))
 
-    def _card_event(self, cmd="y", sid="session-1"):
-        return SimpleNamespace(event=SimpleNamespace(
-            action=SimpleNamespace(value={"cmd": cmd, "sid": sid}),
-        ))
 
 
 # =========================================================================
@@ -142,7 +138,7 @@ class HookNewSessionTests(_Base):
         self.assertIsInstance(title, str)
         parent_id, content = self.replied[0]
         self.assertEqual(parent_id, "root-1")
-        self.assertEqual(content, "done")
+        self.assertIn("done", content)
 
         session = server.session_store.get("session-1")
         self.assertIsNotNone(session)
@@ -150,29 +146,24 @@ class HookNewSessionTests(_Base):
         self.assertEqual(session.root_msg_id, "root-1")
 
     def test_new_session_title_contains_project_session_and_snippet(self):
+        long_msg = "a]" * 20  # 40 chars, exceeds 22-char snippet limit
         self._post_hook(hook_type="stop", matcher="", cwd="/tmp/myproject",
-                        session_id="abcdef1234567890", message="hello world")
+                        session_id="abcdef1234567890", message=long_msg)
         self.assertEqual(len(self.sent), 1)
         self.assertEqual(len(self.replied), 1)
         _, title = self.sent[0]
         self.assertIn("myproject", title)
         self.assertIn("abcdef12", title)  # session_id[:8]
-        self.assertIn("hello worl", title)
         self.assertIn("...", title)
 
-    def test_permission_prompt_sends_text_root_and_card_reply(self):
-        self._post_hook(matcher="permission_prompt", hook_type="notification")
-        # Interactive: text root + card reply with buttons
+    def test_permission_prompt_sends_text_like_other_notifications(self):
+        self._post_hook(matcher="permission_prompt", hook_type="notification",
+                        message="Claude Code needs your approval")
         self.assertEqual(len(self.sent), 1)
         self.assertEqual(len(self.replied), 1)
-        _, card = self.replied[0]
-        self.assertIn("header", card)
-        self.assertEqual(card["header"]["title"]["content"], "🔐 需要权限确认")
-        action_elements = [e for e in card["elements"] if e["tag"] == "action"]
-        self.assertEqual(len(action_elements), 1)
-        buttons = action_elements[0]["actions"]
-        cmds = [b["value"]["cmd"] for b in buttons]
-        self.assertEqual(cmds, ["y", "n", "a"])
+        _, content = self.replied[0]
+        self.assertIsInstance(content, str)
+        self.assertIn("Claude Code needs your approval", content)
 
     def test_hook_missing_tty_returns_error(self):
         resp = self.client.post("/hook", json={
@@ -352,59 +343,7 @@ class MessageReplyTests(_Base):
 
 
 # =========================================================================
-# 5. Card action (button click) → inject command
-# =========================================================================
-
-class CardActionTests(_Base):
-    def _setup_session(self):
-        self._post_hook()
-
-    def test_card_action_injects_and_returns_success(self):
-        self._setup_session()
-        with mock.patch("walkcode.server.validate_target", return_value=None), \
-             mock.patch("walkcode.server.inject", return_value=True) as inj:
-            resp = server._on_card_action(self._card_event(cmd="y", sid="session-1"))
-        inj.assert_called_once_with("claude-project-123", "y")
-        self.assertEqual(resp.toast.type, "success")
-        self.assertIn("已送达", resp.toast.content)
-        self.assertEqual(resp.card.data["header"]["template"], "green")
-
-    def test_card_action_inject_failure_returns_error(self):
-        self._setup_session()
-        with mock.patch("walkcode.server.validate_target", return_value=None), \
-             mock.patch("walkcode.server.inject", side_effect=RuntimeError("no tab")):
-            resp = server._on_card_action(self._card_event(cmd="y", sid="session-1"))
-        self.assertEqual(resp.toast.type, "error")
-        self.assertIn("注入失败", resp.toast.content)
-
-    def test_card_action_missing_cmd_returns_error(self):
-        event = SimpleNamespace(event=SimpleNamespace(
-            action=SimpleNamespace(value={"cmd": "", "sid": "session-1"}),
-        ))
-        resp = server._on_card_action(event)
-        self.assertEqual(resp.toast.type, "error")
-
-    def test_card_action_missing_sid_returns_error(self):
-        event = SimpleNamespace(event=SimpleNamespace(
-            action=SimpleNamespace(value={"cmd": "y", "sid": ""}),
-        ))
-        resp = server._on_card_action(event)
-        self.assertEqual(resp.toast.type, "error")
-
-    def test_card_action_expired_session_returns_error(self):
-        resp = server._on_card_action(self._card_event(cmd="y", sid="nonexistent"))
-        self.assertEqual(resp.toast.type, "error")
-        self.assertIn("会话已过期", resp.toast.content)
-
-    def test_card_action_dead_tmux_session_returns_error(self):
-        self._setup_session()
-        with mock.patch("walkcode.server.validate_target", return_value="session not found"):
-            resp = server._on_card_action(self._card_event(cmd="y", sid="session-1"))
-        self.assertEqual(resp.toast.type, "error")
-
-
-# =========================================================================
-# 6. Multi-session routing
+# 5. Multi-session routing
 # =========================================================================
 
 class MultiSessionTests(_Base):
@@ -450,7 +389,7 @@ class MultiSessionTests(_Base):
 
 
 # =========================================================================
-# 7. Session persistence across restart
+# 6. Session persistence across restart
 # =========================================================================
 
 class PersistenceTests(_Base):
@@ -483,7 +422,7 @@ class PersistenceTests(_Base):
 
 
 # =========================================================================
-# 8. Feishu-initiated Claude Code (pending_roots)
+# 7. Feishu-initiated Claude Code (pending_roots)
 # =========================================================================
 
 class FeishuInitiatedTests(_Base):
@@ -505,7 +444,7 @@ class FeishuInitiatedTests(_Base):
         self.assertEqual(len(self.replied), 1)
         parent_id, content = self.replied[0]
         self.assertEqual(parent_id, "feishu-msg-100")
-        self.assertEqual(content, "started")
+        self.assertIn("started", content)
 
         # Session should be stored with the Feishu root
         session = server.session_store.get("s1")
@@ -570,7 +509,7 @@ class FeishuInitiatedTests(_Base):
 
 
 # =========================================================================
-# 9. Idle reaper
+# 8. Idle reaper
 # =========================================================================
 
 class IdleReaperTests(_Base):

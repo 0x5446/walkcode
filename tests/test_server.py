@@ -53,7 +53,14 @@ class ServerReplySessionTests(unittest.TestCase):
 
     def test_make_title_project_with_snippet(self):
         title = server._make_title("/tmp/myproject", message="hello world")
-        self.assertEqual(title, "myproject | hello worl...")
+        self.assertEqual(title, "myproject | hello world")
+
+    def test_make_title_long_message_truncated(self):
+        title = server._make_title("/tmp/myproject", message="a]" * 20)
+        self.assertIn("...", title)
+        # snippet is 22 chars max
+        parts = title.split(" | ")
+        self.assertTrue(len(parts[-1]) <= 25)  # 22 + "..."
 
     def test_make_title_with_session_id(self):
         title = server._make_title("/tmp/myproject", session_id="abcdef1234567890", message="fix bug")
