@@ -11,8 +11,8 @@ WalkCode 让 Coding Agent 在需要帮助时给你发消息，你用手机就能
 **边走边 Code，口喷编程。这就是 WalkCode。**
 
 ```
-Coding Agent (tmux) ──Hook──> WalkCode ──API──> 聊天（话题 + 按钮）
-                     <──tmux send-keys──  <──WS── （点击 / 回复）
+Coding Agent (tmux) ──Hook──> WalkCode ──API──> 聊天（话题）
+                     <──tmux send-keys──  <──WS── （回复）
 ```
 
 ## 为什么要用 WalkCode？
@@ -28,7 +28,7 @@ Coding Agent (tmux) ──Hook──> WalkCode ──API──> 聊天（话题 
 ## 功能特性
 
 **核心：**
-- **一键授权** —— 权限确认以交互卡片展示，支持 允许 / 拒绝 / 始终允许
+- **权限审批** —— 直接在聊天中回复审批
 - **文字回复** —— 在话题中回复文字，直接输入到对应终端
 - **远程启动** —— 在聊天中发条消息，就能远程启动一个新的 Coding Agent
 - **会话恢复** —— 话题中的 tmux 会话过期后，回复任意消息自动恢复
@@ -38,6 +38,7 @@ Coding Agent (tmux) ──Hook──> WalkCode ──API──> 聊天（话题 
 - **多会话** —— 多个 Coding Agent，一个实例，自动路由
 - **会话持久化** —— 服务重启后自动恢复
 - **表情回执** —— 随机表情回应确认送达
+- **i18n** —— 自动检测系统语言（zh* 中文，其余英文）
 
 ## 架构设计：1:1:1 映射
 
@@ -89,7 +90,7 @@ WalkCode 的核心设计：**1 个聊天话题 = 1 个 tmux 会话 = 1 个 Codin
 curl -fsSL https://raw.githubusercontent.com/0x5446/walkcode/main/install.sh | bash
 ```
 
-自动完成：安装 tmux/uv → 克隆仓库 → `uv sync` → 创建 `.env` → 注入 Shell Wrapper → 配置 tmux 滚动历史 → 安装 Hooks。运行前可先[查看脚本内容](install.sh)。
+自动完成：安装 tmux/uv → 通过 `uv tool install` 安装 WalkCode CLI → 创建 `.env` → 注入 Shell Wrapper → 配置 tmux 滚动历史 → 安装 Hooks。运行前可先[查看脚本内容](install.sh)。
 
 打开一个新的终端窗口，或运行 `exec $SHELL` 重新加载当前 Shell 会话。
 
@@ -136,9 +137,7 @@ vim ~/.walkcode/.env
 walkcode serve
 ```
 
-在飞书中给机器人发任意消息，查看日志中的 `open_id`，填入 `.env` 的 `FEISHU_RECEIVE_ID`，然后 Ctrl+C 停止。
-
-#### 4. 启动守护进程
+在飞书中给机器人发任意消息，WalkCode 会在控制台直接打印发送者的 `open_id`。将其填入 `.env` 的 `FEISHU_RECEIVE_ID`，然后 Ctrl+C 并启动守护进程：
 
 ```bash
 walkcode start
@@ -146,7 +145,7 @@ walkcode start
 
 搞定。输入 `claude`，然后出门散步。
 
-#### 5. （推荐）防止 macOS 系统休眠
+#### 4. （推荐）防止 macOS 系统休眠
 
 WalkCode 依赖持续的网络连接来接收飞书消息。如果 Mac 在接外部电源时进入系统休眠，网络会被挂起——休眠期间发送的消息直到唤醒后才会被收到，期间无法远程操控电脑。
 
@@ -194,7 +193,7 @@ cp .env.example .env
 uv run walkcode serve
 ```
 
-在飞书中给机器人发消息，查看日志中的 `open_id`，填入 `.env` 的 `FEISHU_RECEIVE_ID`，重启服务。
+在飞书中给机器人发消息，发送者的 `open_id` 会直接打印在控制台。填入 `.env` 的 `FEISHU_RECEIVE_ID`，重启服务。
 
 #### 4. 添加 Shell Wrapper
 
@@ -238,14 +237,14 @@ uv run walkcode install-hooks
 2. Coding Agent [Hooks](https://docs.anthropic.com/en/docs/claude-code/hooks) 在任务完成 / 需要权限 / 等待输入时触发
 3. `walkcode hook` 检测当前 tmux 会话名并 POST 到本地服务器
 4. WalkCode 在聊天中创建**话题消息**（`项目名 | session_id | prompt` 作为标题，内容作为首条回复）
-5. 你点击按钮或回复文字 —— 通过 WebSocket 实时送达
+5. 你在话题中回复文字 —— 通过 WebSocket 实时送达
 6. `tmux send-keys` 将你的回复注入到对应会话 —— 无需 GUI
 
 ## 使用方式
 
 | 场景 | 你看到的 | 你要做的 |
 |------|---------|---------|
-| 权限确认 | 带按钮的交互卡片 | 点击 **允许** / **拒绝** / **始终允许** |
+| 权限确认 | 话题中的文字消息 | 回复 **允许** / **拒绝** / **始终允许** |
 | 等待输入 | 话题中的文字消息 | 回复文字 |
 | 任务完成 | 话题中的文字消息 | 回复以继续，或忽略 |
 | 会话过期 | 在旧话题中回复 | 自动通过 `--resume` 恢复会话 |
@@ -262,6 +261,7 @@ walkcode status                           # 查看运行状态
 walkcode serve                            # 前台运行（调试用）
 walkcode install-hooks                    # 安装 Hooks
 walkcode upgrade                          # 拉取最新代码 + 重装 CLI + 重启
+walkcode uninstall                        # 卸载 WalkCode
 walkcode test-inject <tmux-session> "hi"  # 测试注入
 ```
 
@@ -271,7 +271,7 @@ walkcode test-inject <tmux-session> "hi"  # 测试注入
 |------|------|------|
 | `FEISHU_APP_ID` | 是 | 飞书应用 ID |
 | `FEISHU_APP_SECRET` | 是 | 飞书应用密钥 |
-| `FEISHU_RECEIVE_ID` | 是 | 你的 open_id 或 chat_id |
+| `FEISHU_RECEIVE_ID` | 否 | 你的 open_id 或 chat_id（运行 `walkcode serve` 获取） |
 | `FEISHU_RECEIVE_ID_TYPE` | 否 | `open_id`（默认）或 `chat_id` |
 | `WALKCODE_STATE_PATH` | 否 | 自定义状态文件路径 |
 | `WALKCODE_CWD` | 否 | 远程启动会话的默认工作目录（默认 `~/.walkcode/workspace`） |

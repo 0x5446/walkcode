@@ -11,6 +11,7 @@ This document describes the internal design of WalkCode for developers who want 
 - [Message Routing](#message-routing)
 - [State Persistence](#state-persistence)
 - [Idle Reaper](#idle-reaper)
+- [i18n](#i18n)
 
 ---
 
@@ -120,14 +121,14 @@ User replies in dead thread
   → _resume_claude(session_id, old_session, reply_text, message_id)
     → tmux new-session -d -s walkcode-{ts} "cd '{cwd}' && claude --resume '{session_id}' ..."
     → session_store.upsert(session_id, tty=new_tmux_name, root_msg_id=old_root)
-    → _reply(message_id, "🔄 已恢复...")
+    → _reply(message_id, "🔄 Session resumed...")
     → threading.Thread: sleep(3) → inject(new_tmux_name, reply_text)
 ```
 
 Key design decisions:
 
 - **`claude --resume {session_id}`** is used instead of `--continue` for precision — `--continue` picks the most recent conversation in the cwd, which could be wrong if multiple sessions share a directory; `--resume` targets the exact conversation.
-- **The Feishu thread is reused** — `root_msg_id` is preserved in `upsert()`, so the thread mapping stays intact. The user sees a new "🔄 已恢复" message in the existing thread.
+- **The Feishu thread is reused** — `root_msg_id` is preserved in `upsert()`, so the thread mapping stays intact. The user sees a new "Session resumed" message in the existing thread.
 - **Delayed inject** — Claude needs ~3 seconds to initialize before it can accept input. A daemon thread handles the delay without blocking the WebSocket event handler.
 - **Sessions never expire from state** — there is no TTL on `SessionStore` entries. This ensures resume is always possible, regardless of how long the session has been idle. Storage cost is negligible (a few dozen bytes per session).
 - **Card actions do not trigger resume** — if a user clicks a permission button on an old card, it returns an error toast. Resume is only triggered by text replies, which carry meaningful context.
@@ -178,6 +179,9 @@ Claude Code hooks call `walkcode hook {stop|notification}` which reads JSON from
 ```
 message received
   │
+  ├─ config.feishu_receive_id empty?
+  │    └─→ print sender's open_id to console (setup helper)
+  │
   ├─ no parent_id AND no root_id?
   │    └─→ _start_claude(text, message_id)          # new session
   │
@@ -187,11 +191,11 @@ message received
        │    └─ _load_reply_session(session_id)
        │         ├─ tmux alive?  → inject(tty, text)
        │         ├─ tmux dead, session data exists?  → _resume_claude(...)
-       │         └─ session not in store?  → "会话已过期"
+       │         └─ session not in store?  → "session expired"
        │
        └─ no session_id (pending feishu-initiated session)
             ├─ _pending_msg_to_tty[root_id] found?  → inject(pending_tty, text)
-            └─ not found?  → "找不到对应会话"
+            └─ not found?  → "session not found"
 ```
 
 `_resolve_session_id()` looks up `msg.root_id` first, then `msg.parent_id`, in `_root_to_session`. This handles both top-level thread replies (where `root_id` is set) and direct replies to individual messages (where only `parent_id` is set).
@@ -265,8 +269,47 @@ otherwise  →  skip
 ```python
 kill_session(session.tty)          # tmux kill-session -t {name}
 _reply(root_msg_id,                # notify user in Feishu thread
-    "⏰ 会话因长时间无活动已关闭，回复任意消息可恢复",
+    t("feishu.idle_killed"),       # locale-aware message (see i18n)
     reply_in_thread=True)
 ```
 
 The session record is **not deleted** from state — it stays for resume.
+
+---
+
+## i18n
+
+All user-facing strings — CLI output, Feishu messages, error messages — pass through a lightweight i18n module (`src/walkcode/i18n.py`).
+
+### Locale detection
+
+```python
+def _detect_zh() -> bool:
+    lang = os.environ.get("LANG", "") or os.environ.get("LANGUAGE", "")
+    return lang.startswith("zh")
+```
+
+If the system locale starts with `zh` (e.g., `zh_CN.UTF-8`), all output is Chinese. Otherwise, English.
+
+### Translation function
+
+```python
+_T: dict[str, tuple[str, str]] = {
+    "feishu.idle_killed": (
+        "⏰ Session closed due to inactivity, reply to resume",    # en
+        "⏰ 会话因长时间无活动已关闭，回复任意消息可恢复",              # zh
+    ),
+    # ... ~60 keys
+}
+
+def t(key: str, **kwargs) -> str:
+    pair = _T[key]
+    text = pair[1] if _ZH else pair[0]
+    return text.format(**kwargs) if kwargs else text
+```
+
+### Design decisions
+
+- **Logger messages stay English** — logs are for developers; mixing locales in log output hurts searchability.
+- **Shell scripts have their own i18n** — `install.sh` and `uninstall.sh` use `is_zh()` / `msg()` functions, not the Python module.
+- **No framework dependency** — the entire i18n system is a single file with zero external imports.

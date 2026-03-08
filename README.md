@@ -9,8 +9,8 @@
 WalkCode lets AI coding agents message you when they need help, so you can review, approve, or redirect them from your phone. Stay in the loop without being stuck at your desk.
 
 ```
-Coding Agent (tmux) ──Hook──> WalkCode ──API──> Chat (thread + buttons)
-                     <──tmux send-keys──  <──WS── (tap / reply)
+Coding Agent (tmux) ──Hook──> WalkCode ──API──> Chat (thread)
+                     <──tmux send-keys──  <──WS── (reply)
 ```
 
 ## Why WalkCode?
@@ -24,7 +24,7 @@ Your agent hits a permission prompt while you're away. Without WalkCode, it bloc
 ## Features
 
 **Core:**
-- **One-tap permissions** — interactive cards with Allow / Deny / Always buttons
+- **Permission approvals** — approve or deny directly from chat
 - **Text replies** — reply in a thread to type directly into the agent's terminal
 - **Remote start** — send a message to start a new agent session from your phone
 - **Session resume** — reply in an expired thread to automatically resume the conversation
@@ -34,6 +34,7 @@ Your agent hits a permission prompt while you're away. Without WalkCode, it bloc
 - **Multi-session** — multiple agents, one instance, auto-routing
 - **Session persistence** — survives server restarts
 - **Emoji receipts** — random emoji reactions confirm delivery at a glance
+- **i18n** — auto-detects system locale (Chinese for zh*, English otherwise)
 
 ## Architecture: 1:1:1 Mapping
 
@@ -85,7 +86,7 @@ This means remote-started sessions respect whatever permissions you have configu
 curl -fsSL https://raw.githubusercontent.com/0x5446/walkcode/main/install.sh | bash
 ```
 
-This installs tmux/uv if missing, clones the repo, runs `uv sync`, creates `.env`, adds a shell wrapper, configures tmux scrollback, and installs Claude Code hooks. [Review the script](install.sh) before running if you prefer.
+This installs tmux/uv if missing, installs the WalkCode CLI via `uv tool install`, creates `.env`, adds a shell wrapper, configures tmux scrollback, and installs Claude Code hooks. [Review the script](install.sh) before running if you prefer.
 
 Open a new terminal window, or run `exec $SHELL` to reload your current session.
 
@@ -132,9 +133,7 @@ Fill in `FEISHU_APP_ID` and `FEISHU_APP_SECRET` from your Feishu app dashboard.
 walkcode serve
 ```
 
-Send any message to your bot in Feishu, check logs for `open_id`, add it to `FEISHU_RECEIVE_ID` in `.env`, then Ctrl+C to stop.
-
-#### 4. Start the Daemon
+Send any message to your bot in Feishu. WalkCode will print the sender's `open_id` in the console. Add it to `FEISHU_RECEIVE_ID` in `.env`, then Ctrl+C and start the daemon:
 
 ```bash
 walkcode start
@@ -142,7 +141,7 @@ walkcode start
 
 That's it. Type `claude` and go for a walk.
 
-#### 5. (Recommended) Prevent macOS from Sleeping
+#### 4. (Recommended) Prevent macOS from Sleeping
 
 WalkCode depends on a persistent network connection to receive Feishu messages. If your Mac goes to sleep while on AC power, the network is suspended — messages sent while it sleeps will not be received until it wakes up.
 
@@ -190,7 +189,7 @@ Edit `.env` with your Feishu App ID and Secret.
 uv run walkcode serve
 ```
 
-Send any message to your bot in Feishu, check logs for `open_id`, add to `FEISHU_RECEIVE_ID` in `.env`, restart.
+Send any message to your bot in Feishu, the sender's `open_id` will be printed in the console. Add to `FEISHU_RECEIVE_ID` in `.env`, restart.
 
 #### 4. Add Shell Wrapper
 
@@ -234,14 +233,14 @@ uv run walkcode install-hooks
 2. Agent [Hooks](https://docs.anthropic.com/en/docs/claude-code/hooks) fire on stop / permission / input needed
 3. `walkcode hook` detects tmux session name and POSTs to local server
 4. WalkCode creates a **chat thread** (`project | session_id | prompt` as title, content as first reply)
-5. You tap a button or reply with text — real-time via WebSocket
+5. You reply with text — real-time via WebSocket
 6. `tmux send-keys` injects your response — no GUI required
 
 ## Usage
 
 | Scenario | What You See | What You Do |
 |----------|-------------|-------------|
-| Permission prompt | Card with buttons | Tap **Allow** / **Deny** / **Always** |
+| Permission prompt | Text in thread | Reply **Allow** / **Deny** / **Always** |
 | Waiting for input | Text in thread | Reply with text |
 | Task complete | Text in thread | Reply to continue, or ignore |
 | Session expired | Reply in old thread | Agent resumes automatically via `--resume` |
@@ -258,6 +257,7 @@ walkcode status                           # Check if running
 walkcode serve                            # Foreground (debug)
 walkcode install-hooks                    # Install hooks
 walkcode upgrade                          # Pull + reinstall + restart
+walkcode uninstall                        # Uninstall WalkCode
 walkcode test-inject <tmux-session> "hi"  # Test injection
 ```
 
@@ -267,7 +267,7 @@ walkcode test-inject <tmux-session> "hi"  # Test injection
 |----------|----------|-------------|
 | `FEISHU_APP_ID` | Yes | Feishu app ID |
 | `FEISHU_APP_SECRET` | Yes | Feishu app secret |
-| `FEISHU_RECEIVE_ID` | Yes | Your open_id or chat_id |
+| `FEISHU_RECEIVE_ID` | No | Your open_id or chat_id (run `walkcode serve` to discover) |
 | `FEISHU_RECEIVE_ID_TYPE` | No | `open_id` (default) or `chat_id` |
 | `WALKCODE_STATE_PATH` | No | Custom state file path |
 | `WALKCODE_CWD` | No | Default cwd for remote-started sessions (default: `~/.walkcode/workspace`) |
