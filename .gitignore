@@ -10,3 +10,4 @@ dist/
 .eggs/
 .playwright-mcp/
 .claude/
+AGENTS.md
