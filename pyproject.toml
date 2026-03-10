@@ -1,6 +1,6 @@
 [project]
 name = "walkcode"
-version = "0.5.0"
+version = "0.7.0"
 description = "Let your AI agent call you when it needs help — human-in-the-loop via Feishu"
 readme = "README.md"
 requires-python = ">=3.13"

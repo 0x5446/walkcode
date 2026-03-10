@@ -1,5 +1,6 @@
 """WalkCode server: FastAPI for hooks + Feishu WebSocket for events."""
 
+import asyncio
 import json
 import logging
 import os
@@ -8,7 +9,9 @@ import re
 import subprocess
 import threading
 import time
+import uuid
 from os.path import basename
+from pathlib import Path
 
 import lark_oapi as lark
 from lark_oapi.api.im.v1 import (
@@ -23,6 +26,12 @@ from lark_oapi.api.im.v1 import (
     P2ImMessageReceiveV1,
 )
 from lark_oapi.api.im.v1.model.emoji import Emoji
+from lark_oapi.event.callback.model.p2_card_action_trigger import (
+    P2CardActionTrigger,
+    P2CardActionTriggerResponse,
+    CallBackToast,
+    CallBackCard,
+)
 from fastapi import FastAPI, Request
 
 from .config import Config
@@ -32,7 +41,7 @@ from .tty import inject, validate_target, get_session_activity, kill_session
 
 logger = logging.getLogger("walkcode")
 
-app = FastAPI(title="WalkCode", version="0.5.0")
+app = FastAPI(title="WalkCode", version="0.7.0")
 
 # --- State ---
 
@@ -41,6 +50,82 @@ lark_client: lark.Client = None  # type: ignore
 session_store: SessionStore = None  # type: ignore
 _IDLE_TIMEOUT = 7200  # 2h — kill tmux sessions idle longer than this
 _REAPER_INTERVAL = 600  # 10min — how often the idle reaper runs
+
+
+# --- Permission request state ---
+
+_perm_requests: dict[str, dict] = {}   # request_id → {tool_name, tool_input, ...}
+_perm_decisions: dict[str, dict] = {}  # request_id → {behavior, tool_name, always}
+_perm_events: dict[str, threading.Event] = {}  # request_id → Event for signaling
+
+
+def _build_permission_card(request_id: str, tool_name: str, tool_input: dict) -> dict:
+    """Build a Feishu interactive card for a permission request."""
+    input_str = json.dumps(tool_input, indent=2, ensure_ascii=False)
+    if len(input_str) > 500:
+        input_str = input_str[:500] + "\n..."
+    return {
+        "config": {"wide_screen_mode": True},
+        "header": {
+            "title": {"tag": "plain_text", "content": t("feishu.perm.header")},
+            "template": "orange",
+        },
+        "elements": [
+            {
+                "tag": "div",
+                "text": {
+                    "tag": "lark_md",
+                    "content": f"**Tool:** `{tool_name}`\n**Input:**\n```json\n{input_str}\n```",
+                },
+            },
+            {
+                "tag": "action",
+                "actions": [
+                    {
+                        "tag": "button",
+                        "text": {"tag": "plain_text", "content": t("feishu.perm.allow")},
+                        "type": "primary",
+                        "value": {"rid": request_id, "b": "allow"},
+                    },
+                    {
+                        "tag": "button",
+                        "text": {"tag": "plain_text", "content": t("feishu.perm.deny")},
+                        "type": "danger",
+                        "value": {"rid": request_id, "b": "deny"},
+                    },
+                    {
+                        "tag": "button",
+                        "text": {"tag": "plain_text", "content": t("feishu.perm.always_allow")},
+                        "type": "default",
+                        "value": {"rid": request_id, "b": "always_allow"},
+                    },
+                ],
+            },
+        ],
+    }
+
+
+def _build_permission_result_card(tool_name: str, behavior: str) -> dict:
+    """Build a result card showing the permission decision."""
+    if behavior == "always_allow":
+        label = t("feishu.perm.always_allowed")
+        template = "green"
+    elif behavior == "allow":
+        label = t("feishu.perm.allowed")
+        template = "green"
+    else:
+        label = t("feishu.perm.denied")
+        template = "red"
+    return {
+        "config": {"wide_screen_mode": True},
+        "header": {
+            "title": {"tag": "plain_text", "content": label},
+            "template": template,
+        },
+        "elements": [
+            {"tag": "div", "text": {"tag": "lark_md", "content": f"**Tool:** `{tool_name}`"}},
+        ],
+    }
 
 
 def _labels() -> dict[str, str]:
@@ -170,6 +255,146 @@ def _add_reaction(message_id: str, emoji_type: str):
         logger.error(f"Add reaction failed: {resp.code} {resp.msg}")
 
 
+def _reply_card(message_id: str, card: dict, reply_in_thread: bool = False) -> str | None:
+    """Reply with an interactive card message."""
+    content = json.dumps(card)
+    builder = ReplyMessageRequestBody.builder() \
+        .msg_type("interactive") \
+        .content(content)
+    if reply_in_thread:
+        builder = builder.reply_in_thread(True)
+    body = builder.build()
+    req = ReplyMessageRequest.builder() \
+        .message_id(message_id) \
+        .request_body(body) \
+        .build()
+    resp = lark_client.im.v1.message.reply(req)
+    if not resp.success():
+        logger.error(f"Reply card failed: {resp.code} {resp.msg}")
+        return None
+    return resp.data.message_id
+
+
+def _send_card(card: dict) -> str | None:
+    """Send an interactive card as a new message."""
+    if not config.feishu_receive_id:
+        logger.warning("Cannot send card: FEISHU_RECEIVE_ID not configured")
+        return None
+    content = json.dumps(card)
+    body = CreateMessageRequestBody.builder() \
+        .receive_id(config.feishu_receive_id) \
+        .msg_type("interactive") \
+        .content(content) \
+        .build()
+    req = CreateMessageRequest.builder() \
+        .receive_id_type(config.feishu_receive_id_type) \
+        .request_body(body) \
+        .build()
+    resp = lark_client.im.v1.message.create(req)
+    if not resp.success():
+        logger.error(f"Send card failed: {resp.code} {resp.msg}")
+        return None
+    return resp.data.message_id
+
+
+def _edit_card(message_id: str, card: dict):
+    """Update an interactive card message."""
+    body = PatchMessageRequestBody.builder() \
+        .content(json.dumps(card)) \
+        .build()
+    req = PatchMessageRequest.builder() \
+        .message_id(message_id) \
+        .request_body(body) \
+        .build()
+    resp = lark_client.im.v1.message.patch(req)
+    if not resp.success():
+        logger.error(f"Edit card failed: {resp.code} {resp.msg}")
+
+
+# --- Card action handler ---
+
+def _on_card_action(data: P2CardActionTrigger) -> P2CardActionTriggerResponse:
+    """Handle Feishu card button clicks for permission decisions."""
+    resp = P2CardActionTriggerResponse()
+    try:
+        event = data.event
+        if not event or not event.action:
+            return resp
+
+        value = event.action.value or {}
+        request_id = value.get("rid", "")
+        behavior = value.get("b", "")
+
+        if not request_id or not behavior:
+            return resp
+
+        req_data = _perm_requests.get(request_id)
+        if not req_data:
+            resp.toast = CallBackToast()
+            resp.toast.type = "info"
+            resp.toast.content = t("feishu.perm.expired")
+            return resp
+
+        tool_name = req_data.get("tool_name", "unknown")
+        decision_behavior = "allow" if behavior in ("allow", "always_allow") else "deny"
+
+        # Store decision and signal the waiting hook process
+        _perm_decisions[request_id] = {
+            "behavior": decision_behavior,
+            "tool_name": tool_name,
+            "always": behavior == "always_allow",
+        }
+        perm_event = _perm_events.get(request_id)
+        if perm_event:
+            perm_event.set()
+
+        logger.info(f"Permission decision: {behavior} for {tool_name} (rid={request_id[:8]})")
+
+        result_card = _build_permission_result_card(tool_name, behavior)
+
+        # Return updated card inline (replaces buttons within 3s)
+        resp.card = CallBackCard()
+        resp.card.type = "raw"
+        resp.card.data = result_card
+
+        # Toast notification
+        if behavior == "always_allow":
+            toast_text = t("feishu.perm.always_allowed")
+        elif behavior == "allow":
+            toast_text = t("feishu.perm.allowed")
+        else:
+            toast_text = t("feishu.perm.denied")
+        resp.toast = CallBackToast()
+        resp.toast.type = "success" if decision_behavior == "allow" else "warning"
+        resp.toast.content = toast_text
+
+        # If "always allow", add rule to settings.json
+        if behavior == "always_allow":
+            _add_permission_rule(tool_name)
+
+        return resp
+
+    except Exception as e:
+        logger.error(f"Card action error: {e}")
+        return resp
+
+
+def _add_permission_rule(tool_name: str):
+    """Add a tool to ~/.claude/settings.json permissions.allow."""
+    try:
+        settings_path = Path.home() / ".claude" / "settings.json"
+        if not settings_path.exists():
+            return
+        settings = json.loads(settings_path.read_text())
+        allow = settings.setdefault("permissions", {}).setdefault("allow", [])
+        if tool_name not in allow:
+            allow.append(tool_name)
+            settings_path.write_text(json.dumps(settings, indent=2, ensure_ascii=False) + "\n")
+            logger.info(f"Added permission rule: {tool_name}")
+    except Exception as e:
+        logger.error(f"Failed to add permission rule: {e}")
+
+
 # --- Feishu WebSocket event handlers ---
 
 def _start_claude(prompt: str, message_id: str):
@@ -178,7 +403,7 @@ def _start_claude(prompt: str, message_id: str):
     os.makedirs(cwd, exist_ok=True)
     tmux_name = f"walkcode-{int(time.time())}"
     escaped = prompt.replace("'", "'\\''")
-    cmd = f"cd '{cwd}' && claude --permission-mode dontAsk '{escaped}'"
+    cmd = f"cd '{cwd}' && claude --permission-mode default '{escaped}'"
 
     try:
         result = subprocess.run(
@@ -206,7 +431,7 @@ def _resume_claude(session_id: str, old_session: Session, reply_text: str, messa
     cwd = old_session.cwd or config.default_cwd
     tmux_name = f"walkcode-{int(time.time())}"
     escaped_sid = session_id.replace("'", "'\\''")
-    cmd = f"cd '{cwd}' && claude --resume '{escaped_sid}' --permission-mode dontAsk"
+    cmd = f"cd '{cwd}' && claude --resume '{escaped_sid}' --permission-mode default"
 
     try:
         result = subprocess.run(
@@ -379,6 +604,70 @@ async def receive_hook(request: Request):
     return {"ok": False, "error": "send failed"}
 
 
+@app.post("/hook/permission")
+async def receive_permission_hook(request: Request):
+    """Receive a PermissionRequest hook, send Feishu card, return request_id."""
+    body = await request.json()
+    tty = body.get("tty", "")
+    cwd = body.get("cwd", "")
+    session_id = body.get("session_id", "")
+    tool_name = body.get("tool_name", "")
+    tool_input = body.get("tool_input", {})
+
+    if not tty:
+        return {"ok": False, "error": "missing tty"}
+
+    request_id = str(uuid.uuid4())
+    _perm_requests[request_id] = {"tool_name": tool_name, "tool_input": tool_input, "tty": tty}
+    _perm_events[request_id] = threading.Event()
+
+    # Find the Feishu thread to reply in
+    session = session_store.get(session_id) if session_id else None
+    root_msg_id = None
+
+    if session and session.root_msg_id:
+        root_msg_id = session.root_msg_id
+        session_store.upsert(session_id, tty=tty, cwd=cwd)
+    else:
+        pending_root, reply_id = session_store.pop_pending(tty)
+        if pending_root:
+            root_msg_id = pending_root
+            if session_id:
+                session_store.upsert(session_id, tty=tty, cwd=cwd, root_msg_id=root_msg_id)
+                if reply_id:
+                    _edit_message(reply_id, t("feishu.started_with_session", session_id=session_id[:8], tmux=tty))
+
+    card = _build_permission_card(request_id, tool_name, tool_input)
+    if root_msg_id:
+        _reply_card(root_msg_id, card, reply_in_thread=True)
+    else:
+        _send_card(card)
+
+    project = basename(cwd) if cwd else "unknown"
+    logger.info(f"Permission request: {tool_name} | rid={request_id[:8]} tmux={tty} ({project})")
+    return {"ok": True, "request_id": request_id}
+
+
+@app.get("/hook/permission/{request_id}/decision")
+async def get_permission_decision(request_id: str):
+    """Long-poll for a permission decision (up to 30s per call)."""
+    event = _perm_events.get(request_id)
+    if not event:
+        return {"status": "not_found"}
+
+    loop = asyncio.get_event_loop()
+    decided = await loop.run_in_executor(None, event.wait, 30)
+
+    if decided:
+        decision = _perm_decisions.pop(request_id, None)
+        _perm_events.pop(request_id, None)
+        _perm_requests.pop(request_id, None)
+        if decision:
+            return {"status": "decided", "decision": decision}
+
+    return {"status": "pending"}
+
+
 @app.get("/health")
 async def health():
     return {"status": "ok", "sessions": session_store.count()}
@@ -455,6 +744,8 @@ def start_ws_client(cfg: Config):
         "", ""
     ).register_p2_im_message_receive_v1(
         _on_message
+    ).register_p2_card_action_trigger(
+        _on_card_action
     ).build()
 
     cli = lark.ws.Client(

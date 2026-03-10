@@ -152,24 +152,88 @@ def cmd_hook(args):
 
     cwd = hook_data.get("cwd", "") or os.getcwd()
     session_id = hook_data.get("session_id", "")
+    port = int(os.environ.get("WALKCODE_PORT", os.environ.get("PORT", "3001")))
 
+    # --- PermissionRequest: send card, poll for decision ---
+    if args.hook_type == "permission-request":
+        import time as _time
+        tool_name = hook_data.get("tool_name", "")
+        tool_input = hook_data.get("tool_input", {})
+
+        payload = json.dumps({
+            "tty": tmux_session,
+            "cwd": cwd,
+            "session_id": session_id,
+            "tool_name": tool_name,
+            "tool_input": tool_input,
+        }).encode()
+
+        try:
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{port}/hook/permission",
+                data=payload,
+                headers={"Content-Type": "application/json"},
+            )
+            resp = urllib.request.urlopen(req, timeout=10)
+            result = json.loads(resp.read())
+            request_id = result.get("request_id", "")
+        except Exception as e:
+            print(f"[walkcode] permission hook failed: {e}", file=sys.stderr)
+            sys.exit(2)  # deny on failure
+
+        if not request_id:
+            sys.exit(2)
+
+        # Poll for decision (long-poll, up to 120s total)
+        decision_url = f"http://127.0.0.1:{port}/hook/permission/{request_id}/decision"
+        deadline = _time.monotonic() + 120
+
+        while _time.monotonic() < deadline:
+            try:
+                req = urllib.request.Request(decision_url)
+                resp = urllib.request.urlopen(req, timeout=35)
+                result = json.loads(resp.read())
+
+                if result.get("status") == "decided":
+                    decision = result["decision"]
+                    behavior = decision.get("behavior", "deny")
+                    always = decision.get("always", False)
+
+                    decision_obj = {"behavior": behavior}
+                    if always and behavior == "allow":
+                        decision_obj["updatedPermissions"] = tool_name
+                    hook_response = {
+                        "hookSpecificOutput": {
+                            "hookEventName": "PermissionRequest",
+                            "decision": decision_obj,
+                        }
+                    }
+
+                    print(json.dumps(hook_response))
+                    sys.exit(0 if behavior == "allow" else 2)
+
+                # status == "pending" or "not_found", keep polling
+            except Exception as e:
+                print(f"[walkcode] poll error: {e}", file=sys.stderr)
+            _time.sleep(2)
+
+        # Timeout: deny
+        sys.exit(2)
+
+    # --- Notification ---
     if args.hook_type == "notification":
-        # Notification hook: message, title, notification_type
         message = hook_data.get("message", "")
         title = hook_data.get("title", "")
-        # Prefer JSON field, fall back to env var (env var may be missing per known bug)
         matcher = hook_data.get("notification_type", "") or os.environ.get("CLAUDE_NOTIFICATION_TYPE", "")
     else:
         # Stop hook: last_assistant_message
         message = hook_data.get("last_assistant_message", "")
         title = ""
         matcher = ""
-        # Filter out non-useful stop messages
         _SKIP = {"no response requested.", ""}
         if message.strip().lower() in _SKIP:
             message = ""
 
-    port = int(os.environ.get("WALKCODE_PORT", os.environ.get("PORT", "3001")))
     payload = json.dumps({
         "type": args.hook_type,
         "tty": tmux_session,
@@ -206,8 +270,11 @@ def cmd_install_hooks(_args):
         "Stop": [{"matcher": "", "hooks": [
             {"type": "command", "command": hook_cmd("stop", "Hero")}
         ]}],
-        "Notification": [{"matcher": "permission_prompt|elicitation_dialog", "hooks": [
+        "Notification": [{"matcher": "elicitation_dialog", "hooks": [
             {"type": "command", "command": hook_cmd("notification", "Ping")}
+        ]}],
+        "PermissionRequest": [{"matcher": "", "hooks": [
+            {"type": "command", "command": "afplay /System/Library/Sounds/Ping.aiff & walkcode hook permission-request", "timeout": 120000}
         ]}],
     }
 
@@ -399,7 +466,7 @@ def main():
     sub.add_parser("status", help="Check if server is running")
 
     hp = sub.add_parser("hook", help="Handle a Claude Code hook event (reads stdin)")
-    hp.add_argument("hook_type", choices=["stop", "notification"], help="Hook event type")
+    hp.add_argument("hook_type", choices=["stop", "notification", "permission-request"], help="Hook event type")
 
     sub.add_parser("install-hooks", help="Install Claude Code hooks")
     sub.add_parser("upgrade", help="Upgrade to latest release")

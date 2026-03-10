@@ -60,15 +60,16 @@ You can start an agent directly from chat — no terminal needed:
 
 ### Security: Remote Start Permissions
 
-When you start an agent from chat, WalkCode launches Claude Code with `--permission-mode dontAsk`. This is a deliberate security design:
+When you start an agent from chat, WalkCode launches Claude Code with `--permission-mode default`. Combined with a **PermissionRequest hook**, this gives you full control:
 
-| | `dontAsk` mode (WalkCode) | `dangerouslySkipPermissions` |
-|---|---|---|
-| Trust dialog | Skipped | Skipped |
-| Tools in `permissions.allow` | Auto-approved | Auto-approved |
-| Tools NOT in `permissions.allow` | **Auto-denied (safe)** | **Auto-approved (unsafe)** |
+| Tool status | What happens |
+|---|---|
+| In `permissions.allow` | Auto-approved, no prompt |
+| **Not** in `permissions.allow` | **Interactive card sent to chat** — you tap Allow / Deny / Always Allow |
 
-This means remote-started sessions respect whatever permissions you have configured in `~/.claude/settings.json` — tools in your `allow` list work automatically, while anything else is denied rather than left hanging for approval that will never come. The permission rules are entirely yours to define; WalkCode does not add or modify them.
+If you tap **Always Allow**, the tool is automatically added to `~/.claude/settings.json` `permissions.allow` so future calls skip the prompt entirely. If no response within 2 minutes, the request is auto-denied.
+
+This is safer than `dangerouslySkipPermissions` (which auto-approves everything) and more usable than `dontAsk` (which silently rejects unknown tools). You stay in the loop for anything new, but never get blocked by prompts you've already approved.
 
 ## Quick Start
 
@@ -114,9 +115,11 @@ Removes the daemon, shell wrapper, tmux config, Claude Code hooks, and the `~/.w
 2. **Add capability** > Bot
 3. **Permissions** > Enable:
    - `im:message` — Read messages
-   - `im:message:send_as_bot` — Send messages
+   - `im:message:send_as_bot` — Send messages as bot (also covers message updates)
    - `im:message.reactions:write_only` — Add emoji reactions
-4. **Events & Callbacks** > Long connection mode > Add event `im.message.receive_v1`
+4. **Events & Callbacks** > Long connection mode > Add events:
+   - `im.message.receive_v1` — Receive messages
+   - `card.action.trigger` — Receive card button clicks
 5. **Version Management** > Create version > Publish
 
 #### 2. Edit `.env`
@@ -164,9 +167,11 @@ This only affects AC power behavior. Battery settings are unchanged.
 2. **Add capability** > Bot
 3. **Permissions** > Enable:
    - `im:message` — Read messages
-   - `im:message:send_as_bot` — Send messages
+   - `im:message:send_as_bot` — Send messages as bot (also covers message updates)
    - `im:message.reactions:write_only` — Add emoji reactions
-4. **Events & Callbacks** > Long connection mode > Add event `im.message.receive_v1`
+4. **Events & Callbacks** > Long connection mode > Add events:
+   - `im.message.receive_v1` — Receive messages
+   - `card.action.trigger` — Receive card button clicks
 5. **Version Management** > Create version > Publish
 
 #### 2. Install
@@ -233,14 +238,14 @@ uv run walkcode install-hooks
 2. Agent [Hooks](https://docs.anthropic.com/en/docs/claude-code/hooks) fire on stop / permission / input needed
 3. `walkcode hook` detects tmux session name and POSTs to local server
 4. WalkCode creates a **chat thread** (`project | session_id | prompt` as title, content as first reply)
-5. You reply with text — real-time via WebSocket
-6. `tmux send-keys` injects your response — no GUI required
+5. Permission requests send **interactive cards** with Allow / Deny / Always Allow buttons — your decision is returned directly to the hook process (no terminal injection needed)
+6. Text replies are injected via `tmux send-keys` — no GUI required
 
 ## Usage
 
 | Scenario | What You See | What You Do |
 |----------|-------------|-------------|
-| Permission prompt | Text in thread | Reply **Allow** / **Deny** / **Always** |
+| Permission prompt | Interactive card with tool details | Tap **Allow** / **Deny** / **Always Allow** |
 | Waiting for input | Text in thread | Reply with text |
 | Task complete | Text in thread | Reply to continue, or ignore |
 | Session expired | Reply in old thread | Agent resumes automatically via `--resume` |

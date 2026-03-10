@@ -64,15 +64,16 @@ WalkCode 的核心设计：**1 个聊天话题 = 1 个 tmux 会话 = 1 个 Codin
 
 ### 安全设计：远程启动的权限控制
 
-通过聊天远程启动 Coding Agent 时，WalkCode 使用 `--permission-mode dontAsk` 启动 Claude Code。这是一个刻意的安全设计：
+通过聊天远程启动 Coding Agent 时，WalkCode 使用 `--permission-mode default` 启动 Claude Code，并通过 **PermissionRequest Hook** 实现飞书端的权限审批：
 
-| | `dontAsk` 模式（WalkCode 采用） | `dangerouslySkipPermissions` |
-|---|---|---|
-| 目录信任对话框 | 跳过 | 跳过 |
-| `permissions.allow` 中的工具 | 自动通过 | 自动通过 |
-| **不在** `permissions.allow` 中的工具 | **自动拒绝（安全）** | **自动通过（危险）** |
+| 工具状态 | 行为 |
+|---|---|
+| 在 `permissions.allow` 中 | 自动通过，无需审批 |
+| **不在** `permissions.allow` 中 | **发送交互式卡片到聊天** —— 你点击 允许 / 拒绝 / 始终允许 |
 
-远程启动的会话会遵守你在 `~/.claude/settings.json` 中配置的权限规则 —— `allow` 列表中的工具自动通过，其余工具自动拒绝，不会卡住等待一个永远不会来的审批。权限规则完全由你自己定义，WalkCode 不会添加或修改它们。
+点击**始终允许**时，该工具会被自动添加到 `~/.claude/settings.json` 的 `permissions.allow` 列表，后续调用直接通过。如果 2 分钟内未响应，请求自动拒绝。
+
+这比 `dangerouslySkipPermissions`（全部自动通过）更安全，比 `dontAsk`（静默拒绝未知工具）更好用。对于新工具你始终在回路中做决策，对于已审批的工具则完全自动化。
 
 ## 快速开始
 
@@ -118,9 +119,11 @@ curl -fsSL https://raw.githubusercontent.com/0x5446/walkcode/main/uninstall.sh |
 2. **添加应用能力** > 机器人
 3. **权限管理** > 开通以下权限：
    - `im:message` — 读取消息
-   - `im:message:send_as_bot` — 以机器人身份发送消息
+   - `im:message:send_as_bot` — 以机器人身份发送消息（同时覆盖消息更新）
    - `im:message.reactions:write_only` — 添加表情回复
-4. **事件与回调** > 长连接模式 > 添加事件 `im.message.receive_v1`
+4. **事件与回调** > 长连接模式 > 添加事件：
+   - `im.message.receive_v1` — 接收消息
+   - `card.action.trigger` — 接收卡片按钮点击
 5. **版本管理与发布** > 创建版本 > 发布上线
 
 #### 2. 编辑 `.env`
@@ -168,9 +171,11 @@ sudo pmset -c sleep 0 && sudo pmset -c disksleep 0 && sudo pmset -c standby 0 &&
 2. **添加应用能力** > 机器人
 3. **权限管理** > 开通以下权限：
    - `im:message` — 读取消息
-   - `im:message:send_as_bot` — 以机器人身份发送消息
+   - `im:message:send_as_bot` — 以机器人身份发送消息（同时覆盖消息更新）
    - `im:message.reactions:write_only` — 添加表情回复
-4. **事件与回调** > 长连接模式 > 添加事件 `im.message.receive_v1`
+4. **事件与回调** > 长连接模式 > 添加事件：
+   - `im.message.receive_v1` — 接收消息
+   - `card.action.trigger` — 接收卡片按钮点击
 5. **版本管理与发布** > 创建版本 > 发布上线
 
 #### 2. 安装
@@ -237,14 +242,14 @@ uv run walkcode install-hooks
 2. Coding Agent [Hooks](https://docs.anthropic.com/en/docs/claude-code/hooks) 在任务完成 / 需要权限 / 等待输入时触发
 3. `walkcode hook` 检测当前 tmux 会话名并 POST 到本地服务器
 4. WalkCode 在聊天中创建**话题消息**（`项目名 | session_id | prompt` 作为标题，内容作为首条回复）
-5. 你在话题中回复文字 —— 通过 WebSocket 实时送达
-6. `tmux send-keys` 将你的回复注入到对应会话 —— 无需 GUI
+5. 权限请求通过**交互式卡片**发送，附带 允许 / 拒绝 / 始终允许 按钮 —— 你的决策直接返回给 Hook 进程（无需终端注入）
+6. 文字回复通过 `tmux send-keys` 注入到对应会话 —— 无需 GUI
 
 ## 使用方式
 
 | 场景 | 你看到的 | 你要做的 |
 |------|---------|---------|
-| 权限确认 | 话题中的文字消息 | 回复 **允许** / **拒绝** / **始终允许** |
+| 权限确认 | 带工具详情的交互式卡片 | 点击 **允许** / **拒绝** / **始终允许** |
 | 等待输入 | 话题中的文字消息 | 回复文字 |
 | 任务完成 | 话题中的文字消息 | 回复以继续，或忽略 |
 | 会话过期 | 在旧话题中回复 | 自动通过 `--resume` 恢复会话 |

@@ -73,7 +73,7 @@ User runs `claude` in terminal
 ```
 User sends message to Feishu bot
   → _on_message() detects no parent/root_id → _start_claude(text, message_id)
-  → tmux new-session -d -s walkcode-{ts} "cd '{cwd}' && claude --permission-mode dontAsk '{prompt}'"
+  → tmux new-session -d -s walkcode-{ts} "cd '{cwd}' && claude --permission-mode default '{prompt}'"
   → _pending_roots[tmux_name] = message_id
   → First hook arrives → pending_root matched → session_store.upsert(..., root_msg_id=message_id)
   → Launch reply edited to include session_id[:8]
@@ -137,9 +137,17 @@ Key design decisions:
 
 ## Hook Communication Protocol
 
-Claude Code hooks call `walkcode hook {stop|notification}` which reads JSON from stdin and POSTs to `http://localhost:{PORT}/hook`.
+Claude Code hooks call `walkcode hook {stop|notification|permission-request}` which reads JSON from stdin and communicates with the WalkCode server.
 
-### Payload
+### Hook types
+
+| Hook | Claude Event | Endpoint | Feishu Format | Blocking |
+|------|-------------|----------|---------------|----------|
+| `stop` | Stop | POST /hook | Plain text | No |
+| `notification` | Notification (elicitation_dialog) | POST /hook | Plain text | No |
+| `permission-request` | PermissionRequest | POST /hook/permission → poll GET /hook/permission/{rid}/decision | Interactive card with buttons | Yes (up to 120s) |
+
+### Stop / Notification payload
 
 ```json
 {
@@ -149,11 +157,34 @@ Claude Code hooks call `walkcode hook {stop|notification}` which reads JSON from
   "session_id": "claude-uuid",
   "message": "content text",
   "title": "optional title",
-  "matcher": "permission_prompt | idle_prompt | elicitation_dialog | …"
+  "matcher": "elicitation_dialog | idle_prompt | …"
 }
 ```
 
-`matcher` takes precedence over `type` as the `effective_type` for routing decisions. This allows the same hook event to produce different UI (e.g., a card with buttons for `permission_prompt` vs plain text for `stop`).
+### PermissionRequest flow
+
+```
+Claude Code needs permission for a tool
+  ↓ PermissionRequest hook fires
+walkcode hook permission-request (reads stdin JSON with tool_name, tool_input)
+  ↓ POST /hook/permission
+Server sends Feishu interactive card (tool name + input + 3 buttons)
+  ↓ hook process long-polls GET /hook/permission/{request_id}/decision
+User clicks card button (Allow / Deny / Always Allow)
+  ↓ register_p2_card_action_trigger callback
+Server stores decision, signals waiting hook process; card updates inline (buttons removed)
+  ↓ hook outputs JSON to stdout:
+  {"hookSpecificOutput": {"hookEventName": "PermissionRequest", "decision": {"behavior": "allow"}}}
+  ↓
+Claude Code receives decision, continues execution
+```
+
+If "Always Allow" is clicked:
+
+1. **Current session**: the hook returns `updatedPermissions` in the decision, which tells Claude Code to remember this rule for the rest of the session — no more prompts for the same tool.
+2. **Future sessions**: the tool is added to `~/.claude/settings.json` `permissions.allow`, so Claude Code auto-approves it at startup and never fires the PermissionRequest hook.
+
+Note: Claude Code reads `settings.json` only at startup, so writing to it alone does not affect the running session. The `updatedPermissions` field is what makes the "Always Allow" take effect immediately.
 
 ### Hook installation
 
@@ -163,8 +194,11 @@ Claude Code hooks call `walkcode hook {stop|notification}` which reads JSON from
 {
   "hooks": {
     "Stop": [{"hooks": [{"type": "command", "command": "walkcode hook stop"}]}],
-    "Notification": [{"matcher": "permission_prompt|elicitation_dialog", "hooks": [
+    "Notification": [{"matcher": "elicitation_dialog", "hooks": [
       {"type": "command", "command": "walkcode hook notification"}
+    ]}],
+    "PermissionRequest": [{"matcher": "", "hooks": [
+      {"type": "command", "command": "walkcode hook permission-request", "timeout": 120000}
     ]}]
   }
 }

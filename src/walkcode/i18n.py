@@ -230,6 +230,44 @@ _T: dict[str, tuple[str, str]] = {
         "📋 请选择",
     ),
 
+    # --- server.py: Permission card ---
+    "feishu.perm.header": (
+        "🔐 Permission Required",
+        "🔐 需要权限确认",
+    ),
+    "feishu.perm.allow": (
+        "✅ Allow",
+        "✅ 允许",
+    ),
+    "feishu.perm.deny": (
+        "❌ Deny",
+        "❌ 拒绝",
+    ),
+    "feishu.perm.always_allow": (
+        "🔓 Always Allow",
+        "🔓 始终允许",
+    ),
+    "feishu.perm.allowed": (
+        "✅ Allowed",
+        "✅ 已允许",
+    ),
+    "feishu.perm.denied": (
+        "❌ Denied",
+        "❌ 已拒绝",
+    ),
+    "feishu.perm.always_allowed": (
+        "🔓 Always Allowed (rule added)",
+        "🔓 已始终允许（规则已添加）",
+    ),
+    "feishu.perm.timeout": (
+        "⏰ Timed out — denied",
+        "⏰ 超时未响应，已拒绝",
+    ),
+    "feishu.perm.expired": (
+        "Request expired",
+        "请求已过期",
+    ),
+
     # --- server.py: Feishu user-facing messages ---
     "feishu.stale_session": (
         "⚠️ tmux session expired, please wait for the next notification from Claude",
