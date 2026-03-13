@@ -201,7 +201,7 @@ def cmd_hook(args):
 
                     decision_obj = {"behavior": behavior}
                     if always and behavior == "allow":
-                        decision_obj["updatedPermissions"] = tool_name
+                        decision_obj["updatedPermissions"] = [tool_name]
                     hook_response = {
                         "hookSpecificOutput": {
                             "hookEventName": "PermissionRequest",
@@ -209,7 +209,7 @@ def cmd_hook(args):
                         }
                     }
 
-                    print(json.dumps(hook_response))
+                    print(json.dumps(hook_response), flush=True)
                     sys.exit(0 if behavior == "allow" else 2)
 
                 # status == "pending" or "not_found", keep polling
