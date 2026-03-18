@@ -41,7 +41,7 @@ from .tty import inject, validate_target, get_session_activity, kill_session
 
 logger = logging.getLogger("walkcode")
 
-app = FastAPI(title="WalkCode", version="0.7.1")
+app = FastAPI(title="WalkCode", version="0.8.0")
 
 # --- State ---
 
