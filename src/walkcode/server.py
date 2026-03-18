@@ -105,6 +105,68 @@ def _build_permission_card(request_id: str, tool_name: str, tool_input: dict) ->
     }
 
 
+def _build_askuserquestion_card(request_id: str, questions: list, question_index: int = 0) -> dict:
+    """Build a Feishu interactive card for AskUserQuestion with dynamic option buttons.
+
+    Supports multiple questions via sequential processing (Method A):
+    - Display current question with its options
+    - User clicks answer → next question card appears
+    - After last question, all answers are returned
+    """
+    if not questions or len(questions) == 0:
+        return {
+            "config": {"wide_screen_mode": True},
+            "header": {
+                "title": {"tag": "plain_text", "content": "Question"},
+                "template": "blue",
+            },
+            "elements": [
+                {"tag": "div", "text": {"tag": "lark_md", "content": "No questions found"}},
+            ],
+        }
+
+    if question_index >= len(questions):
+        question_index = 0
+
+    question_obj = questions[question_index]
+    question_text = question_obj.get("question", "Choose an option:")
+    options = question_obj.get("options", [])
+
+    # Add progress indicator for multiple questions
+    total_questions = len(questions)
+    progress_text = f"({question_index + 1}/{total_questions})" if total_questions > 1 else ""
+    full_title = f"{question_text} {progress_text}".strip()
+
+    # Build action buttons from options
+    buttons = []
+    for opt in options:
+        buttons.append({
+            "tag": "button",
+            "text": {"tag": "plain_text", "content": opt.get("label", opt.get("value", ""))},
+            "type": "primary",
+            "value": {
+                "rid": request_id,
+                "answer": opt.get("value", ""),
+                "question_index": question_index,  # Track which question this answer is for
+                "total_questions": total_questions,
+            },
+        })
+
+    return {
+        "config": {"wide_screen_mode": True},
+        "header": {
+            "title": {"tag": "plain_text", "content": full_title},
+            "template": "blue",
+        },
+        "elements": [
+            {
+                "tag": "action",
+                "actions": buttons,
+            },
+        ],
+    }
+
+
 def _build_permission_result_card(tool_name: str, behavior: str) -> dict:
     """Build a result card showing the permission decision."""
     if behavior == "always_allow":
@@ -314,7 +376,7 @@ def _edit_card(message_id: str, card: dict):
 # --- Card action handler ---
 
 def _on_card_action(data: P2CardActionTrigger) -> P2CardActionTriggerResponse:
-    """Handle Feishu card button clicks for permission decisions."""
+    """Handle Feishu card button clicks for permission decisions and AskUserQuestion answers."""
     resp = P2CardActionTriggerResponse()
     try:
         event = data.event
@@ -323,9 +385,8 @@ def _on_card_action(data: P2CardActionTrigger) -> P2CardActionTriggerResponse:
 
         value = event.action.value or {}
         request_id = value.get("rid", "")
-        behavior = value.get("b", "")
 
-        if not request_id or not behavior:
+        if not request_id:
             return resp
 
         req_data = _perm_requests.get(request_id)
@@ -336,14 +397,106 @@ def _on_card_action(data: P2CardActionTrigger) -> P2CardActionTriggerResponse:
             return resp
 
         tool_name = req_data.get("tool_name", "unknown")
+
+        # Handle AskUserQuestion answers (supports multiple questions via sequential processing)
+        if tool_name == "AskUserQuestion":
+            answer = value.get("answer")
+            question_index = value.get("question_index", 0)
+            total_questions = value.get("total_questions", 1)
+
+            if answer is None:
+                resp.toast = CallBackToast()
+                resp.toast.type = "warning"
+                resp.toast.content = "No answer provided"
+                return resp
+
+            # Get tool input to access all questions
+            tool_input = req_data.get("tool_input", {})
+            questions = tool_input.get("questions", [])
+
+            # Initialize answers storage if needed
+            if not hasattr(_perm_decisions.get(request_id, {}), "get"):
+                _perm_decisions[request_id] = {}
+            current_decision = _perm_decisions.get(request_id, {})
+
+            # Store this answer
+            if "answers" not in current_decision:
+                current_decision["answers"] = []
+            # Ensure answers list is long enough
+            while len(current_decision["answers"]) <= question_index:
+                current_decision["answers"].append(None)
+            current_decision["answers"][question_index] = answer
+
+            logger.info(f"AskUserQuestion answer[{question_index}]: {answer} (rid={request_id[:8]})")
+
+            # Check if there are more questions
+            has_next_question = question_index + 1 < total_questions
+
+            if has_next_question:
+                # Build card for next question
+                next_index = question_index + 1
+                next_card = _build_askuserquestion_card(request_id, questions, next_index)
+
+                # Return updated card to show next question
+                resp.card = CallBackCard()
+                resp.card.type = "raw"
+                resp.card.data = next_card
+
+                # Toast notification
+                resp.toast = CallBackToast()
+                resp.toast.type = "success"
+                resp.toast.content = f"Question {question_index + 1}/{total_questions} answered. Next question..."
+            else:
+                # All questions answered - prepare final response
+                final_decision = {
+                    "behavior": "allow",
+                    "answers": current_decision["answers"],
+                }
+                _perm_decisions[request_id] = final_decision
+
+                # Signal that all answers are collected
+                perm_event = _perm_events.get(request_id)
+                if perm_event:
+                    perm_event.set()
+
+                # Build completion card
+                result_card = {
+                    "config": {"wide_screen_mode": True},
+                    "header": {
+                        "title": {"tag": "plain_text", "content": "All questions answered"},
+                        "template": "green",
+                    },
+                    "elements": [
+                        {"tag": "div", "text": {"tag": "lark_md", "content": f"✓ All {total_questions} question(s) answered successfully"}},
+                    ],
+                }
+
+                resp.card = CallBackCard()
+                resp.card.type = "raw"
+                resp.card.data = result_card
+
+                # Toast notification
+                resp.toast = CallBackToast()
+                resp.toast.type = "success"
+                resp.toast.content = f"All answers submitted"
+
+            return resp
+
+        # Handle permission decisions
+        behavior = value.get("b", "")
+        if not behavior:
+            return resp
+
         decision_behavior = "allow" if behavior in ("allow", "always_allow") else "deny"
 
         # Store decision and signal the waiting hook process
-        _perm_decisions[request_id] = {
+        decision_dict = {
             "behavior": decision_behavior,
-            "tool_name": tool_name,
-            "always": behavior == "always_allow",
         }
+        # When "always allow", include updatedPermissions so Claude Code remembers in current session
+        if behavior == "always_allow":
+            decision_dict["updatedPermissions"] = [tool_name]
+        _perm_decisions[request_id] = decision_dict
         perm_event = _perm_events.get(request_id)
         if perm_event:
             perm_event.set()
@@ -555,6 +708,10 @@ async def receive_hook(request: Request):
     message = body.get("message", "")
     title = body.get("title", "")
 
+    # Debug: Log all hook inputs to see elicitation_dialog structure
+    logger.info(f"[DEBUG HOOK] type={hook_type} matcher={matcher}")
+    logger.debug(f"[HOOK BODY] {json.dumps(body, indent=2, ensure_ascii=False)}")
+
     if not tty:
         return {"ok": False, "error": "missing tty (not in tmux?)"}
 
@@ -637,7 +794,13 @@ async def receive_permission_hook(request: Request):
                 if reply_id:
                     _edit_message(reply_id, t("feishu.started_with_session", session_id=session_id[:8], tmux=tty))
 
-    card = _build_permission_card(request_id, tool_name, tool_input)
+    # Generate appropriate card based on tool type
+    if tool_name == "AskUserQuestion":
+        questions = tool_input.get("questions", [])
+        card = _build_askuserquestion_card(request_id, questions)
+    else:
+        card = _build_permission_card(request_id, tool_name, tool_input)
+
     if root_msg_id:
         _reply_card(root_msg_id, card, reply_in_thread=True)
     else:
