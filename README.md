@@ -326,7 +326,34 @@ WalkCode 的目标：**连接任意 Coding Agent 到任意聊天平台。**
 
 ## 参与贡献
 
-欢迎提交 Issue 和 PR。提交前请运行 `uv run pytest` 确保测试通过。
+欢迎提交 Issue 和 PR。
+
+### 运行测试
+
+提交前请运行测试确保无回归：
+
+**单元测试 + 集成测试（自动运行）：**
+```bash
+git commit
+# 或
+uv run pytest tests/test_askuserquestion_feishu.py -v
+```
+
+**E2E Playwright 测试（可选，需要 Feishu 账号）：**
+```bash
+# 与 commit 一起运行 E2E 测试
+RUN_E2E_TESTS=true git commit
+
+# 或单独运行
+pytest tests/test_e2e_feishu_playwright.py -v
+```
+
+**跳过自动测试：**
+```bash
+git commit --no-verify
+```
+
+详见 [ARCHITECTURE.md](ARCHITECTURE.md) 中的 "Playwright E2E Testing Layer" 部分。
 
 ## 声明
 
