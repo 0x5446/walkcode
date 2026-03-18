@@ -507,8 +507,65 @@ git push origin main
    - **Current:** All markers always run (no filtering needed)
    - **Future:** Could skip perf tests in CI if needed
 
+### Playwright E2E Testing Layer
+
+**Status:** Implemented via MCP integration with Feishu web client
+
+#### Overview
+
+In addition to unit/integration tests, automated E2E testing simulates real user interactions in Feishu via Playwright browser automation:
+
+**Flow:**
+```
+Playwright automation
+  ↓
+1. Navigate to Feishu messenger (https://nicebuild.feishu.cn/next/messenger)
+2. Open Claude Code bot conversation
+3. Click interactive card buttons
+4. Verify UI state changes and success messages
+5. Confirm answer submission to backend
+```
+
+#### Test Scenarios Automated
+
+| Scenario | Playwright Interaction | Verification |
+|----------|----------------------|--------------|
+| Single-question | Click button on card | ✓ "All 1 question(s) answered" |
+| Multi-question (3Q) | Click Q0 → Q1 → Q2 buttons sequentially | ✓ Progress: (1/3)→(2/3)→(3/3) |
+| Many options (20) | Click one of 20 option buttons | ✓ Answer received |
+| Unicode/emoji | Click "Go 🎯" in Chinese card | ✓ Emoji rendered and interactive |
+| Progress indication | Observe toast: "Next question..." | ✓ Toast confirms progress |
+| Toast notifications | Final submission triggers "All answers submitted" | ✓ Alert element appears |
+
+#### Validation Results (Manual E2E with Playwright)
+
+✅ **Single-question flow:**
+- Clicked "Go 🎯" → Success: "All answers submitted"
+
+✅ **Multi-question sequential (3 questions):**
+- Question 0: Clicked Option 0 → Toast: "Question 1/3 answered. Next question..."
+- Question 1: Clicked Option 1 → Toast: "Question 2/3 answered. Next question..."
+- Question 2: Clicked Option 2 → Final: "✓ All 3 question(s) answered successfully"
+
+✅ **20 options rendering:**
+- All buttons rendered correctly, clickable, answer submitted
+
+✅ **Feishu UI responsiveness:**
+- Sub-second card updates
+- Toast notifications appear reliably
+- No UI freezing during rapid interactions
+
+#### Implementation Notes
+
+- Test file: `tests/test_e2e_playwright.py`
+- Requires: Feishu account with Claude Code bot access + Playwright browser
+- Can be integrated into CI/CD via Playwright Grid or headless browser automation
+- Currently documented as manual reference; automated CI/CD integration pending
+
 ### Future Enhancements
 
+- [ ] Full Playwright CI/CD integration (GitHub Actions with headless browser)
+- [ ] Automated screenshot comparison for UI regression detection
 - [ ] Performance regression tracking (graph trends)
 - [ ] Code coverage metrics
 - [ ] Extended Unicode test cases
