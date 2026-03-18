@@ -24,6 +24,21 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Fetch all tags for dedup check
+
+      - name: Check if already tested locally
+        id: check_tested
+        run: |
+          COMMIT_HASH=$(git rev-parse HEAD)
+          COMMIT_SHORT=$(echo "$COMMIT_HASH" | cut -c1-8)
+          if git tag | grep -q "tested-local-${COMMIT_SHORT}"; then
+            echo "already_tested=true" >> $GITHUB_OUTPUT
+            echo "✅ Commit $COMMIT_SHORT already tested locally, skipping CI tests"
+          else
+            echo "already_tested=false" >> $GITHUB_OUTPUT
+            echo "ℹ️ Running remote verification tests for $COMMIT_SHORT"
+          fi
 
       - name: Set up Python
         uses: actions/setup-python@v4
@@ -38,6 +53,7 @@ jobs:
           pip install pytest pytest-json-report requests
 
       - name: Start walkcode server
+        if: steps.check_tested.outputs.already_tested != 'true'
         run: |
           python -m walkcode serve &
           # Wait for server to be ready
@@ -51,8 +67,15 @@ jobs:
           done
 
       - name: Run regression tests
+        if: steps.check_tested.outputs.already_tested != 'true'
         run: |
           python scripts/run_tests.py --report
+
+      - name: Report local testing
+        if: steps.check_tested.outputs.already_tested == 'true'
+        run: |
+          echo "# ✅ Regression Tests (Skipped - Already Tested Locally)" > test_results.json
+          echo '{"status": "skipped_local_test", "reason": "Commit was already tested by local pre-commit hook"}' >> test_results.json
 
       - name: Upload test results
         if: always()

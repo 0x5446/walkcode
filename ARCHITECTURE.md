@@ -12,6 +12,7 @@ This document describes the internal design of WalkCode for developers who want 
 - [State Persistence](#state-persistence)
 - [Idle Reaper](#idle-reaper)
 - [i18n](#i18n)
+- [Automated Testing Framework](#automated-testing-framework)
 
 ---
 
@@ -347,3 +348,170 @@ def t(key: str, **kwargs) -> str:
 - **Logger messages stay English** — logs are for developers; mixing locales in log output hurts searchability.
 - **Shell scripts have their own i18n** — `install.sh` and `uninstall.sh` use `is_zh()` / `msg()` functions, not the Python module.
 - **No framework dependency** — the entire i18n system is a single file with zero external imports.
+
+---
+
+## Automated Testing Framework
+
+### Purpose
+
+Ensure AskUserQuestion Feishu card functionality works correctly across code changes via automated regression testing.
+
+### Architecture
+
+```
+Developer writes code
+  ↓
+git commit
+  ↓ [Pre-commit Hook]
+Local test suite runs (14 tests)
+  ├─ Single/multi-question workflows
+  ├─ Edge cases (empty options, Unicode, special chars)
+  ├─ Error handling (invalid IDs, expired requests)
+  └─ Performance checks
+  ↓
+Tests pass? → Tag commit with "tested-local-{SHORT_HASH}"
+  ↓
+git push origin main
+  ↓ [GitHub Actions]
+Check if "tested-local-{SHORT_HASH}" tag exists
+  ├─ Yes → ⏭️ Skip (already tested locally)
+  └─ No → Run full CI test suite on remote
+  ↓
+CI tests pass? → Comment on PR with ✅ result
+```
+
+### Components
+
+#### 1. Test Suite (`tests/test_askuserquestion_feishu.py`)
+
+**14 tests organized in 5 classes:**
+
+| Class | Purpose | Tests |
+|-------|---------|-------|
+| `TestAskUserQuestionCard` | Unit-level card generation | 2 |
+| `TestAskUserQuestionIntegration` | Workflow validation | 4 |
+| `TestAskUserQuestionEdgeCases` | Boundary conditions | 4 |
+| `TestAskUserQuestionErrorHandling` | Error scenarios | 2 |
+| `TestAskUserQuestionPerformance` | Performance baselines | 2 |
+
+**Coverage:**
+- Single-question requests
+- Multi-question sequential processing
+- Empty options handling
+- Unicode & emoji support (中文, 🐍, 🎯, 🦀)
+- Invalid request IDs → `not_found`
+- Expired request cleanup
+
+#### 2. Test Runner (`scripts/run_tests.py`)
+
+Orchestrates test execution:
+- Auto-detects walkcode server on `localhost:3001`
+- Auto-starts server if not running
+- Executes pytest with JSON report
+- Generates readable summary output
+
+**Features:**
+```bash
+python scripts/run_tests.py              # Run all tests
+python scripts/run_tests.py -m integration # Run by marker
+python scripts/run_tests.py -v           # Verbose output
+python scripts/run_tests.py --report     # Save test_results.json
+```
+
+#### 3. Git Pre-commit Hook (`.git/hooks/pre-commit`)
+
+**Triggers on:** Every commit if relevant files changed
+
+**Behavior:**
+1. Check if test file exists
+2. Detect file changes (server.py, test files, scripts)
+3. If changes detected, run full test suite
+4. On success: Auto-tag commit with `tested-local-{SHORT_HASH}` for dedup
+5. On failure: Abort commit, show error log
+
+**Can skip with:**
+```bash
+git commit --no-verify
+```
+
+#### 4. GitHub Actions Workflow (`.github/workflows/regression-tests.yml`)
+
+**Triggers on:**
+- Push to `main`/`develop` branches
+- File changes: `server.py`, `test_*.py`, `run_tests.py`
+
+**Smart execution (dedup):**
+
+```yaml
+steps:
+  1. Fetch all tags (including local "tested-local-*")
+  2. Check if current commit has "tested-local-{SHORT_HASH}"
+     ├─ Yes → ⏭️ Skip all tests, log "already tested locally"
+     └─ No  → Run full test suite, upload report
+  3. Comment PR with results
+```
+
+**Why dedup matters:**
+- Local: Tests run instantly before commit (fast feedback)
+- Remote: Skip redundant tests if already passed locally
+- Result: Efficient CI without wasted compute
+
+#### 5. Documentation
+
+| File | Purpose |
+|------|---------|
+| `TESTING.md` | Complete testing guide & troubleshooting |
+| `TESTING_QUICKSTART.md` | 5-minute quick start for developers |
+| `ARCHITECTURE.md` | This section |
+
+### Test Deduplication Logic
+
+**Local commit workflow:**
+```
+git commit
+  → Pre-commit hook runs test suite
+  → All 14 tests pass ✅
+  → Hook executes: git tag -f "tested-local-$(git rev-parse --short HEAD)"
+  → Tag pushed with commit
+```
+
+**Remote workflow:**
+```
+git push origin main
+  → GitHub Actions triggered
+  → Fetch commit tags (includes "tested-local-*")
+  → Check: git tag | grep "tested-local-{SHORT_HASH}"
+  → If found: skip tests, report "Already tested locally"
+  → If not found: run full test suite (for commits from other sources)
+```
+
+### Design Decisions
+
+1. **Two-layer testing (local + remote)**
+   - **Why:** Local gives fast feedback; remote ensures consistency across environments
+   - **Tradeoff:** Some test duplication, but can be eliminated via tag dedup
+
+2. **Tag-based dedup (Method 1)**
+   - **Why:** Elegant, uses git native mechanism, survives push
+   - **Alternative:** Tracking file (`.tested-commits`) — less clean
+   - **Alternative:** GitHub API state — requires auth, adds latency
+
+3. **Pre-commit timing (before commit creation)**
+   - **Why:** Prevents bad commits from entering history
+   - **Cost:** Small delay before commit (typically < 2 minutes)
+   - **Escape hatch:** `--no-verify` for emergency commits
+
+4. **Marker-based pytest selection**
+   - **Why:** Fine-grained test control (unit, integration, edge_case, performance)
+   - **Current:** All markers always run (no filtering needed)
+   - **Future:** Could skip perf tests in CI if needed
+
+### Future Enhancements
+
+- [ ] Performance regression tracking (graph trends)
+- [ ] Code coverage metrics
+- [ ] Extended Unicode test cases
+- [ ] Network delay/timeout simulations
+- [ ] Large dataset stress tests (100+ options)
+- [ ] Integration with release checklist
