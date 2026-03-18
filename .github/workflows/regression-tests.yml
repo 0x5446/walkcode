@@ -1,0 +1,97 @@
+name: Automated Regression Tests - AskUserQuestion Feishu
+
+on:
+  push:
+    branches: [main, develop]
+    paths:
+      - 'src/walkcode/server.py'
+      - 'tests/test_askuserquestion_feishu.py'
+      - 'scripts/run_tests.py'
+      - '.github/workflows/regression-tests.yml'
+  pull_request:
+    branches: [main, develop]
+    paths:
+      - 'src/walkcode/server.py'
+      - 'tests/test_askuserquestion_feishu.py'
+      - 'scripts/run_tests.py'
+
+jobs:
+  regression-tests:
+    name: AskUserQuestion Feishu Regression Tests
+    runs-on: macos-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+          pip install pytest pytest-json-report requests
+
+      - name: Start walkcode server
+        run: |
+          python -m walkcode serve &
+          # Wait for server to be ready
+          for i in {1..30}; do
+            if nc -z localhost 3001 2>/dev/null; then
+              echo "✅ Server ready"
+              break
+            fi
+            echo "Waiting for server... ($i/30)"
+            sleep 1
+          done
+
+      - name: Run regression tests
+        run: |
+          python scripts/run_tests.py --report
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: test-results
+          path: test_results.json
+          retention-days: 30
+
+      - name: Comment PR with test results
+        if: github.event_name == 'pull_request' && always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const results = JSON.parse(fs.readFileSync('test_results.json', 'utf8'));
+            const passed = results.passed;
+            const failed = results.failed;
+            const total = results.total;
+            const duration = results.duration.toFixed(2);
+
+            const emoji = failed === 0 ? '✅' : '❌';
+            const comment = `## ${emoji} Regression Test Results
+
+            - **Total**: ${total}
+            - **Passed**: ${passed}
+            - **Failed**: ${failed}
+            - **Duration**: ${duration}s
+
+            Tests run for AskUserQuestion Feishu functionality.
+            `;
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: comment
+            });
+
+      - name: Fail if tests failed
+        if: failure()
+        run: exit 1

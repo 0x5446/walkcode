@@ -152,6 +152,25 @@ def _build_askuserquestion_card(request_id: str, questions: list, question_index
             },
         })
 
+    # Handle empty options case
+    if not buttons:
+        return {
+            "config": {"wide_screen_mode": True},
+            "header": {
+                "title": {"tag": "plain_text", "content": full_title},
+                "template": "blue",
+            },
+            "elements": [
+                {
+                    "tag": "div",
+                    "text": {
+                        "tag": "lark_md",
+                        "content": "⚠️ No options available for this question",
+                    },
+                },
+            ],
+        }
+
     return {
         "config": {"wide_screen_mode": True},
         "header": {
