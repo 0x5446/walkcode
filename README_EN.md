@@ -25,6 +25,7 @@ Your agent hits a permission prompt while you're away. Without WalkCode, it bloc
 
 **Core:**
 - **Permission approvals** — approve or deny directly from chat
+- **Question answering** — AskUserQuestion interactive cards with multi-question sequential flow
 - **Text replies** — reply in a thread to type directly into the agent's terminal
 - **Remote start** — send a message to start a new agent session from your phone
 - **Session resume** — reply in an expired thread to automatically resume the conversation
@@ -246,6 +247,7 @@ uv run walkcode install-hooks
 | Scenario | What You See | What You Do |
 |----------|-------------|-------------|
 | Permission prompt | Interactive card with tool details | Tap **Allow** / **Deny** / **Always Allow** |
+| Question from agent | Interactive card with option buttons | Tap an option; for multi-question flows the card auto-advances |
 | Waiting for input | Text in thread | Reply with text |
 | Task complete | Text in thread | Reply to continue, or ignore |
 | Session expired | Reply in old thread | Agent resumes automatically via `--resume` |
@@ -275,6 +277,7 @@ walkcode test-inject <tmux-session> "hi"  # Test injection
 | `FEISHU_RECEIVE_ID` | No | Your open_id or chat_id (run `walkcode serve` to discover) |
 | `FEISHU_RECEIVE_ID_TYPE` | No | `open_id` (default) or `chat_id` |
 | `WALKCODE_STATE_PATH` | No | Custom state file path |
+| `PORT` / `WALKCODE_PORT` | No | HTTP server port (default: `3001`) |
 | `WALKCODE_CWD` | No | Default cwd for remote-started sessions (default: `~/.walkcode/workspace`) |
 
 ## Roadmap
@@ -316,9 +319,13 @@ WalkCode's goal: **connect any coding agent to any chat platform.**
 - [GitHub Issues](https://github.com/0x5446/walkcode/issues) — Bug reports & feature requests
 - [GitHub Discussions](https://github.com/0x5446/walkcode/discussions) — Q&A & ideas
 
+### Feishu Group
+
+<img src="docs/images/feishu-group-qr.jpg" width="300" alt="Feishu Group">
+
 ## Contributing
 
-Issues and PRs welcome. Run `uv run pytest` before submitting.
+Issues and PRs welcome.
 
 ## Disclaimer
 

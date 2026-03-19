@@ -12,7 +12,7 @@ This document describes the internal design of WalkCode for developers who want 
 - [State Persistence](#state-persistence)
 - [Idle Reaper](#idle-reaper)
 - [i18n](#i18n)
-- [Automated Testing Framework](#automated-testing-framework)
+
 
 ---
 
@@ -80,15 +80,15 @@ User sends message to Feishu bot
   → Launch reply edited to include session_id[:8]
 ```
 
-The pending period (between tmux creation and first hook) uses two in-memory dicts:
+The pending period (between tmux creation and first hook) is tracked by `SessionStore` and **persisted to `state.json`**, so pending sessions survive server restarts:
 
 ```python
-_pending_roots: dict[str, str]      # tmux_name → feishu_message_id
-_pending_msg_to_tty: dict[str, str] # feishu_message_id → tmux_name
-_pending_reply_ids: dict[str, str]  # tmux_name → reply_message_id (for editing)
+# Inside SessionStore (persisted to disk)
+_pending: dict[str, dict]            # tmux_name → {"root_msg_id": str, "reply_id": str|None}
+_pending_msg_to_tty: dict[str, str]  # root_msg_id → tmux_name (rebuilt from _pending on load)
 ```
 
-These are consumed atomically when the first hook arrives (`_pending_roots.pop(tty, None)`).
+These are consumed atomically when the first hook arrives (`session_store.pop_pending(tty)`).
 
 ### Activity tracking
 
@@ -145,8 +145,12 @@ Claude Code hooks call `walkcode hook {stop|notification|permission-request}` wh
 | Hook | Claude Event | Endpoint | Feishu Format | Blocking |
 |------|-------------|----------|---------------|----------|
 | `stop` | Stop | POST /hook | Plain text | No |
-| `notification` | Notification (elicitation_dialog) | POST /hook | Plain text | No |
+| `notification` | Notification (elicitation_dialog) | POST /hook | Plain text or interactive card (AskUserQuestion) | No |
 | `permission-request` | PermissionRequest | POST /hook/permission → poll GET /hook/permission/{rid}/decision | Interactive card with buttons | Yes (up to 120s) |
+
+**Note on Notification subtypes:**
+- **elicitation_dialog** — When the notification carries an `AskUserQuestion` payload (with `question` and `options` fields), WalkCode sends an interactive card with option buttons instead of plain text. Supports multi-question flows: each question generates a card, the card auto-updates to the next question when answered, and all answers are returned together after the last question.
+- **Other matchers** — Sent as plain text messages in the Feishu thread.
 
 ### Stop / Notification payload
 
@@ -252,9 +256,17 @@ State is stored in `~/.walkcode/state.json` (configurable via `WALKCODE_STATE_PA
       "root_msg_id": "feishu-root-message-id",
       "created_at": 1709876543.0
     }
+  },
+  "pending": {
+    "<tmux_session_name>": {
+      "root_msg_id": "feishu-message-id",
+      "reply_id": "feishu-reply-message-id"
+    }
   }
 }
 ```
+
+The `pending` section tracks Feishu-initiated sessions that have been launched but whose first hook has not yet arrived. Once the first hook fires, the entry is consumed and moved into `sessions`.
 
 ### Indexes
 
@@ -349,305 +361,3 @@ def t(key: str, **kwargs) -> str:
 - **Shell scripts have their own i18n** — `install.sh` and `uninstall.sh` use `is_zh()` / `msg()` functions, not the Python module.
 - **No framework dependency** — the entire i18n system is a single file with zero external imports.
 
----
-
-## Automated Testing Framework
-
-### Purpose
-
-Ensure AskUserQuestion Feishu card functionality works correctly across code changes via automated regression testing.
-
-### Architecture
-
-```
-Developer writes code
-  ↓
-git commit                          # Run unit tests only (default)
-  OR
-RUN_E2E_TESTS=true git commit       # Run unit + E2E tests (optional, needs Feishu login)
-  ↓ [Pre-commit Hook]
-Unit test suite runs (14 tests)
-  ├─ Single/multi-question workflows
-  ├─ Edge cases (empty options, Unicode, special chars)
-  ├─ Error handling (invalid IDs, expired requests)
-  └─ Performance checks
-  ↓
-Optional: E2E Playwright tests (if RUN_E2E_TESTS=true)
-  ├─ Real Feishu web client interaction
-  ├─ Single/multi-question card flows
-  ├─ Unicode/emoji button functionality
-  └─ Card auto-update verification
-  ↓
-Tests pass? → Tag commit with "tested-local-{SHORT_HASH}"
-  ↓
-git push origin main
-  ↓ [GitHub Actions]
-Check if "tested-local-{SHORT_HASH}" tag exists
-  ├─ Yes → ⏭️ Skip (already tested locally)
-  └─ No → Run full CI test suite on remote
-  ↓
-CI tests pass? → Comment on PR with ✅ result
-```
-
-### Components
-
-#### 1. Test Suite (`tests/test_askuserquestion_feishu.py`)
-
-**14 tests organized in 5 classes:**
-
-| Class | Purpose | Tests |
-|-------|---------|-------|
-| `TestAskUserQuestionCard` | Unit-level card generation | 2 |
-| `TestAskUserQuestionIntegration` | Workflow validation | 4 |
-| `TestAskUserQuestionEdgeCases` | Boundary conditions | 4 |
-| `TestAskUserQuestionErrorHandling` | Error scenarios | 2 |
-| `TestAskUserQuestionPerformance` | Performance baselines | 2 |
-
-**Coverage:**
-- Single-question requests
-- Multi-question sequential processing
-- Empty options handling
-- Unicode & emoji support (中文, 🐍, 🎯, 🦀)
-- Invalid request IDs → `not_found`
-- Expired request cleanup
-
-#### 2. Test Runner (`scripts/run_tests.py`)
-
-Orchestrates test execution:
-- Auto-detects walkcode server on `localhost:3001`
-- Auto-starts server if not running
-- Executes pytest with JSON report
-- Generates readable summary output
-
-**Features:**
-```bash
-python scripts/run_tests.py              # Run all tests
-python scripts/run_tests.py -m integration # Run by marker
-python scripts/run_tests.py -v           # Verbose output
-python scripts/run_tests.py --report     # Save test_results.json
-```
-
-#### 3. Git Pre-commit Hook (`.git/hooks/pre-commit`)
-
-**Triggers on:** Every commit if relevant files changed
-
-**Behavior:**
-1. Check if test file exists
-2. Detect file changes (server.py, test files, scripts)
-3. If changes detected, run unit test suite (14 tests)
-4. Optionally run E2E Playwright tests (if `RUN_E2E_TESTS=true`)
-   - E2E tests verify real Feishu web client interactions
-   - Require interactive Feishu login (扫码登录)
-   - Can fail without blocking commit (optional step)
-5. On success: Auto-tag commit with `tested-local-{SHORT_HASH}` for dedup
-6. On failure: Abort commit, show error log
-
-**Usage:**
-```bash
-git commit                          # Unit tests only (default)
-RUN_E2E_TESTS=true git commit       # Unit + E2E tests (requires Feishu)
-git commit --no-verify              # Skip all tests
-```
-
-**Why optional E2E:**
-- E2E requires Feishu account login (interactive 扫码)
-- Only needed when modifying card UI/interaction logic
-- Unit tests run automatically to catch basic regressions
-- Developers choose to run E2E for extra verification
-
-#### 4. GitHub Actions Workflow (`.github/workflows/regression-tests.yml`)
-
-**Triggers on:**
-- Push to `main`/`develop` branches
-- File changes: `server.py`, `test_*.py`, `run_tests.py`
-
-**Smart execution (dedup):**
-
-```yaml
-steps:
-  1. Fetch all tags (including local "tested-local-*")
-  2. Check if current commit has "tested-local-{SHORT_HASH}"
-     ├─ Yes → ⏭️ Skip all tests, log "already tested locally"
-     └─ No  → Run full test suite, upload report
-  3. Comment PR with results
-```
-
-**Why dedup matters:**
-- Local: Tests run instantly before commit (fast feedback)
-- Remote: Skip redundant tests if already passed locally
-- Result: Efficient CI without wasted compute
-
-#### 5. Documentation
-
-| File | Purpose |
-|------|---------|
-| `TESTING.md` | Complete testing guide & troubleshooting |
-| `TESTING_QUICKSTART.md` | 5-minute quick start for developers |
-| `ARCHITECTURE.md` | This section |
-
-### Test Deduplication Logic
-
-**Local commit workflow:**
-```
-git commit
-  → Pre-commit hook runs test suite
-  → All 14 tests pass ✅
-  → Hook executes: git tag -f "tested-local-$(git rev-parse --short HEAD)"
-  → Tag pushed with commit
-```
-
-**Remote workflow:**
-```
-git push origin main
-  → GitHub Actions triggered
-  → Fetch commit tags (includes "tested-local-*")
-  → Check: git tag | grep "tested-local-{SHORT_HASH}"
-  → If found: skip tests, report "Already tested locally"
-  → If not found: run full test suite (for commits from other sources)
-```
-
-### Design Decisions
-
-1. **Two-layer testing (local + remote)**
-   - **Why:** Local gives fast feedback; remote ensures consistency across environments
-   - **Tradeoff:** Some test duplication, but can be eliminated via tag dedup
-
-2. **Tag-based dedup (Method 1)**
-   - **Why:** Elegant, uses git native mechanism, survives push
-   - **Alternative:** Tracking file (`.tested-commits`) — less clean
-   - **Alternative:** GitHub API state — requires auth, adds latency
-
-3. **Pre-commit timing (before commit creation)**
-   - **Why:** Prevents bad commits from entering history
-   - **Cost:** Small delay before commit (typically < 2 minutes)
-   - **Escape hatch:** `--no-verify` for emergency commits
-
-4. **Marker-based pytest selection**
-   - **Why:** Fine-grained test control (unit, integration, edge_case, performance)
-   - **Current:** All markers always run (no filtering needed)
-   - **Future:** Could skip perf tests in CI if needed
-
-### Playwright E2E Testing Layer
-
-**Status:** ✅ Complete - Executable tests verified in real Feishu environment
-
-#### Overview
-
-Complete end-to-end test automation using Playwright browser automation against the real Feishu web client. These tests verify the entire closed-loop flow:
-
-```
-Playwright automation
-  ↓
-1. Navigate to Feishu messenger (https://nicebuild.feishu.cn/next/messenger)
-2. Open Claude Code bot conversation
-3. Locate and click interactive card options
-4. Verify UI state changes and success messages
-5. Confirm answer submission flows through to Claude Code backend
-  ↓
-Verified: UI updates → WebSocket events → Claude Code response
-```
-
-#### Test Scenarios (All ✅ Verified)
-
-| Scenario | Playwright Interaction | Verification |
-|----------|----------------------|--------------|
-| **Single-question** | Click "Python" on single card | ✓ "✓ All 1 question(s) answered successfully" |
-| **Multi-question (2Q)** | Click Option A → Card auto-updates to Q2 → Click Option B | ✓ Progress (1/2)→(2/2), final success |
-| **Unicode/emoji** | Click "Rust 🦀" in Chinese card | ✓ Emoji rendered, toast "All answers submitted" |
-| **Empty options** | Card "没有选项的问题" loads gracefully | ✓ Card visible, no buttons |
-| **UI responsiveness** | Click button, measure time to next card | ✓ Sub-second updates |
-
-#### Verification Results (Tested with Playwright MCP)
-
-**✅ Single-question flow:**
-```
-Action: Click "Python" button
-Result: Card updates to "All questions answered"
-Verify: "✓ All 1 question(s) answered successfully" displayed
-Status: PASS - Immediate success message
-```
-
-**✅ Multi-question sequential:**
-```
-Q1: Click "Option A" → Card auto-updates to "Question 2 (2/2)"
-Q2: Click "Option B" → Displays "All questions answered"
-Verify: Progress (1/2) → (2/2), final message displayed
-Status: PASS - Sequential flow works, card auto-advances
-```
-
-**✅ Unicode/emoji support:**
-```
-Action: Click "Rust 🦀" button on "选择编程语言" card
-Result: Toast "All answers submitted" appears
-Verify: Chinese text + emoji button fully functional
-Status: PASS - Unicode rendering and transmission confirmed
-```
-
-**✅ Empty options handling:**
-```
-Card: "没有选项的问题" (no options)
-Result: Card loads without error, no interactive buttons
-Status: PASS - Graceful handling verified
-```
-
-#### Test Execution
-
-**File:** `tests/test_e2e_feishu_playwright.py`
-
-**Run tests:**
-```bash
-# Install Playwright browsers
-playwright install chromium
-
-# Run with pytest
-pytest tests/test_e2e_feishu_playwright.py -v
-
-# Or run directly
-python tests/test_e2e_feishu_playwright.py
-```
-
-**Requirements:**
-- Python 3.13+
-- Playwright library (in dev dependencies)
-- Feishu account with Claude Code bot access
-- Network access to Feishu web client
-
-#### Test Architecture
-
-The test suite uses:
-- **Playwright async API** for browser automation
-- **pytest fixtures** for page lifecycle management
-- **Timeout-aware assertions** for async operations (3s default)
-- **Real Feishu URLs** - no local simulators
-
-Each test:
-1. Launches a fresh Chromium browser
-2. Navigates to real Feishu web client
-3. Performs user interactions (clicks)
-4. Waits for success indicators with timeout
-5. Asserts expected outcomes
-
-#### CI/CD Integration
-
-Ready to integrate into `.github/workflows/`:
-- Tests can run headless in GitHub Actions
-- No special infrastructure required
-- Feishu credentials handled via environment variables (future)
-- Results reported via GitHub PR comments (regression-tests.yml template)
-
-#### Implementation Notes
-
-- Each test is fully async and independent
-- Timeout: 3 seconds per operation (generous for network latency)
-- Tests run sequentially (safer state isolation)
-- Can be extended with additional card scenarios as needed
-
-### Future Enhancements
-
-- [ ] CI/CD integration in GitHub Actions (headless browser)
-- [ ] Automatic screenshot capture on failure
-- [ ] Performance regression tracking (click-to-response time)
-- [ ] Multiple card scenarios (5+ question chain, 50+ options, etc.)
-- [ ] Stress tests (rapid clicks, network slowdown simulation)
-- [ ] Screenshot regression detection
-- [ ] Code coverage metrics

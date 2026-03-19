@@ -1,6 +1,6 @@
 [project]
 name = "walkcode"
-version = "0.9.0"
+version = "0.9.1"
 description = "Let your AI agent call you when it needs help — human-in-the-loop via Feishu"
 readme = "README.md"
 requires-python = ">=3.13"
@@ -18,13 +18,6 @@ dependencies = [
     "lark-oapi>=1.4.0",
 ]
 
-[dependency-groups]
-dev = [
-    "pytest>=8.0",
-    "pytest-asyncio>=0.23.0",
-    "playwright>=1.40.0",
-]
-
 [project.urls]
 Homepage = "https://github.com/0x5446/walkcode"
 
@@ -37,6 +30,3 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/walkcode"]
-
-[tool.pytest.ini_options]
-testpaths = ["tests"]

@@ -32,6 +32,8 @@ from lark_oapi.event.callback.model.p2_card_action_trigger import (
     CallBackToast,
     CallBackCard,
 )
+from importlib.metadata import version as pkg_version
+
 from fastapi import FastAPI, Request
 
 from .config import Config
@@ -41,7 +43,7 @@ from .tty import inject, validate_target, get_session_activity, kill_session
 
 logger = logging.getLogger("walkcode")
 
-app = FastAPI(title="WalkCode", version="0.8.0")
+app = FastAPI(title="WalkCode", version=pkg_version("walkcode"))
 
 # --- State ---
 
