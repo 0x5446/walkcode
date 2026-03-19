@@ -154,6 +154,21 @@ def cmd_hook(args):
     session_id = hook_data.get("session_id", "")
     port = int(os.environ.get("WALKCODE_PORT", os.environ.get("PORT", "3001")))
 
+    # DEBUG: dump full hook_data to file for analysis
+    try:
+        import datetime as _dt
+        _dbg_path = Path.home() / ".walkcode" / "hook_debug.jsonl"
+        with open(_dbg_path, "a") as _f:
+            _f.write(json.dumps({
+                "ts": _dt.datetime.now().isoformat(),
+                "hook_type": args.hook_type,
+                "tmux": tmux_session,
+                "hook_data_keys": sorted(hook_data.keys()),
+                "hook_data": hook_data,
+            }, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
     # --- PermissionRequest: send card, poll for decision ---
     if args.hook_type == "permission-request":
         import time as _time
@@ -166,6 +181,7 @@ def cmd_hook(args):
             "session_id": session_id,
             "tool_name": tool_name,
             "tool_input": tool_input,
+            "hook_data_full": hook_data,
         }).encode()
 
         try:
@@ -197,11 +213,11 @@ def cmd_hook(args):
                 if result.get("status") == "decided":
                     decision = result["decision"]
                     behavior = decision.get("behavior", "deny")
-                    always = decision.get("always", False)
 
                     decision_obj = {"behavior": behavior}
-                    if always and behavior == "allow":
-                        decision_obj["updatedPermissions"] = [tool_name]
+                    # Pass through updatedPermissions from server (permission_suggestions)
+                    if "updatedPermissions" in decision:
+                        decision_obj["updatedPermissions"] = decision["updatedPermissions"]
                     hook_response = {
                         "hookSpecificOutput": {
                             "hookEventName": "PermissionRequest",

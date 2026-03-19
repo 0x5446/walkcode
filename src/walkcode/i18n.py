@@ -268,6 +268,28 @@ _T: dict[str, tuple[str, str]] = {
         "请求已过期",
     ),
 
+    # --- server.py: SetMode card (Write/Edit .claude/) ---
+    "feishu.setmode.header": (
+        "🔐 Allow editing .claude/ settings?",
+        "🔐 允许编辑 .claude/ 配置？",
+    ),
+    "feishu.setmode.yes": (
+        "✅ Yes",
+        "✅ 是",
+    ),
+    "feishu.setmode.no": (
+        "❌ No",
+        "❌ 否",
+    ),
+    "feishu.setmode.accept_edits": (
+        "🔓 Yes + allow for session",
+        "🔓 是，且本次会话始终允许",
+    ),
+    "feishu.setmode.accepted": (
+        "✅ Allowed for session",
+        "✅ 已允许（本次会话）",
+    ),
+
     # --- server.py: Feishu user-facing messages ---
     "feishu.stale_session": (
         "⚠️ tmux session expired, please wait for the next notification from Claude",

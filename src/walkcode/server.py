@@ -105,6 +105,52 @@ def _build_permission_card(request_id: str, tool_name: str, tool_input: dict) ->
     }
 
 
+def _build_setmode_card(request_id: str, tool_name: str, tool_input: dict) -> dict:
+    """Build a Feishu card for a setMode permission request (Write/Edit .claude/)."""
+    input_str = json.dumps(tool_input, indent=2, ensure_ascii=False)
+    if len(input_str) > 500:
+        input_str = input_str[:500] + "\n..."
+    return {
+        "config": {"wide_screen_mode": True},
+        "header": {
+            "title": {"tag": "plain_text", "content": t("feishu.setmode.header")},
+            "template": "orange",
+        },
+        "elements": [
+            {
+                "tag": "div",
+                "text": {
+                    "tag": "lark_md",
+                    "content": f"**Tool:** `{tool_name}`\n**Input:**\n```json\n{input_str}\n```",
+                },
+            },
+            {
+                "tag": "action",
+                "actions": [
+                    {
+                        "tag": "button",
+                        "text": {"tag": "plain_text", "content": t("feishu.setmode.yes")},
+                        "type": "primary",
+                        "value": {"rid": request_id, "b": "allow"},
+                    },
+                    {
+                        "tag": "button",
+                        "text": {"tag": "plain_text", "content": t("feishu.setmode.no")},
+                        "type": "danger",
+                        "value": {"rid": request_id, "b": "deny"},
+                    },
+                    {
+                        "tag": "button",
+                        "text": {"tag": "plain_text", "content": t("feishu.setmode.accept_edits")},
+                        "type": "default",
+                        "value": {"rid": request_id, "b": "accept_edits"},
+                    },
+                ],
+            },
+        ],
+    }
+
+
 def _build_askuserquestion_card(request_id: str, questions: list, question_index: int = 0) -> dict:
     """Build a Feishu interactive card for AskUserQuestion with dynamic option buttons.
 
@@ -146,7 +192,7 @@ def _build_askuserquestion_card(request_id: str, questions: list, question_index
             "type": "primary",
             "value": {
                 "rid": request_id,
-                "answer": opt.get("value", ""),
+                "answer": opt.get("label", opt.get("value", "")),
                 "question_index": question_index,  # Track which question this answer is for
                 "total_questions": total_questions,
             },
@@ -190,6 +236,9 @@ def _build_permission_result_card(tool_name: str, behavior: str) -> dict:
     """Build a result card showing the permission decision."""
     if behavior == "always_allow":
         label = t("feishu.perm.always_allowed")
+        template = "green"
+    elif behavior == "accept_edits":
+        label = t("feishu.setmode.accepted")
         template = "green"
     elif behavior == "allow":
         label = t("feishu.perm.allowed")
@@ -392,6 +441,95 @@ def _edit_card(message_id: str, card: dict):
         logger.error(f"Edit card failed: {resp.code} {resp.msg}")
 
 
+# --- tmux send-keys fallback ---
+
+def _tmux_fallback(request_id: str, behavior: str, req_data: dict):
+    """Fallback: if hook process timed out, send key via tmux to answer terminal prompt."""
+    tty = req_data.get("tty", "")
+    if not tty:
+        return
+
+    tool_name = req_data.get("tool_name", "")
+    perm_suggestions = req_data.get("permission_suggestions", [])
+    suggestion_type = perm_suggestions[0].get("type") if perm_suggestions else "addRules"
+
+    if suggestion_type == "setMode":
+        # Terminal: 1=Yes, 2=Yes+acceptEdits, 3=No
+        key_map = {"allow": "1", "accept_edits": "2", "deny": "3"}
+    else:
+        # Terminal: 1=Allow, 2=Always Allow, 3=Deny
+        key_map = {"allow": "1", "always_allow": "2", "deny": "3"}
+
+    key = key_map.get(behavior, "3")
+
+    error = validate_target(tty)
+    if error:
+        logger.warning(f"tmux fallback: session {tty} not found (rid={request_id[:8]})")
+        return
+
+    try:
+        inject(tty, key, enter=True)
+        logger.info(f"tmux fallback: sent '{key}' to {tty} for {tool_name} behavior={behavior} (rid={request_id[:8]})")
+    except Exception as e:
+        logger.error(f"tmux fallback failed: {e} (rid={request_id[:8]})")
+
+
+def _tmux_fallback_askuser(request_id: str, answers: list, req_data: dict):
+    """Fallback for AskUserQuestion: send option numbers via tmux."""
+    tty = req_data.get("tty", "")
+    if not tty:
+        return
+    tool_input = req_data.get("tool_input", {})
+    questions = tool_input.get("questions", [])
+
+    error = validate_target(tty)
+    if error:
+        logger.warning(f"tmux fallback AskUser: session {tty} not found (rid={request_id[:8]})")
+        return
+
+    for i, answer in enumerate(answers):
+        if i < len(questions):
+            options = questions[i].get("options", [])
+            option_idx = None
+            for j, opt in enumerate(options):
+                if opt.get("label", opt.get("value", "")) == answer:
+                    option_idx = j + 1  # 1-based
+                    break
+            if option_idx is not None:
+                try:
+                    inject(tty, str(option_idx), enter=True)
+                    time.sleep(1)
+                    logger.info(f"tmux fallback AskUser: sent '{option_idx}' to {tty} for Q{i+1} (rid={request_id[:8]})")
+                except Exception as e:
+                    logger.error(f"tmux fallback AskUser failed: {e} (rid={request_id[:8]})")
+
+
+def _schedule_tmux_fallback(request_id: str, behavior: str, req_data: dict):
+    """Schedule tmux fallback: wait 5s, if decision not consumed by hook, send keys."""
+    def _check():
+        time.sleep(5)
+        if request_id in _perm_decisions:
+            logger.info(f"Hook timed out, tmux fallback (rid={request_id[:8]})")
+            _tmux_fallback(request_id, behavior, req_data)
+            _perm_decisions.pop(request_id, None)
+            _perm_events.pop(request_id, None)
+            _perm_requests.pop(request_id, None)
+    threading.Thread(target=_check, daemon=True).start()
+
+
+def _schedule_tmux_fallback_askuser(request_id: str, answers: list, req_data: dict):
+    """Schedule tmux fallback for AskUserQuestion."""
+    def _check():
+        time.sleep(5)
+        if request_id in _perm_decisions:
+            logger.info(f"Hook timed out for AskUser, tmux fallback (rid={request_id[:8]})")
+            _tmux_fallback_askuser(request_id, answers, req_data)
+            _perm_decisions.pop(request_id, None)
+            _perm_events.pop(request_id, None)
+            _perm_requests.pop(request_id, None)
+    threading.Thread(target=_check, daemon=True).start()
+
+
 # --- Card action handler ---
 
 def _on_card_action(data: P2CardActionTrigger) -> P2CardActionTriggerResponse:
@@ -478,6 +616,9 @@ def _on_card_action(data: P2CardActionTrigger) -> P2CardActionTriggerResponse:
                 if perm_event:
                     perm_event.set()
 
+                # Schedule tmux fallback for AskUserQuestion
+                _schedule_tmux_fallback_askuser(request_id, list(current_decision["answers"]), dict(req_data))
+
                 # Build completion card
                 result_card = {
                     "config": {"wide_screen_mode": True},
@@ -506,19 +647,26 @@ def _on_card_action(data: P2CardActionTrigger) -> P2CardActionTriggerResponse:
         if not behavior:
             return resp
 
-        decision_behavior = "allow" if behavior in ("allow", "always_allow") else "deny"
+        decision_behavior = "allow" if behavior in ("allow", "always_allow", "accept_edits") else "deny"
+        perm_suggestions = req_data.get("permission_suggestions", [])
 
         # Store decision and signal the waiting hook process
         decision_dict = {
             "behavior": decision_behavior,
         }
-        # When "always allow", include updatedPermissions so Claude Code remembers in current session
+        # Include updatedPermissions using original permission_suggestions from Claude Code
         if behavior == "always_allow":
-            decision_dict["updatedPermissions"] = [tool_name]
+            decision_dict["updatedPermissions"] = perm_suggestions if perm_suggestions else [{"type": "addRules", "rules": [{"toolName": tool_name}], "behavior": "allow", "destination": "localSettings"}]
+        elif behavior == "accept_edits":
+            decision_dict["updatedPermissions"] = perm_suggestions if perm_suggestions else [{"type": "setMode", "mode": "acceptEdits", "destination": "session"}]
+
         _perm_decisions[request_id] = decision_dict
         perm_event = _perm_events.get(request_id)
         if perm_event:
             perm_event.set()
+
+        # Schedule tmux fallback in case hook already timed out
+        _schedule_tmux_fallback(request_id, behavior, dict(req_data))
 
         logger.info(f"Permission decision: {behavior} for {tool_name} (rid={request_id[:8]})")
 
@@ -532,6 +680,8 @@ def _on_card_action(data: P2CardActionTrigger) -> P2CardActionTriggerResponse:
         # Toast notification
         if behavior == "always_allow":
             toast_text = t("feishu.perm.always_allowed")
+        elif behavior == "accept_edits":
+            toast_text = t("feishu.setmode.accepted")
         elif behavior == "allow":
             toast_text = t("feishu.perm.allowed")
         else:
@@ -540,7 +690,7 @@ def _on_card_action(data: P2CardActionTrigger) -> P2CardActionTriggerResponse:
         resp.toast.type = "success" if decision_behavior == "allow" else "warning"
         resp.toast.content = toast_text
 
-        # If "always allow", add rule to settings.json
+        # If "always allow", add rule to settings.json (accept_edits is session-scoped, no persist)
         if behavior == "always_allow":
             _add_permission_rule(tool_name)
 
@@ -789,12 +939,32 @@ async def receive_permission_hook(request: Request):
     session_id = body.get("session_id", "")
     tool_name = body.get("tool_name", "")
     tool_input = body.get("tool_input", {})
+    hook_data_full = body.get("hook_data_full", {})
 
     if not tty:
         return {"ok": False, "error": "missing tty"}
 
+    # DEBUG: log full hook data for analysis
+    if hook_data_full:
+        extra_keys = sorted(set(hook_data_full.keys()) - {"tool_name", "tool_input", "cwd", "session_id"})
+        logger.info(f"[HOOK_DEBUG] tool={tool_name} extra_keys={extra_keys}")
+        if hook_data_full.get("permission_suggestions"):
+            logger.info(f"[HOOK_DEBUG] permission_suggestions={json.dumps(hook_data_full['permission_suggestions'], ensure_ascii=False)}")
+        for k in extra_keys:
+            if k != "permission_suggestions":
+                logger.info(f"[HOOK_DEBUG] {k}={json.dumps(hook_data_full.get(k), ensure_ascii=False)}")
+
+    perm_suggestions = hook_data_full.get("permission_suggestions", [])
+
     request_id = str(uuid.uuid4())
-    _perm_requests[request_id] = {"tool_name": tool_name, "tool_input": tool_input, "tty": tty}
+    _perm_requests[request_id] = {
+        "tool_name": tool_name,
+        "tool_input": tool_input,
+        "tty": tty,
+        "hook_data_full": hook_data_full,
+        "permission_suggestions": perm_suggestions,
+        "created_at": time.time(),
+    }
     _perm_events[request_id] = threading.Event()
 
     # Find the Feishu thread to reply in
@@ -813,16 +983,22 @@ async def receive_permission_hook(request: Request):
                 if reply_id:
                     _edit_message(reply_id, t("feishu.started_with_session", session_id=session_id[:8], tmux=tty))
 
-    # Generate appropriate card based on tool type
+    # Generate appropriate card based on tool type and permission_suggestions
     if tool_name == "AskUserQuestion":
         questions = tool_input.get("questions", [])
         card = _build_askuserquestion_card(request_id, questions)
     else:
-        card = _build_permission_card(request_id, tool_name, tool_input)
+        suggestion_type = perm_suggestions[0].get("type") if perm_suggestions else "addRules"
+        if suggestion_type == "setMode":
+            card = _build_setmode_card(request_id, tool_name, tool_input)
+        else:
+            card = _build_permission_card(request_id, tool_name, tool_input)
 
     if root_msg_id:
+        logger.info(f"[CARD_DEBUG] Replying card in thread root_msg_id={root_msg_id} for {tool_name}")
         _reply_card(root_msg_id, card, reply_in_thread=True)
     else:
+        logger.info(f"[CARD_DEBUG] Sending card as root message for {tool_name} (no root_msg_id, session={session_id[:8] if session_id else 'none'}, tty={tty})")
         _send_card(card)
 
     project = basename(cwd) if cwd else "unknown"
