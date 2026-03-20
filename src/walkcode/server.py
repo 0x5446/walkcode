@@ -932,6 +932,29 @@ async def receive_hook(request: Request):
     return {"ok": False, "error": "send failed"}
 
 
+@app.post("/hook/sync")
+async def receive_sync_hook(request: Request):
+    """Lightweight tty mapping update — called by SessionStart hook."""
+    body = await request.json()
+    tty = body.get("tty", "")
+    session_id = body.get("session_id", "")
+    cwd = body.get("cwd", "")
+
+    if not tty or not session_id:
+        return {"ok": False, "error": "missing tty or session_id"}
+
+    session = session_store.get(session_id)
+    if session and session.root_msg_id:
+        session_store.upsert(session_id, tty=tty, cwd=cwd)
+        logger.info(f"Sync: session={session_id[:8]} tty={tty} (updated)")
+    else:
+        # New session or no Feishu thread yet — store tty+cwd so first hook finds it
+        session_store.upsert(session_id, tty=tty, cwd=cwd)
+        logger.info(f"Sync: session={session_id[:8]} tty={tty} (new, no thread yet)")
+
+    return {"ok": True}
+
+
 @app.post("/hook/permission")
 async def receive_permission_hook(request: Request):
     """Receive a PermissionRequest hook, send Feishu card, return request_id."""

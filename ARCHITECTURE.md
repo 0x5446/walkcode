@@ -51,7 +51,7 @@ Feishu reply arrives
 
 ### tty is always kept current
 
-Every time a Claude hook fires, it carries the current tmux session name. `receive_hook()` calls `session_store.upsert(session_id, tty=tty, ...)` unconditionally, so `tty` is always updated to wherever Claude is running right now. There is a brief window between a new Claude start and its first hook where `tty` is stale, but this is harmless — the user cannot have replied yet.
+A `SessionStart` hook fires the moment Claude starts (including `--continue` and `--resume`), calling `POST /hook/sync` with the current `session_id` and tmux name. This ensures the `session_id → tty` mapping is updated **before** Claude processes any user input or tools. Subsequent hooks (`Stop`, `Notification`, `PermissionRequest`) also carry the tmux name and call `session_store.upsert()`, keeping the mapping current throughout the session.
 
 ---
 
@@ -144,6 +144,7 @@ Claude Code hooks call `walkcode hook {stop|notification|permission-request}` wh
 
 | Hook | Claude Event | Endpoint | Feishu Format | Blocking |
 |------|-------------|----------|---------------|----------|
+| `sync` | SessionStart | POST /hook/sync | None (mapping update only) | No |
 | `stop` | Stop | POST /hook | Plain text | No |
 | `notification` | Notification (elicitation_dialog) | POST /hook | Plain text or interactive card (AskUserQuestion) | No |
 | `permission-request` | PermissionRequest | POST /hook/permission → poll GET /hook/permission/{rid}/decision | Interactive card with buttons | Yes (up to 120s) |
@@ -198,6 +199,7 @@ Note: Claude Code reads `settings.json` only at startup, so writing to it alone 
 ```json
 {
   "hooks": {
+    "SessionStart": [{"hooks": [{"type": "command", "command": "walkcode hook sync"}]}],
     "Stop": [{"hooks": [{"type": "command", "command": "walkcode hook stop"}]}],
     "Notification": [{"matcher": "elicitation_dialog", "hooks": [
       {"type": "command", "command": "walkcode hook notification"}

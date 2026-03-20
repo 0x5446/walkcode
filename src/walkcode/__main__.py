@@ -169,6 +169,24 @@ def cmd_hook(args):
     except Exception:
         pass
 
+    # --- Sync: lightweight tty mapping update (SessionStart) ---
+    if args.hook_type == "sync":
+        payload = json.dumps({
+            "tty": tmux_session,
+            "cwd": cwd,
+            "session_id": session_id,
+        }).encode()
+        try:
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{port}/hook/sync",
+                data=payload,
+                headers={"Content-Type": "application/json"},
+            )
+            urllib.request.urlopen(req, timeout=5)
+        except Exception:
+            pass  # best-effort, don't block Claude startup
+        return
+
     # --- PermissionRequest: send card, poll for decision ---
     if args.hook_type == "permission-request":
         import time as _time
@@ -283,6 +301,9 @@ def cmd_install_hooks(_args):
         return f"afplay /System/Library/Sounds/{sound}.aiff & walkcode hook {hook_type}"
 
     settings["hooks"] = {
+        "SessionStart": [{"matcher": "", "hooks": [
+            {"type": "command", "command": "walkcode hook sync"}
+        ]}],
         "Stop": [{"matcher": "", "hooks": [
             {"type": "command", "command": hook_cmd("stop", "Hero")}
         ]}],
@@ -346,6 +367,8 @@ def cmd_upgrade(_args):
         source = f"git+{_GITHUB_URL}"
 
     _run(f"uv tool install {source} --force")
+
+    cmd_install_hooks(None)
 
     pid = _read_pid()
     if pid:
@@ -482,7 +505,7 @@ def main():
     sub.add_parser("status", help="Check if server is running")
 
     hp = sub.add_parser("hook", help="Handle a Claude Code hook event (reads stdin)")
-    hp.add_argument("hook_type", choices=["stop", "notification", "permission-request"], help="Hook event type")
+    hp.add_argument("hook_type", choices=["stop", "notification", "permission-request", "sync"], help="Hook event type")
 
     sub.add_parser("install-hooks", help="Install Claude Code hooks")
     sub.add_parser("upgrade", help="Upgrade to latest release")
