@@ -205,7 +205,7 @@ Add to `~/.zshrc` (or `~/.bashrc`):
 claude() {
   if [ -z "$TMUX" ]; then
     local session="claude-$(basename "$PWD")-$$"
-    tmux new-session -s "$session" "command claude $@"
+    tmux new-session -s "$session" "command claude $(printf '%q ' "$@")"
   else
     command claude "$@"
   fi
