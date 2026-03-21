@@ -154,25 +154,40 @@ WRAPPER
 # --- Configure tmux ---
 configure_tmux() {
   local tmux_conf="$HOME/.tmux.conf"
-  local marker="# >>> walkcode tmux config >>>"
+  local marker_start="# >>> walkcode tmux config >>>"
+  local marker_end="# <<< walkcode tmux config <<<"
 
-  if grep -q "$marker" "$tmux_conf" 2>/dev/null; then
-    info "$(msg "tmux config already present in $tmux_conf" "tmux 配置已存在于 $tmux_conf")"
-    return
+  # Remove old walkcode config block if present (handles upgrade)
+  if [ -f "$tmux_conf" ] && grep -q "$marker_start" "$tmux_conf" 2>/dev/null; then
+    info "$(msg "Removing old WalkCode tmux config..." "正在移除旧的 WalkCode tmux 配置...")"
+    sed -i.walkcode-bak "/$marker_start/,/$marker_end/d" "$tmux_conf"
+    rm -f "${tmux_conf}.walkcode-bak"
   fi
 
-  info "$(msg "Adding tmux scrollback config to $tmux_conf..." "正在将 tmux scrollback 配置添加到 $tmux_conf...")"
+  info "$(msg "Adding tmux config to $tmux_conf..." "正在将 tmux 配置添加到 $tmux_conf...")"
   cat >> "$tmux_conf" << 'TMUXCFG'
 
 # >>> walkcode tmux config >>>
-# Disable alternate screen so TUI output (e.g. Claude Code) stays in scrollback
-# Use Ctrl-b [ to scroll back through history
-set-option -ga terminal-overrides ',*:smcup@:rmcup@'
+# Increase scrollback buffer for Claude Code sessions
+set-option -g history-limit 50000
 # <<< walkcode tmux config <<<
 TMUXCFG
 
   # Hot-reload if tmux server is running
-  tmux source-file "$tmux_conf" 2>/dev/null || true
+  if tmux list-sessions &>/dev/null 2>&1; then
+    tmux set-option -g history-limit 50000 2>/dev/null || true
+    # Undo old smcup@:rmcup@ overrides — reset terminal-overrides then re-source
+    tmux set-option -gu terminal-overrides 2>/dev/null || true
+    tmux source-file "$tmux_conf" 2>/dev/null || true
+  fi
+
+  # Warn if smcup@:rmcup@ still exists outside walkcode markers
+  if grep -q 'smcup@:rmcup@' "$tmux_conf" 2>/dev/null; then
+    warn "$(msg \
+      "Found smcup@:rmcup@ in $tmux_conf outside WalkCode markers. This disables alternate screen and causes scrollback corruption with TUI apps. Please remove it manually." \
+      "在 $tmux_conf 中发现 WalkCode 标记之外的 smcup@:rmcup@ 配置。这会禁用备用屏幕导致 TUI 应用滚动异常，请手动删除。")"
+  fi
+
   info "$(msg "tmux config installed" "tmux 配置已安装")"
 }
 

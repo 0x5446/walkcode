@@ -490,6 +490,7 @@ def cmd_test_inject(args):
 
 def main():
     parser = argparse.ArgumentParser(prog="walkcode", description="Let your AI agent call you when it needs help")
+    parser.add_argument("-v", "--version", action="version", version=f"walkcode {_current_version()}")
     sub = parser.add_subparsers(dest="command")
 
     sub.add_parser("serve", help="Start server (foreground)")
