@@ -47,7 +47,7 @@ def get_session_activity(session_name: str) -> float | None:
     """Return the epoch timestamp of last activity in a tmux session."""
     try:
         result = subprocess.run(
-            ["tmux", "display-message", "-t", session_name, "-p", "#{session_activity}"],
+            ["tmux", "display-message", "-t", session_name, "-p", "#{window_activity}"],
             capture_output=True, text=True, timeout=2,
         )
         if result.returncode == 0:

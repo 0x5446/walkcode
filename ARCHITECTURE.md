@@ -299,11 +299,11 @@ A background daemon thread runs every 10 minutes and checks all tracked sessions
 
 ```python
 activity = get_session_activity(session.tty)
-# calls: tmux display-message -t {name} -p "#{session_activity}"
+# calls: tmux display-message -t {name} -p "#{window_activity}"
 # returns: epoch float of last terminal output, or None if session doesn't exist
 ```
 
-`#{session_activity}` is tmux's native tracking of the last time any output was written to a pane. This is more accurate than WalkCode's own `created_at` — it reflects actual Claude activity (file reads, shell commands, output) not just hook events.
+`#{window_activity}` is tmux's native tracking of the last time any output was written to a window. Unlike `#{session_activity}` (which only updates on real client attach/keypress), `window_activity` correctly tracks `send-keys` input and program output in detached sessions.
 
 ### Reap decision
 
