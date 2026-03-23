@@ -170,12 +170,15 @@ configure_tmux() {
 # >>> walkcode tmux config >>>
 # Increase scrollback buffer for Claude Code sessions
 set-option -g history-limit 50000
+# Enable mouse — scroll events pass through to Claude Code in alternate screen
+set-option -g mouse on
 # <<< walkcode tmux config <<<
 TMUXCFG
 
   # Hot-reload if tmux server is running
   if tmux list-sessions &>/dev/null 2>&1; then
     tmux set-option -g history-limit 50000 2>/dev/null || true
+    tmux set-option -g mouse on 2>/dev/null || true
     # Undo old smcup@:rmcup@ overrides — reset terminal-overrides then re-source
     tmux set-option -gu terminal-overrides 2>/dev/null || true
     tmux source-file "$tmux_conf" 2>/dev/null || true
