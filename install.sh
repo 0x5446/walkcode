@@ -172,11 +172,17 @@ configure_tmux() {
 set-option -g history-limit 50000
 # Enable mouse — scroll events pass through to Claude Code in alternate screen
 set-option -g mouse on
-# Mouse drag selection → macOS clipboard, highlight stays until next click
-bind-key -T copy-mode MouseDragEnd1Pane send-keys -X copy-pipe-no-clear "pbcopy"
-bind-key -T copy-mode-vi MouseDragEnd1Pane send-keys -X copy-pipe-no-clear "pbcopy"
-bind-key -T copy-mode MouseDown1Pane select-pane \; send-keys -X cancel
-bind-key -T copy-mode-vi MouseDown1Pane select-pane \; send-keys -X cancel
+# Drag end: copy to clipboard, keep highlight, mark selection active
+bind-key -T copy-mode MouseDragEnd1Pane send-keys -X copy-pipe-no-clear "pbcopy" \; set -p @has_selection 1
+bind-key -T copy-mode-vi MouseDragEnd1Pane send-keys -X copy-pipe-no-clear "pbcopy" \; set -p @has_selection 1
+# Click: has selection → exit copy mode; no selection → position cursor for new drag
+bind-key -T copy-mode MouseDown1Pane if-shell -F "#{@has_selection}" "set -p @has_selection 0 ; send-keys -X cancel" "select-pane ; send-keys -X clear-selection"
+bind-key -T copy-mode-vi MouseDown1Pane if-shell -F "#{@has_selection}" "set -p @has_selection 0 ; send-keys -X cancel" "select-pane ; send-keys -X clear-selection"
+# Scroll: clear selection to prevent extension, stay in copy mode
+bind-key -T copy-mode WheelUpPane set -p @has_selection 0 \; send-keys -X clear-selection \; send-keys -X -N 5 scroll-up
+bind-key -T copy-mode WheelDownPane set -p @has_selection 0 \; send-keys -X clear-selection \; send-keys -X -N 5 scroll-down
+bind-key -T copy-mode-vi WheelUpPane set -p @has_selection 0 \; send-keys -X clear-selection \; send-keys -X -N 5 scroll-up
+bind-key -T copy-mode-vi WheelDownPane set -p @has_selection 0 \; send-keys -X clear-selection \; send-keys -X -N 5 scroll-down
 # Selection highlight style
 set-option -g mode-style "bg=colour240,fg=white"
 # <<< walkcode tmux config <<<
