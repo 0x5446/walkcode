@@ -172,6 +172,13 @@ configure_tmux() {
 set-option -g history-limit 50000
 # Enable mouse — scroll events pass through to Claude Code in alternate screen
 set-option -g mouse on
+# Mouse drag selection → macOS clipboard, highlight stays until next click
+bind-key -T copy-mode MouseDragEnd1Pane send-keys -X copy-pipe-no-clear "pbcopy"
+bind-key -T copy-mode-vi MouseDragEnd1Pane send-keys -X copy-pipe-no-clear "pbcopy"
+bind-key -T copy-mode MouseDown1Pane select-pane \; send-keys -X cancel
+bind-key -T copy-mode-vi MouseDown1Pane select-pane \; send-keys -X cancel
+# Selection highlight style
+set-option -g mode-style "bg=colour240,fg=white"
 # <<< walkcode tmux config <<<
 TMUXCFG
 
