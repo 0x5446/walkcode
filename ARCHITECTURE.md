@@ -174,9 +174,9 @@ Claude Code needs permission for a tool
   ↓ PermissionRequest hook fires
 walkcode hook permission-request (reads stdin JSON with tool_name, tool_input)
   ↓ POST /hook/permission
-Server sends Feishu interactive card (tool name + input + 3 buttons)
+Server captures terminal options via tmux, determines perm_type, sends Feishu card
   ↓ hook process long-polls GET /hook/permission/{request_id}/decision
-User clicks card button (Allow / Deny / Always Allow)
+User clicks card button (options match the terminal exactly)
   ↓ register_p2_card_action_trigger callback
 Server stores decision, signals waiting hook process; card updates inline (buttons removed)
   ↓ hook outputs JSON to stdout:
@@ -185,7 +185,17 @@ Server stores decision, signals waiting hook process; card updates inline (butto
 Claude Code receives decision, continues execution
 ```
 
-If "Always Allow" is clicked:
+**Dynamic button text**: The Feishu card buttons are captured from the terminal's actual prompt via `tmux capture-pane`, so they always match Claude Code's UI regardless of version changes. Falls back to hardcoded defaults if capture fails.
+
+**Permission types**: The server classifies each request into a `perm_type` based on `permission_mode` and `permission_suggestions`:
+
+| perm_type | Condition | Terminal options (example) | Button behaviors |
+|-----------|-----------|--------------------------|-----------------|
+| `plan` | `permission_mode == "plan"` + no suggestions | Yes, auto-accept edits / Yes, manually approve edits / Tell Claude what to change | `plan_auto_accept` / `plan_manual_approve` / `deny` |
+| `setMode` | first suggestion `type == "setMode"` | Yes / Yes, and allow Claude to edit... / No | `allow` / `accept_edits` / `deny` |
+| `addRules` | default | Allow / Always Allow / Deny | `allow` / `always_allow` / `deny` |
+
+If "Always Allow" is clicked (addRules type):
 
 1. **Current session**: the hook returns `updatedPermissions` in the decision, which tells Claude Code to remember this rule for the rest of the session — no more prompts for the same tool.
 2. **Future sessions**: the tool is added to `~/.claude/settings.json` `permissions.allow`, so Claude Code auto-approves it at startup and never fires the PermissionRequest hook.

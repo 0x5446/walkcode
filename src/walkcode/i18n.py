@@ -290,6 +290,12 @@ _T: dict[str, tuple[str, str]] = {
         "✅ 已允许（本次会话）",
     ),
 
+    # --- server.py: Plan approval card (ExitPlanMode) ---
+    "feishu.plan.header": (
+        "📋 Ready to code?",
+        "📋 准备开始执行？",
+    ),
+
     # --- server.py: Feishu user-facing messages ---
     "feishu.stale_session": (
         "⚠️ tmux session expired, please wait for the next notification from Claude",

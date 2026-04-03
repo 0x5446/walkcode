@@ -61,94 +61,85 @@ _perm_decisions: dict[str, dict] = {}  # request_id → {behavior, tool_name, al
 _perm_events: dict[str, threading.Event] = {}  # request_id → Event for signaling
 
 
-def _build_permission_card(request_id: str, tool_name: str, tool_input: dict) -> dict:
-    """Build a Feishu interactive card for a permission request."""
-    input_str = json.dumps(tool_input, indent=2, ensure_ascii=False)
-    if len(input_str) > 500:
-        input_str = input_str[:500] + "\n..."
-    return {
-        "config": {"wide_screen_mode": True},
-        "header": {
-            "title": {"tag": "plain_text", "content": t("feishu.perm.header")},
-            "template": "orange",
-        },
-        "elements": [
-            {
-                "tag": "div",
-                "text": {
-                    "tag": "lark_md",
-                    "content": f"**Tool:** `{tool_name}`\n**Input:**\n```json\n{input_str}\n```",
-                },
-            },
-            {
-                "tag": "action",
-                "actions": [
-                    {
-                        "tag": "button",
-                        "text": {"tag": "plain_text", "content": t("feishu.perm.allow")},
-                        "type": "primary",
-                        "value": {"rid": request_id, "b": "allow"},
-                    },
-                    {
-                        "tag": "button",
-                        "text": {"tag": "plain_text", "content": t("feishu.perm.deny")},
-                        "type": "danger",
-                        "value": {"rid": request_id, "b": "deny"},
-                    },
-                    {
-                        "tag": "button",
-                        "text": {"tag": "plain_text", "content": t("feishu.perm.always_allow")},
-                        "type": "default",
-                        "value": {"rid": request_id, "b": "always_allow"},
-                    },
-                ],
-            },
-        ],
-    }
+def _capture_terminal_options(tty: str) -> list[str]:
+    """Capture numbered option text from the terminal's permission prompt via tmux."""
+    try:
+        result = subprocess.run(
+            ["tmux", "capture-pane", "-t", tty, "-p", "-S", "-15"],
+            capture_output=True, text=True, timeout=5,
+        )
+        options = []
+        for line in result.stdout.split("\n"):
+            # Match "❯ 1. Option text" or "   2. Option text"
+            m = re.match(r'\s*[❯>]?\s*(\d+)\.\s+(.+)', line)
+            if m:
+                options.append(m.group(2).strip())
+        return options
+    except Exception as e:
+        logger.warning(f"Failed to capture terminal options from {tty}: {e}")
+        return []
 
 
-def _build_setmode_card(request_id: str, tool_name: str, tool_input: dict) -> dict:
-    """Build a Feishu card for a setMode permission request (Write/Edit .claude/)."""
-    input_str = json.dumps(tool_input, indent=2, ensure_ascii=False)
-    if len(input_str) > 500:
-        input_str = input_str[:500] + "\n..."
+# --- Unified permission card builder ---
+# Each perm_type defines: behavior values per button position, fallback labels, header, template.
+
+_PERM_BEHAVIORS = {
+    "plan":     ["plan_auto_accept", "plan_manual_approve", "deny"],
+    "setMode":  ["allow", "accept_edits", "deny"],
+    "addRules": ["allow", "always_allow", "deny"],
+}
+_PERM_FALLBACK_OPTIONS = {
+    "plan":     ["Yes, auto-accept edits", "Yes, manually approve edits", "Tell Claude what to change"],
+    "setMode":  ["Yes", "Yes, auto-accept edits", "No"],
+    "addRules": ["Allow", "Always Allow", "Deny"],
+}
+_PERM_BUTTON_TYPES = ["primary", "default", "danger"]
+
+
+def _build_dynamic_permission_card(
+    request_id: str, perm_type: str, tool_name: str,
+    tool_input: dict, terminal_options: list[str],
+) -> dict:
+    """Build a Feishu permission card with buttons matching the terminal's actual options.
+
+    Works for all permission types: addRules, setMode, and plan approval.
+    Button text is captured from the terminal via tmux; falls back to hardcoded defaults.
+    """
+    behaviors = _PERM_BEHAVIORS.get(perm_type, _PERM_BEHAVIORS["addRules"])
+    fallbacks = _PERM_FALLBACK_OPTIONS.get(perm_type, _PERM_FALLBACK_OPTIONS["addRules"])
+    opts = terminal_options if terminal_options and len(terminal_options) >= 3 else fallbacks
+
+    buttons = []
+    for i, (behavior, btn_type) in enumerate(zip(behaviors, _PERM_BUTTON_TYPES)):
+        buttons.append({
+            "tag": "button",
+            "text": {"tag": "plain_text", "content": opts[i]},
+            "type": btn_type,
+            "value": {"rid": request_id, "b": behavior},
+        })
+
+    # Content: plan shows markdown, others show tool + input JSON
+    if perm_type == "plan":
+        plan = tool_input.get("plan", "")
+        if len(plan) > 800:
+            plan = plan[:800] + "\n..."
+        content = plan
+        header = t("feishu.plan.header")
+        template = "blue"
+    else:
+        input_str = json.dumps(tool_input, indent=2, ensure_ascii=False)
+        if len(input_str) > 500:
+            input_str = input_str[:500] + "\n..."
+        content = f"**Tool:** `{tool_name}`\n**Input:**\n```json\n{input_str}\n```"
+        header = t("feishu.setmode.header") if perm_type == "setMode" else t("feishu.perm.header")
+        template = "orange"
+
     return {
         "config": {"wide_screen_mode": True},
-        "header": {
-            "title": {"tag": "plain_text", "content": t("feishu.setmode.header")},
-            "template": "orange",
-        },
+        "header": {"title": {"tag": "plain_text", "content": header}, "template": template},
         "elements": [
-            {
-                "tag": "div",
-                "text": {
-                    "tag": "lark_md",
-                    "content": f"**Tool:** `{tool_name}`\n**Input:**\n```json\n{input_str}\n```",
-                },
-            },
-            {
-                "tag": "action",
-                "actions": [
-                    {
-                        "tag": "button",
-                        "text": {"tag": "plain_text", "content": t("feishu.setmode.yes")},
-                        "type": "primary",
-                        "value": {"rid": request_id, "b": "allow"},
-                    },
-                    {
-                        "tag": "button",
-                        "text": {"tag": "plain_text", "content": t("feishu.setmode.no")},
-                        "type": "danger",
-                        "value": {"rid": request_id, "b": "deny"},
-                    },
-                    {
-                        "tag": "button",
-                        "text": {"tag": "plain_text", "content": t("feishu.setmode.accept_edits")},
-                        "type": "default",
-                        "value": {"rid": request_id, "b": "accept_edits"},
-                    },
-                ],
-            },
+            {"tag": "div", "text": {"tag": "lark_md", "content": content}},
+            {"tag": "action", "actions": buttons},
         ],
     }
 
@@ -454,13 +445,18 @@ def _tmux_fallback(request_id: str, behavior: str, req_data: dict):
     tool_name = req_data.get("tool_name", "")
     perm_suggestions = req_data.get("permission_suggestions", [])
     suggestion_type = perm_suggestions[0].get("type") if perm_suggestions else "addRules"
+    hook_data_full = req_data.get("hook_data_full", {})
+    permission_mode = hook_data_full.get("permission_mode", "")
 
-    if suggestion_type == "setMode":
-        # Terminal: 1=Yes, 2=Yes+acceptEdits, 3=No
-        key_map = {"allow": "1", "accept_edits": "2", "deny": "3"}
+    # Determine perm_type → build key_map from _PERM_BEHAVIORS
+    if permission_mode == "plan" and not perm_suggestions:
+        perm_type = "plan"
+    elif suggestion_type == "setMode":
+        perm_type = "setMode"
     else:
-        # Terminal: 1=Allow, 2=Always Allow, 3=Deny
-        key_map = {"allow": "1", "always_allow": "2", "deny": "3"}
+        perm_type = "addRules"
+    behaviors = _PERM_BEHAVIORS.get(perm_type, _PERM_BEHAVIORS["addRules"])
+    key_map = {b: str(i + 1) for i, b in enumerate(behaviors)}
 
     key = key_map.get(behavior, "3")
 
@@ -649,7 +645,7 @@ def _on_card_action(data: P2CardActionTrigger) -> P2CardActionTriggerResponse:
         if not behavior:
             return resp
 
-        decision_behavior = "allow" if behavior in ("allow", "always_allow", "accept_edits") else "deny"
+        decision_behavior = "allow" if behavior in ("allow", "always_allow", "accept_edits", "plan_auto_accept", "plan_manual_approve") else "deny"
         perm_suggestions = req_data.get("permission_suggestions", [])
 
         # Store decision and signal the waiting hook process
@@ -661,6 +657,8 @@ def _on_card_action(data: P2CardActionTrigger) -> P2CardActionTriggerResponse:
             decision_dict["updatedPermissions"] = perm_suggestions if perm_suggestions else [{"type": "addRules", "rules": [{"toolName": tool_name}], "behavior": "allow", "destination": "localSettings"}]
         elif behavior == "accept_edits":
             decision_dict["updatedPermissions"] = perm_suggestions if perm_suggestions else [{"type": "setMode", "mode": "acceptEdits", "destination": "session"}]
+        elif behavior == "plan_auto_accept":
+            decision_dict["updatedPermissions"] = [{"type": "setMode", "mode": "acceptEdits", "destination": "session"}]
 
         _perm_decisions[request_id] = decision_dict
         perm_event = _perm_events.get(request_id)
@@ -684,7 +682,7 @@ def _on_card_action(data: P2CardActionTrigger) -> P2CardActionTriggerResponse:
             toast_text = t("feishu.perm.always_allowed")
         elif behavior == "accept_edits":
             toast_text = t("feishu.setmode.accepted")
-        elif behavior == "allow":
+        elif behavior in ("allow", "plan_auto_accept", "plan_manual_approve"):
             toast_text = t("feishu.perm.allowed")
         else:
             toast_text = t("feishu.perm.denied")
@@ -1009,15 +1007,21 @@ async def receive_permission_hook(request: Request):
                     _edit_message(reply_id, t("feishu.started_with_session", session_id=session_id[:8], tmux=tty))
 
     # Generate appropriate card based on tool type and permission_suggestions
+    permission_mode = hook_data_full.get("permission_mode", "")
     if tool_name == "AskUserQuestion":
         questions = tool_input.get("questions", [])
         card = _build_askuserquestion_card(request_id, questions)
     else:
-        suggestion_type = perm_suggestions[0].get("type") if perm_suggestions else "addRules"
-        if suggestion_type == "setMode":
-            card = _build_setmode_card(request_id, tool_name, tool_input)
+        # Determine perm_type for unified card builder
+        if permission_mode == "plan" and not perm_suggestions:
+            perm_type = "plan"
+        elif perm_suggestions and perm_suggestions[0].get("type") == "setMode":
+            perm_type = "setMode"
         else:
-            card = _build_permission_card(request_id, tool_name, tool_input)
+            perm_type = "addRules"
+        terminal_options = _capture_terminal_options(tty)
+        logger.info(f"[PERM_DEBUG] perm_type={perm_type} terminal_options={terminal_options}")
+        card = _build_dynamic_permission_card(request_id, perm_type, tool_name, tool_input, terminal_options)
 
     if root_msg_id:
         logger.info(f"[CARD_DEBUG] Replying card in thread root_msg_id={root_msg_id} for {tool_name}")
