@@ -472,34 +472,48 @@ def _tmux_fallback(request_id: str, behavior: str, req_data: dict):
         logger.error(f"tmux fallback failed: {e} (rid={request_id[:8]})")
 
 
-def _tmux_fallback_askuser(request_id: str, answers: list, req_data: dict):
-    """Fallback for AskUserQuestion: send option numbers via tmux."""
+def _tmux_inject_askuser(request_id: str, answers: list, req_data: dict):
+    """Inject AskUserQuestion answer via tmux.
+
+    The hook process exits with code 2 (no JSON), so Claude falls back to
+    the interactive terminal.  We then:
+      1. approve the permission prompt  (send "1" + Enter)
+      2. send the answer option number  (send N + Enter)
+    """
     tty = req_data.get("tty", "")
     if not tty:
         return
     tool_input = req_data.get("tool_input", {})
     questions = tool_input.get("questions", [])
 
-    error = validate_target(tty)
-    if error:
-        logger.warning(f"tmux fallback AskUser: session {tty} not found (rid={request_id[:8]})")
-        return
+    def _do_inject():
+        # Wait for hook to exit(2) and Claude to show the question UI.
+        # Claude auto-allows AskUserQuestion after hook denial, no separate
+        # permission prompt is shown — we only need to inject the answer.
+        time.sleep(4)
 
-    for i, answer in enumerate(answers):
-        if i < len(questions):
-            options = questions[i].get("options", [])
-            option_idx = None
-            for j, opt in enumerate(options):
-                if opt.get("label", opt.get("value", "")) == answer:
-                    option_idx = j + 1  # 1-based
-                    break
-            if option_idx is not None:
-                try:
-                    inject(tty, str(option_idx), enter=True)
-                    time.sleep(1)
-                    logger.info(f"tmux fallback AskUser: sent '{option_idx}' to {tty} for Q{i+1} (rid={request_id[:8]})")
-                except Exception as e:
-                    logger.error(f"tmux fallback AskUser failed: {e} (rid={request_id[:8]})")
+        error = validate_target(tty)
+        if error:
+            logger.warning(f"tmux inject AskUser: session {tty} not found (rid={request_id[:8]})")
+            return
+
+        for i, answer in enumerate(answers):
+            if i < len(questions):
+                options = questions[i].get("options", [])
+                option_idx = None
+                for j, opt in enumerate(options):
+                    if opt.get("label", opt.get("value", "")) == answer:
+                        option_idx = j + 1  # 1-based
+                        break
+                if option_idx is not None:
+                    try:
+                        inject(tty, str(option_idx), enter=True)
+                        time.sleep(1)
+                        logger.info(f"tmux inject AskUser: sent '{option_idx}' to {tty} for Q{i+1} answer={answer} (rid={request_id[:8]})")
+                    except Exception as e:
+                        logger.error(f"tmux inject AskUser answer failed: {e} (rid={request_id[:8]})")
+
+    threading.Thread(target=_do_inject, daemon=True).start()
 
 
 def _schedule_tmux_fallback(request_id: str, behavior: str, req_data: dict):
@@ -516,16 +530,8 @@ def _schedule_tmux_fallback(request_id: str, behavior: str, req_data: dict):
 
 
 def _schedule_tmux_fallback_askuser(request_id: str, answers: list, req_data: dict):
-    """Schedule tmux fallback for AskUserQuestion."""
-    def _check():
-        time.sleep(5)
-        if request_id in _perm_decisions:
-            logger.info(f"Hook timed out for AskUser, tmux fallback (rid={request_id[:8]})")
-            _tmux_fallback_askuser(request_id, answers, req_data)
-            _perm_decisions.pop(request_id, None)
-            _perm_events.pop(request_id, None)
-            _perm_requests.pop(request_id, None)
-    threading.Thread(target=_check, daemon=True).start()
+    """Legacy fallback — kept for reference, no longer called."""
+    pass
 
 
 # --- Card action handler ---
@@ -614,8 +620,8 @@ def _on_card_action(data: P2CardActionTrigger) -> P2CardActionTriggerResponse:
                 if perm_event:
                     perm_event.set()
 
-                # Schedule tmux fallback for AskUserQuestion
-                _schedule_tmux_fallback_askuser(request_id, list(current_decision["answers"]), dict(req_data))
+                # Schedule tmux injection: approve permission + send answer
+                _tmux_inject_askuser(request_id, list(current_decision["answers"]), dict(req_data))
 
                 # Build completion card
                 result_card = {

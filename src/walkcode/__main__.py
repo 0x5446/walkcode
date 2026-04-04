@@ -232,6 +232,12 @@ def cmd_hook(args):
                     decision = result["decision"]
                     behavior = decision.get("behavior", "deny")
 
+                    # AskUserQuestion: exit without hook response so Claude
+                    # falls back to the interactive terminal prompt.
+                    # The server injects the answer via tmux after we exit.
+                    if tool_name == "AskUserQuestion":
+                        sys.exit(2)
+
                     decision_obj = {"behavior": behavior}
                     # Pass through updatedPermissions from server (permission_suggestions)
                     if "updatedPermissions" in decision:
