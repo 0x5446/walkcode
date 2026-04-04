@@ -139,6 +139,13 @@ install_wrapper() {
 # >>> walkcode claude wrapper >>>
 claude() {
   if [ -z "$TMUX" ]; then
+    # non-interactive flags: run directly without tmux
+    case "$1" in
+      --version|-v|--help|-h|-p|--print)
+        command claude "$@"
+        return
+        ;;
+    esac
     local session="claude-$(basename "$PWD")-$$"
     tmux new-session -s "$session" "command claude $(printf '%q ' "$@")"
   else

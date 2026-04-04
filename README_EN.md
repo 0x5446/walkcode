@@ -204,6 +204,12 @@ Add to `~/.zshrc` (or `~/.bashrc`):
 ```bash
 claude() {
   if [ -z "$TMUX" ]; then
+    case "$1" in
+      --version|-v|--help|-h|-p|--print)
+        command claude "$@"
+        return
+        ;;
+    esac
     local session="claude-$(basename "$PWD")-$$"
     tmux new-session -s "$session" "command claude $(printf '%q ' "$@")"
   else
