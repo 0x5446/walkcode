@@ -16,6 +16,7 @@ class Session:
     tty: str  # tmux session name
     cwd: str
     root_msg_id: str | None = None
+    subscribed: bool = False  # user @mentioned for thread subscription
     created_at: float = field(default_factory=time.time)
 
     @classmethod
@@ -25,6 +26,7 @@ class Session:
             tty=str(data.get("tty", "")),
             cwd=str(data.get("cwd", "")),
             root_msg_id=str(root_msg_id) if root_msg_id else None,
+            subscribed=bool(data.get("subscribed", False)),
             created_at=float(data.get("created_at", time.time())),
         )
 
@@ -33,6 +35,7 @@ class Session:
             "tty": self.tty,
             "cwd": self.cwd,
             "root_msg_id": self.root_msg_id,
+            "subscribed": self.subscribed,
             "created_at": self.created_at,
         }
 
@@ -204,6 +207,13 @@ class SessionStore:
             self._pending_msg_to_tty.pop(entry["root_msg_id"], None)
             self._save_locked()
             return entry["root_msg_id"], entry.get("reply_id")
+
+    def mark_subscribed(self, session_id: str):
+        with self._lock:
+            session = self._sessions.get(session_id)
+            if session and not session.subscribed:
+                session.subscribed = True
+                self._save_locked()
 
     def resolve_pending_tty(self, msg_id: str) -> str | None:
         with self._lock:

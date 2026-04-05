@@ -907,8 +907,14 @@ async def receive_hook(request: Request):
     if session and session.root_msg_id:
         # Existing session: reply to thread root
         session_store.upsert(session_id, tty=tty, cwd=cwd)
-        msg_id = _reply(session.root_msg_id, text=display_message, reply_in_thread=True)
+        text = display_message
+        need_subscribe = not session.subscribed and config.feishu_receive_id
+        if need_subscribe:
+            text = f'<at user_id="{config.feishu_receive_id}"></at> {text}'
+        msg_id = _reply(session.root_msg_id, text=text, reply_in_thread=True)
         if msg_id:
+            if need_subscribe:
+                session_store.mark_subscribed(session_id)
             return {"ok": True, "msg_id": msg_id, "thread": session.root_msg_id}
     else:
         # New session: check if Feishu-initiated (pending root exists)
@@ -921,7 +927,12 @@ async def receive_hook(request: Request):
                 # Update the launch reply with session info
                 if reply_id:
                     _edit_message(reply_id, t("feishu.started_with_session", session_id=session_id[:8], tmux=tty))
-            _reply(root_id, text=display_message, reply_in_thread=True)
+            text = display_message
+            if config.feishu_receive_id:
+                text = f'<at user_id="{config.feishu_receive_id}"></at> {text}'
+            _reply(root_id, text=text, reply_in_thread=True)
+            if session_id:
+                session_store.mark_subscribed(session_id)
             return {"ok": True, "msg_id": root_id}
 
         # User-initiated: send title as thread root, reply with content
@@ -930,7 +941,12 @@ async def receive_hook(request: Request):
         if root_id:
             if session_id:
                 session_store.upsert(session_id, tty=tty, cwd=cwd, root_msg_id=root_id)
-            _reply(root_id, text=display_message, reply_in_thread=True)
+            text = display_message
+            if config.feishu_receive_id:
+                text = f'<at user_id="{config.feishu_receive_id}"></at> {text}'
+            _reply(root_id, text=text, reply_in_thread=True)
+            if session_id:
+                session_store.mark_subscribed(session_id)
             return {"ok": True, "msg_id": root_id}
 
     return {"ok": False, "error": "send failed"}

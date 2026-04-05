@@ -153,6 +153,10 @@ Claude Code hooks call `walkcode hook {stop|notification|permission-request}` wh
 - **elicitation_dialog** — When the notification carries an `AskUserQuestion` payload (with `question` and `options` fields), WalkCode sends an interactive card with option buttons instead of plain text. Supports multi-question flows: each question generates a card, the card auto-updates to the next question when answered, and all answers are returned together after the last question.
 - **Other matchers** — Sent as plain text messages in the Feishu thread.
 
+### Thread subscription
+
+Feishu does not send push notifications for thread replies unless the user has subscribed to the thread. WalkCode auto-subscribes the user by @mentioning them (`<at user_id="..."></at>`) in the **first** thread reply of each session. The `Session.subscribed` flag tracks this — once set to `True`, subsequent replies are sent without @mention.
+
 ### Stop / Notification payload
 
 ```json
