@@ -62,19 +62,35 @@ _perm_events: dict[str, threading.Event] = {}  # request_id → Event for signal
 
 
 def _capture_terminal_options(tty: str) -> list[str]:
-    """Capture numbered option text from the terminal's permission prompt via tmux."""
+    """Capture numbered option text from the terminal's permission prompt via tmux.
+
+    Parses from the bottom up to find the last contiguous block of numbered
+    lines, then takes only the final "restart-at-1" subsequence.  This avoids
+    false-matching numbered lines in user input, plan content, or tool output.
+    """
     try:
         result = subprocess.run(
             ["tmux", "capture-pane", "-t", tty, "-p", "-S", "-15"],
             capture_output=True, text=True, timeout=5,
         )
-        options = []
-        for line in result.stdout.split("\n"):
-            # Match "❯ 1. Option text" or "   2. Option text"
+        # Collect last contiguous block of numbered lines (bottom-up)
+        items: list[tuple[int, str]] = []  # (number, text)
+        for line in reversed(result.stdout.split("\n")):
             m = re.match(r'\s*[❯>]?\s*(\d+)\.\s+(.+)', line)
             if m:
-                options.append(m.group(2).strip())
-        return options
+                items.insert(0, (int(m.group(1)), m.group(2).strip()))
+            elif items:
+                break
+        if not items:
+            return []
+        # Permission options always start at 1; if plan content (1..N) is
+        # contiguous with options (1..3), find the last restart at 1.
+        last_restart = 0
+        for i in range(len(items) - 1, -1, -1):
+            if items[i][0] == 1:
+                last_restart = i
+                break
+        return [text for _, text in items[last_restart:]]
     except Exception as e:
         logger.warning(f"Failed to capture terminal options from {tty}: {e}")
         return []
