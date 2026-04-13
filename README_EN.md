@@ -145,7 +145,52 @@ walkcode start
 
 That's it. Type `claude` and go for a walk.
 
-#### 4. (Recommended) Prevent macOS from Sleeping
+#### 4. (Recommended) Auto-start on Login
+
+Create a launchd plist so WalkCode starts automatically when you log in:
+
+```bash
+cat > ~/Library/LaunchAgents/com.walkcode.plist << 'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.walkcode</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/YOU/.local/bin/walkcode</string>
+        <string>start</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+</dict>
+</plist>
+EOF
+```
+
+> **Important:** Replace `/Users/YOU/.local/bin/walkcode` with your actual walkcode path (run `which walkcode` to find it).
+>
+> The `PATH` in `EnvironmentVariables` must include the directories containing `tmux` and `claude` (typically `/opt/homebrew/bin`). Without this, WalkCode will fail to start because it cannot find tmux.
+
+Load and start:
+
+```bash
+launchctl load ~/Library/LaunchAgents/com.walkcode.plist
+```
+
+Stop and unload:
+
+```bash
+launchctl unload ~/Library/LaunchAgents/com.walkcode.plist
+```
+
+#### 5. (Recommended) Prevent macOS from Sleeping
 
 WalkCode depends on a persistent network connection to receive Feishu messages. If your Mac goes to sleep while on AC power, the network is suspended — messages sent while it sleeps will not be received until it wakes up.
 

@@ -34,6 +34,22 @@ _T: dict[str, tuple[str, str]] = {
         "tmux 检查失败: {error}",
     ),
 
+    # --- __main__.py: preflight ---
+    "preflight.tmux_not_found": (
+        "❌ tmux is not installed or not in PATH.\n"
+        "   Install: brew install tmux\n"
+        "   If running via launchd, add /opt/homebrew/bin to PATH in your plist.\n"
+        "   See: https://github.com/0x5446/walkcode#开机自启动推荐",
+        "❌ tmux 未安装或不在 PATH 中。\n"
+        "   安装: brew install tmux\n"
+        "   如果通过 launchd 启动，需要在 plist 中将 /opt/homebrew/bin 加入 PATH。\n"
+        "   参考: https://github.com/0x5446/walkcode#开机自启动推荐",
+    ),
+    "preflight.claude_not_found": (
+        "⚠️  claude (Claude Code CLI) not found in PATH. Remote start will fail.",
+        "⚠️  claude (Claude Code CLI) 不在 PATH 中，远程启动将无法工作。",
+    ),
+
     # --- __main__.py: serve ---
     "serve.listening": (
         "WalkCode serving on http://localhost:{port}",

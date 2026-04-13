@@ -149,7 +149,52 @@ walkcode start
 
 搞定。输入 `claude`，然后出门散步。
 
-#### 4. （推荐）防止 macOS 系统休眠
+#### 4. （推荐）开机自启动
+
+创建 launchd plist 文件，让 WalkCode 在登录时自动启动：
+
+```bash
+cat > ~/Library/LaunchAgents/com.walkcode.plist << 'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.walkcode</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/YOU/.local/bin/walkcode</string>
+        <string>start</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+</dict>
+</plist>
+EOF
+```
+
+> **重要：** 将 `/Users/YOU/.local/bin/walkcode` 替换为你实际的 walkcode 路径（通过 `which walkcode` 查看）。
+>
+> `EnvironmentVariables` 中的 `PATH` 必须包含 `tmux` 和 `claude` 所在的目录（通常是 `/opt/homebrew/bin`），否则 WalkCode 启动后会因找不到 tmux 而报错。
+
+加载并启动：
+
+```bash
+launchctl load ~/Library/LaunchAgents/com.walkcode.plist
+```
+
+停止并卸载：
+
+```bash
+launchctl unload ~/Library/LaunchAgents/com.walkcode.plist
+```
+
+#### 5. （推荐）防止 macOS 系统休眠
 
 WalkCode 依赖持续的网络连接来接收飞书消息。如果 Mac 在接外部电源时进入系统休眠，网络会被挂起——休眠期间发送的消息直到唤醒后才会被收到，期间无法远程操控电脑。
 

@@ -18,11 +18,22 @@ _PID_FILE = _RUNTIME_DIR / "walkcode.pid"
 _DEFAULT_LOG = _RUNTIME_DIR / "walkcode.log"
 
 
+def _preflight_check():
+    """Verify required external tools are available before starting."""
+    import shutil
+    if not shutil.which("tmux"):
+        print(t("preflight.tmux_not_found"), file=sys.stderr)
+        sys.exit(1)
+    if not shutil.which("claude"):
+        print(t("preflight.claude_not_found"), file=sys.stderr)
+
+
 def cmd_serve(_args):
     import uvicorn
     from .config import Config
     from .server import app, init, start_ws_client
 
+    _preflight_check()
     cfg = Config.load()
     init(cfg)
     logging.basicConfig(
