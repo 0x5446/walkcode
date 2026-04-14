@@ -34,6 +34,13 @@ def cmd_serve(_args):
     from .server import app, init, start_ws_client
 
     _preflight_check()
+    # Auto-cleanup images older than 180 days
+    try:
+        cleaned = _clean_images(180)
+        if cleaned:
+            print(f"Auto-cleaned {cleaned} image(s) older than 180 days")
+    except Exception:
+        pass
     cfg = Config.load()
     init(cfg)
     logging.basicConfig(
@@ -492,6 +499,37 @@ def cmd_uninstall(_args):
     print(t("uninstall.complete"))
 
 
+_IMAGE_DIR = _RUNTIME_DIR / "images"
+_AGE_MAP = {"1d": 1, "1w": 7, "1m": 30, "180d": 180}
+
+
+def _clean_images(max_age_days: int) -> int:
+    """Remove images older than max_age_days. Returns count of deleted files."""
+    if not _IMAGE_DIR.exists():
+        return 0
+    import datetime
+    cutoff = datetime.datetime.now().timestamp() - max_age_days * 86400
+    count = 0
+    for f in _IMAGE_DIR.iterdir():
+        if f.is_file() and f.stat().st_mtime < cutoff:
+            f.unlink()
+            count += 1
+    return count
+
+
+def cmd_clean_images(args):
+    age = args.age
+    days = _AGE_MAP.get(age)
+    if days is None:
+        print(f"Invalid age: {age}. Use one of: {', '.join(_AGE_MAP.keys())}")
+        sys.exit(1)
+    count = _clean_images(days)
+    if count:
+        print(t("clean_images.cleaned", count=count, age=age))
+    else:
+        print(t("clean_images.none"))
+
+
 def cmd_test_inject(args):
     from .tty import inject, validate_target
 
@@ -529,6 +567,9 @@ def main():
     sub.add_parser("upgrade", help="Upgrade to latest release")
     sub.add_parser("uninstall", help="Uninstall WalkCode completely")
 
+    cp = sub.add_parser("clean-images", help="Clean downloaded Feishu images")
+    cp.add_argument("age", choices=list(_AGE_MAP.keys()), help="Delete images older than: 1d, 1w, 1m, 180d")
+
     p = sub.add_parser("test-inject", help="Test tmux injection")
     p.add_argument("session", help="tmux session name")
     p.add_argument("text", help="Text to inject")
@@ -545,6 +586,7 @@ def main():
         "install-hooks": cmd_install_hooks,
         "upgrade": cmd_upgrade,
         "uninstall": cmd_uninstall,
+        "clean-images": cmd_clean_images,
         "test-inject": cmd_test_inject,
     }
     fn = cmds.get(args.command)

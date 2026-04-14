@@ -341,6 +341,28 @@ _T: dict[str, tuple[str, str]] = {
         "⚠️ Only text replies are supported",
         "⚠️ 只支持文本回复",
     ),
+    "feishu.unsupported_type": (
+        "⚠️ Only text, image and rich text messages are supported",
+        "⚠️ 仅支持文本、图片和富文本消息",
+    ),
+
+    # --- image ---
+    "image.label": (
+        "Image {n}",
+        "图{n}",
+    ),
+    "image.download_failed": (
+        "image download failed",
+        "图片下载失败",
+    ),
+    "clean_images.cleaned": (
+        "Cleaned {count} image(s) older than {age}",
+        "已清理 {count} 张 {age} 前的图片",
+    ),
+    "clean_images.none": (
+        "No images to clean",
+        "没有需要清理的图片",
+    ),
     "feishu.session_expired": (
         "⚠️ Session expired, send a new message to start",
         "⚠️ 会话已过期，请发送新消息开始新会话",

@@ -27,6 +27,7 @@ Your agent hits a permission prompt while you're away. Without WalkCode, it bloc
 - **Permission approvals** — approve or deny directly from chat
 - **Question answering** — AskUserQuestion interactive cards with multi-question sequential flow
 - **Text replies** — reply in a thread to type directly into the agent's terminal
+- **Image & rich text** — send images or rich text (text + images); images are auto-downloaded and passed to the agent
 - **Remote start** — send a message to start a new agent session from your phone
 - **Session resume** — reply in an expired thread to automatically resume the conversation
 - **Auto-cleanup** — idle tmux sessions are killed after 2 hours and you get notified
@@ -299,6 +300,8 @@ uv run walkcode install-hooks
 |----------|-------------|-------------|
 | Permission prompt | Interactive card with tool details | Tap **Allow** / **Deny** / **Always Allow** |
 | Question from agent | Interactive card with option buttons | Tap an option; for multi-question flows the card auto-advances |
+| Send image | Reply with image in thread | Image auto-downloaded, passed as `![Image N](path)` to agent |
+| Send rich text | Reply with rich text in thread | Text and images preserved in order, images auto-downloaded |
 | Waiting for input | Text in thread | Reply with text |
 | Task complete | Text in thread | Reply to continue, or ignore |
 | Session expired | Reply in old thread | Agent resumes automatically via `--resume` |
@@ -317,6 +320,7 @@ walkcode install-hooks                    # Install hooks
 walkcode upgrade                          # Pull + reinstall + restart
 walkcode uninstall                        # Uninstall WalkCode
 walkcode test-inject <tmux-session> "hi"  # Test injection
+walkcode clean-images 1d                  # Clean images older than 1d (1d/1w/1m/180d)
 ```
 
 ## Configuration

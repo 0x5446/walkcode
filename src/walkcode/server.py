@@ -19,6 +19,7 @@ from lark_oapi.api.im.v1 import (
     CreateMessageRequestBody,
     CreateMessageReactionRequest,
     CreateMessageReactionRequestBody,
+    GetMessageResourceRequest,
     ReplyMessageRequest,
     ReplyMessageRequestBody,
     PatchMessageRequest,
@@ -313,6 +314,131 @@ _FAILURE_EMOJIS = [
 ]
 
 _MENTION_RE = re.compile(r"@_user_\d+\s*")
+_IMAGE_DIR = Path.home() / ".walkcode" / "images"
+
+
+_IMAGE_MAGIC = {
+    b"\xff\xd8\xff": "jpg",
+    b"\x89PNG": "png",
+    b"GIF8": "gif",
+    b"RIFF": "webp",  # RIFF....WEBP
+}
+
+
+def _detect_image_ext(data: bytes) -> str:
+    """Detect image format from magic bytes."""
+    for magic, ext in _IMAGE_MAGIC.items():
+        if data[:len(magic)] == magic:
+            return ext
+    return "png"
+
+
+def _download_image(message_id: str, image_key: str) -> str | None:
+    """Download an image from Feishu and save to local disk. Returns absolute path or None."""
+    _IMAGE_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        request = GetMessageResourceRequest.builder() \
+            .message_id(message_id) \
+            .file_key(image_key) \
+            .type("image") \
+            .build()
+        resp = lark_client.im.v1.message_resource.get(request)
+        if not resp.success():
+            logger.error(f"Download image failed: {resp.code} {resp.msg}")
+            return None
+        data = resp.file.read()
+        ext = _detect_image_ext(data)
+        filename = f"{int(time.time())}_{image_key[:16]}.{ext}"
+        filepath = _IMAGE_DIR / filename
+        filepath.write_bytes(data)
+        logger.info(f"Downloaded image: {filepath} ({len(data)} bytes)")
+        return str(filepath)
+    except Exception as e:
+        logger.error(f"Download image error: {e}")
+        return None
+
+
+def _parse_message_content(msg, message_id: str) -> str | None:
+    """Parse Feishu message content (text/image/post) into injectable text.
+
+    Returns the text to inject (may include markdown image refs), or None if empty/unsupported.
+    """
+    msg_type = msg.message_type
+    try:
+        content = json.loads(msg.content)
+    except (json.JSONDecodeError, TypeError):
+        return None
+
+    if msg_type == "text":
+        text = content.get("text", "").strip()
+        return _MENTION_RE.sub("", text).strip() or None
+
+    if msg_type == "image":
+        image_key = content.get("image_key", "")
+        if not image_key:
+            return None
+        path = _download_image(message_id, image_key)
+        if not path:
+            return None
+        return f"![{t('image.label', n=1)}]({path})"
+
+    if msg_type == "post":
+        return _parse_post_content(content, message_id)
+
+    return None
+
+
+def _parse_post_content(content: dict, message_id: str) -> str | None:
+    """Parse a post (rich text) message, preserving text and image positions."""
+    # post content structure: {"title": "...", "content": [[{tag, ...}], ...]}
+    # content may be localized: {"zh_cn": {"title": ..., "content": ...}}
+    post_body = content
+    if "content" not in post_body:
+        # Try localized keys
+        for key in ("zh_cn", "en_us", "ja_jp"):
+            if key in content:
+                post_body = content[key]
+                break
+    paragraphs = post_body.get("content", [])
+    if not paragraphs:
+        return None
+
+    parts: list[str] = []
+    title = post_body.get("title", "").strip()
+    if title:
+        parts.append(title)
+
+    img_counter = 0
+    for paragraph in paragraphs:
+        line_parts: list[str] = []
+        for element in paragraph:
+            tag = element.get("tag", "")
+            if tag == "text":
+                t_text = element.get("text", "")
+                if t_text:
+                    line_parts.append(t_text)
+            elif tag == "at":
+                # skip @mentions
+                pass
+            elif tag == "a":
+                href = element.get("href", "")
+                a_text = element.get("text", href)
+                line_parts.append(f"[{a_text}]({href})" if href else a_text)
+            elif tag == "img":
+                image_key = element.get("image_key", "")
+                if image_key:
+                    img_counter += 1
+                    path = _download_image(message_id, image_key)
+                    if path:
+                        line_parts.append(f"![{t('image.label', n=img_counter)}]({path})")
+                    else:
+                        line_parts.append(f"[{t('image.download_failed')}]")
+        if line_parts:
+            parts.append("".join(line_parts))
+
+    result = "\n".join(parts).strip()
+    result = _MENTION_RE.sub("", result).strip()
+    return result or None
 
 
 def _make_title(cwd: str, session_id: str = "", message: str = "") -> str:
@@ -741,13 +867,27 @@ def _add_permission_rule(tool_name: str):
 
 # --- Feishu WebSocket event handlers ---
 
+_CLAUDE_ENV_PREFIXES = ("ANTHROPIC_", "CLAUDE_CODE_", "CLAUDE_")
+
+
+def _build_claude_env_exports() -> str:
+    """Build shell export statements for Claude-related env vars."""
+    exports = []
+    for key, value in os.environ.items():
+        if any(key.startswith(p) for p in _CLAUDE_ENV_PREFIXES):
+            escaped_val = value.replace("'", "'\\''")
+            exports.append(f"export {key}='{escaped_val}'")
+    return " && ".join(exports) + " && " if exports else ""
+
+
 def _start_claude(prompt: str, message_id: str):
     """Start a Claude Code instance in a tmux session, triggered from Feishu."""
     cwd = config.default_cwd
     os.makedirs(cwd, exist_ok=True)
     tmux_name = f"walkcode-{int(time.time())}"
     escaped = prompt.replace("'", "'\\''")
-    cmd = f"cd '{cwd}' && claude --permission-mode default '{escaped}'"
+    env_exports = _build_claude_env_exports()
+    cmd = f"{env_exports}cd '{cwd}' && claude --permission-mode default '{escaped}'"
 
     try:
         result = subprocess.run(
@@ -775,7 +915,8 @@ def _resume_claude(session_id: str, old_session: Session, reply_text: str, messa
     cwd = old_session.cwd or config.default_cwd
     tmux_name = f"walkcode-{int(time.time())}"
     escaped_sid = session_id.replace("'", "'\\''")
-    cmd = f"cd '{cwd}' && claude --resume '{escaped_sid}' --permission-mode default"
+    env_exports = _build_claude_env_exports()
+    cmd = f"{env_exports}cd '{cwd}' && claude --resume '{escaped_sid}' --permission-mode default"
 
     try:
         result = subprocess.run(
@@ -821,16 +962,12 @@ def _on_message(data: P2ImMessageReceiveV1):
     message_id = msg.message_id
 
     # --- Parse message content early ---
-    if msg.message_type != "text":
+    if msg.message_type not in ("text", "image", "post"):
         if parent_id or root_id:
-            _reply(message_id, t("feishu.text_only"))
+            _reply(message_id, t("feishu.unsupported_type"))
         return
 
-    try:
-        text = json.loads(msg.content).get("text", "").strip()
-    except (json.JSONDecodeError, TypeError):
-        return
-    text = _MENTION_RE.sub("", text).strip()
+    text = _parse_message_content(msg, message_id)
     if not text:
         return
 
