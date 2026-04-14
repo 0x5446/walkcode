@@ -49,6 +49,10 @@ _T: dict[str, tuple[str, str]] = {
         "⚠️  claude (Claude Code CLI) not found in PATH. Remote start will fail.",
         "⚠️  claude (Claude Code CLI) 不在 PATH 中，远程启动将无法工作。",
     ),
+    "preflight.agent_not_found": (
+        "⚠️  {agent} CLI not found in PATH. Remote start will fail.",
+        "⚠️  {agent} CLI 不在 PATH 中，远程启动将无法工作。",
+    ),
 
     # --- __main__.py: serve ---
     "serve.listening": (

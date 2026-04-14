@@ -37,6 +37,7 @@ from importlib.metadata import version as pkg_version
 
 from fastapi import FastAPI, Request
 
+from .agent import AgentAdapter, get_agent
 from .config import Config
 from .i18n import t
 from .state import Session, SessionStore
@@ -51,6 +52,7 @@ app = FastAPI(title="WalkCode", version=pkg_version("walkcode"))
 config: Config = None  # type: ignore
 lark_client: lark.Client = None  # type: ignore
 session_store: SessionStore = None  # type: ignore
+agent_adapter: AgentAdapter = None  # type: ignore
 _IDLE_TIMEOUT = 7200  # 2h — kill tmux sessions idle longer than this
 _REAPER_INTERVAL = 600  # 10min — how often the idle reaper runs
 
@@ -250,7 +252,7 @@ def _build_permission_result_card(tool_name: str, behavior: str) -> dict:
     elif behavior == "accept_edits":
         label = t("feishu.setmode.accepted")
         template = "green"
-    elif behavior == "allow":
+    elif behavior in ("allow", "plan_auto_accept", "plan_manual_approve"):
         label = t("feishu.perm.allowed")
         template = "green"
     else:
@@ -867,27 +869,13 @@ def _add_permission_rule(tool_name: str):
 
 # --- Feishu WebSocket event handlers ---
 
-_CLAUDE_ENV_PREFIXES = ("ANTHROPIC_", "CLAUDE_CODE_", "CLAUDE_")
-
-
-def _build_claude_env_exports() -> str:
-    """Build shell export statements for Claude-related env vars."""
-    exports = []
-    for key, value in os.environ.items():
-        if any(key.startswith(p) for p in _CLAUDE_ENV_PREFIXES):
-            escaped_val = value.replace("'", "'\\''")
-            exports.append(f"export {key}='{escaped_val}'")
-    return " && ".join(exports) + " && " if exports else ""
-
-
-def _start_claude(prompt: str, message_id: str):
-    """Start a Claude Code instance in a tmux session, triggered from Feishu."""
+def _start_agent(prompt: str, message_id: str, image_path: str | None = None):
+    """Start an agent instance in a tmux session, triggered from Feishu."""
     cwd = config.default_cwd
     os.makedirs(cwd, exist_ok=True)
     tmux_name = f"walkcode-{int(time.time())}"
-    escaped = prompt.replace("'", "'\\''")
-    env_exports = _build_claude_env_exports()
-    cmd = f"{env_exports}cd '{cwd}' && claude --permission-mode default '{escaped}'"
+    env_exports = agent_adapter.build_env_exports()
+    cmd = f"{env_exports}{agent_adapter.build_start_cmd(prompt, cwd, image_path)}"
 
     try:
         result = subprocess.run(
@@ -899,7 +887,7 @@ def _start_claude(prompt: str, message_id: str):
             _reply(message_id, t("feishu.start_failed", error=result.stderr.strip()), reply_in_thread=True)
             return
     except Exception as e:
-        logger.error(f"Start Claude failed: {e}")
+        logger.error(f"Start {agent_adapter.name} failed: {e}")
         _reply(message_id, t("feishu.start_failed", error=e), reply_in_thread=True)
         return
 
@@ -907,16 +895,15 @@ def _start_claude(prompt: str, message_id: str):
     reply_id = _reply(message_id, t("feishu.started", tmux=tmux_name), reply_in_thread=True)
     if reply_id:
         session_store.update_pending_reply(tmux_name, reply_id)
-    logger.info(f"Started Claude Code: tmux={tmux_name} cwd={cwd} prompt={prompt[:50]}")
+    logger.info(f"Started {agent_adapter.name}: tmux={tmux_name} cwd={cwd} prompt={prompt[:50]}")
 
 
-def _resume_claude(session_id: str, old_session: Session, reply_text: str, message_id: str):
-    """Resume a dead Claude session in a new tmux, reusing the Feishu thread."""
+def _resume_agent(session_id: str, old_session: Session, reply_text: str, message_id: str):
+    """Resume a dead agent session in a new tmux, reusing the Feishu thread."""
     cwd = old_session.cwd or config.default_cwd
     tmux_name = f"walkcode-{int(time.time())}"
-    escaped_sid = session_id.replace("'", "'\\''")
-    env_exports = _build_claude_env_exports()
-    cmd = f"{env_exports}cd '{cwd}' && claude --resume '{escaped_sid}' --permission-mode default"
+    env_exports = agent_adapter.build_env_exports()
+    cmd = f"{env_exports}{agent_adapter.build_resume_cmd(session_id, cwd)}"
 
     try:
         result = subprocess.run(
@@ -928,13 +915,13 @@ def _resume_claude(session_id: str, old_session: Session, reply_text: str, messa
             _reply(message_id, t("feishu.resume_failed", error=result.stderr.strip()))
             return
     except Exception as e:
-        logger.error(f"Resume Claude failed: {e}")
+        logger.error(f"Resume {agent_adapter.name} failed: {e}")
         _reply(message_id, t("feishu.resume_failed", error=e))
         return
 
     session_store.upsert(session_id, tty=tmux_name, cwd=cwd, root_msg_id=old_session.root_msg_id)
     _reply(message_id, t("feishu.resumed", tmux=tmux_name))
-    logger.info(f"Resumed Claude: session={session_id[:8]} tmux={tmux_name} cwd={cwd}")
+    logger.info(f"Resumed {agent_adapter.name}: session={session_id[:8]} tmux={tmux_name} cwd={cwd}")
 
     if reply_text.strip():
         def _delayed_inject():
@@ -971,9 +958,20 @@ def _on_message(data: P2ImMessageReceiveV1):
     if not text:
         return
 
-    # --- New message: start a new Claude Code instance ---
+    # --- New message: start a new agent instance ---
     if not parent_id and not root_id:
-        _start_claude(text, message_id)
+        # For agents with native --image flag (e.g. Codex), extract first image path
+        image_path = None
+        if agent_adapter.image_flag and msg.message_type == "image":
+            try:
+                content = json.loads(msg.content)
+                image_key = content.get("image_key", "")
+                if image_key:
+                    image_path = _download_image(message_id, image_key)
+                    text = ""  # prompt is just the image
+            except Exception:
+                pass
+        _start_agent(text, message_id, image_path=image_path)
         return
 
     # --- Reply: route to existing session ---
@@ -986,7 +984,7 @@ def _on_message(data: P2ImMessageReceiveV1):
         if session_error:
             if session:
                 # tmux dead but session data exists → resume
-                _resume_claude(session_id, session, text, message_id)
+                _resume_agent(session_id, session, text, message_id)
             else:
                 _reply(message_id, t("feishu.session_expired"))
             return
@@ -1289,8 +1287,9 @@ def _start_idle_reaper():
 # --- Init ---
 
 def init(cfg: Config):
-    global config, lark_client, session_store
+    global config, lark_client, session_store, agent_adapter
     config = cfg
+    agent_adapter = get_agent(cfg.agent)
     lark_client = lark.Client.builder() \
         .app_id(cfg.feishu_app_id) \
         .app_secret(cfg.feishu_app_secret) \

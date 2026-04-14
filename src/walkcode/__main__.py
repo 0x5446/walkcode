@@ -14,18 +14,55 @@ from .i18n import t
 from .tty import detect_tmux_session
 
 _RUNTIME_DIR = Path.home() / ".walkcode"
-_PID_FILE = _RUNTIME_DIR / "walkcode.pid"
-_DEFAULT_LOG = _RUNTIME_DIR / "walkcode.log"
+
+
+def _quick_load_env(keys: set[str]):
+    """Load specific keys from the env file into os.environ (if not already set)."""
+    env_file_override = os.environ.get("WALKCODE_ENV_FILE")
+    path = Path(env_file_override).expanduser() if env_file_override else _RUNTIME_DIR / ".env"
+    if not path.exists():
+        return
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        k, _, v = line.partition("=")
+        k, v = k.strip(), v.strip()
+        if k in keys and k not in os.environ:
+            os.environ[k] = v
+
+
+def _instance_name() -> str:
+    """Return effective instance name for PID/log file naming."""
+    _quick_load_env({"WALKCODE_AGENT", "WALKCODE_INSTANCE"})
+    agent = os.environ.get("WALKCODE_AGENT", "claude")
+    instance = os.environ.get("WALKCODE_INSTANCE", "")
+    effective = instance or agent
+    # backward compat: default claude instance uses "walkcode" prefix
+    if agent == "claude" and not instance:
+        return "walkcode"
+    return effective
+
+
+def _pid_file() -> Path:
+    return _RUNTIME_DIR / f"{_instance_name()}.pid"
+
+
+def _log_file() -> Path:
+    return _RUNTIME_DIR / f"{_instance_name()}.log"
 
 
 def _preflight_check():
     """Verify required external tools are available before starting."""
     import shutil
+    from .agent import get_agent
     if not shutil.which("tmux"):
         print(t("preflight.tmux_not_found"), file=sys.stderr)
         sys.exit(1)
-    if not shutil.which("claude"):
-        print(t("preflight.claude_not_found"), file=sys.stderr)
+    agent_name = os.environ.get("WALKCODE_AGENT", "claude")
+    agent = get_agent(agent_name)
+    if not shutil.which(agent.command):
+        print(t("preflight.agent_not_found", agent=agent.command), file=sys.stderr)
 
 
 def cmd_serve(_args):
@@ -61,14 +98,15 @@ def cmd_serve(_args):
 # --- Daemon management ---
 
 def _read_pid() -> int | None:
-    if not _PID_FILE.exists():
+    pf = _pid_file()
+    if not pf.exists():
         return None
     try:
-        pid = int(_PID_FILE.read_text().strip())
+        pid = int(pf.read_text().strip())
         os.kill(pid, 0)  # check alive
         return pid
     except (ValueError, OSError):
-        _PID_FILE.unlink(missing_ok=True)
+        pf.unlink(missing_ok=True)
         return None
 
 
@@ -96,6 +134,9 @@ def cmd_start(args):
     # Build command: use the same Python + module to run serve
     cmd = [sys.executable, "-m", "walkcode", "serve"]
 
+    # Propagate env file and agent config to child process
+    env = os.environ.copy()
+
     if log_path:
         log_file = open(log_path, "a")
         stdout = stderr = log_file
@@ -109,9 +150,10 @@ def cmd_start(args):
         stdin=subprocess.DEVNULL,
         start_new_session=True,
         cwd=os.getcwd(),
+        env=env,
     )
 
-    _PID_FILE.write_text(str(proc.pid))
+    _pid_file().write_text(str(proc.pid))
     if log_path:
         print(t("start.started_with_log", pid=proc.pid, log=log_path))
     else:
@@ -125,12 +167,13 @@ def cmd_stop(_args):
         sys.exit(1)
 
     os.kill(pid, signal.SIGTERM)
+    pf = _pid_file()
     if _wait_exit(pid):
-        _PID_FILE.unlink(missing_ok=True)
+        pf.unlink(missing_ok=True)
         print(t("stop.stopped", pid=pid))
     else:
         os.kill(pid, signal.SIGKILL)
-        _PID_FILE.unlink(missing_ok=True)
+        pf.unlink(missing_ok=True)
         print(t("stop.killed", pid=pid))
 
 
@@ -140,7 +183,7 @@ def cmd_restart(args):
         os.kill(pid, signal.SIGTERM)
         if not _wait_exit(pid):
             os.kill(pid, signal.SIGKILL)
-        _PID_FILE.unlink(missing_ok=True)
+        _pid_file().unlink(missing_ok=True)
         print(t("stop.stopped", pid=pid))
 
     cmd_start(args)
@@ -156,8 +199,8 @@ def cmd_status(_args):
 
 
 def cmd_hook(args):
-    """Handle a Claude Code hook event: read stdin, POST to server."""
-    # Read hook data from stdin (Claude Code pipes JSON)
+    """Handle an agent hook event: read stdin, POST to server."""
+    # Read hook data from stdin (agent pipes JSON)
     try:
         hook_data = json.load(sys.stdin)
     except (json.JSONDecodeError, ValueError):
@@ -202,12 +245,14 @@ def cmd_hook(args):
             )
             urllib.request.urlopen(req, timeout=5)
         except Exception:
-            pass  # best-effort, don't block Claude startup
+            pass  # best-effort, don't block startup
         return
 
-    # --- PermissionRequest: send card, poll for decision ---
+    # --- PermissionRequest / PreToolUse: send card, poll for decision ---
     if args.hook_type == "permission-request":
         import time as _time
+        from .agent import get_agent
+
         tool_name = hook_data.get("tool_name", "")
         tool_input = hook_data.get("tool_input", {})
 
@@ -240,6 +285,9 @@ def cmd_hook(args):
         decision_url = f"http://127.0.0.1:{port}/hook/permission/{request_id}/decision"
         deadline = _time.monotonic() + 120
 
+        agent_name = os.environ.get("WALKCODE_AGENT", "claude")
+        agent = get_agent(agent_name)
+
         while _time.monotonic() < deadline:
             try:
                 req = urllib.request.Request(decision_url)
@@ -250,22 +298,16 @@ def cmd_hook(args):
                     decision = result["decision"]
                     behavior = decision.get("behavior", "deny")
 
-                    # AskUserQuestion: exit without hook response so Claude
+                    # AskUserQuestion: exit without hook response so agent
                     # falls back to the interactive terminal prompt.
                     # The server injects the answer via tmux after we exit.
                     if tool_name == "AskUserQuestion":
                         sys.exit(2)
 
-                    decision_obj = {"behavior": behavior}
-                    # Pass through updatedPermissions from server (permission_suggestions)
-                    if "updatedPermissions" in decision:
-                        decision_obj["updatedPermissions"] = decision["updatedPermissions"]
-                    hook_response = {
-                        "hookSpecificOutput": {
-                            "hookEventName": "PermissionRequest",
-                            "decision": decision_obj,
-                        }
-                    }
+                    hook_response = agent.build_hook_response(
+                        behavior=behavior,
+                        updated_permissions=decision.get("updatedPermissions"),
+                    )
 
                     print(json.dumps(hook_response), flush=True)
                     sys.exit(0 if behavior == "allow" else 2)
@@ -313,7 +355,10 @@ def cmd_hook(args):
         print(t("hook.failed", error=e), file=sys.stderr)
 
 
-def cmd_install_hooks(_args):
+# --- Hook installation ---
+
+def _install_claude_hooks(_args):
+    """Install hooks into Claude Code settings.json."""
     settings_path = Path.home() / ".claude" / "settings.json"
     if not settings_path.exists():
         print(t("install_hooks.not_found", path=settings_path))
@@ -342,6 +387,64 @@ def cmd_install_hooks(_args):
     settings_path.write_text(json.dumps(settings, indent=2, ensure_ascii=False) + "\n")
     print(t("install_hooks.done", path=settings_path))
     print(t("install_hooks.restart_hint"))
+
+
+def _install_codex_hooks(_args):
+    """Install hooks into Codex CLI hooks.json and enable feature flag."""
+    port = os.environ.get("WALKCODE_PORT", os.environ.get("PORT", "3001"))
+    port_env = f"WALKCODE_PORT={port} " if port != "3001" else ""
+
+    def hook_cmd(hook_type: str, sound: str) -> str:
+        return f"afplay /System/Library/Sounds/{sound}.aiff & {port_env}walkcode hook {hook_type}"
+
+    hooks_config = {
+        "hooks": {
+            "SessionStart": [{"matcher": "", "hooks": [
+                {"type": "command", "command": f"{port_env}walkcode hook sync", "timeout": 5}
+            ]}],
+            "Stop": [{"matcher": "", "hooks": [
+                {"type": "command", "command": hook_cmd("stop", "Hero")}
+            ]}],
+            "PreToolUse": [{"matcher": "", "hooks": [
+                {"type": "command", "command": f"afplay /System/Library/Sounds/Ping.aiff & {port_env}walkcode hook permission-request", "timeout": 120}
+            ]}],
+        }
+    }
+
+    hooks_path = Path.home() / ".codex" / "hooks.json"
+    hooks_path.parent.mkdir(parents=True, exist_ok=True)
+    hooks_path.write_text(json.dumps(hooks_config, indent=2) + "\n")
+
+    # Enable feature flag in config.toml
+    config_toml = Path.home() / ".codex" / "config.toml"
+    _ensure_codex_hooks_feature(config_toml)
+
+    print(t("install_hooks.done", path=hooks_path))
+    print(t("install_hooks.restart_hint"))
+
+
+def _ensure_codex_hooks_feature(config_toml: Path):
+    """Ensure [features] codex_hooks = true in Codex config.toml."""
+    if config_toml.exists():
+        content = config_toml.read_text()
+        if "codex_hooks" in content:
+            return
+        if "[features]" in content:
+            content = content.replace("[features]", "[features]\ncodex_hooks = true")
+        else:
+            content += "\n[features]\ncodex_hooks = true\n"
+        config_toml.write_text(content)
+    else:
+        config_toml.parent.mkdir(parents=True, exist_ok=True)
+        config_toml.write_text("[features]\ncodex_hooks = true\n")
+
+
+def cmd_install_hooks(args):
+    agent_name = getattr(args, "agent", None) or os.environ.get("WALKCODE_AGENT", "claude")
+    if agent_name == "codex":
+        _install_codex_hooks(args)
+    else:
+        _install_claude_hooks(args)
 
 
 _GITHUB_REPO = "0x5446/walkcode"
@@ -392,19 +495,20 @@ def cmd_upgrade(_args):
 
     _run(f"uv tool install {source} --force")
 
-    cmd_install_hooks(None)
+    cmd_install_hooks(argparse.Namespace(agent=None))
 
     pid = _read_pid()
     if pid:
         print(t("upgrade.restarting"))
         os.kill(pid, signal.SIGTERM)
+        pf = _pid_file()
         if _wait_exit(pid):
-            _PID_FILE.unlink(missing_ok=True)
+            pf.unlink(missing_ok=True)
         else:
             os.kill(pid, signal.SIGKILL)
-            _PID_FILE.unlink(missing_ok=True)
+            pf.unlink(missing_ok=True)
         # Start with default log
-        cmd_start(argparse.Namespace(log=str(_DEFAULT_LOG)))
+        cmd_start(argparse.Namespace(log=str(_log_file())))
     else:
         print(t("upgrade.not_running"))
 
@@ -418,11 +522,12 @@ def cmd_uninstall(_args):
     if pid:
         print(t("uninstall.stopping", pid=pid))
         os.kill(pid, signal.SIGTERM)
+        pf = _pid_file()
         if _wait_exit(pid):
-            _PID_FILE.unlink(missing_ok=True)
+            pf.unlink(missing_ok=True)
         else:
             os.kill(pid, signal.SIGKILL)
-            _PID_FILE.unlink(missing_ok=True)
+            pf.unlink(missing_ok=True)
         print(t("uninstall.stopped"))
 
     # 2. Remove uv tool
@@ -438,13 +543,11 @@ def cmd_uninstall(_args):
         start = "# >>> walkcode claude wrapper >>>"
         end = "# <<< walkcode claude wrapper <<<"
         if start in content:
-            # Remove the block including surrounding blank lines
             lines = content.split("\n")
             new_lines = []
             skip = False
             for line in lines:
                 if start in line:
-                    # Also remove the blank line before the block
                     if new_lines and new_lines[-1].strip() == "":
                         new_lines.pop()
                     skip = True
@@ -551,19 +654,21 @@ def main():
     sub.add_parser("serve", help="Start server (foreground)")
 
     sp = sub.add_parser("start", help="Start server (background)")
-    sp.add_argument("--log", default=str(_DEFAULT_LOG), help=f"Log file path, '-' for none (default: {_DEFAULT_LOG})")
+    sp.add_argument("--log", default=str(_log_file()), help=f"Log file path, '-' for none (default: {_log_file()})")
 
     sub.add_parser("stop", help="Stop background server")
 
     rp = sub.add_parser("restart", help="Restart background server")
-    rp.add_argument("--log", default=str(_DEFAULT_LOG), help=f"Log file path, '-' for none (default: {_DEFAULT_LOG})")
+    rp.add_argument("--log", default=str(_log_file()), help=f"Log file path, '-' for none (default: {_log_file()})")
 
     sub.add_parser("status", help="Check if server is running")
 
-    hp = sub.add_parser("hook", help="Handle a Claude Code hook event (reads stdin)")
+    hp = sub.add_parser("hook", help="Handle an agent hook event (reads stdin)")
     hp.add_argument("hook_type", choices=["stop", "notification", "permission-request", "sync"], help="Hook event type")
 
-    sub.add_parser("install-hooks", help="Install Claude Code hooks")
+    ihp = sub.add_parser("install-hooks", help="Install agent hooks")
+    ihp.add_argument("--agent", choices=["claude", "codex"], default=None, help="Agent type (default: from WALKCODE_AGENT or claude)")
+
     sub.add_parser("upgrade", help="Upgrade to latest release")
     sub.add_parser("uninstall", help="Uninstall WalkCode completely")
 
