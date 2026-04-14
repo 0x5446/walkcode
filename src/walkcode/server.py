@@ -974,7 +974,7 @@ def _start_agent(prompt: str, message_id: str, image_path: str | None = None):
         return
 
     session_store.add_pending(tmux_name, message_id)
-    reply_id = _reply(message_id, t("feishu.started", tmux=tmux_name), reply_in_thread=True)
+    reply_id = _reply(message_id, t("feishu.started", agent=agent_adapter.name.title(), tmux=tmux_name), reply_in_thread=True)
     if reply_id:
         session_store.update_pending_reply(tmux_name, reply_id)
     logger.info(f"Started {agent_adapter.name}: tmux={tmux_name} cwd={cwd} prompt={prompt[:50]}")
@@ -1010,7 +1010,7 @@ def _resume_agent(session_id: str, old_session: Session, reply_text: str, messag
         return
 
     session_store.upsert(session_id, tty=tmux_name, cwd=cwd, root_msg_id=old_session.root_msg_id)
-    _reply(message_id, t("feishu.resumed", tmux=tmux_name))
+    _reply(message_id, t("feishu.resumed", agent=agent_adapter.name.title(), tmux=tmux_name))
     logger.info(f"Resumed {agent_adapter.name}: session={session_id[:8]} tmux={tmux_name} cwd={cwd}")
 
     if reply_text.strip():
@@ -1167,7 +1167,7 @@ async def receive_hook(request: Request):
                 session_store.upsert(session_id, tty=tty, cwd=cwd, root_msg_id=root_id)
                 # Update the launch reply with session info
                 if reply_id:
-                    _edit_message(reply_id, t("feishu.started_with_session", session_id=session_id[:8], tmux=tty))
+                    _edit_message(reply_id, t("feishu.started_with_session", agent=agent_adapter.name.title(), session_id=session_id[:8], tmux=tty))
             text = display_message
             if config.feishu_receive_id:
                 text = f'<at user_id="{config.feishu_receive_id}"></at> {text}'
@@ -1267,7 +1267,7 @@ async def receive_permission_hook(request: Request):
             if session_id:
                 session_store.upsert(session_id, tty=tty, cwd=cwd, root_msg_id=root_msg_id)
                 if reply_id:
-                    _edit_message(reply_id, t("feishu.started_with_session", session_id=session_id[:8], tmux=tty))
+                    _edit_message(reply_id, t("feishu.started_with_session", agent=agent_adapter.name.title(), session_id=session_id[:8], tmux=tty))
 
     # Generate appropriate card based on tool type and permission_suggestions
     permission_mode = hook_data_full.get("permission_mode", "")

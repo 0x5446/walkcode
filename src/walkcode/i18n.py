@@ -326,20 +326,20 @@ _T: dict[str, tuple[str, str]] = {
         "⚠️ 启动失败: {error}",
     ),
     "feishu.started": (
-        "🚀 Claude Code started\ntmux attach -t {tmux}",
-        "🚀 已启动 Claude Code\ntmux attach -t {tmux}",
+        "🚀 {agent} started\ntmux attach -t {tmux}",
+        "🚀 已启动 {agent}\ntmux attach -t {tmux}",
     ),
     "feishu.started_with_session": (
-        "🚀 Claude Code | {session_id}\ntmux attach -t {tmux}",
-        "🚀 Claude Code | {session_id}\ntmux attach -t {tmux}",
+        "🚀 {agent} | {session_id}\ntmux attach -t {tmux}",
+        "🚀 {agent} | {session_id}\ntmux attach -t {tmux}",
     ),
     "feishu.resume_failed": (
         "⚠️ Resume failed: {error}",
         "⚠️ 恢复失败: {error}",
     ),
     "feishu.resumed": (
-        "🔄 Claude Code session resumed\ntmux attach -t {tmux}",
-        "🔄 已恢复 Claude Code 会话\ntmux attach -t {tmux}",
+        "🔄 {agent} session resumed\ntmux attach -t {tmux}",
+        "🔄 已恢复 {agent} 会话\ntmux attach -t {tmux}",
     ),
     "feishu.text_only": (
         "⚠️ Only text replies are supported",
