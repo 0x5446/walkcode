@@ -41,7 +41,7 @@ from .agent import AgentAdapter, get_agent
 from .config import Config
 from .i18n import t
 from .state import Session, SessionStore
-from .tty import inject, validate_target, get_session_activity, kill_session
+from .tty import inject, validate_target, get_session_activity, kill_session, capture_pane
 
 logger = logging.getLogger("walkcode")
 
@@ -869,6 +869,88 @@ def _add_permission_rule(tool_name: str):
 
 # --- Feishu WebSocket event handlers ---
 
+def _auth_recovery_check(tmux_name: str, prompt: str, message_id: str, image_path: str | None):
+    """Background: detect auth failure after agent start, run device-auth if supported."""
+    if not agent_adapter.device_auth_command:
+        return
+
+    time.sleep(5)  # wait for agent to start and potentially fail
+
+    # Check if session still exists
+    if validate_target(tmux_name):
+        return  # session already dead (handled elsewhere)
+
+    # Capture pane output and check for auth errors
+    output = capture_pane(tmux_name, 30)
+    if not output:
+        return
+
+    matched = any(re.search(p, output, re.IGNORECASE) for p in agent_adapter.auth_error_patterns)
+    if not matched:
+        return  # no auth error, agent started normally
+
+    logger.warning(f"Auth error detected in {tmux_name}, starting device-auth recovery")
+    kill_session(tmux_name)
+    session_store.pop_pending(tmux_name)
+
+    # Run device-auth with Popen to stream stdout
+    try:
+        proc = subprocess.Popen(
+            list(agent_adapter.device_auth_command),
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True,
+        )
+
+        # Read output lines to find URL + code
+        url = ""
+        code = ""
+        lines_read = []
+        for line in proc.stdout:
+            lines_read.append(line.rstrip())
+            # Look for URL
+            url_match = re.search(r'(https?://\S+)', line)
+            if url_match and not url:
+                url = url_match.group(1)
+            # Look for device code (typically uppercase letters/digits with dash)
+            code_match = re.search(r'\b([A-Z0-9]{4,}-[A-Z0-9]{4,})\b', line)
+            if code_match and not code:
+                code = code_match.group(1)
+            # If we have both, notify user
+            if url and code:
+                break
+
+        if url:
+            auth_msg = t("feishu.auth_expired", url=url, code=code or "—")
+            _reply(message_id, auth_msg, reply_in_thread=True)
+            logger.info(f"Auth recovery: sent device-auth URL to Feishu (code={code})")
+        else:
+            # Couldn't parse URL, send raw output
+            raw = "\n".join(lines_read[:10])
+            _reply(message_id, t("feishu.auth_failed", error=raw), reply_in_thread=True)
+            proc.terminate()
+            return
+
+        # Wait for user to complete auth (up to 5 min)
+        try:
+            proc.wait(timeout=300)
+        except subprocess.TimeoutExpired:
+            proc.terminate()
+            _reply(message_id, t("feishu.auth_failed", error="timeout"), reply_in_thread=True)
+            return
+
+        if proc.returncode == 0:
+            _reply(message_id, t("feishu.auth_success"), reply_in_thread=True)
+            logger.info("Auth recovery: device-auth succeeded, restarting agent")
+            # Restart the agent with original prompt
+            _start_agent(prompt, message_id, image_path)
+        else:
+            _reply(message_id, t("feishu.auth_failed", error=f"exit code {proc.returncode}"), reply_in_thread=True)
+
+    except Exception as e:
+        logger.error(f"Auth recovery failed: {e}")
+        _reply(message_id, t("feishu.auth_failed", error=str(e)), reply_in_thread=True)
+
+
 def _start_agent(prompt: str, message_id: str, image_path: str | None = None):
     """Start an agent instance in a tmux session, triggered from Feishu."""
     cwd = config.default_cwd
@@ -896,6 +978,14 @@ def _start_agent(prompt: str, message_id: str, image_path: str | None = None):
     if reply_id:
         session_store.update_pending_reply(tmux_name, reply_id)
     logger.info(f"Started {agent_adapter.name}: tmux={tmux_name} cwd={cwd} prompt={prompt[:50]}")
+
+    # Background: detect auth failure and recover via device-auth
+    if agent_adapter.device_auth_command:
+        threading.Thread(
+            target=_auth_recovery_check,
+            args=(tmux_name, prompt, message_id, image_path),
+            daemon=True,
+        ).start()
 
 
 def _resume_agent(session_id: str, old_session: Session, reply_text: str, message_id: str):

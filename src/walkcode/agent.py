@@ -16,6 +16,8 @@ class AgentAdapter:
     hook_event_permission: str         # "PermissionRequest" or "PreToolUse"
     settings_dir: str                  # ".claude" or ".codex"
     image_flag: str | None             # None = path injection, "--image" = native flag
+    auth_error_patterns: tuple[str, ...]  # regex patterns to detect auth failure in tmux output
+    device_auth_command: tuple[str, ...] | None  # command to run device-auth, None = not supported
 
     def build_start_cmd(self, prompt: str, cwd: str, image_path: str | None = None) -> str:
         escaped = prompt.replace("'", "'\\''")
@@ -74,6 +76,8 @@ CLAUDE = AgentAdapter(
     hook_event_permission="PermissionRequest",
     settings_dir=".claude",
     image_flag=None,
+    auth_error_patterns=("Not logged in",),
+    device_auth_command=None,
 )
 
 CODEX = AgentAdapter(
@@ -87,6 +91,8 @@ CODEX = AgentAdapter(
     hook_event_permission="PreToolUse",
     settings_dir=".codex",
     image_flag="--image",
+    auth_error_patterns=("refresh_token_expired", "Please log out and sign in", "unauthorized", "not authenticated"),
+    device_auth_command=("codex", "login", "--device-auth"),
 )
 
 _AGENTS = {"claude": CLAUDE, "codex": CODEX}

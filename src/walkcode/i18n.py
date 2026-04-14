@@ -367,6 +367,22 @@ _T: dict[str, tuple[str, str]] = {
         "No images to clean",
         "没有需要清理的图片",
     ),
+    # --- auth recovery ---
+    "feishu.auth_expired": (
+        "🔑 Authentication expired. Please visit the link below and enter the code to re-login:\n\n"
+        "🔗 {url}\n📋 Code: {code}",
+        "🔑 认证已过期，请打开以下链接并输入验证码重新登录：\n\n"
+        "🔗 {url}\n📋 验证码: {code}",
+    ),
+    "feishu.auth_success": (
+        "✅ Authentication successful, restarting agent...",
+        "✅ 认证成功，正在重新启动...",
+    ),
+    "feishu.auth_failed": (
+        "❌ Authentication failed: {error}",
+        "❌ 认证失败: {error}",
+    ),
+
     "feishu.session_expired": (
         "⚠️ Session expired, send a new message to start",
         "⚠️ 会话已过期，请发送新消息开始新会话",

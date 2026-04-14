@@ -69,6 +69,20 @@ def kill_session(session_name: str) -> bool:
         return False
 
 
+def capture_pane(session_name: str, lines: int = 30) -> str:
+    """Capture last N lines of tmux pane output. Returns empty string on failure."""
+    try:
+        result = subprocess.run(
+            ["tmux", "capture-pane", "-t", session_name, "-p", "-S", f"-{lines}"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0:
+            return result.stdout
+    except Exception:
+        pass
+    return ""
+
+
 def inject(session_name: str, text: str, enter: bool | None = None) -> bool:
     """Inject text into a tmux session via send-keys.
 
