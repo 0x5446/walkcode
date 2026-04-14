@@ -391,6 +391,7 @@ def _install_claude_hooks(_args):
 
 def _install_codex_hooks(_args):
     """Install hooks into Codex CLI hooks.json and enable feature flag."""
+    _quick_load_env({"WALKCODE_PORT", "PORT"})
     port = os.environ.get("WALKCODE_PORT", os.environ.get("PORT", "3001"))
     port_env = f"WALKCODE_PORT={port} " if port != "3001" else ""
 

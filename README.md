@@ -272,26 +272,50 @@ FEISHU_APP_ID=cli_codex_xxx
 FEISHU_APP_SECRET=xxx
 FEISHU_RECEIVE_ID=ou_xxx
 
-# Codex API key
-OPENAI_API_KEY=sk-xxx
+# 认证方式（二选一）：
+# 方式 A：ChatGPT 订阅（推荐）— 先运行 codex login 完成 OAuth 登录
+#   Token 过期时 WalkCode 会自动发起 device-auth，你在手机上完成验证即可
+# 方式 B：API Key
+# OPENAI_API_KEY=sk-xxx
 EOF
 ```
 
-#### 4. 安装 Codex Hooks
+#### 4. 添加 Shell Wrapper
+
+添加到 `~/.zshrc`（或 `~/.bashrc`），让本地运行 `codex` 时自动套 tmux：
 
 ```bash
-walkcode install-hooks --agent codex
+codex() {
+  if [ -z "$TMUX" ]; then
+    local session="codex-$(basename "$PWD")-$$"
+    tmux new-session -s "$session" "command codex --no-alt-screen $(printf '%q ' "$@")"
+  else
+    command codex "$@"
+  fi
+}
 ```
 
-这会写入 `~/.codex/hooks.json` 并启用 Codex 的 hooks feature flag。
+然后：`source ~/.zshrc`
 
-#### 5. 启动 Codex 实例
+> `--no-alt-screen` 让 Codex 的输出保留在 tmux 滚动历史中，WalkCode 需要它来捕获输出。
+
+#### 5. 安装 Codex Hooks
+
+```bash
+WALKCODE_ENV_FILE=~/.walkcode/codex.env walkcode install-hooks --agent codex
+```
+
+这会写入 `~/.codex/hooks.json`（hook 命令自动指向 port 3002）并启用 Codex 的 hooks feature flag。
+
+#### 6. 启动 Codex 实例
 
 ```bash
 WALKCODE_ENV_FILE=~/.walkcode/codex.env walkcode start
 ```
 
 现在你有两个飞书机器人：给 Claude 机器人发消息启动 Claude Code，给 Codex 机器人发消息启动 Codex CLI。
+
+**认证过期自动恢复：** 当 Codex OAuth token 过期时，WalkCode 会自动检测并发起 device-auth 流程，在飞书发送验证链接和验证码，你在手机浏览器上完成验证即可，无需回到电脑前。
 
 #### 6. （推荐）开机自启动
 

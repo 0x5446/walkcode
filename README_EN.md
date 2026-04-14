@@ -264,26 +264,50 @@ FEISHU_APP_ID=cli_codex_xxx
 FEISHU_APP_SECRET=xxx
 FEISHU_RECEIVE_ID=ou_xxx
 
-# Codex API key
-OPENAI_API_KEY=sk-xxx
+# Authentication (pick one):
+# Option A: ChatGPT subscription (recommended) — run `codex login` first
+#   When token expires, WalkCode auto-starts device-auth and sends the code to Feishu
+# Option B: API Key
+# OPENAI_API_KEY=sk-xxx
 EOF
 ```
 
-#### 4. Install Codex Hooks
+#### 4. Add Shell Wrapper
+
+Add to `~/.zshrc` (or `~/.bashrc`) so local `codex` runs auto-wrap in tmux:
 
 ```bash
-walkcode install-hooks --agent codex
+codex() {
+  if [ -z "$TMUX" ]; then
+    local session="codex-$(basename "$PWD")-$$"
+    tmux new-session -s "$session" "command codex --no-alt-screen $(printf '%q ' "$@")"
+  else
+    command codex "$@"
+  fi
+}
 ```
 
-This writes `~/.codex/hooks.json` and enables the Codex hooks feature flag.
+Then: `source ~/.zshrc`
 
-#### 5. Start Codex Instance
+> `--no-alt-screen` keeps Codex output in tmux scrollback, which WalkCode needs for output capture.
+
+#### 5. Install Codex Hooks
+
+```bash
+WALKCODE_ENV_FILE=~/.walkcode/codex.env walkcode install-hooks --agent codex
+```
+
+This writes `~/.codex/hooks.json` (hook commands auto-point to port 3002) and enables the Codex hooks feature flag.
+
+#### 6. Start Codex Instance
 
 ```bash
 WALKCODE_ENV_FILE=~/.walkcode/codex.env walkcode start
 ```
 
 Now you have two bots: message the Claude bot for Claude Code, message the Codex bot for Codex CLI.
+
+**Auto auth recovery:** When Codex OAuth token expires, WalkCode detects the error, runs device-auth, and sends the verification URL + code to Feishu. Complete re-login from your phone — no need to go back to your computer.
 
 #### 6. (Recommended) Auto-start on Login
 
