@@ -69,6 +69,24 @@ def kill_session(session_name: str) -> bool:
         return False
 
 
+_SHELLS = {"zsh", "bash", "sh", "fish", "dash", "csh", "tcsh", "ksh"}
+
+
+def is_agent_alive(session_name: str) -> bool:
+    """Check if an agent process (not a shell) is running in the tmux pane."""
+    try:
+        result = subprocess.run(
+            ["tmux", "list-panes", "-t", session_name, "-F", "#{pane_current_command}"],
+            capture_output=True, text=True, timeout=2,
+        )
+        if result.returncode == 0:
+            cmd = result.stdout.strip().split("\n")[0]
+            return cmd not in _SHELLS and cmd != ""
+    except Exception:
+        pass
+    return False
+
+
 def capture_pane(session_name: str, lines: int = 30) -> str:
     """Capture last N lines of tmux pane output. Returns empty string on failure."""
     try:

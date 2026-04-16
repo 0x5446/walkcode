@@ -41,7 +41,7 @@ from .agent import AgentAdapter, get_agent
 from .config import Config
 from .i18n import t
 from .state import Session, SessionStore
-from .tty import inject, validate_target, get_session_activity, kill_session, capture_pane
+from .tty import inject, validate_target, get_session_activity, kill_session, capture_pane, is_agent_alive
 
 logger = logging.getLogger("walkcode")
 
@@ -1101,6 +1101,17 @@ def _on_message(data: P2ImMessageReceiveV1):
             )
             _reply(message_id, t("feishu.session_not_found"))
             return
+
+    # Check if agent process is still running (not just tmux session alive)
+    if not is_agent_alive(tty):
+        logger.info(f"Agent not alive in {tty}, triggering resume")
+        if session_id:
+            session = session_store.get(session_id)
+            if session:
+                _resume_agent(session_id, session, text, message_id)
+                return
+        _reply(message_id, t("feishu.stale_session"))
+        return
 
     try:
         inject(tty, text)
