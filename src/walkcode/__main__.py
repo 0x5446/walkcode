@@ -253,6 +253,11 @@ def cmd_hook(args):
         import time as _time
         from .agent import get_agent
 
+        # Codex PreToolUse fires for ALL tools, even auto-approved ones.
+        # When permission_mode is "bypassPermissions", just let it proceed.
+        if hook_data.get("permission_mode") == "bypassPermissions":
+            sys.exit(0)
+
         tool_name = hook_data.get("tool_name", "")
         tool_input = hook_data.get("tool_input", {})
 
