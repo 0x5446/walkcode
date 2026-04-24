@@ -37,24 +37,49 @@ class AgentAdapter:
             # claude --resume '<sid>' --permission-mode default
             return f"cd '{cwd}' && {self.command} {self.resume_flag} '{escaped_sid}' {self.permission_mode_flag}"
 
-    def build_hook_response(self, behavior: str, updated_permissions: dict | None = None) -> dict:
+    def build_hook_response(self, behavior: str, updated_permissions: dict | None = None) -> dict | None:
         if self.hook_event_permission == "PreToolUse":
-            # Codex format: flat permissionDecision
-            codex_decision = "allow" if behavior in ("allow", "always_allow", "accept_edits") else "deny"
-            output = {
-                "hookEventName": "PreToolUse",
-                "permissionDecision": codex_decision,
+            # Codex PreToolUse protocol (from codex 0.124.0 binary strings):
+            #   - `permissionDecision: "deny"` + non-empty `permissionDecisionReason` = block
+            #   - `permissionDecision: "allow"` triggers a warning "unsupported
+            #     permissionDecision:allow" in codex logs, but empirically codex
+            #     still honors it as allow. Keep emitting it for now to avoid
+            #     breaking the working allow path; revisit once we can
+            #     empirically verify whether exit-0-no-output is safe.
+            if behavior in ("allow", "always_allow", "accept_edits"):
+                return {
+                    "hookSpecificOutput": {
+                        "hookEventName": "PreToolUse",
+                        "permissionDecision": "allow",
+                    }
+                }
+            reason = f"Denied by user via Feishu (behavior={behavior})"
+            return {
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason": reason,
+                }
             }
         else:
-            # Claude Code format: nested decision object
+            # Claude Code PermissionRequest: nested decision object, well-supported
             decision_obj = {"behavior": behavior}
             if updated_permissions:
                 decision_obj["updatedPermissions"] = updated_permissions
-            output = {
-                "hookEventName": "PermissionRequest",
-                "decision": decision_obj,
+            return {
+                "hookSpecificOutput": {
+                    "hookEventName": "PermissionRequest",
+                    "decision": decision_obj,
+                }
             }
-        return {"hookSpecificOutput": output}
+
+    def hook_exit_code(self, behavior: str) -> int:
+        """Exit code after printing the hook response (if any)."""
+        if self.hook_event_permission == "PreToolUse":
+            # Codex reads stdout JSON; exit code 0 so codex trusts printed JSON.
+            return 0
+        # Claude convention: 0 on allow (accept), 2 on deny (block with stderr).
+        return 0 if behavior in ("allow", "always_allow", "accept_edits") else 2
 
     def build_env_exports(self) -> str:
         exports = []

@@ -268,8 +268,9 @@ def _handle_permission_request(hook_data, port, tmux_session, cwd, session_id):
                     updated_permissions=decision.get("updatedPermissions"),
                 )
 
-                print(json.dumps(hook_response), flush=True)
-                sys.exit(0 if behavior == "allow" else 2)
+                if hook_response is not None:
+                    print(json.dumps(hook_response), flush=True)
+                sys.exit(agent.hook_exit_code(behavior))
 
             # status == "pending" or "not_found", keep polling
         except Exception as e:
