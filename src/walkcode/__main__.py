@@ -198,6 +198,90 @@ def cmd_status(_args):
         sys.exit(1)
 
 
+def _handle_permission_request(hook_data, port, tmux_session, cwd, session_id):
+    """Permission request body. Raises SystemExit on valid decision paths;
+    any other exception is caught by caller and treated as fail-open."""
+    import time as _time
+    from .agent import get_agent
+
+    # Codex PreToolUse fires for ALL tools, even auto-approved ones.
+    # When permission_mode is "bypassPermissions", just let it proceed.
+    if hook_data.get("permission_mode") == "bypassPermissions":
+        sys.exit(0)
+
+    tool_name = hook_data.get("tool_name", "")
+    tool_input = hook_data.get("tool_input", {})
+
+    payload = json.dumps({
+        "tty": tmux_session,
+        "cwd": cwd,
+        "session_id": session_id,
+        "tool_name": tool_name,
+        "tool_input": tool_input,
+        "hook_data_full": hook_data,
+    }).encode()
+
+    try:
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}/hook/permission",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+        )
+        resp = urllib.request.urlopen(req, timeout=10)
+        result = json.loads(resp.read())
+        request_id = result.get("request_id", "")
+    except Exception as e:
+        # Fail-open: server unreachable or malformed response.
+        # Let the agent fall back to its own native permission prompt.
+        print(f"[walkcode] permission hook failed, fail-open: {e}", file=sys.stderr)
+        sys.exit(0)
+
+    if not request_id:
+        print("[walkcode] no request_id from server, fail-open", file=sys.stderr)
+        sys.exit(0)
+
+    # Poll for decision (long-poll, up to 120s total)
+    decision_url = f"http://127.0.0.1:{port}/hook/permission/{request_id}/decision"
+    deadline = _time.monotonic() + 120
+
+    agent_name = os.environ.get("WALKCODE_AGENT", "claude")
+    agent = get_agent(agent_name)
+
+    while _time.monotonic() < deadline:
+        try:
+            req = urllib.request.Request(decision_url)
+            resp = urllib.request.urlopen(req, timeout=35)
+            result = json.loads(resp.read())
+
+            if result.get("status") == "decided":
+                decision = result["decision"]
+                behavior = decision.get("behavior", "deny")
+
+                # AskUserQuestion: exit without hook response so agent
+                # falls back to the interactive terminal prompt.
+                # The server injects the answer via tmux after we exit.
+                if tool_name == "AskUserQuestion":
+                    sys.exit(2)
+
+                hook_response = agent.build_hook_response(
+                    behavior=behavior,
+                    updated_permissions=decision.get("updatedPermissions"),
+                )
+
+                print(json.dumps(hook_response), flush=True)
+                sys.exit(0 if behavior == "allow" else 2)
+
+            # status == "pending" or "not_found", keep polling
+        except Exception as e:
+            print(f"[walkcode] poll error: {e}", file=sys.stderr)
+        _time.sleep(2)
+
+    # Timeout: fail-open so agent falls back to its native prompt.
+    # A 2-min Feishu silence is not the same as an explicit deny.
+    print("[walkcode] permission poll timed out after 120s, fail-open", file=sys.stderr)
+    sys.exit(0)
+
+
 def cmd_hook(args):
     """Handle an agent hook event: read stdin, POST to server."""
     # Read hook data from stdin (agent pipes JSON)
@@ -250,80 +334,14 @@ def cmd_hook(args):
 
     # --- PermissionRequest / PreToolUse: send card, poll for decision ---
     if args.hook_type == "permission-request":
-        import time as _time
-        from .agent import get_agent
-
-        # Codex PreToolUse fires for ALL tools, even auto-approved ones.
-        # When permission_mode is "bypassPermissions", just let it proceed.
-        if hook_data.get("permission_mode") == "bypassPermissions":
-            sys.exit(0)
-
-        tool_name = hook_data.get("tool_name", "")
-        tool_input = hook_data.get("tool_input", {})
-
-        payload = json.dumps({
-            "tty": tmux_session,
-            "cwd": cwd,
-            "session_id": session_id,
-            "tool_name": tool_name,
-            "tool_input": tool_input,
-            "hook_data_full": hook_data,
-        }).encode()
-
         try:
-            req = urllib.request.Request(
-                f"http://127.0.0.1:{port}/hook/permission",
-                data=payload,
-                headers={"Content-Type": "application/json"},
-            )
-            resp = urllib.request.urlopen(req, timeout=10)
-            result = json.loads(resp.read())
-            request_id = result.get("request_id", "")
-        except Exception as e:
-            print(f"[walkcode] permission hook failed: {e}", file=sys.stderr)
-            sys.exit(2)  # deny on failure
-
-        if not request_id:
-            sys.exit(2)
-
-        # Poll for decision (long-poll, up to 120s total)
-        decision_url = f"http://127.0.0.1:{port}/hook/permission/{request_id}/decision"
-        deadline = _time.monotonic() + 120
-
-        agent_name = os.environ.get("WALKCODE_AGENT", "claude")
-        agent = get_agent(agent_name)
-
-        while _time.monotonic() < deadline:
-            try:
-                req = urllib.request.Request(decision_url)
-                resp = urllib.request.urlopen(req, timeout=35)
-                result = json.loads(resp.read())
-
-                if result.get("status") == "decided":
-                    decision = result["decision"]
-                    behavior = decision.get("behavior", "deny")
-
-                    # AskUserQuestion: exit without hook response so agent
-                    # falls back to the interactive terminal prompt.
-                    # The server injects the answer via tmux after we exit.
-                    if tool_name == "AskUserQuestion":
-                        sys.exit(2)
-
-                    hook_response = agent.build_hook_response(
-                        behavior=behavior,
-                        updated_permissions=decision.get("updatedPermissions"),
-                    )
-
-                    print(json.dumps(hook_response), flush=True)
-                    sys.exit(0 if behavior == "allow" else 2)
-
-                # status == "pending" or "not_found", keep polling
-            except Exception as e:
-                print(f"[walkcode] poll error: {e}", file=sys.stderr)
-            _time.sleep(2)
-
-        # Timeout: deny
-        sys.exit(2)
+            _handle_permission_request(hook_data, port, tmux_session, cwd, session_id)
+        except SystemExit:
+            raise
+        except BaseException as e:
+            print(f"[walkcode] permission hook crashed (fail-open): {e}", file=sys.stderr)
+            sys.exit(0)
+        return
 
     # --- Notification ---
     if args.hook_type == "notification":

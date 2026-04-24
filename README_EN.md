@@ -122,7 +122,7 @@ That's it. Type `claude` and go for a walk.
 
 #### 4. (Recommended) Auto-start on Login
 
-Create a launchd plist so WalkCode starts automatically when you log in:
+Create a launchd plist so WalkCode starts automatically on login and auto-restarts on crash:
 
 ```bash
 cat > ~/Library/LaunchAgents/com.walkcode.plist << 'EOF'
@@ -132,29 +132,69 @@ cat > ~/Library/LaunchAgents/com.walkcode.plist << 'EOF'
 <dict>
     <key>Label</key>
     <string>com.walkcode</string>
+
     <key>ProgramArguments</key>
     <array>
         <string>/Users/YOU/.local/bin/walkcode</string>
-        <string>start</string>
+        <string>serve</string>
     </array>
+
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
-        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <string>/Users/YOU/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>WALKCODE_ENV_FILE</key>
+        <string>/Users/YOU/.walkcode/.env</string>
+        <key>HOME</key>
+        <string>/Users/YOU</string>
     </dict>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/YOU/.walkcode</string>
+
     <key>RunAtLoad</key>
     <true/>
+
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+        <key>Crashed</key>
+        <true/>
+    </dict>
+
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <key>ExitTimeOut</key>
+    <integer>15</integer>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+
+    <key>StandardOutPath</key>
+    <string>/Users/YOU/.walkcode/launchd.out.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/YOU/.walkcode/launchd.err.log</string>
 </dict>
 </plist>
 EOF
 ```
 
-> **Important:** Replace `/Users/YOU/.local/bin/walkcode` with your actual walkcode path (run `which walkcode` to find it). The `PATH` must include the directories containing `tmux` and `claude` (typically `/opt/homebrew/bin`).
+> **Important:**
+> - Replace `/Users/YOU` with your actual home directory.
+> - Use `walkcode serve` (foreground uvicorn), **not** `walkcode start` (daemonizer). `start` forks and the parent exits immediately — launchd loses track of the real PID and `KeepAlive` silently stops working. `serve` blocks in the foreground so launchd watches it and restarts on crash.
+> - `KeepAlive { SuccessfulExit=false, Crashed=true }` keeps a clean `launchctl unload` from triggering a respawn while still recovering from crashes (throttled by `ThrottleInterval=10s`).
+> - `WALKCODE_ENV_FILE` must be an absolute path. The launchd environment does not inherit direnv/shell rc files, so Feishu credentials have to be pointed at explicitly.
 
 ```bash
 launchctl load ~/Library/LaunchAgents/com.walkcode.plist     # Load and start
 launchctl unload ~/Library/LaunchAgents/com.walkcode.plist   # Stop and unload
+launchctl list | grep walkcode                               # Status (PID + last exit code)
 ```
+
+> Once launchd owns the process, **don't also run `walkcode start` manually** — both would fight for the same port. Use `launchctl load/unload` for lifecycle, or unload first before attaching a manual `walkcode start` for debugging.
 
 #### 5. (Recommended) Prevent macOS from Sleeping
 
@@ -311,7 +351,7 @@ Now you have two bots: message the Claude bot for Claude Code, message the Codex
 
 #### 6. (Recommended) Auto-start on Login
 
-Create a second launchd plist for the Codex instance:
+Create a second launchd plist for the Codex instance (same template as the Claude one, only `Label`, `WALKCODE_ENV_FILE` and log paths differ):
 
 ```bash
 cat > ~/Library/LaunchAgents/com.walkcode-codex.plist << 'EOF'
@@ -321,26 +361,59 @@ cat > ~/Library/LaunchAgents/com.walkcode-codex.plist << 'EOF'
 <dict>
     <key>Label</key>
     <string>com.walkcode-codex</string>
+
     <key>ProgramArguments</key>
     <array>
         <string>/Users/YOU/.local/bin/walkcode</string>
-        <string>start</string>
+        <string>serve</string>
     </array>
+
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
-        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <string>/Users/YOU/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
         <key>WALKCODE_ENV_FILE</key>
         <string>/Users/YOU/.walkcode/codex.env</string>
+        <key>HOME</key>
+        <string>/Users/YOU</string>
     </dict>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/YOU/.walkcode</string>
+
     <key>RunAtLoad</key>
     <true/>
+
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+        <key>Crashed</key>
+        <true/>
+    </dict>
+
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <key>ExitTimeOut</key>
+    <integer>15</integer>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+
+    <key>StandardOutPath</key>
+    <string>/Users/YOU/.walkcode/launchd.codex.out.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/YOU/.walkcode/launchd.codex.err.log</string>
 </dict>
 </plist>
 EOF
+
+launchctl load ~/Library/LaunchAgents/com.walkcode-codex.plist
 ```
 
-> Replace `/Users/YOU` with your actual home directory.
+> Replace `/Users/YOU` with your actual home directory. Same `serve` vs `start` rationale as the Claude instance.
 
 ### Multi-Instance Management
 
@@ -386,7 +459,7 @@ When you start an agent from chat, WalkCode launches it with a controlled permis
 | In allow list | Auto-approved, no prompt |
 | **Not** in allow list | **Interactive card sent to chat** — tap Allow / Deny / Always Allow |
 
-Requests are auto-denied after 2 minutes with no response.
+If you don't respond within 2 minutes, or the WalkCode server is unreachable, or the hook itself crashes, the **hook fails open** — it does not block the agent. The agent falls back to its own native terminal permission prompt, so "hook broken = same as no WalkCode installed" instead of leaving the Coding Agent stuck.
 
 ## Usage
 

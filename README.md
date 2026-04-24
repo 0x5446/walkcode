@@ -126,7 +126,7 @@ walkcode start
 
 #### 4. （推荐）开机自启动
 
-创建 launchd plist 文件，让 WalkCode 在登录时自动启动：
+创建 launchd plist 文件，让 WalkCode 在登录时自动启动并在崩溃时自动重启：
 
 ```bash
 cat > ~/Library/LaunchAgents/com.walkcode.plist << 'EOF'
@@ -136,31 +136,69 @@ cat > ~/Library/LaunchAgents/com.walkcode.plist << 'EOF'
 <dict>
     <key>Label</key>
     <string>com.walkcode</string>
+
     <key>ProgramArguments</key>
     <array>
         <string>/Users/YOU/.local/bin/walkcode</string>
-        <string>start</string>
+        <string>serve</string>
     </array>
+
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
-        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <string>/Users/YOU/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>WALKCODE_ENV_FILE</key>
+        <string>/Users/YOU/.walkcode/.env</string>
+        <key>HOME</key>
+        <string>/Users/YOU</string>
     </dict>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/YOU/.walkcode</string>
+
     <key>RunAtLoad</key>
     <true/>
+
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+        <key>Crashed</key>
+        <true/>
+    </dict>
+
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <key>ExitTimeOut</key>
+    <integer>15</integer>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+
+    <key>StandardOutPath</key>
+    <string>/Users/YOU/.walkcode/launchd.out.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/YOU/.walkcode/launchd.err.log</string>
 </dict>
 </plist>
 EOF
 ```
 
-> **重要：** 将 `/Users/YOU/.local/bin/walkcode` 替换为你实际的 walkcode 路径（通过 `which walkcode` 查看）。
->
-> `EnvironmentVariables` 中的 `PATH` 必须包含 `tmux` 和 `claude` 所在的目录（通常是 `/opt/homebrew/bin`），否则 WalkCode 启动后会因找不到 tmux 而报错。
+> **重要：**
+> - 将 `/Users/YOU` 替换为你实际的用户目录。
+> - 用 `walkcode serve`（前台 uvicorn）而非 `walkcode start`（daemonizer）。`start` 会 fork 后父进程立即退出，launchd 追不到真实 PID，`KeepAlive` 失效。`serve` 是前台阻塞，launchd 全程盯住 PID，崩溃即重启。
+> - `KeepAlive { SuccessfulExit=false, Crashed=true }` 保证手动 `launchctl unload` 干净退出不触发重启，但异常崩溃会按 `ThrottleInterval=10s` 节流重拉。
+> - `WALKCODE_ENV_FILE` 指向绝对路径，launchd 环境不经过 direnv/shell rc，不显式指定会找不到 Feishu 凭证。
 
 ```bash
 launchctl load ~/Library/LaunchAgents/com.walkcode.plist     # 加载并启动
 launchctl unload ~/Library/LaunchAgents/com.walkcode.plist   # 停止并卸载
+launchctl list | grep walkcode                               # 查看状态（PID + 退出码）
 ```
+
+> **注意：** launchd 加载后，**不要再手动 `walkcode start`** — 两个进程会抢同一端口互相踩脚。只能用 `launchctl load/unload` 管理，或先 `launchctl unload` 后再手动 `walkcode start` 做调试。
 
 #### 5. （推荐）防止 macOS 系统休眠
 
@@ -319,7 +357,7 @@ WALKCODE_ENV_FILE=~/.walkcode/codex.env walkcode start
 
 #### 6. （推荐）开机自启动
 
-为 Codex 实例创建第二个 launchd plist：
+为 Codex 实例创建第二个 launchd plist（与 Claude 那份是同模板，只换 `Label`、`WALKCODE_ENV_FILE` 和日志路径）：
 
 ```bash
 cat > ~/Library/LaunchAgents/com.walkcode-codex.plist << 'EOF'
@@ -329,26 +367,59 @@ cat > ~/Library/LaunchAgents/com.walkcode-codex.plist << 'EOF'
 <dict>
     <key>Label</key>
     <string>com.walkcode-codex</string>
+
     <key>ProgramArguments</key>
     <array>
         <string>/Users/YOU/.local/bin/walkcode</string>
-        <string>start</string>
+        <string>serve</string>
     </array>
+
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
-        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <string>/Users/YOU/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
         <key>WALKCODE_ENV_FILE</key>
         <string>/Users/YOU/.walkcode/codex.env</string>
+        <key>HOME</key>
+        <string>/Users/YOU</string>
     </dict>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/YOU/.walkcode</string>
+
     <key>RunAtLoad</key>
     <true/>
+
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+        <key>Crashed</key>
+        <true/>
+    </dict>
+
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <key>ExitTimeOut</key>
+    <integer>15</integer>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+
+    <key>StandardOutPath</key>
+    <string>/Users/YOU/.walkcode/launchd.codex.out.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/YOU/.walkcode/launchd.codex.err.log</string>
 </dict>
 </plist>
 EOF
+
+launchctl load ~/Library/LaunchAgents/com.walkcode-codex.plist
 ```
 
-> 将 `/Users/YOU` 替换为你的实际用户目录。
+> 将 `/Users/YOU` 替换为你的实际用户目录。同理推荐用 `serve` 而非 `start`（见 Claude 实例注释）。
 
 ### 多实例管理
 
@@ -398,7 +469,7 @@ WalkCode 的核心设计：**1 个聊天话题 = 1 个 tmux 会话 = 1 个 Codin
 | 在允许列表中 | 自动通过，无需审批 |
 | **不在**允许列表中 | **发送交互式卡片到聊天** —— 你点击 允许 / 拒绝 / 始终允许 |
 
-如果 2 分钟内未响应，请求自动拒绝。
+如果 2 分钟内未响应，或 WalkCode 服务端不可达、Hook 本身异常，**Hook 会 fail-open**（不阻塞 Agent），退回到 Agent 自身的原生终端权限提示。这样「Hook 挂了 = 你回到没装 WalkCode 的状态」，不会把 Coding Agent 整个卡死。
 
 ## 使用方式
 
