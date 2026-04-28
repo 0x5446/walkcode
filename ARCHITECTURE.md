@@ -46,7 +46,7 @@ Feishu reply arrives
   → root_msg_id
   → _root_to_session[root_msg_id]  →  session_id   (reverse index in SessionStore)
   → _sessions[session_id].tty      →  tmux name    (always current — see below)
-  → tmux send-keys -t {tty}
+  → PermissionRequest hook returns updatedInput.answers to Claude
 ```
 
 ### tty is always kept current
@@ -147,11 +147,17 @@ Claude Code hooks call `walkcode hook {stop|notification|permission-request}` wh
 | `sync` | SessionStart | POST /hook/sync | None (mapping update only) | No |
 | `stop` | Stop | POST /hook | Plain text | No |
 | `notification` | Notification (elicitation_dialog) | POST /hook | Plain text or interactive card (AskUserQuestion) | No |
-| `permission-request` | PermissionRequest | POST /hook/permission → poll GET /hook/permission/{rid}/decision | Interactive card with buttons | Yes (up to 120s) |
+| `permission-request` | PermissionRequest | POST /hook/permission → poll GET /hook/permission/{rid}/decision | Interactive card with buttons | Yes (up to 30m) |
 
 **Note on Notification subtypes:**
 - **elicitation_dialog** — When the notification carries an `AskUserQuestion` payload (with `question` and `options` fields), WalkCode sends an interactive card with option buttons instead of plain text. Supports multi-question flows: each question generates a card, the card auto-updates to the next question when answered, and all answers are returned together after the last question.
 - **Other matchers** — Sent as plain text messages in the Feishu thread.
+
+**AskUserQuestion features:**
+- **Single-select** — Click an option button to select it immediately.
+- **multiSelect** — Options render as toggle buttons (✓ prefix when selected). Click to toggle, then click the green "✅ 提交所选" button to finalize. Labels are joined with comma in the answer (e.g. "蓝,绿").
+- **Other (custom text)** — Each question card has an "✏️ 其他（自定义文本）" button. Click it, then reply with plain text in the Feishu thread. The next text reply becomes the answer for that question.
+- **Answer delivery** — All answers are returned to Claude via `PermissionRequest.decision.updatedInput.answers`, bypassing the native terminal TUI entirely. No tmux key injection is involved.
 
 ### Thread subscription
 
@@ -219,7 +225,7 @@ Note: Claude Code reads `settings.json` only at startup, so writing to it alone 
       {"type": "command", "command": "walkcode hook notification"}
     ]}],
     "PermissionRequest": [{"matcher": "", "hooks": [
-      {"type": "command", "command": "walkcode hook permission-request", "timeout": 120000}
+      {"type": "command", "command": "walkcode hook permission-request", "timeout": 1800000}
     ]}]
   }
 }

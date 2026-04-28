@@ -35,7 +35,7 @@ Your agent hits a permission prompt while you're away. Without WalkCode, it bloc
 
 **Core:**
 - **Permission approvals** — approve or deny directly from chat
-- **Question answering** — AskUserQuestion interactive cards with multi-question sequential flow
+- **Question answering** — AskUserQuestion interactive cards with multi-question sequential flow, multiSelect, and custom text (Other) via thread reply
 - **Text replies** — reply in a thread to type directly into the agent's terminal
 - **Image & rich text** — send images or rich text (text + images); images are auto-downloaded and passed to the agent
 - **Remote start** — send a message to start a new agent session from your phone
