@@ -163,84 +163,147 @@ def _build_dynamic_permission_card(
     }
 
 
-def _build_askuserquestion_card(request_id: str, questions: list, question_index: int = 0) -> dict:
-    """Build a Feishu interactive card for AskUserQuestion with dynamic option buttons.
+def _build_askuserquestion_card(
+    request_id: str,
+    questions: list,
+    question_index: int = 0,
+    selected_indices: list[int] | None = None,
+    other_pending: bool = False,
+) -> dict:
+    """Build the Feishu card for one AskUserQuestion question.
 
-    Supports multiple questions via sequential processing (Method A):
-    - Display current question with its options
-    - User clicks answer → next question card appears
-    - After last question, all answers are returned
+    Supports three interaction modes per question:
+    - single-select: clicking an option finalizes the answer immediately
+    - multi-select: clicking an option toggles its selection; a Submit button
+      finalizes the chosen subset (joined with comma in updatedInput.answers)
+    - Other: a button asking the user to reply with custom text in the thread.
+      The next plain-text reply on the thread becomes the answer for this
+      question.
+
+    selected_indices: for multiSelect, current toggled set (1-based option idx);
+                      ignored otherwise.
+    other_pending: when True, render an instruction card asking the user to
+                   send a thread reply.
     """
-    if not questions or len(questions) == 0:
-        return {
-            "config": {"wide_screen_mode": True},
-            "header": {
-                "title": {"tag": "plain_text", "content": "Question"},
-                "template": "blue",
-            },
-            "elements": [
-                {"tag": "div", "text": {"tag": "lark_md", "content": "No questions found"}},
-            ],
-        }
+    if not questions:
+        return _empty_card("Question", "No questions found")
 
     if question_index >= len(questions):
         question_index = 0
 
-    question_obj = questions[question_index]
-    question_text = question_obj.get("question", "Choose an option:")
-    options = question_obj.get("options", [])
+    q = questions[question_index]
+    question_text = q.get("question", "Choose an option:")
+    options = q.get("options", [])
+    multi_select = bool(q.get("multiSelect"))
 
-    # Add progress indicator for multiple questions
     total_questions = len(questions)
-    progress_text = f"({question_index + 1}/{total_questions})" if total_questions > 1 else ""
-    full_title = f"{question_text} {progress_text}".strip()
+    progress = f"({question_index + 1}/{total_questions})" if total_questions > 1 else ""
+    title = f"{question_text} {progress}".strip()
 
-    # Build action buttons from options
-    buttons = []
-    for opt in options:
-        buttons.append({
-            "tag": "button",
-            "text": {"tag": "plain_text", "content": opt.get("label", opt.get("value", ""))},
-            "type": "primary",
-            "value": {
-                "rid": request_id,
-                "answer": opt.get("label", opt.get("value", "")),
-                "question_index": question_index,  # Track which question this answer is for
-                "total_questions": total_questions,
-            },
-        })
-
-    # Handle empty options case
-    if not buttons:
+    if other_pending:
         return {
             "config": {"wide_screen_mode": True},
             "header": {
-                "title": {"tag": "plain_text", "content": full_title},
-                "template": "blue",
+                "title": {"tag": "plain_text", "content": title},
+                "template": "yellow",
             },
             "elements": [
                 {
                     "tag": "div",
                     "text": {
                         "tag": "lark_md",
-                        "content": "⚠️ No options available for this question",
+                        "content": (
+                            "✏️ **请在本条消息所在的话题里直接回复你想要的自定义答案文本**。\n"
+                            "下一条文本回复会作为该问题的答案提交给 Claude。"
+                        ),
                     },
                 },
             ],
         }
 
+    if not options:
+        return _empty_card(title, "⚠️ No options available for this question")
+
+    selected = set(selected_indices or [])
+
+    # Each option = a button. For multiSelect, prefix selected ones with ✓ and
+    # use a different button type so the toggle state is visible. The button
+    # value's `action` field tells _on_card_action whether this is a final
+    # selection (single-select) or a toggle (multi-select).
+    buttons = []
+    for j, opt in enumerate(options):
+        idx = j + 1  # 1-based option position (kept stable across turns)
+        label = opt.get("label", opt.get("value", ""))
+        if multi_select:
+            checked = idx in selected
+            text = f"{'✓ ' if checked else ''}{label}"
+            btn_type = "primary" if checked else "default"
+            action = "toggle"
+        else:
+            text = label
+            btn_type = "primary"
+            action = "select"
+        buttons.append({
+            "tag": "button",
+            "text": {"tag": "plain_text", "content": text},
+            "type": btn_type,
+            "value": {
+                "rid": request_id,
+                "action": action,
+                "answer": label,
+                "option_idx": idx,
+                "question_index": question_index,
+                "total_questions": total_questions,
+            },
+        })
+
+    # Bottom row: per-question control buttons.
+    # - multiSelect: Submit (finalizes selected list)
+    # - Any: Other (prompts thread reply for free-form text)
+    control_buttons = []
+    if multi_select:
+        control_buttons.append({
+            "tag": "button",
+            "text": {"tag": "plain_text", "content": f"✅ 提交所选 ({len(selected)})"},
+            "type": "primary",
+            "value": {
+                "rid": request_id,
+                "action": "submit_multi",
+                "question_index": question_index,
+                "total_questions": total_questions,
+            },
+        })
+    control_buttons.append({
+        "tag": "button",
+        "text": {"tag": "plain_text", "content": "✏️ 其他（自定义文本）"},
+        "type": "default",
+        "value": {
+            "rid": request_id,
+            "action": "request_other",
+            "question_index": question_index,
+            "total_questions": total_questions,
+        },
+    })
+
     return {
         "config": {"wide_screen_mode": True},
         "header": {
-            "title": {"tag": "plain_text", "content": full_title},
+            "title": {"tag": "plain_text", "content": title},
             "template": "blue",
         },
         "elements": [
-            {
-                "tag": "action",
-                "actions": buttons,
-            },
+            {"tag": "action", "actions": buttons},
+            {"tag": "hr"},
+            {"tag": "action", "actions": control_buttons},
         ],
+    }
+
+
+def _empty_card(title: str, message: str) -> dict:
+    return {
+        "config": {"wide_screen_mode": True},
+        "header": {"title": {"tag": "plain_text", "content": title}, "template": "blue"},
+        "elements": [{"tag": "div", "text": {"tag": "lark_md", "content": message}}],
     }
 
 
@@ -616,6 +679,67 @@ def _tmux_fallback(request_id: str, behavior: str, req_data: dict):
         logger.error(f"tmux fallback failed: {e} (rid={request_id[:8]})")
 
 
+def _finalize_askuser_answer(
+    resp,
+    request_id: str,
+    questions: list,
+    question_index: int,
+    total_questions: int,
+    final_answer,
+    current_decision: dict,
+):
+    """Persist the answer for question_index and either show next question or
+    finalize the decision (signal the hook process)."""
+    answers_list = current_decision.setdefault("answers", [])
+    while len(answers_list) <= question_index:
+        answers_list.append(None)
+    answers_list[question_index] = final_answer
+    # Clear any awaiting_other marker since this question is done
+    current_decision.pop("awaiting_other", None)
+
+    logger.info(f"AskUserQuestion answer[{question_index}]: {final_answer!r} (rid={request_id[:8]})")
+
+    has_next = question_index + 1 < total_questions
+    if has_next:
+        next_card = _build_askuserquestion_card(request_id, questions, question_index + 1)
+        resp.card = CallBackCard()
+        resp.card.type = "raw"
+        resp.card.data = next_card
+        resp.toast = CallBackToast()
+        resp.toast.type = "success"
+        resp.toast.content = f"Q{question_index + 1}/{total_questions} answered"
+        return resp
+
+    # All answered → build final decision with updatedInput
+    final_decision = {
+        "behavior": "allow",
+        "answers": answers_list,
+        "updatedInput": _build_askuser_updated_input(questions, answers_list),
+    }
+    _perm_decisions[request_id] = final_decision
+    perm_event = _perm_events.get(request_id)
+    if perm_event:
+        perm_event.set()
+
+    resp.card = CallBackCard()
+    resp.card.type = "raw"
+    resp.card.data = {
+        "config": {"wide_screen_mode": True},
+        "header": {
+            "title": {"tag": "plain_text", "content": "All questions answered"},
+            "template": "green",
+        },
+        "elements": [
+            {"tag": "div", "text": {"tag": "lark_md",
+                                    "content": f"✓ All {total_questions} question(s) answered"}},
+        ],
+    }
+    resp.toast = CallBackToast()
+    resp.toast.type = "success"
+    resp.toast.content = "All answers submitted"
+    return resp
+
+
 def _build_askuser_updated_input(questions: list, answers: list) -> dict:
     """Build PermissionRequest decision.updatedInput payload for AskUserQuestion.
 
@@ -634,8 +758,7 @@ def _build_askuser_updated_input(questions: list, answers: list) -> dict:
         ans = answers[i]
         if ans is None:
             continue
-        # multiSelect placeholder: hook layer currently sends a single label;
-        # if list given, join with comma per spec.
+        # multiSelect: hook layer may send list; spec says join with comma.
         if isinstance(ans, list):
             ans = ",".join(str(x) for x in ans)
         answers_map[question_text] = ans
@@ -680,92 +803,84 @@ def _on_card_action(data: P2CardActionTrigger) -> P2CardActionTriggerResponse:
 
         tool_name = req_data.get("tool_name", "unknown")
 
-        # Handle AskUserQuestion answers (supports multiple questions via sequential processing)
+        # Handle AskUserQuestion: select / toggle / submit_multi / request_other
         if tool_name == "AskUserQuestion":
-            answer = value.get("answer")
+            action = value.get("action", "select")
             question_index = value.get("question_index", 0)
             total_questions = value.get("total_questions", 1)
 
-            if answer is None:
-                resp.toast = CallBackToast()
-                resp.toast.type = "warning"
-                resp.toast.content = "No answer provided"
-                return resp
-
-            # Get tool input to access all questions
             tool_input = req_data.get("tool_input", {})
             questions = tool_input.get("questions", [])
 
-            # Persist answer into _perm_decisions[request_id]; setdefault keeps
-            # earlier answers across multi-question rounds (previous code held an
-            # orphan dict and lost answers 0..N-2).
             current_decision = _perm_decisions.setdefault(request_id, {})
-            answers_list = current_decision.setdefault("answers", [])
-            while len(answers_list) <= question_index:
-                answers_list.append(None)
-            answers_list[question_index] = answer
 
-            logger.info(f"AskUserQuestion answer[{question_index}]: {answer} (rid={request_id[:8]})")
-
-            # Check if there are more questions
-            has_next_question = question_index + 1 < total_questions
-
-            if has_next_question:
-                # Build card for next question
-                next_index = question_index + 1
-                next_card = _build_askuserquestion_card(request_id, questions, next_index)
-
-                # Return updated card to show next question
+            if action == "toggle":
+                # multiSelect: toggle option_idx in pending_selections[question_index]
+                option_idx = value.get("option_idx")
+                if option_idx is None:
+                    resp.toast = CallBackToast()
+                    resp.toast.type = "warning"
+                    resp.toast.content = "Missing option_idx"
+                    return resp
+                pending_all = current_decision.setdefault("pending_selections", {})
+                selected = pending_all.setdefault(question_index, [])
+                if option_idx in selected:
+                    selected.remove(option_idx)
+                else:
+                    selected.append(option_idx)
+                logger.info(f"AskUser toggle Q{question_index+1} idx={option_idx} → selected={selected} (rid={request_id[:8]})")
                 resp.card = CallBackCard()
                 resp.card.type = "raw"
-                resp.card.data = next_card
+                resp.card.data = _build_askuserquestion_card(
+                    request_id, questions, question_index, selected_indices=selected,
+                )
+                return resp
 
-                # Toast notification
+            if action == "request_other":
+                # Mark this rid+question waiting for a thread text reply.
+                current_decision["awaiting_other"] = {
+                    "question_index": question_index,
+                    "root_msg_id": req_data.get("feishu_root_msg_id", ""),
+                }
+                logger.info(f"AskUser request_other Q{question_index+1} (rid={request_id[:8]})")
+                resp.card = CallBackCard()
+                resp.card.type = "raw"
+                resp.card.data = _build_askuserquestion_card(
+                    request_id, questions, question_index, other_pending=True,
+                )
                 resp.toast = CallBackToast()
-                resp.toast.type = "success"
-                resp.toast.content = f"Question {question_index + 1}/{total_questions} answered. Next question..."
+                resp.toast.type = "info"
+                resp.toast.content = "请在话题里回复你的自定义文本"
+                return resp
+
+            # action == "select" (single-select final) or "submit_multi"
+            if action == "submit_multi":
+                pending_all = current_decision.get("pending_selections", {})
+                selected = pending_all.get(question_index, [])
+                if not selected:
+                    resp.toast = CallBackToast()
+                    resp.toast.type = "warning"
+                    resp.toast.content = "未选择任何选项"
+                    return resp
+                # Map selected option indices back to labels (1-based → 0-based)
+                q = questions[question_index]
+                opts = q.get("options", [])
+                labels = [opts[i - 1].get("label", opts[i - 1].get("value", ""))
+                          for i in selected if 0 < i <= len(opts)]
+                final_answer = labels  # list → joined with comma in updatedInput
             else:
-                # All questions answered — return decision with updatedInput so
-                # the hook process can inject {questions, answers} back to
-                # Claude Code via PermissionRequest.decision.updatedInput.
-                # Claude consumes answers directly, no native TUI is rendered,
-                # no tmux injection is needed.
-                final_decision = {
-                    "behavior": "allow",
-                    "answers": current_decision["answers"],
-                    "updatedInput": _build_askuser_updated_input(
-                        questions, current_decision["answers"]
-                    ),
-                }
-                _perm_decisions[request_id] = final_decision
+                # action == "select" — single-select option click
+                final_answer = value.get("answer")
+                if final_answer is None:
+                    resp.toast = CallBackToast()
+                    resp.toast.type = "warning"
+                    resp.toast.content = "No answer provided"
+                    return resp
 
-                # Signal that all answers are collected
-                perm_event = _perm_events.get(request_id)
-                if perm_event:
-                    perm_event.set()
-
-                # Build completion card
-                result_card = {
-                    "config": {"wide_screen_mode": True},
-                    "header": {
-                        "title": {"tag": "plain_text", "content": "All questions answered"},
-                        "template": "green",
-                    },
-                    "elements": [
-                        {"tag": "div", "text": {"tag": "lark_md", "content": f"✓ All {total_questions} question(s) answered successfully"}},
-                    ],
-                }
-
-                resp.card = CallBackCard()
-                resp.card.type = "raw"
-                resp.card.data = result_card
-
-                # Toast notification
-                resp.toast = CallBackToast()
-                resp.toast.type = "success"
-                resp.toast.content = f"All answers submitted"
-
-            return resp
+            return _finalize_askuser_answer(
+                resp, request_id, questions, question_index,
+                total_questions, final_answer, current_decision,
+            )
 
         # Handle permission decisions
         behavior = value.get("b", "")
@@ -1002,6 +1117,62 @@ def _resume_agent(session_id: str, old_session: Session, reply_text: str, messag
         threading.Thread(target=_delayed_inject, daemon=True).start()
 
 
+def _find_askuser_awaiting_other(thread_root: str | None) -> str | None:
+    """Return the request_id whose AskUserQuestion is awaiting a thread-reply
+    Other answer in the given Feishu thread root, or None."""
+    if not thread_root:
+        return None
+    for rid, req_data in _perm_requests.items():
+        if req_data.get("tool_name") != "AskUserQuestion":
+            continue
+        if req_data.get("feishu_root_msg_id") != thread_root:
+            continue
+        decision = _perm_decisions.get(rid, {})
+        if decision.get("awaiting_other"):
+            return rid
+    return None
+
+
+def _consume_other_answer(request_id: str, text: str, message_id: str):
+    """Use `text` as the AskUserQuestion answer for the question currently
+    awaiting Other input. Advances to next question or finalizes."""
+    req_data = _perm_requests.get(request_id, {})
+    questions = req_data.get("tool_input", {}).get("questions", [])
+    decision = _perm_decisions.setdefault(request_id, {})
+    awaiting = decision.get("awaiting_other") or {}
+    qi = awaiting.get("question_index", 0)
+    total = len(questions)
+
+    answers_list = decision.setdefault("answers", [])
+    while len(answers_list) <= qi:
+        answers_list.append(None)
+    answers_list[qi] = text
+    decision.pop("awaiting_other", None)
+    logger.info(f"AskUser other answer Q{qi+1}={text!r} (rid={request_id[:8]})")
+
+    has_next = qi + 1 < total
+    if has_next:
+        # Send next question card as a fresh thread reply since we don't have a
+        # CallBackCard channel for the original card.
+        next_card = _build_askuserquestion_card(request_id, questions, qi + 1)
+        root = req_data.get("feishu_root_msg_id")
+        if root:
+            _reply_card(root, next_card, reply_in_thread=True)
+        _add_reaction(message_id, random.choice(_SUCCESS_EMOJIS))
+        return
+
+    final_decision = {
+        "behavior": "allow",
+        "answers": answers_list,
+        "updatedInput": _build_askuser_updated_input(questions, answers_list),
+    }
+    _perm_decisions[request_id] = final_decision
+    perm_event = _perm_events.get(request_id)
+    if perm_event:
+        perm_event.set()
+    _add_reaction(message_id, random.choice(_SUCCESS_EMOJIS))
+
+
 def _on_message(data: P2ImMessageReceiveV1):
     sender_id = data.event.sender.sender_id
     logger.info("Message from open_id=%s", sender_id.open_id)
@@ -1024,6 +1195,14 @@ def _on_message(data: P2ImMessageReceiveV1):
     text = _parse_message_content(msg, message_id)
     if not text:
         return
+
+    # --- AskUserQuestion "Other" path: thread reply becomes the answer ---
+    if (parent_id or root_id) and msg.message_type == "text":
+        thread_root = root_id or parent_id
+        rid = _find_askuser_awaiting_other(thread_root)
+        if rid:
+            _consume_other_answer(rid, text, message_id)
+            return
 
     # --- New message: start a new agent instance ---
     if not parent_id and not root_id:
@@ -1238,6 +1417,9 @@ async def receive_permission_hook(request: Request):
         "hook_data_full": hook_data_full,
         "permission_suggestions": perm_suggestions,
         "created_at": time.time(),
+        # feishu_root_msg_id is filled below once we know the thread root, so
+        # AskUserQuestion's "Other" thread-reply lookup can locate this rid.
+        "feishu_root_msg_id": "",
     }
     _perm_events[request_id] = threading.Event()
 
@@ -1280,6 +1462,11 @@ async def receive_permission_hook(request: Request):
     else:
         logger.info(f"[CARD_DEBUG] Sending card as root message for {tool_name} (no root_msg_id, session={session_id[:8] if session_id else 'none'}, tty={tty})")
         _send_card(card)
+
+    # Track which Feishu thread root this rid belongs to so AskUserQuestion
+    # "Other" can match a free-form text reply back to the correct request.
+    if root_msg_id:
+        _perm_requests[request_id]["feishu_root_msg_id"] = root_msg_id
 
     project = basename(cwd) if cwd else "unknown"
     logger.info(f"Permission request: {tool_name} | rid={request_id[:8]} tmux={tty} ({project})")

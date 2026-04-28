@@ -240,9 +240,14 @@ def _handle_permission_request(hook_data, port, tmux_session, cwd, session_id):
         print("[walkcode] no request_id from server, fail-open", file=sys.stderr)
         sys.exit(0)
 
-    # Poll for decision (long-poll, up to 120s total)
+    # Poll for decision (long-poll, up to 30 minutes total). Long ceiling
+    # accommodates AskUserQuestion's Other / multiSelect flow where the user
+    # may take many minutes typing custom text or selecting multiple options
+    # in Feishu before clicking Submit. Must stay <= the matching settings.json
+    # hook timeout (1_800_000 ms) — Claude Code kills the hook process at that
+    # external limit regardless of internal deadline.
     decision_url = f"http://127.0.0.1:{port}/hook/permission/{request_id}/decision"
-    deadline = _time.monotonic() + 120
+    deadline = _time.monotonic() + 1800
 
     agent_name = os.environ.get("WALKCODE_AGENT", "claude")
     agent = get_agent(agent_name)
@@ -288,7 +293,7 @@ def _handle_permission_request(hook_data, port, tmux_session, cwd, session_id):
 
     # Timeout: fail-open so agent falls back to its native prompt.
     # A 2-min Feishu silence is not the same as an explicit deny.
-    print("[walkcode] permission poll timed out after 120s, fail-open", file=sys.stderr)
+    print("[walkcode] permission poll timed out after 1800s, fail-open", file=sys.stderr)
     sys.exit(0)
 
 
@@ -413,7 +418,7 @@ def _install_claude_hooks(_args):
             {"type": "command", "command": hook_cmd("notification", "Ping")}
         ]}],
         "PermissionRequest": [{"matcher": "", "hooks": [
-            {"type": "command", "command": "afplay /System/Library/Sounds/Ping.aiff & walkcode hook permission-request", "timeout": 120000}
+            {"type": "command", "command": "afplay /System/Library/Sounds/Ping.aiff & walkcode hook permission-request", "timeout": 1800000}
         ]}],
     }
 
@@ -440,7 +445,7 @@ def _install_codex_hooks(_args):
                 {"type": "command", "command": hook_cmd("stop", "Hero")}
             ]}],
             "PreToolUse": [{"matcher": "", "hooks": [
-                {"type": "command", "command": f"afplay /System/Library/Sounds/Ping.aiff & {port_env}walkcode hook permission-request", "timeout": 120}
+                {"type": "command", "command": f"afplay /System/Library/Sounds/Ping.aiff & {port_env}walkcode hook permission-request", "timeout": 1800}
             ]}],
         }
     }
