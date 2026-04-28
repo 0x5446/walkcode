@@ -616,64 +616,30 @@ def _tmux_fallback(request_id: str, behavior: str, req_data: dict):
         logger.error(f"tmux fallback failed: {e} (rid={request_id[:8]})")
 
 
-def _tmux_inject_askuser(request_id: str, answers: list, req_data: dict):
-    """Inject AskUserQuestion answer via tmux.
+def _build_askuser_updated_input(questions: list, answers: list) -> dict:
+    """Build PermissionRequest decision.updatedInput payload for AskUserQuestion.
 
-    The hook process exits with code 2 (no JSON), so Claude falls back to
-    the interactive terminal.  We then:
-      1. approve the permission prompt  (send "1" + Enter)
-      2. send the answer option number  (send N + Enter)
+    Per Claude Code hook spec, returning the original `questions` array along
+    with an `answers` map (question text → selected label) makes Claude consume
+    the answers directly without rendering its native TUI prompt. This replaces
+    the old tmux send-keys injection path entirely.
+
+    For multiSelect questions, Claude expects labels joined by commas.
     """
-    tty = req_data.get("tty", "")
-    if not tty:
-        return
-    tool_input = req_data.get("tool_input", {})
-    questions = tool_input.get("questions", [])
-
-    def _do_inject():
-        # Wait for hook to exit(2) and Claude to show the question UI.
-        # Claude auto-allows AskUserQuestion after hook denial, no separate
-        # permission prompt is shown — we only need to inject the answer.
-        time.sleep(4)
-
-        error = validate_target(tty)
-        if error:
-            logger.warning(f"tmux inject AskUser: session {tty} not found (rid={request_id[:8]})")
-            return
-
-        for i, answer in enumerate(answers):
-            if i < len(questions):
-                options = questions[i].get("options", [])
-                option_idx = None
-                for j, opt in enumerate(options):
-                    if opt.get("label", opt.get("value", "")) == answer:
-                        option_idx = j + 1  # 1-based
-                        break
-                if option_idx is not None:
-                    try:
-                        inject(tty, str(option_idx), enter=True)
-                        time.sleep(1)
-                        logger.info(f"tmux inject AskUser: sent '{option_idx}' to {tty} for Q{i+1} answer={answer} (rid={request_id[:8]})")
-                    except Exception as e:
-                        logger.error(f"tmux inject AskUser answer failed: {e} (rid={request_id[:8]})")
-
-        # Multi-question Submit/Review tab probe.
-        # Terminal Claude Code shows a final "Submit answers / Cancel" tab after
-        # the last answer when there are 2+ questions. Without an extra Enter the
-        # session sits idle. Single-question flows skip this tab — probe avoids
-        # blind injection that would corrupt prompt input.
-        for _ in range(3):
-            time.sleep(1)
-            pane = capture_pane(tty, lines=20)
-            if "Submit answers" in pane or "Review your answers" in pane:
-                try:
-                    inject(tty, "1", enter=True)
-                    logger.info(f"tmux inject AskUser: confirmed Submit tab '1' to {tty} (rid={request_id[:8]})")
-                except Exception as e:
-                    logger.error(f"tmux inject AskUser submit failed: {e} (rid={request_id[:8]})")
-                break
-
-    threading.Thread(target=_do_inject, daemon=True).start()
+    answers_map: dict[str, str] = {}
+    for i, q in enumerate(questions):
+        question_text = q.get("question", "")
+        if not question_text or i >= len(answers):
+            continue
+        ans = answers[i]
+        if ans is None:
+            continue
+        # multiSelect placeholder: hook layer currently sends a single label;
+        # if list given, join with comma per spec.
+        if isinstance(ans, list):
+            ans = ",".join(str(x) for x in ans)
+        answers_map[question_text] = ans
+    return {"questions": questions, "answers": answers_map}
 
 
 def _schedule_tmux_fallback(request_id: str, behavior: str, req_data: dict):
@@ -687,11 +653,6 @@ def _schedule_tmux_fallback(request_id: str, behavior: str, req_data: dict):
             _perm_events.pop(request_id, None)
             _perm_requests.pop(request_id, None)
     threading.Thread(target=_check, daemon=True).start()
-
-
-def _schedule_tmux_fallback_askuser(request_id: str, answers: list, req_data: dict):
-    """Legacy fallback — kept for reference, no longer called."""
-    pass
 
 
 # --- Card action handler ---
@@ -735,18 +696,14 @@ def _on_card_action(data: P2CardActionTrigger) -> P2CardActionTriggerResponse:
             tool_input = req_data.get("tool_input", {})
             questions = tool_input.get("questions", [])
 
-            # Initialize answers storage if needed
-            if not hasattr(_perm_decisions.get(request_id, {}), "get"):
-                _perm_decisions[request_id] = {}
-            current_decision = _perm_decisions.get(request_id, {})
-
-            # Store this answer
-            if "answers" not in current_decision:
-                current_decision["answers"] = []
-            # Ensure answers list is long enough
-            while len(current_decision["answers"]) <= question_index:
-                current_decision["answers"].append(None)
-            current_decision["answers"][question_index] = answer
+            # Persist answer into _perm_decisions[request_id]; setdefault keeps
+            # earlier answers across multi-question rounds (previous code held an
+            # orphan dict and lost answers 0..N-2).
+            current_decision = _perm_decisions.setdefault(request_id, {})
+            answers_list = current_decision.setdefault("answers", [])
+            while len(answers_list) <= question_index:
+                answers_list.append(None)
+            answers_list[question_index] = answer
 
             logger.info(f"AskUserQuestion answer[{question_index}]: {answer} (rid={request_id[:8]})")
 
@@ -768,10 +725,17 @@ def _on_card_action(data: P2CardActionTrigger) -> P2CardActionTriggerResponse:
                 resp.toast.type = "success"
                 resp.toast.content = f"Question {question_index + 1}/{total_questions} answered. Next question..."
             else:
-                # All questions answered - prepare final response
+                # All questions answered — return decision with updatedInput so
+                # the hook process can inject {questions, answers} back to
+                # Claude Code via PermissionRequest.decision.updatedInput.
+                # Claude consumes answers directly, no native TUI is rendered,
+                # no tmux injection is needed.
                 final_decision = {
                     "behavior": "allow",
                     "answers": current_decision["answers"],
+                    "updatedInput": _build_askuser_updated_input(
+                        questions, current_decision["answers"]
+                    ),
                 }
                 _perm_decisions[request_id] = final_decision
 
@@ -779,9 +743,6 @@ def _on_card_action(data: P2CardActionTrigger) -> P2CardActionTriggerResponse:
                 perm_event = _perm_events.get(request_id)
                 if perm_event:
                     perm_event.set()
-
-                # Schedule tmux injection: approve permission + send answer
-                _tmux_inject_askuser(request_id, list(current_decision["answers"]), dict(req_data))
 
                 # Build completion card
                 result_card = {

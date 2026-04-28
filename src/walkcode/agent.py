@@ -37,7 +37,12 @@ class AgentAdapter:
             # claude --resume '<sid>' --permission-mode default
             return f"cd '{cwd}' && {self.command} {self.resume_flag} '{escaped_sid}' {self.permission_mode_flag}"
 
-    def build_hook_response(self, behavior: str, updated_permissions: dict | None = None) -> dict | None:
+    def build_hook_response(
+        self,
+        behavior: str,
+        updated_permissions: dict | None = None,
+        updated_input: dict | None = None,
+    ) -> dict | None:
         if self.hook_event_permission == "PreToolUse":
             # Codex PreToolUse protocol (from codex 0.124.0 binary strings):
             #   - `permissionDecision: "deny"` + non-empty `permissionDecisionReason` = block
@@ -66,6 +71,10 @@ class AgentAdapter:
             decision_obj = {"behavior": behavior}
             if updated_permissions:
                 decision_obj["updatedPermissions"] = updated_permissions
+            if updated_input is not None:
+                # Used for AskUserQuestion to inject answers map directly,
+                # bypassing the native TUI prompt entirely.
+                decision_obj["updatedInput"] = updated_input
             return {
                 "hookSpecificOutput": {
                     "hookEventName": "PermissionRequest",

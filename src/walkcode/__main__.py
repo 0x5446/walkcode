@@ -257,15 +257,24 @@ def _handle_permission_request(hook_data, port, tmux_session, cwd, session_id):
                 decision = result["decision"]
                 behavior = decision.get("behavior", "deny")
 
-                # AskUserQuestion: exit without hook response so agent
-                # falls back to the interactive terminal prompt.
-                # The server injects the answer via tmux after we exit.
+                # AskUserQuestion: inject answers via PermissionRequest
+                # `updatedInput.answers` so Claude consumes them directly and
+                # skips its native TUI prompt entirely. The server has already
+                # collected answers from Feishu and packaged them in the
+                # decision payload as {questions, answers} ready to echo back.
+                updated_input = None
                 if tool_name == "AskUserQuestion":
-                    sys.exit(2)
+                    updated_input = decision.get("updatedInput")
+                    if updated_input is None:
+                        # Server somehow didn't supply updated_input — fail-open
+                        # so the agent falls back to its native prompt.
+                        print("[walkcode] AskUserQuestion decision missing updatedInput, fail-open", file=sys.stderr)
+                        sys.exit(0)
 
                 hook_response = agent.build_hook_response(
                     behavior=behavior,
                     updated_permissions=decision.get("updatedPermissions"),
+                    updated_input=updated_input,
                 )
 
                 if hook_response is not None:
