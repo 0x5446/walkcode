@@ -382,7 +382,7 @@ def _parse_message_content(msg, message_id: str) -> str | None:
         path = _download_image(message_id, image_key)
         if not path:
             return None
-        return f"![{t('image.label', n=1)}]({path})"
+        return f"[{t('image.label', n=1)}]({path})"
 
     if msg_type == "post":
         return _parse_post_content(content, message_id)
@@ -432,7 +432,7 @@ def _parse_post_content(content: dict, message_id: str) -> str | None:
                     img_counter += 1
                     path = _download_image(message_id, image_key)
                     if path:
-                        line_parts.append(f"![{t('image.label', n=img_counter)}]({path})")
+                        line_parts.append(f"[{t('image.label', n=img_counter)}]({path})")
                     else:
                         line_parts.append(f"[{t('image.download_failed')}]")
         if line_parts:
@@ -656,6 +656,22 @@ def _tmux_inject_askuser(request_id: str, answers: list, req_data: dict):
                         logger.info(f"tmux inject AskUser: sent '{option_idx}' to {tty} for Q{i+1} answer={answer} (rid={request_id[:8]})")
                     except Exception as e:
                         logger.error(f"tmux inject AskUser answer failed: {e} (rid={request_id[:8]})")
+
+        # Multi-question Submit/Review tab probe.
+        # Terminal Claude Code shows a final "Submit answers / Cancel" tab after
+        # the last answer when there are 2+ questions. Without an extra Enter the
+        # session sits idle. Single-question flows skip this tab — probe avoids
+        # blind injection that would corrupt prompt input.
+        for _ in range(3):
+            time.sleep(1)
+            pane = capture_pane(tty, lines=20)
+            if "Submit answers" in pane or "Review your answers" in pane:
+                try:
+                    inject(tty, "1", enter=True)
+                    logger.info(f"tmux inject AskUser: confirmed Submit tab '1' to {tty} (rid={request_id[:8]})")
+                except Exception as e:
+                    logger.error(f"tmux inject AskUser submit failed: {e} (rid={request_id[:8]})")
+                break
 
     threading.Thread(target=_do_inject, daemon=True).start()
 
