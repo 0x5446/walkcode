@@ -518,16 +518,18 @@ def _make_title(cwd: str, session_id: str = "", message: str = "") -> str:
     return " | ".join(parts)
 
 
+def _post_content(text: str) -> str:
+    return json.dumps({"zh_cn": {"content": [[{"tag": "md", "text": text}]]}})
+
+
 def _send(text: str) -> str | None:
     if not config.feishu_receive_id:
         logger.warning("Cannot send: FEISHU_RECEIVE_ID not configured")
         return None
-    msg_type = "text"
-    content = json.dumps({"text": text})
     body = CreateMessageRequestBody.builder() \
         .receive_id(config.feishu_receive_id) \
-        .msg_type(msg_type) \
-        .content(content) \
+        .msg_type("post") \
+        .content(_post_content(text)) \
         .build()
     req = CreateMessageRequest.builder() \
         .receive_id_type(config.feishu_receive_id_type) \
@@ -541,11 +543,9 @@ def _send(text: str) -> str | None:
 
 
 def _reply(message_id: str, text: str, reply_in_thread: bool = False) -> str | None:
-    msg_type = "text"
-    content = json.dumps({"text": text})
     builder = ReplyMessageRequestBody.builder() \
-        .msg_type(msg_type) \
-        .content(content)
+        .msg_type("post") \
+        .content(_post_content(text))
     if reply_in_thread:
         builder = builder.reply_in_thread(True)
     body = builder.build()
@@ -562,7 +562,7 @@ def _reply(message_id: str, text: str, reply_in_thread: bool = False) -> str | N
 
 def _edit_message(message_id: str, text: str):
     body = PatchMessageRequestBody.builder() \
-        .content(json.dumps({"text": text})) \
+        .content(_post_content(text)) \
         .build()
     req = PatchMessageRequest.builder() \
         .message_id(message_id) \
