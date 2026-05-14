@@ -177,6 +177,8 @@ Feishu does not send push notifications for thread replies unless the user has s
 }
 ```
 
+For Stop hooks `message` is sourced from Claude Code's `last_assistant_message` field. When that field arrives empty — which happens when the final assistant turn is a pure `tool_use` block (e.g. ends on `TaskUpdate`) — `walkcode hook stop` tails the `transcript_path` JSONL and recovers the most recent assistant text content. Without this fallback the Feishu thread would show only the "✅ Task complete" label with no reply body.
+
 ### PermissionRequest flow
 
 ```

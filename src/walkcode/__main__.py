@@ -298,6 +298,34 @@ def _handle_permission_request(hook_data, port, tmux_session, cwd, session_id):
     sys.exit(0)
 
 
+def _read_last_assistant_text(path: str, max_chars: int = 28000) -> str:
+    """Tail transcript JSONL; return most recent assistant message's text content.
+
+    Used as a fallback when Stop hook's `last_assistant_message` is empty
+    (e.g. the final assistant message was a pure tool_use with no text block).
+    """
+    if not path:
+        return ""
+    try:
+        lines = Path(path).read_text().splitlines()
+    except OSError:
+        return ""
+    for line in reversed(lines):
+        try:
+            rec = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if rec.get("type") != "assistant":
+            continue
+        content = rec.get("message", {}).get("content", [])
+        parts = [b.get("text", "") for b in content
+                 if isinstance(b, dict) and b.get("type") == "text"]
+        text = "".join(parts).strip()
+        if text:
+            return text if len(text) <= max_chars else text[:max_chars] + "\n…(truncated)"
+    return ""
+
+
 def cmd_hook(args):
     """Handle an agent hook event: read stdin, POST to server."""
     # Read hook data from stdin (agent pipes JSON)
@@ -365,13 +393,16 @@ def cmd_hook(args):
         title = hook_data.get("title", "")
         matcher = hook_data.get("notification_type", "") or os.environ.get("CLAUDE_NOTIFICATION_TYPE", "")
     else:
-        # Stop hook: last_assistant_message
+        # Stop hook: prefer last_assistant_message; fallback to transcript_path
+        # when the final message is a pure tool_use block (no text).
         message = hook_data.get("last_assistant_message", "")
         title = ""
         matcher = ""
         _SKIP = {"no response requested.", ""}
         if message.strip().lower() in _SKIP:
-            message = ""
+            message = _read_last_assistant_text(hook_data.get("transcript_path", ""))
+            if message.strip().lower() in _SKIP:
+                message = ""
 
     payload = json.dumps({
         "type": args.hook_type,
