@@ -1,9 +1,12 @@
 """Terminal injection via tmux send-keys."""
 
+import logging
 import os
 import subprocess
 
 from .i18n import t
+
+logger = logging.getLogger("walkcode")
 
 # Single-key replies that should NOT have a newline appended
 SINGLE_KEYS = {"y", "n", "a", "1", "2", "3", "4", "5", "6", "7", "8", "9", "0"}
@@ -111,7 +114,10 @@ def inject(session_name: str, text: str, enter: bool | None = None) -> bool:
         raise RuntimeError(error)
 
     if enter is None:
-        enter = text.strip().lower() not in SINGLE_KEYS
+        stripped = text.strip()
+        # For multi-character text, always send Enter
+        # SINGLE_KEYS logic only applies to single-char replies (y/n/1-9/0)
+        enter = len(stripped) > 1 or stripped.lower() not in SINGLE_KEYS
 
     # Use send-keys -l (literal) to avoid tmux key binding interpretation
     result = subprocess.run(

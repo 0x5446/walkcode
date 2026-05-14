@@ -11,3 +11,4 @@ dist/
 .playwright-mcp/
 .claude/
 AGENTS.md
+.envrc
