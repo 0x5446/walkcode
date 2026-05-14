@@ -5,6 +5,9 @@ from dataclasses import dataclass
 from .i18n import t
 
 
+DEFAULT_OPENAPI_DOMAIN = "https://open.feishu.cn"
+
+
 def _load_env_file(env_file: Path):
     """Parse a .env file and set values into os.environ (won't overwrite existing)."""
     if not env_file.exists():
@@ -26,6 +29,7 @@ class Config:
     feishu_app_secret: str
     feishu_receive_id: str  # may be empty during initial setup
     feishu_receive_id_type: str  # "open_id" or "chat_id"
+    openapi_domain: str = DEFAULT_OPENAPI_DOMAIN
     port: int = 3001
     state_path: Path = Path.home() / ".walkcode" / "state.json"
     default_cwd: str = str(Path.home() / ".walkcode" / "workspace")
@@ -70,6 +74,10 @@ class Config:
             feishu_app_secret=os.environ["FEISHU_APP_SECRET"],
             feishu_receive_id=os.environ.get("FEISHU_RECEIVE_ID", ""),
             feishu_receive_id_type=os.environ.get("FEISHU_RECEIVE_ID_TYPE", "open_id"),
+            openapi_domain=os.environ.get(
+                "LARK_OPENAPI_DOMAIN",
+                os.environ.get("FEISHU_OPENAPI_DOMAIN", DEFAULT_OPENAPI_DOMAIN),
+            ).rstrip("/"),
             port=int(os.environ.get("WALKCODE_PORT", os.environ.get("PORT", "3001"))),
             state_path=Path(
                 os.environ.get("WALKCODE_STATE_PATH", default_state)

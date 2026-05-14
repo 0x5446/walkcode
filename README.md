@@ -310,6 +310,9 @@ FEISHU_APP_ID=cli_codex_xxx
 FEISHU_APP_SECRET=xxx
 FEISHU_RECEIVE_ID=ou_xxx
 
+# Lark 国际版应用请启用这一行
+# LARK_OPENAPI_DOMAIN=https://open.larksuite.com
+
 # 认证方式（二选一）：
 # 方式 A：ChatGPT 订阅（推荐）— 先运行 codex login 完成 OAuth 登录
 #   Token 过期时 WalkCode 会自动发起 device-auth，你在手机上完成验证即可
@@ -317,6 +320,8 @@ FEISHU_RECEIVE_ID=ou_xxx
 # OPENAI_API_KEY=sk-xxx
 EOF
 ```
+
+> `FEISHU_RECEIVE_ID` 必须用 Codex 机器人对应应用下获取到的 `open_id`。不要复用 Claude 机器人里打印出的 `open_id`，飞书/Lark 的 `open_id` 是按应用隔离的，跨应用会导致 `open_id cross app` 发送失败。
 
 #### 4. 添加 Shell Wrapper
 
@@ -344,6 +349,8 @@ WALKCODE_ENV_FILE=~/.walkcode/codex.env walkcode install-hooks --agent codex
 ```
 
 这会写入 `~/.codex/hooks.json`（hook 命令自动指向 port 3002）并启用 Codex 的 hooks feature flag。
+
+安装后的 hook 命令会显式携带 `WALKCODE_AGENT=codex`、`WALKCODE_PORT=3002`，并保留 `WALKCODE_ENV_FILE`，避免 Codex 审批回包误用 Claude 协议。
 
 #### 6. 启动 Codex 实例
 
@@ -508,6 +515,7 @@ walkcode test-inject <tmux-session> "hi"  # 测试注入
 | `FEISHU_APP_SECRET` | 是 | 飞书应用密钥 |
 | `FEISHU_RECEIVE_ID` | 否 | 你的 open_id 或 chat_id（运行 `walkcode serve` 获取） |
 | `FEISHU_RECEIVE_ID_TYPE` | 否 | `open_id`（默认）或 `chat_id` |
+| `LARK_OPENAPI_DOMAIN` | 否 | OpenAPI 域名。飞书默认 `https://open.feishu.cn`；Lark 国际版设为 `https://open.larksuite.com` |
 | `PORT` / `WALKCODE_PORT` | 否 | HTTP 服务器端口（默认 `3001`） |
 | `WALKCODE_CWD` | 否 | 远程启动会话的默认工作目录（默认 `~/.walkcode/workspace`） |
 | `WALKCODE_AGENT` | 否 | Agent 类型：`claude`（默认）或 `codex` |

@@ -1558,10 +1558,12 @@ def init(cfg: Config):
     lark_client = lark.Client.builder() \
         .app_id(cfg.feishu_app_id) \
         .app_secret(cfg.feishu_app_secret) \
+        .domain(cfg.openapi_domain) \
         .log_level(lark.LogLevel.INFO) \
         .build()
     session_store = SessionStore(cfg.state_path)
     session_store.load()
+    logger.info("Using OpenAPI domain: %s", cfg.openapi_domain)
     logger.info("Loaded %s persisted sessions from %s", session_store.count(), cfg.state_path)
 
 
@@ -1577,6 +1579,7 @@ def start_ws_client(cfg: Config):
     cli = lark.ws.Client(
         cfg.feishu_app_id, cfg.feishu_app_secret,
         event_handler=handler, log_level=lark.LogLevel.INFO,
+        domain=cfg.openapi_domain,
     )
     threading.Thread(target=cli.start, daemon=True).start()
     logger.info("Feishu WebSocket client started")

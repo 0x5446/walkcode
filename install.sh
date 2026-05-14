@@ -100,6 +100,11 @@ setup_config() {
 FEISHU_APP_ID=
 FEISHU_APP_SECRET=
 
+# OpenAPI domain (optional)
+# Feishu: https://open.feishu.cn (default)
+# Lark:    https://open.larksuite.com
+# LARK_OPENAPI_DOMAIN=https://open.larksuite.com
+
 # Who receives notifications
 # Use open_id for direct messages, or chat_id for group chats
 # Run "walkcode serve" to discover your open_id

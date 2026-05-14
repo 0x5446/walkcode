@@ -4,6 +4,7 @@ import argparse
 import json
 import logging
 import os
+import shlex
 import signal
 import subprocess
 import sys
@@ -395,6 +396,26 @@ def cmd_hook(args):
 
 # --- Hook installation ---
 
+def _shell_env_prefix(values: list[tuple[str, str]]) -> str:
+    parts = [f"{key}={shlex.quote(value)}" for key, value in values if value]
+    return (" ".join(parts) + " ") if parts else ""
+
+
+def _read_env_file_values(path: str | None = None) -> dict[str, str]:
+    env_path = Path(path).expanduser() if path else _RUNTIME_DIR / ".env"
+    if not env_path.exists():
+        return {}
+    values = {}
+    for line in env_path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        key, _, value = line.partition("=")
+        if key and value:
+            values[key.strip()] = value.strip()
+    return values
+
+
 def _install_claude_hooks(_args):
     """Install hooks into Claude Code settings.json."""
     settings_path = Path.home() / ".claude" / "settings.json"
@@ -429,23 +450,39 @@ def _install_claude_hooks(_args):
 
 def _install_codex_hooks(_args):
     """Install hooks into Codex CLI hooks.json and enable feature flag."""
-    _quick_load_env({"WALKCODE_PORT", "PORT"})
-    port = os.environ.get("WALKCODE_PORT", os.environ.get("PORT", "3001"))
-    port_env = f"WALKCODE_PORT={port} " if port != "3001" else ""
+    env_file = os.environ.get("WALKCODE_ENV_FILE")
+    file_values = _read_env_file_values(env_file)
+    port = (
+        os.environ.get("WALKCODE_PORT")
+        or file_values.get("WALKCODE_PORT")
+        or file_values.get("PORT")
+        or os.environ.get("PORT", "3001")
+    )
+    env_values = []
+    if env_file:
+        env_values.append(("WALKCODE_ENV_FILE", str(Path(env_file).expanduser())))
+    env_values.extend([
+        ("WALKCODE_AGENT", "codex"),
+        ("WALKCODE_PORT", port),
+    ])
+    instance = os.environ.get("WALKCODE_INSTANCE") or file_values.get("WALKCODE_INSTANCE")
+    if instance:
+        env_values.append(("WALKCODE_INSTANCE", instance))
+    env_prefix = _shell_env_prefix(env_values)
 
     def hook_cmd(hook_type: str, sound: str) -> str:
-        return f"afplay /System/Library/Sounds/{sound}.aiff & {port_env}walkcode hook {hook_type}"
+        return f"afplay /System/Library/Sounds/{sound}.aiff & {env_prefix}walkcode hook {hook_type}"
 
     hooks_config = {
         "hooks": {
             "SessionStart": [{"matcher": "", "hooks": [
-                {"type": "command", "command": f"{port_env}walkcode hook sync", "timeout": 5}
+                {"type": "command", "command": f"{env_prefix}walkcode hook sync", "timeout": 5}
             ]}],
             "Stop": [{"matcher": "", "hooks": [
                 {"type": "command", "command": hook_cmd("stop", "Hero")}
             ]}],
             "PreToolUse": [{"matcher": "", "hooks": [
-                {"type": "command", "command": f"afplay /System/Library/Sounds/Ping.aiff & {port_env}walkcode hook permission-request", "timeout": 1800}
+                {"type": "command", "command": f"afplay /System/Library/Sounds/Ping.aiff & {env_prefix}walkcode hook permission-request", "timeout": 1800}
             ]}],
         }
     }

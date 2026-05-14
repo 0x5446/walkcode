@@ -304,6 +304,9 @@ FEISHU_APP_ID=cli_codex_xxx
 FEISHU_APP_SECRET=xxx
 FEISHU_RECEIVE_ID=ou_xxx
 
+# Enable this for Lark international apps
+# LARK_OPENAPI_DOMAIN=https://open.larksuite.com
+
 # Authentication (pick one):
 # Option A: ChatGPT subscription (recommended) — run `codex login` first
 #   When token expires, WalkCode auto-starts device-auth and sends the code to Feishu
@@ -311,6 +314,8 @@ FEISHU_RECEIVE_ID=ou_xxx
 # OPENAI_API_KEY=sk-xxx
 EOF
 ```
+
+> `FEISHU_RECEIVE_ID` must be the `open_id` discovered from the Codex bot's own app. Do not reuse an `open_id` printed by the Claude bot; Feishu/Lark `open_id` values are app-scoped, and cross-app IDs fail with `open_id cross app`.
 
 #### 4. Add Shell Wrapper
 
@@ -338,6 +343,8 @@ WALKCODE_ENV_FILE=~/.walkcode/codex.env walkcode install-hooks --agent codex
 ```
 
 This writes `~/.codex/hooks.json` (hook commands auto-point to port 3002) and enables the Codex hooks feature flag.
+
+The installed hook commands explicitly include `WALKCODE_AGENT=codex`, `WALKCODE_PORT=3002`, and preserve `WALKCODE_ENV_FILE`, so Codex permission responses don't accidentally use the Claude hook protocol.
 
 #### 6. Start Codex Instance
 
@@ -498,6 +505,7 @@ walkcode test-inject <tmux-session> "hi"  # Test injection
 | `FEISHU_APP_SECRET` | Yes | Feishu app secret |
 | `FEISHU_RECEIVE_ID` | No | Your open_id or chat_id (run `walkcode serve` to discover) |
 | `FEISHU_RECEIVE_ID_TYPE` | No | `open_id` (default) or `chat_id` |
+| `LARK_OPENAPI_DOMAIN` | No | OpenAPI domain. Feishu defaults to `https://open.feishu.cn`; use `https://open.larksuite.com` for Lark international |
 | `PORT` / `WALKCODE_PORT` | No | HTTP server port (default: `3001`) |
 | `WALKCODE_CWD` | No | Default cwd for remote-started sessions (default: `~/.walkcode/workspace`) |
 | `WALKCODE_AGENT` | No | Agent type: `claude` (default) or `codex` |
