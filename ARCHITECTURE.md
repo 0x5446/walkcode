@@ -53,6 +53,10 @@ Feishu reply arrives
 
 A `SessionStart` hook fires the moment Claude starts (including `--continue` and `--resume`), calling `POST /hook/sync` with the current `session_id` and tmux name. This ensures the `session_id → tty` mapping is updated **before** Claude processes any user input or tools. Subsequent hooks (`Stop`, `Notification`, `PermissionRequest`) also carry the tmux name and call `session_store.upsert()`, keeping the mapping current throughout the session.
 
+### Eviction when a tmux is reused
+
+A single tmux session is often reused by multiple `session_id`s — typically when the user runs `/clear` or restarts Claude inside an existing tmux. Without protection, every prior `session_id` would keep pointing at the shared tmux, and a Feishu reply on an older thread would inject into whichever Claude is currently active there — silently routing messages to the wrong session. `session_store.upsert()` therefore clears the `tty` field of any other `session_id` that previously held the same tmux name. Older threads then fall through to the dead-tty branch in `_load_reply_session` and trigger `_resume_agent`, which spins up a fresh tmux via `--resume` and keeps the conversation in its original Feishu thread.
+
 ---
 
 ## Session Lifecycle

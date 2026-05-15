@@ -127,6 +127,15 @@ class SessionStore:
         root_msg_id: str | None = None,
     ) -> Session:
         with self._lock:
+            if tty:
+                for other_id, other in self._sessions.items():
+                    if other_id != session_id and other.tty == tty:
+                        logger.info(
+                            "Evicting stale tty mapping: session=%s tty=%s (taken over by session=%s)",
+                            other_id[:8], tty, session_id[:8],
+                        )
+                        other.tty = ""
+
             session = self._sessions.get(session_id)
             if session is None:
                 session = Session(
