@@ -241,7 +241,19 @@ Note: Claude Code reads `settings.json` only at startup, so writing to it alone 
 
 ## Message Routing
 
-`_on_message()` handles all incoming Feishu messages. The routing logic after parsing the message text:
+### Async dispatch (the SDK must ack fast)
+
+The Lark SDK calls our handler synchronously on its WebSocket asyncio loop and then sends the WebSocket ack frame **only after the handler returns**. Doing tmux/HTTP work inline therefore delays the ack, starves the heartbeat (PING/PONG keepalive timeouts in the SDK logs), and causes Feishu to redeliver the same message on the next reconnect.
+
+`_on_message()` is therefore a thin shim: it submits the work to a single-worker `ThreadPoolExecutor` (`_msg_executor`) and returns. The actual work runs in `_handle_message()`, wrapped by `_handle_message_safe()` so a raised exception is logged and the executor thread survives.
+
+Single worker (not a pool) preserves the FIFO ordering the synchronous path used to give us — important because multiple replies to the same thread must inject in the order they arrived.
+
+The first log line per message now also carries `message_id`, `parent`, and `root` so duplicate deliveries can be diagnosed by grepping the `message_id`.
+
+### Routing logic
+
+`_handle_message()` handles all incoming Feishu messages. The routing logic after parsing the message text:
 
 ```
 message received

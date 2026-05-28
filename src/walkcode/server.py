@@ -10,6 +10,7 @@ import subprocess
 import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from os.path import basename
 from pathlib import Path
 
@@ -380,6 +381,11 @@ _FAILURE_EMOJIS = [
 
 _MENTION_RE = re.compile(r"@_user_\d+\s*")
 _IMAGE_DIR = Path.home() / ".walkcode" / "images"
+
+# Single-worker executor so the Lark SDK callback returns immediately and the
+# SDK can ack the WebSocket frame without waiting for tmux/HTTP work. Single
+# worker preserves FIFO ordering of the original synchronous dispatch.
+_msg_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="walkcode-msg")
 
 
 _IMAGE_MAGIC = {
@@ -1174,10 +1180,35 @@ def _consume_other_answer(request_id: str, text: str, message_id: str):
 
 
 def _on_message(data: P2ImMessageReceiveV1):
+    # Dispatch to background worker so the SDK returns immediately and can ack
+    # the WebSocket frame. Doing tmux/HTTP work in the SDK callback blocks the
+    # event loop, misses PING/PONG heartbeats, and causes Feishu to redeliver
+    # the same message after reconnect.
+    _msg_executor.submit(_handle_message_safe, data)
+
+
+def _handle_message_safe(data: P2ImMessageReceiveV1):
+    try:
+        _handle_message(data)
+    except Exception:
+        message_id = ""
+        sender = ""
+        try:
+            message_id = data.event.message.message_id or ""
+            sender = data.event.sender.sender_id.open_id or ""
+        except Exception:
+            pass
+        logger.exception(
+            "Unhandled error in _handle_message message_id=%s open_id=%s",
+            message_id, sender,
+        )
+
+
+def _handle_message(data: P2ImMessageReceiveV1):
     sender_id = data.event.sender.sender_id
-    logger.info("Message from open_id=%s", sender_id.open_id)
 
     if not config.feishu_receive_id:
+        logger.info("Message from open_id=%s", sender_id.open_id)
         print(t("serve.received_open_id", open_id=sender_id.open_id))
         return
 
@@ -1185,6 +1216,11 @@ def _on_message(data: P2ImMessageReceiveV1):
     parent_id = msg.parent_id
     root_id = msg.root_id
     message_id = msg.message_id
+
+    logger.info(
+        "Message from open_id=%s message_id=%s parent=%s root=%s",
+        sender_id.open_id, message_id, parent_id or "-", root_id or "-",
+    )
 
     # --- Parse message content early ---
     if msg.message_type not in ("text", "image", "post"):
