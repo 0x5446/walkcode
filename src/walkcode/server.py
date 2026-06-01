@@ -65,6 +65,28 @@ _perm_decisions: dict[str, dict] = {}  # request_id → {behavior, tool_name, al
 _perm_events: dict[str, threading.Event] = {}  # request_id → Event for signaling
 
 
+# --- Inject delivery confirmation ---
+# A successful `tmux send-keys` only means the bytes reached the pane — NOT that
+# Claude accepted them as a prompt. A modal/dialog (/status, /model, permission
+# prompt), copy-mode, or a 100%-context state silently swallows the keystrokes.
+# We confirm REAL delivery via the UserPromptSubmit hook: after injecting we wait
+# for that session to report a matching prompt. If it never arrives the message
+# was swallowed, and we tell the user instead of faking success with an emoji.
+#
+# Busy/idle is derived purely from hooks (no screen scraping): UserPromptSubmit
+# marks a turn start (busy), Stop marks a turn end (idle). An inject during a
+# busy turn is queued (modals can't coexist with active generation) and confirms
+# when the queued prompt fires its UserPromptSubmit after the turn ends.
+_session_last_ups: dict[str, float] = {}   # session_id → ts of last UserPromptSubmit
+_session_last_stop: dict[str, float] = {}  # session_id → ts of last Stop
+_ups_capable_sessions: set[str] = set()    # sessions seen to emit UserPromptSubmit
+_pending_injects: list[dict] = []          # see _register_pending_inject for shape
+_pending_lock = threading.Lock()
+_INJECT_CONFIRM_GRACE = 4.0    # s to wait for UserPromptSubmit after the session is idle
+_INJECT_CONFIRM_MAX = 600.0    # s absolute backstop: stop waiting even if never idle
+_SWEEPER_INTERVAL = 1.0        # s between pending-inject sweeps
+
+
 def _capture_terminal_options(tty: str) -> list[str]:
     """Capture numbered option text from the terminal's permission prompt via tmux.
 
@@ -1116,10 +1138,12 @@ def _resume_agent(session_id: str, old_session: Session, reply_text: str, messag
             time.sleep(3)
             try:
                 inject(tmux_name, reply_text)
-                _add_reaction(message_id, random.choice(_SUCCESS_EMOJIS))
             except Exception as e:
                 logger.error(f"Delayed inject after resume failed: {e}")
+                _reply(message_id, t("feishu.inject_timeout"), reply_in_thread=True)
                 _add_reaction(message_id, random.choice(_FAILURE_EMOJIS))
+                return
+            _register_pending_inject(session_id, tmux_name, reply_text, message_id)
         threading.Thread(target=_delayed_inject, daemon=True).start()
 
 
@@ -1177,6 +1201,141 @@ def _consume_other_answer(request_id: str, text: str, message_id: str):
     if perm_event:
         perm_event.set()
     _add_reaction(message_id, random.choice(_SUCCESS_EMOJIS))
+
+
+def _norm(s: str) -> str:
+    """Collapse whitespace for tolerant prompt matching."""
+    return " ".join((s or "").split())
+
+
+def _mark_session_busy(session_id: str):
+    if session_id:
+        with _pending_lock:
+            _session_last_ups[session_id] = time.time()
+            # Receiving any UserPromptSubmit proves this session has the hook
+            # installed — so a *missing* one later is a real swallow, not just a
+            # legacy session that predates the hook.
+            _ups_capable_sessions.add(session_id)
+
+
+def _mark_session_idle(session_id: str):
+    if session_id:
+        with _pending_lock:
+            _session_last_stop[session_id] = time.time()
+
+
+def _is_session_busy(session_id: str) -> bool:
+    """A turn is in progress if the last UserPromptSubmit is newer than the last Stop."""
+    if not session_id:
+        return False
+    with _pending_lock:
+        return _session_last_ups.get(session_id, 0.0) > _session_last_stop.get(session_id, 0.0)
+
+
+def _register_pending_inject(session_id: str | None, tty: str, text: str, message_id: str):
+    """Record an injected message awaiting UserPromptSubmit confirmation.
+
+    The success/failure emoji is deferred until we either see a matching
+    UserPromptSubmit (delivered) or the wait window expires (swallowed).
+    """
+    with _pending_lock:
+        _pending_injects.append({
+            "session_id": session_id or "",
+            "tty": tty,
+            "text": text,
+            "message_id": message_id,
+            "injected_at": time.time(),
+            "busy_at_inject": _session_last_ups.get(session_id or "", 0.0)
+            > _session_last_stop.get(session_id or "", 0.0),
+        })
+
+
+def _confirm_pending_inject(session_id: str, tty: str, prompt: str):
+    """Match an incoming UserPromptSubmit against pending injects; confirm delivery."""
+    np = _norm(prompt)
+    if not np:
+        return
+    hit = None
+    with _pending_lock:
+        for p in _pending_injects:
+            same = (session_id and p["session_id"] and p["session_id"] == session_id) or \
+                   (tty and p["tty"] == tty)
+            if not same:
+                continue
+            nt = _norm(p["text"])
+            if nt and (nt in np or np in nt):
+                hit = p
+                break
+        if hit:
+            _pending_injects.remove(hit)
+    if hit:
+        sid = (session_id or "")[:8]
+        logger.info(f"Inject confirmed delivered: '{hit['text'][:40]}' session={sid or '-'} tty={tty}")
+        _add_reaction(hit["message_id"], random.choice(_SUCCESS_EMOJIS))
+
+
+def _sweep_pending_injects():
+    """Fail any pending inject whose confirmation window has elapsed.
+
+    Idle anchor = when the session first became idle at/after the inject:
+      - injected while idle  → anchor = inject time
+      - injected while busy  → anchor = first Stop after inject (queued case);
+                               None until that Stop arrives (keep waiting)
+    Swallowed = anchor set and GRACE elapsed since it, OR absolute MAX exceeded.
+    """
+    now = time.time()
+    failed = []
+    with _pending_lock:
+        for p in list(_pending_injects):
+            if not p["busy_at_inject"]:
+                anchor = p["injected_at"]
+            else:
+                last_stop = _session_last_stop.get(p["session_id"], 0.0)
+                anchor = last_stop if last_stop > p["injected_at"] else None
+            swallowed = anchor is not None and (now - anchor) > _INJECT_CONFIRM_GRACE
+            timed_out = (now - p["injected_at"]) > _INJECT_CONFIRM_MAX
+            if swallowed or timed_out:
+                _pending_injects.remove(p)
+                failed.append(p)
+    for p in failed:
+        sid = p["session_id"]
+        capable = bool(sid) and sid in _ups_capable_sessions
+        if not capable:
+            # This session has never emitted a UserPromptSubmit — it predates the
+            # hook (started before reinstall). We can't confirm delivery, so fall
+            # back to the legacy assume-delivered behavior rather than crying wolf.
+            logger.info(
+                f"Inject unconfirmed (no UserPromptSubmit hook on session "
+                f"{(sid or '-')[:8]}); assuming delivered: '{p['text'][:40]}'"
+            )
+            try:
+                _add_reaction(p["message_id"], random.choice(_SUCCESS_EMOJIS))
+            except Exception as e:
+                logger.error(f"Failed to mark unconfirmed inject: {e}")
+            continue
+        logger.warning(
+            f"Inject NOT delivered (swallowed/timeout): '{p['text'][:40]}' "
+            f"tty={p['tty']} session={sid[:8]}"
+        )
+        try:
+            _reply(p["message_id"], t("feishu.inject_swallowed"), reply_in_thread=True)
+            _add_reaction(p["message_id"], random.choice(_FAILURE_EMOJIS))
+        except Exception as e:
+            logger.error(f"Failed to notify inject failure: {e}")
+
+
+def _start_inject_sweeper():
+    """Background thread that resolves pending injects (delivered vs swallowed)."""
+    def _loop():
+        while True:
+            time.sleep(_SWEEPER_INTERVAL)
+            try:
+                _sweep_pending_injects()
+            except Exception as e:
+                logger.error(f"Inject sweeper error: {e}")
+    threading.Thread(target=_loop, daemon=True).start()
+    logger.info("Inject delivery sweeper started (grace=%.0fs, max=%.0fs)",
+                _INJECT_CONFIRM_GRACE, _INJECT_CONFIRM_MAX)
 
 
 def _on_message(data: P2ImMessageReceiveV1):
@@ -1307,11 +1466,18 @@ def _handle_message(data: P2ImMessageReceiveV1):
 
     try:
         inject(tty, text)
-        logger.info(f"Injected '{text}' -> {tty} ({project})")
-        _add_reaction(message_id, random.choice(_SUCCESS_EMOJIS))
     except Exception as e:
+        # send-keys timed out / session gone → immediate, honest failure
         logger.error(f"Inject failed: {e}")
+        _reply(message_id, t("feishu.inject_timeout"), reply_in_thread=True)
         _add_reaction(message_id, random.choice(_FAILURE_EMOJIS))
+        return
+    # tmux accepted the keys, but that is NOT proof Claude received them: a modal
+    # (/status, /model, permission prompt), copy-mode, or 100%-context state
+    # silently swallows input. Defer the verdict until the UserPromptSubmit hook
+    # confirms delivery (or the wait window expires → reported as not delivered).
+    logger.info(f"Injected '{text[:50]}' -> {tty} ({project}); awaiting delivery confirmation")
+    _register_pending_inject(session_id, tty, text, message_id)
 
 
 # --- FastAPI routes ---
@@ -1333,6 +1499,10 @@ async def receive_hook(request: Request):
 
     if not tty:
         return {"ok": False, "error": "missing tty (not in tmux?)"}
+
+    # Stop = turn ended → session is idle (drives inject-delivery confirmation)
+    if hook_type == "stop" and session_id:
+        _mark_session_idle(session_id)
 
     effective_type = matcher or hook_type
     labels = _labels()
@@ -1416,6 +1586,24 @@ async def receive_sync_hook(request: Request):
         session_store.upsert(session_id, tty=tty, cwd=cwd)
         logger.info(f"Sync: session={session_id[:8]} tty={tty} (new, no thread yet)")
 
+    return {"ok": True}
+
+
+@app.post("/hook/prompt")
+async def receive_prompt_hook(request: Request):
+    """UserPromptSubmit hook — confirms a prompt was actually accepted by Claude.
+
+    Used to verify walkcode's tmux injections really landed (vs being swallowed
+    by a modal / copy-mode), and to track per-session busy state. Best-effort:
+    the hook POSTs with a short timeout and never blocks prompt submission.
+    """
+    body = await request.json()
+    tty = body.get("tty", "")
+    session_id = body.get("session_id", "")
+    prompt = body.get("prompt", "")
+    if session_id:
+        _mark_session_busy(session_id)
+    _confirm_pending_inject(session_id, tty, prompt)
     return {"ok": True}
 
 
@@ -1621,3 +1809,4 @@ def start_ws_client(cfg: Config):
     logger.info("Feishu WebSocket client started")
 
     _start_idle_reaper()
+    _start_inject_sweeper()

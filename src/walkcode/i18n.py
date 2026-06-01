@@ -387,6 +387,20 @@ _T: dict[str, tuple[str, str]] = {
         "⚠️ Session expired, send a new message to start",
         "⚠️ 会话已过期，请发送新消息开始新会话",
     ),
+
+    # --- inject delivery confirmation ---
+    "feishu.inject_swallowed": (
+        "⚠️ Not delivered: the terminal isn't accepting input right now "
+        "(a dialog/menu is open, or it's in scroll/copy mode). Nothing was "
+        "forced through — please handle it in the terminal and resend.",
+        "⚠️ 没送达：终端当前不在输入状态（开着弹窗/菜单，或处于滚屏/复制模式）。"
+        "已避免误触你的终端，请处理后重发。",
+    ),
+    "feishu.inject_timeout": (
+        "⚠️ Not delivered: the terminal didn't respond "
+        "(tmux is busy, or the session has exited). Please retry shortly.",
+        "⚠️ 没送达：终端无响应（tmux 繁忙或会话已退出）。请稍后重发。",
+    ),
     "feishu.session_not_found": (
         "⚠️ Session not found, wait for next notification to reply",
         "⚠️ 找不到对应会话，请等待下一条通知后再回复",
