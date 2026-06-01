@@ -254,15 +254,17 @@ Server stores decision, signals waiting hook process; card updates inline (butto
 Claude Code receives decision, continues execution
 ```
 
-**Dynamic button text**: The Feishu card buttons are captured from the terminal's actual prompt via `tmux capture-pane`, so they always match Claude Code's UI regardless of version changes. Falls back to hardcoded defaults if capture fails.
+**Button text**: Button labels come from walkcode's i18n table (`_PERM_BUTTON_LABELS`), not from the terminal. Earlier versions scraped numbered lines from `tmux capture-pane`, but any preceding Claude output (plan steps, todo lists, ...) could be misidentified as the permission prompt's options, producing buttons with completely unrelated text. Since button **semantics** (allow / always_allow / deny) are owned by walkcode anyway, the screen has no authoritative information to contribute.
+
+**Suggestion rendering**: When the hook supplies `permission_suggestions` (roughly 1/3 of requests in practice), `_format_permission_suggestions` renders the rule scope into the card body — e.g. `Edit /.claude/skills/deep-debug/**` _(this session)_ — so the user can see exactly what "always allow" will cover.
 
 **Permission types**: The server classifies each request into a `perm_type` based on `permission_mode` and `permission_suggestions`:
 
-| perm_type | Condition | Terminal options (example) | Button behaviors |
-|-----------|-----------|--------------------------|-----------------|
-| `plan` | `permission_mode == "plan"` + no suggestions | Yes, auto-accept edits / Yes, manually approve edits / Tell Claude what to change | `plan_auto_accept` / `plan_manual_approve` / `deny` |
-| `setMode` | first suggestion `type == "setMode"` | Yes / Yes, and allow Claude to edit... / No | `allow` / `accept_edits` / `deny` |
-| `addRules` | default | Allow / Always Allow / Deny | `allow` / `always_allow` / `deny` |
+| perm_type | Condition | Button labels | Button behaviors |
+|-----------|-----------|---------------|-----------------|
+| `plan` | `permission_mode == "plan"` + no suggestions | `feishu.plan.auto_accept` / `feishu.plan.manual_approve` / `feishu.plan.tell_claude` | `plan_auto_accept` / `plan_manual_approve` / `deny` |
+| `setMode` | first suggestion `type == "setMode"` | `feishu.setmode.yes` / `feishu.setmode.accept_edits` / `feishu.setmode.no` | `allow` / `accept_edits` / `deny` |
+| `addRules` | default | `feishu.perm.allow` / `feishu.perm.always_allow` / `feishu.perm.deny` | `allow` / `always_allow` / `deny` |
 
 If "Always Allow" is clicked (addRules type):
 

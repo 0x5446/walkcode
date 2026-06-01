@@ -287,6 +287,26 @@ _T: dict[str, tuple[str, str]] = {
         "Request expired",
         "请求已过期",
     ),
+    "feishu.perm.suggestion_label": (
+        "📋 Will allow",
+        "📋 将允许的范围",
+    ),
+    "feishu.perm.dest_session": (
+        "this session",
+        "本次会话",
+    ),
+    "feishu.perm.dest_local": (
+        "local settings",
+        "项目本地配置",
+    ),
+    "feishu.perm.dest_user": (
+        "user settings",
+        "用户全局配置",
+    ),
+    "feishu.perm.dest_project": (
+        "project settings",
+        "项目共享配置",
+    ),
 
     # --- server.py: SetMode card (Write/Edit .claude/) ---
     "feishu.setmode.header": (
@@ -314,6 +334,18 @@ _T: dict[str, tuple[str, str]] = {
     "feishu.plan.header": (
         "📋 Ready to code?",
         "📋 准备开始执行？",
+    ),
+    "feishu.plan.auto_accept": (
+        "✅ Yes, auto-accept edits",
+        "✅ 是，且自动接受后续编辑",
+    ),
+    "feishu.plan.manual_approve": (
+        "🔐 Yes, manually approve edits",
+        "🔐 是，但每次编辑都要确认",
+    ),
+    "feishu.plan.tell_claude": (
+        "❌ Tell Claude what to change",
+        "❌ 告诉 Claude 怎么改",
     ),
 
     # --- server.py: Feishu user-facing messages ---

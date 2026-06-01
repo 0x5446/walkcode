@@ -87,75 +87,90 @@ _INJECT_CONFIRM_MAX = 600.0    # s absolute backstop: stop waiting even if never
 _SWEEPER_INTERVAL = 1.0        # s between pending-inject sweeps
 
 
-def _capture_terminal_options(tty: str) -> list[str]:
-    """Capture numbered option text from the terminal's permission prompt via tmux.
-
-    Parses from the bottom up to find the last contiguous block of numbered
-    lines, then takes only the final "restart-at-1" subsequence.  This avoids
-    false-matching numbered lines in user input, plan content, or tool output.
-    """
-    try:
-        result = subprocess.run(
-            ["tmux", "capture-pane", "-t", tty, "-p", "-S", "-15"],
-            capture_output=True, text=True, timeout=5,
-        )
-        # Collect last contiguous block of numbered lines (bottom-up)
-        items: list[tuple[int, str]] = []  # (number, text)
-        for line in reversed(result.stdout.split("\n")):
-            m = re.match(r'\s*[❯>]?\s*(\d+)\.\s+(.+)', line)
-            if m:
-                items.insert(0, (int(m.group(1)), m.group(2).strip()))
-            elif items:
-                break
-        if not items:
-            return []
-        # Permission options always start at 1; if plan content (1..N) is
-        # contiguous with options (1..3), find the last restart at 1.
-        last_restart = 0
-        for i in range(len(items) - 1, -1, -1):
-            if items[i][0] == 1:
-                last_restart = i
-                break
-        return [text for _, text in items[last_restart:]]
-    except Exception as e:
-        logger.warning(f"Failed to capture terminal options from {tty}: {e}")
-        return []
-
-
 # --- Unified permission card builder ---
-# Each perm_type defines: behavior values per button position, fallback labels, header, template.
+# Each perm_type defines: behavior values per button position, button-text i18n keys, header, template.
+#
+# Button text is intentionally NOT derived from terminal screen scraping. The
+# old implementation captured numbered lines from `tmux capture-pane`, which
+# misidentified any preceding Claude output (plan steps, todos, etc.) as
+# permission options. Button semantics are owned by walkcode (see _PERM_BEHAVIORS)
+# and do not depend on what Claude Code happens to render in the TUI.
 
 _PERM_BEHAVIORS = {
     "plan":     ["plan_auto_accept", "plan_manual_approve", "deny"],
     "setMode":  ["allow", "accept_edits", "deny"],
     "addRules": ["allow", "always_allow", "deny"],
 }
-_PERM_FALLBACK_OPTIONS = {
-    "plan":     ["Yes, auto-accept edits", "Yes, manually approve edits", "Tell Claude what to change"],
-    "setMode":  ["Yes", "Yes, auto-accept edits", "No"],
-    "addRules": ["Allow", "Always Allow", "Deny"],
+_PERM_BUTTON_LABELS = {
+    "plan":     ["feishu.plan.auto_accept", "feishu.plan.manual_approve", "feishu.plan.tell_claude"],
+    "setMode":  ["feishu.setmode.yes", "feishu.setmode.accept_edits", "feishu.setmode.no"],
+    "addRules": ["feishu.perm.allow", "feishu.perm.always_allow", "feishu.perm.deny"],
 }
 _PERM_BUTTON_TYPES = ["primary", "default", "danger"]
 
+_DESTINATION_LABELS = {
+    "session":        "feishu.perm.dest_session",
+    "localSettings":  "feishu.perm.dest_local",
+    "userSettings":   "feishu.perm.dest_user",
+    "projectSettings": "feishu.perm.dest_project",
+}
 
-def _build_dynamic_permission_card(
+
+def _format_permission_suggestions(suggestions: list) -> str:
+    """Render permission_suggestions as a short markdown block for the card body.
+
+    Returns empty string when there is nothing to show. Each suggestion item is
+    classified by its `type` and rendered with the most user-relevant fields:
+    addRules → toolName + ruleContent; setMode → mode name; addDirectories →
+    directory list. The destination (session / localSettings / ...) is shown
+    so the user understands the scope of "always allow".
+    """
+    if not suggestions:
+        return ""
+    lines = []
+    for s in suggestions:
+        stype = s.get("type")
+        dest = s.get("destination", "")
+        dest_label = t(_DESTINATION_LABELS[dest]) if dest in _DESTINATION_LABELS else dest
+        if stype == "addRules":
+            for r in s.get("rules", []):
+                tool = r.get("toolName", "")
+                rule = r.get("ruleContent")
+                if rule:
+                    lines.append(f"- `{tool}` `{rule}` _({dest_label})_")
+                else:
+                    lines.append(f"- `{tool}` _({dest_label})_")
+        elif stype == "setMode":
+            mode = s.get("mode", "")
+            lines.append(f"- setMode: `{mode}` _({dest_label})_")
+        elif stype == "addDirectories":
+            for d in s.get("directories", []):
+                lines.append(f"- addDirectory: `{d}` _({dest_label})_")
+        else:
+            lines.append(f"- {stype} _({dest_label})_")
+    if not lines:
+        return ""
+    return f"\n\n**{t('feishu.perm.suggestion_label')}**\n" + "\n".join(lines)
+
+
+def _build_permission_card(
     request_id: str, perm_type: str, tool_name: str,
-    tool_input: dict, terminal_options: list[str],
+    tool_input: dict, permission_suggestions: list | None = None,
 ) -> dict:
-    """Build a Feishu permission card with buttons matching the terminal's actual options.
+    """Build a Feishu permission card.
 
-    Works for all permission types: addRules, setMode, and plan approval.
-    Button text is captured from the terminal via tmux; falls back to hardcoded defaults.
+    Button labels come from i18n (never from terminal screen scraping).
+    When `permission_suggestions` is present, the rule scope is rendered in
+    the card body so the user knows what "always allow" will cover.
     """
     behaviors = _PERM_BEHAVIORS.get(perm_type, _PERM_BEHAVIORS["addRules"])
-    fallbacks = _PERM_FALLBACK_OPTIONS.get(perm_type, _PERM_FALLBACK_OPTIONS["addRules"])
-    opts = terminal_options if terminal_options and len(terminal_options) >= 3 else fallbacks
+    label_keys = _PERM_BUTTON_LABELS.get(perm_type, _PERM_BUTTON_LABELS["addRules"])
 
     buttons = []
-    for i, (behavior, btn_type) in enumerate(zip(behaviors, _PERM_BUTTON_TYPES)):
+    for behavior, btn_type, key in zip(behaviors, _PERM_BUTTON_TYPES, label_keys):
         buttons.append({
             "tag": "button",
-            "text": {"tag": "plain_text", "content": opts[i]},
+            "text": {"tag": "plain_text", "content": t(key)},
             "type": btn_type,
             "value": {"rid": request_id, "b": behavior},
         })
@@ -173,6 +188,7 @@ def _build_dynamic_permission_card(
         if len(input_str) > 500:
             input_str = input_str[:500] + "\n..."
         content = f"**Tool:** `{tool_name}`\n**Input:**\n```json\n{input_str}\n```"
+        content += _format_permission_suggestions(permission_suggestions or [])
         header = t("feishu.setmode.header") if perm_type == "setMode" else t("feishu.perm.header")
         template = "orange"
 
@@ -1676,9 +1692,8 @@ async def receive_permission_hook(request: Request):
             perm_type = "setMode"
         else:
             perm_type = "addRules"
-        terminal_options = _capture_terminal_options(tty)
-        logger.info(f"[PERM_DEBUG] perm_type={perm_type} terminal_options={terminal_options}")
-        card = _build_dynamic_permission_card(request_id, perm_type, tool_name, tool_input, terminal_options)
+        logger.info(f"[PERM_DEBUG] perm_type={perm_type} suggestions={len(perm_suggestions)}")
+        card = _build_permission_card(request_id, perm_type, tool_name, tool_input, perm_suggestions)
 
     if root_msg_id:
         logger.info(f"[CARD_DEBUG] Replying card in thread root_msg_id={root_msg_id} for {tool_name}")
