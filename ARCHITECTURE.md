@@ -140,15 +140,68 @@ Key design decisions:
 
 ---
 
+## Inject Delivery Confirmation
+
+Feishu replies are delivered into Claude by injecting keystrokes with `tmux
+send-keys`. A successful `send-keys` only proves the bytes reached the pane — it
+is **not** proof Claude accepted them as a prompt. When the TUI is not at a
+ready, empty input box, the keystrokes are routed elsewhere and the message is
+silently lost:
+
+- a modal/overlay is open (`/status`, `/model`, a permission prompt, the
+  `/resume` picker, autocomplete) — the text is ignored by the dialog and the
+  injected Enter just dismisses it;
+- the pane is in tmux copy-mode (scrollback) — keys go to copy-mode;
+- the context is 100% full — submission is blocked.
+
+Previously walkcode added a success emoji based purely on the `send-keys` exit
+code, so these losses looked delivered. Delivery is now confirmed out-of-band
+via the **`UserPromptSubmit` hook** — no screen scraping:
+
+```
+_handle_message
+  → inject(tty, text)                 # send-keys; raise → immediate "not delivered" reply
+  → _register_pending_inject(...)     # await confirmation; NO emoji yet
+
+UserPromptSubmit hook (the prompt was actually accepted)
+  → POST /hook/prompt → _confirm_pending_inject()  → success emoji, clear pending
+
+sweeper (1s tick)
+  → window elapsed with no confirmation → "not delivered" reply + failure emoji
+```
+
+**Busy/idle is derived from hooks only**, so an inject during generation is
+treated as *queued* (not lost): `UserPromptSubmit` marks a turn busy, `Stop`
+marks it idle.
+
+| Inject context | Confirmation window | No `UserPromptSubmit` ⇒ |
+|----------------|---------------------|--------------------------|
+| Session idle | `injected_at` + `_INJECT_CONFIRM_GRACE` (4s) | swallowed (modal/copy-mode) → reported failure |
+| Session busy (generating) | first `Stop` after inject, then + grace | queued prompt never landed → reported failure |
+| Never goes idle | `_INJECT_CONFIRM_MAX` (10m) backstop | reported failure |
+
+Matching is by `session_id` (falling back to tmux name), with whitespace-tolerant
+substring comparison of the echoed prompt. The single-key permission-answer path
+(`_tmux_fallback`) is **not** confirmed this way — it targets a prompt overlay on
+purpose, not the chat input.
+
+The cost: `UserPromptSubmit` fires on **every** prompt in every Claude session,
+so `walkcode hook user-prompt-submit` is a fast path — a short-timeout localhost
+POST with no stdout (hook stdout would be injected into the prompt), returning
+before any debug logging.
+
+---
+
 ## Hook Communication Protocol
 
-Claude Code hooks call `walkcode hook {stop|notification|permission-request}` which reads JSON from stdin and communicates with the WalkCode server.
+Claude Code hooks call `walkcode hook {stop|notification|permission-request|sync|user-prompt-submit}` which reads JSON from stdin and communicates with the WalkCode server.
 
 ### Hook types
 
 | Hook | Claude Event | Endpoint | Feishu Format | Blocking |
 |------|-------------|----------|---------------|----------|
 | `sync` | SessionStart | POST /hook/sync | None (mapping update only) | No |
+| `user-prompt-submit` | UserPromptSubmit | POST /hook/prompt | None (delivery confirmation + busy state) | No |
 | `stop` | Stop | POST /hook | Plain text | No |
 | `notification` | Notification (elicitation_dialog) | POST /hook | Plain text or interactive card (AskUserQuestion) | No |
 | `permission-request` | PermissionRequest | POST /hook/permission → poll GET /hook/permission/{rid}/decision | Interactive card with buttons | Yes (up to 30m) |

@@ -343,6 +343,28 @@ def cmd_hook(args):
     session_id = hook_data.get("session_id", "")
     port = int(os.environ.get("WALKCODE_PORT", os.environ.get("PORT", "3001")))
 
+    # --- UserPromptSubmit: confirm a prompt was actually accepted (fast path) ---
+    # Runs on the critical path of EVERY prompt submission, so keep it cheap:
+    # short timeout, no stdout (hook stdout is injected into the prompt), exit 0.
+    # Returns before the debug dump to avoid per-prompt disk writes.
+    if args.hook_type == "user-prompt-submit":
+        payload = json.dumps({
+            "tty": tmux_session,
+            "cwd": cwd,
+            "session_id": session_id,
+            "prompt": hook_data.get("prompt", ""),
+        }).encode()
+        try:
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{port}/hook/prompt",
+                data=payload,
+                headers={"Content-Type": "application/json"},
+            )
+            urllib.request.urlopen(req, timeout=1)
+        except Exception:
+            pass  # best-effort; never block prompt submission
+        return
+
     # DEBUG: dump full hook_data to file for analysis
     try:
         import datetime as _dt
@@ -462,6 +484,9 @@ def _install_claude_hooks(_args):
     settings["hooks"] = {
         "SessionStart": [{"matcher": "", "hooks": [
             {"type": "command", "command": "walkcode hook sync"}
+        ]}],
+        "UserPromptSubmit": [{"matcher": "", "hooks": [
+            {"type": "command", "command": "walkcode hook user-prompt-submit"}
         ]}],
         "Stop": [{"matcher": "", "hooks": [
             {"type": "command", "command": hook_cmd("stop", "Hero")}
@@ -771,7 +796,7 @@ def main():
     sub.add_parser("status", help="Check if server is running")
 
     hp = sub.add_parser("hook", help="Handle an agent hook event (reads stdin)")
-    hp.add_argument("hook_type", choices=["stop", "notification", "permission-request", "sync"], help="Hook event type")
+    hp.add_argument("hook_type", choices=["stop", "notification", "permission-request", "sync", "user-prompt-submit"], help="Hook event type")
 
     ihp = sub.add_parser("install-hooks", help="Install agent hooks")
     ihp.add_argument("--agent", choices=["claude", "codex"], default=None, help="Agent type (default: from WALKCODE_AGENT or claude)")
