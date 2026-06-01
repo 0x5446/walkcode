@@ -627,7 +627,14 @@ def cmd_upgrade(_args):
 
     _run(f"uv tool install {source} --force")
 
-    cmd_install_hooks(argparse.Namespace(agent=None))
+    # Re-run install-hooks via the freshly installed binary — NOT cmd_install_hooks()
+    # in-process. This interpreter is still running the OLD code, so an in-process
+    # call writes the *previous* version's hook set, silently dropping any hook the
+    # new version added (this is exactly how v0.10.17's UserPromptSubmit hook went
+    # missing after upgrade). The `walkcode` shim resolves to the just-installed
+    # version; WALKCODE_AGENT (inherited) keeps the right agent's hooks.
+    agent_name = os.environ.get("WALKCODE_AGENT", "claude")
+    _run(f"walkcode install-hooks --agent {shlex.quote(agent_name)}")
 
     pid = _read_pid()
     if pid:
