@@ -221,6 +221,18 @@ class ReceiveHookDedupeTests(unittest.TestCase):
         r = self._post(body)
         self.assertTrue(r.get("ok"))
 
+    def test_user_initiated_send_failure_lets_duplicate_retry(self):
+        # ISSUE_1: the new-session (user-initiated) branch must also register
+        # dedupe only on a confirmed send. First content reply fails → not deduped
+        # → the duplicate retries via existing-session (the root was created).
+        self._reply_results = [None, "ok-2"]  # 1st content reply fails, 2nd ok
+        with patch.object(server, "_send", lambda text: "root-new"):
+            r1 = self._post(_stop_body(turn_id="turn-A", session_id="s-new"))
+            r2 = self._post(_stop_body(turn_id="turn-A", session_id="s-new"))
+        self.assertFalse(r1.get("ok"))               # first delivery failed
+        self.assertFalse(r2.get("deduped", False))   # second NOT swallowed
+        self.assertEqual(len(self.replies), 2)
+
 
 class CmdHookTurnIdForwardingTests(unittest.TestCase):
     """cmd_hook must forward turn_id into the POST body (tests ISSUE_2): the

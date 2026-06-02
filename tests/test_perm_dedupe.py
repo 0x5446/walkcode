@@ -198,6 +198,20 @@ class ReceivePermDedupeTests(unittest.TestCase):
         self.assertNotIn(rid, server._perm_requests)  # cleaned after injection
         self.assertNotIn(("s1", "tu-1"), server._perm_dedupe)
 
+    def test_card_send_failure_releases_slot(self):
+        # ISSUE_2: if the card never reaches Feishu, the dedupe slot is released so
+        # codex's duplicate comes through as is_new and re-sends (not stranded).
+        with patch.object(server, "_reply_card",
+                          lambda mid, card, reply_in_thread=False: None):
+            r1 = self._post(_perm_body(tool_use_id="tu-1"))
+        self.assertFalse(r1.get("ok"))
+        self.assertNotIn(("s1", "tu-1"), server._perm_dedupe)  # slot released
+        # retry with a working card (setUp's mock) → is_new, sends exactly one card
+        r2 = self._post(_perm_body(tool_use_id="tu-1"))
+        self.assertFalse(r2.get("deduped", False))
+        self.assertTrue(r2.get("ok"))
+        self.assertEqual(len(self.cards), 1)
+
 
 class HandlePermissionForwardingTests(unittest.TestCase):
     """_handle_permission_request must forward tool_use_id + turn_id in the POST."""
