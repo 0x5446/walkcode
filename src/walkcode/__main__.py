@@ -4,10 +4,12 @@ import argparse
 import json
 import logging
 import os
+import re
 import shlex
 import signal
 import subprocess
 import sys
+import tomllib
 import urllib.request
 from pathlib import Path
 
@@ -431,6 +433,9 @@ def cmd_hook(args):
         "tty": tmux_session,
         "cwd": cwd,
         "session_id": session_id,
+        # turn_id lets the server dedupe per-turn: codex (>=0.135) fires each hook
+        # event twice with an identical payload. Claude carries no turn_id.
+        "turn_id": hook_data.get("turn_id", ""),
         "message": message,
         "title": title,
         "matcher": matcher,
@@ -556,19 +561,64 @@ def _install_codex_hooks(_args):
 
 
 def _ensure_codex_hooks_feature(config_toml: Path):
-    """Ensure [features] codex_hooks = true in Codex config.toml."""
-    if config_toml.exists():
-        content = config_toml.read_text()
-        if "codex_hooks" in content:
-            return
-        if "[features]" in content:
-            content = content.replace("[features]", "[features]\ncodex_hooks = true")
-        else:
-            content += "\n[features]\ncodex_hooks = true\n"
-        config_toml.write_text(content)
-    else:
+    """Ensure [features] hooks = true in Codex config.toml.
+
+    Codex 0.135+ gates hooks behind ``hooks = true``; older builds used
+    ``codex_hooks``. Parse with tomllib (robust to trailing comments, whitespace,
+    and the unrelated ``[hooks.state]`` table) and then:
+      - already true   → no-op
+      - present, wrong → replace the value INSIDE [features] (never a dup key)
+      - absent         → insert into [features], or append the table
+    Any legacy ``codex_hooks`` flag is left untouched.
+    """
+    if not config_toml.exists():
         config_toml.parent.mkdir(parents=True, exist_ok=True)
-        config_toml.write_text("[features]\ncodex_hooks = true\n")
+        config_toml.write_text("[features]\nhooks = true\n")
+        return
+
+    content = config_toml.read_text()
+    try:
+        parsed = tomllib.loads(content)
+    except Exception:
+        parsed = None  # corrupt TOML → fall through to best-effort insert
+
+    features = parsed.get("features", {}) if isinstance(parsed, dict) else {}
+    if features.get("hooks") is True:
+        return  # already enabled
+
+    if "hooks" in features:
+        # present but not true → replace the value in-place, no duplicate key
+        content = _replace_features_hooks_true(content)
+    elif "[features]" in content:
+        content = content.replace("[features]", "[features]\nhooks = true", 1)
+    else:
+        content += "\n[features]\nhooks = true\n"
+    config_toml.write_text(content)
+
+
+def _replace_features_hooks_true(content: str) -> str:
+    """Set ``hooks = true`` on the existing hooks line within the [features] table.
+
+    Only the [features] table is touched — sub-tables like [hooks.state] and other
+    sections are left alone.
+    """
+    out = []
+    in_features = False
+    replaced = False
+    for line in content.splitlines(keepends=True):
+        stripped = line.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            in_features = (stripped == "[features]")
+            out.append(line)
+            continue
+        if in_features and not replaced and re.match(r"\s*hooks\s*=", line):
+            out.append("hooks = true\n" if line.endswith("\n") else "hooks = true")
+            replaced = True
+            continue
+        out.append(line)
+    if not replaced:
+        return content.replace("[features]", "[features]\nhooks = true", 1)
+    return "".join(out)
 
 
 def cmd_install_hooks(args):

@@ -1,6 +1,7 @@
 """WalkCode server: FastAPI for hooks + Feishu WebSocket for events."""
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -85,6 +86,31 @@ _pending_lock = threading.Lock()
 _INJECT_CONFIRM_GRACE = 4.0    # s to wait for UserPromptSubmit after the session is idle
 _INJECT_CONFIRM_MAX = 600.0    # s absolute backstop: stop waiting even if never idle
 _SWEEPER_INTERVAL = 1.0        # s between pending-inject sweeps
+
+
+# --- Hook delivery dedupe ---
+# codex CLI (>=0.135) fires each hook event TWICE: two identical hook processes
+# launched microseconds apart with the same payload (same turn_id). Each /hook
+# POST would otherwise produce a duplicate Feishu reply. Hook delivery is
+# "at-least-once" by nature, so we dedupe on the consumer side — a turn ends once
+# → one notification.
+#
+# A key registers ONLY after a successful send (see _hook_mark_delivered), never
+# before. So if the first delivery's _reply fails, the slot stays open and
+# codex's duplicate re-sends instead of being silently dropped — at-least-once is
+# preserved. Check-then-send-then-mark is atomic because receive_hook runs on the
+# asyncio loop with NO `await` between the dedupe check and the send (the lark
+# calls are synchronous and block the loop), so a second request cannot interleave
+# until the first has marked the key. Keys are tuples (no string-concat collision
+# from attacker-controlled session_id/turn_id).
+_recent_hook_keys: dict[tuple, float] = {}  # dedupe key (tuple) → delivered-at ts
+_hook_dedupe_lock = threading.Lock()
+# turn_id keys are precise — a long TTL never false-dedupes distinct turns.
+_HOOK_DEDUPE_TTL_TURN = 30.0
+# message-hash fallback (Claude, no turn_id) is coarse: keep the window tiny so it
+# only collapses near-simultaneous re-delivery, never two genuine identical replies
+# minutes apart. Claude never duplicates anyway, so this is pure defense.
+_HOOK_DEDUPE_TTL_HASH = 2.0
 
 
 # --- Unified permission card builder ---
@@ -1498,6 +1524,57 @@ def _handle_message(data: P2ImMessageReceiveV1):
 
 # --- FastAPI routes ---
 
+def _hook_dedupe_key(session_id: str, hook_type: str, turn_id: str, message: str) -> tuple | None:
+    """Build the dedupe key for a hook delivery, or None when dedupe doesn't apply.
+
+    Tuple (not string concat) so attacker-/bug-controlled session_id or turn_id
+    can't collide two distinct deliveries into one key. turn_id (codex) is exact;
+    Claude has none, so fall back to a hash of the user-visible message.
+    """
+    if not session_id:
+        return None
+    if turn_id:
+        return (session_id, hook_type, "turn", turn_id)
+    digest = hashlib.sha256((message or "").encode("utf-8", "replace")).hexdigest()[:16]
+    return (session_id, hook_type, "msg", digest)
+
+
+def _hook_key_ttl(key: tuple) -> float:
+    return _HOOK_DEDUPE_TTL_TURN if key[2] == "turn" else _HOOK_DEDUPE_TTL_HASH
+
+
+def _hook_already_delivered(key: tuple) -> bool:
+    """Read-only: True if this key was delivered within its TTL. Prunes expired.
+
+    Does NOT register the key — registration happens only after a confirmed send
+    (_hook_mark_delivered), so a failed first delivery leaves the slot open for
+    codex's duplicate to retry rather than swallowing the turn entirely.
+    """
+    now = time.time()
+    with _hook_dedupe_lock:
+        for k in [k for k, ts in _recent_hook_keys.items() if now - ts > _hook_key_ttl(k)]:
+            del _recent_hook_keys[k]
+        return key in _recent_hook_keys
+
+
+def _hook_mark_delivered(key: tuple) -> None:
+    """Register a key as delivered — call only after the Feishu send succeeded."""
+    with _hook_dedupe_lock:
+        _recent_hook_keys[key] = time.time()
+
+
+def _remember_delivery(dedupe_key: tuple | None, hook_type: str, session_id: str) -> None:
+    """Mark a successful Feishu send for dedupe, with a log line sharing a key
+    fingerprint with the 'Hook deduped' line so the two can be correlated."""
+    if dedupe_key is None:
+        return
+    _hook_mark_delivered(dedupe_key)
+    logger.info(
+        f"Hook delivered: {hook_type} session={session_id[:8] or '-'} "
+        f"key={dedupe_key[2]}:{dedupe_key[3][:12]}"
+    )
+
+
 @app.post("/hook")
 async def receive_hook(request: Request):
     body = await request.json()
@@ -1505,9 +1582,12 @@ async def receive_hook(request: Request):
     tty = body.get("tty", "")
     cwd = body.get("cwd", "")
     matcher = body.get("matcher", "")
-    session_id = body.get("session_id", "")
-    message = body.get("message", "")
-    title = body.get("title", "")
+    # Normalize: a JSON null arrives as None (the "" default only applies when the
+    # key is absent), which would break str slicing / hashing downstream.
+    session_id = body.get("session_id") or ""
+    turn_id = body.get("turn_id") or ""
+    message = body.get("message") or ""
+    title = body.get("title") or ""
 
     # Debug: Log all hook inputs to see elicitation_dialog structure
     logger.info(f"[DEBUG HOOK] type={hook_type} matcher={matcher}")
@@ -1516,9 +1596,26 @@ async def receive_hook(request: Request):
     if not tty:
         return {"ok": False, "error": "missing tty (not in tmux?)"}
 
-    # Stop = turn ended → session is idle (drives inject-delivery confirmation)
+    # Stop = turn ended → session is idle (drives inject-delivery confirmation).
+    # Mark idle BEFORE the dedupe gate so the inject-confirmation machinery still
+    # sees every Stop; dedupe only suppresses the duplicate user-facing message.
     if hook_type == "stop" and session_id:
         _mark_session_idle(session_id)
+
+    # codex (>=0.135) fires each hook twice with an identical payload — a turn
+    # ends once, so suppress the duplicate before it becomes a second Feishu reply.
+    # Read-only check here; the key is registered only AFTER a successful send
+    # below, so a failed first delivery still lets codex's duplicate through.
+    dedupe_key = (
+        _hook_dedupe_key(session_id, hook_type, turn_id, message)
+        if hook_type in ("stop", "notification") else None
+    )
+    if dedupe_key is not None and _hook_already_delivered(dedupe_key):
+        logger.info(
+            f"Hook deduped: {hook_type} session={session_id[:8] or '-'} "
+            f"key={dedupe_key[2]}:{dedupe_key[3][:12]}"
+        )
+        return {"ok": True, "deduped": True}
 
     effective_type = matcher or hook_type
     labels = _labels()
@@ -1545,6 +1642,9 @@ async def receive_hook(request: Request):
         if msg_id:
             if need_subscribe:
                 session_store.mark_subscribed(session_id)
+            # Register dedupe ONLY now that the send succeeded (F1: a failed
+            # _reply must leave the slot open for codex's duplicate to retry).
+            _remember_delivery(dedupe_key, hook_type, session_id)
             return {"ok": True, "msg_id": msg_id, "thread": session.root_msg_id}
     else:
         # New session: check if Feishu-initiated (pending root exists)
@@ -1563,6 +1663,7 @@ async def receive_hook(request: Request):
             _reply(root_id, text=text, reply_in_thread=True)
             if session_id:
                 session_store.mark_subscribed(session_id)
+            _remember_delivery(dedupe_key, hook_type, session_id)
             return {"ok": True, "msg_id": root_id}
 
         # User-initiated: send title as thread root, reply with content
@@ -1577,6 +1678,7 @@ async def receive_hook(request: Request):
             _reply(root_id, text=text, reply_in_thread=True)
             if session_id:
                 session_store.mark_subscribed(session_id)
+            _remember_delivery(dedupe_key, hook_type, session_id)
             return {"ok": True, "msg_id": root_id}
 
     return {"ok": False, "error": "send failed"}
