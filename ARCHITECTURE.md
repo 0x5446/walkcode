@@ -228,6 +228,7 @@ Feishu does not send push notifications for thread replies unless the user has s
   "tty": "tmux-session-name",
   "cwd": "/working/directory",
   "session_id": "claude-uuid",
+  "turn_id": "codex-turn-uuid (codex only; empty for Claude)",
   "message": "content text",
   "title": "optional title",
   "matcher": "elicitation_dialog | idle_prompt | …"
@@ -235,6 +236,8 @@ Feishu does not send push notifications for thread replies unless the user has s
 ```
 
 For Stop hooks `message` is sourced from Claude Code's `last_assistant_message` field. When that field arrives empty — which happens when the final assistant turn is a pure `tool_use` block (e.g. ends on `TaskUpdate`) — `walkcode hook stop` tails the `transcript_path` JSONL and recovers the most recent assistant text content. Without this fallback the Feishu thread would show only the "✅ Task complete" label with no reply body.
+
+**Delivery dedupe.** Hook delivery is "at-least-once": codex CLI (≥ 0.135) fires each hook event *twice* — two identical hook processes launched microseconds apart with the same payload (same `turn_id`) — which would otherwise produce a duplicate Feishu reply on every turn. `receive_hook` therefore dedupes `stop`/`notification` deliveries on the consumer side: a turn ends once → one notification. The key is `(session_id, type, turn_id)` when codex supplies a `turn_id`, and falls back to `(session_id, type, message-hash)` within a 30 s TTL for Claude (which carries no `turn_id` but also never duplicates, so the hash path is pure defense). The `Stop`-drives-idle marking for inject confirmation happens *before* the dedupe gate, so dedupe only suppresses the duplicate user-facing message, never the busy/idle state machine.
 
 ### PermissionRequest flow
 
