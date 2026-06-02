@@ -276,6 +276,8 @@ If "Always Allow" is clicked (addRules type):
 
 Note: Claude Code reads `settings.json` only at startup, so writing to it alone does not affect the running session. The `updatedPermissions` field is what makes the "Always Allow" take effect immediately.
 
+**Permission dedupe.** codex (≥ 0.135) double-fires PreToolUse just like Stop, so one tool call would otherwise produce two permission cards and two long-polls. `receive_permission_hook` dedupes by `(session_id, tool_use_id)` — `tool_use_id` identifies a single tool call, whereas `turn_id` would wrongly merge a whole turn's requests. The duplicate reuses the first `request_id` (no second card), and both hook processes long-poll the **same** decision, so codex's two PreToolUse returns can't diverge. Unlike the one-shot pop model, the decision is read-not-popped and reaped lazily: kept `_PERM_GC_GRACE` (5 s) after the first poller reads it, with a `_PERM_DEDUPE_TTL` (30 s) backstop for a codex request no poller ever drains. AskUserQuestion is Claude-only and carries no `tool_use_id`, so its key is `None` → never deduped and never TTL-reaped (it may wait minutes for a multi-step / Other answer). The `_schedule_tmux_fallback` backstop now gates on `consumed_at` (was: decision presence), so a normal double-fire — consumed by at least one poller within 5 s — never triggers a spurious tmux key injection.
+
 ### Hook installation
 
 `walkcode install-hooks` writes to `~/.claude/settings.json`:
