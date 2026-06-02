@@ -221,6 +221,10 @@ def _handle_permission_request(hook_data, port, tmux_session, cwd, session_id):
         "session_id": session_id,
         "tool_name": tool_name,
         "tool_input": tool_input,
+        # tool_use_id dedupes codex 0.135's double-fired PreToolUse (it identifies
+        # a single tool call; turn_id would wrongly merge a whole turn's requests).
+        "tool_use_id": hook_data.get("tool_use_id", ""),
+        "turn_id": hook_data.get("turn_id", ""),
         "hook_data_full": hook_data,
     }).encode()
 

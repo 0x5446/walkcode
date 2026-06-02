@@ -65,6 +65,27 @@ _perm_requests: dict[str, dict] = {}   # request_id → {tool_name, tool_input, 
 _perm_decisions: dict[str, dict] = {}  # request_id → {behavior, tool_name, always}
 _perm_events: dict[str, threading.Event] = {}  # request_id → Event for signaling
 
+# --- Permission-request dedupe (codex 0.135 double-fire) ---
+# codex 0.135 double-fires PreToolUse too (same as stop/notification): two
+# processes POST /hook/permission for ONE tool call → two cards, two long-polls.
+# Dedupe by tool_use_id (NOT turn_id — a turn holds dozens of tool calls): the
+# duplicate reuses the first request_id, so one card is sent and BOTH pollers read
+# the SAME decision (codex's two PreToolUse returns then can't diverge).
+# Unlike the one-shot pop model, the decision is read-not-popped and reaped lazily
+# (GRACE after first read, or a TTL backstop for a codex rid no poller drains).
+# AskUserQuestion is Claude-only (no tool_use_id) → key is None → never deduped,
+# so its multi-step / Other flow is untouched.
+_perm_lock = threading.Lock()
+_perm_dedupe: dict[tuple, str] = {}       # (session_id, tool_use_id) → request_id
+_perm_consumed_at: dict[str, float] = {}  # request_id → ts first poller read the decision
+_perm_last_poll: dict[str, float] = {}    # request_id → ts of last long-poll (liveness)
+# Backstop for a codex rid whose hook PROCESS died: reaped only after no poll for
+# this long. Must exceed one poll cycle (hook waits 30s then sleeps 2s ≈ 32s) so a
+# slow user whose hooks are still polling is never reaped; a dead hook stops
+# polling and gets cleaned ~one cycle later.
+_PERM_DEDUPE_TTL = 90.0
+_PERM_GC_GRACE = 5.0                       # s — keep a read decision this long for the 2nd poller
+
 
 # --- Inject delivery confirmation ---
 # A successful `tmux send-keys` only means the bytes reached the pane — NOT that
@@ -835,16 +856,37 @@ def _build_askuser_updated_input(questions: list, answers: list) -> dict:
     return {"questions": questions, "answers": answers_map}
 
 
+def _maybe_tmux_fallback(request_id: str, behavior: str, req_data: dict):
+    """Inject the decision via tmux iff NO poller consumed it (hook died/timed out).
+
+    Decisions are now read-not-popped, so they linger after a poller reads them —
+    the old `rid in _perm_decisions` test would always fire and wrongly inject.
+    Gate on consumed_at instead: codex's double-fire is read by at least one
+    poller within 5s → consumed → skip injection.
+    """
+    with _perm_lock:
+        consumed = request_id in _perm_consumed_at
+        alive = request_id in _perm_requests
+    if not alive or consumed:
+        return
+    logger.info(f"Hook timed out, tmux fallback (rid={request_id[:8]})")
+    _tmux_fallback(request_id, behavior, req_data)
+    with _perm_lock:
+        _perm_decisions.pop(request_id, None)
+        _perm_events.pop(request_id, None)
+        _perm_requests.pop(request_id, None)
+        _perm_consumed_at.pop(request_id, None)
+        _perm_last_poll.pop(request_id, None)
+        k = req_data.get("dedupe_key")
+        if k is not None:
+            _perm_dedupe.pop(k, None)
+
+
 def _schedule_tmux_fallback(request_id: str, behavior: str, req_data: dict):
-    """Schedule tmux fallback: wait 5s, if decision not consumed by hook, send keys."""
+    """Wait 5s, then run the tmux fallback backstop if still unconsumed."""
     def _check():
         time.sleep(5)
-        if request_id in _perm_decisions:
-            logger.info(f"Hook timed out, tmux fallback (rid={request_id[:8]})")
-            _tmux_fallback(request_id, behavior, req_data)
-            _perm_decisions.pop(request_id, None)
-            _perm_events.pop(request_id, None)
-            _perm_requests.pop(request_id, None)
+        _maybe_tmux_fallback(request_id, behavior, req_data)
     threading.Thread(target=_check, daemon=True).start()
 
 
@@ -1725,6 +1767,71 @@ async def receive_prompt_hook(request: Request):
     return {"ok": True}
 
 
+def _perm_dedupe_key(session_id: str, tool_use_id: str) -> tuple | None:
+    """Dedupe key for a permission request. tool_use_id identifies ONE tool call
+    (turn_id would wrongly merge a whole turn's requests). None → not deduped
+    (e.g. AskUserQuestion, which is Claude-only and carries no tool_use_id)."""
+    if not session_id or not tool_use_id:
+        return None
+    return (session_id, tool_use_id)
+
+
+def _perm_lazy_gc_locked() -> None:
+    """Reap permission state. Caller MUST hold _perm_lock.
+
+    - a decision already read by a poller is kept GRACE seconds for the 2nd poller
+    - a codex (deduped) request no poller ever drains is dropped after TTL
+    AskUserQuestion (dedupe_key is None) is never TTL-reaped — it may wait minutes
+    for the user to answer a multi-step / Other prompt.
+    """
+    now = time.time()
+    dead = []
+    for rid, req in _perm_requests.items():
+        consumed = _perm_consumed_at.get(rid)
+        if consumed is not None and now - consumed > _PERM_GC_GRACE:
+            dead.append(rid)
+        elif (req.get("dedupe_key") is not None
+              and rid not in _perm_decisions
+              and now - max(req.get("created_at", now),
+                            _perm_last_poll.get(rid, 0.0)) > _PERM_DEDUPE_TTL):
+            # No decision AND no poll for a full TTL → the hook process is gone,
+            # not a slow user (whose hooks keep refreshing _perm_last_poll).
+            dead.append(rid)
+    for rid in dead:
+        _perm_requests.pop(rid, None)
+        _perm_events.pop(rid, None)
+        _perm_decisions.pop(rid, None)
+        _perm_consumed_at.pop(rid, None)
+        _perm_last_poll.pop(rid, None)
+    live = set(_perm_requests)
+    for k in [k for k, r in _perm_dedupe.items() if r not in live]:
+        del _perm_dedupe[k]
+
+
+def _perm_lookup_or_register(key: tuple | None) -> tuple[str, bool]:
+    """Return (request_id, is_new). For a live duplicate (same key) return the
+    existing rid and DON'T send a second card. Atomically reserves the event +
+    a request skeleton (created_at/dedupe_key) inside the lock so a
+    near-simultaneous duplicate can't slip past the dedupe before the event exists.
+    """
+    if key is None:
+        rid = str(uuid.uuid4())
+        with _perm_lock:
+            _perm_events[rid] = threading.Event()
+            _perm_requests[rid] = {"created_at": time.time(), "dedupe_key": None}
+        return rid, True
+    with _perm_lock:
+        _perm_lazy_gc_locked()
+        existing = _perm_dedupe.get(key)
+        if existing and existing in _perm_requests:
+            return existing, False
+        rid = str(uuid.uuid4())
+        _perm_dedupe[key] = rid
+        _perm_events[rid] = threading.Event()
+        _perm_requests[rid] = {"created_at": time.time(), "dedupe_key": key}
+        return rid, True
+
+
 @app.post("/hook/permission")
 async def receive_permission_hook(request: Request):
     """Receive a PermissionRequest hook, send Feishu card, return request_id."""
@@ -1751,19 +1858,28 @@ async def receive_permission_hook(request: Request):
 
     perm_suggestions = hook_data_full.get("permission_suggestions", [])
 
-    request_id = str(uuid.uuid4())
-    _perm_requests[request_id] = {
+    # Dedupe codex 0.135's double-fired PreToolUse by tool_use_id: the duplicate
+    # reuses the first rid (no second card), and both hook processes long-poll the
+    # same decision. AskUserQuestion has no tool_use_id → key None → not deduped.
+    tool_use_id = body.get("tool_use_id") or hook_data_full.get("tool_use_id") or ""
+    dedupe_key = _perm_dedupe_key(session_id, tool_use_id)
+    request_id, is_new = _perm_lookup_or_register(dedupe_key)
+    if not is_new:
+        logger.info(f"Permission dedupe: reuse rid={request_id[:8]} tool={tool_name} (codex double-fire)")
+        return {"ok": True, "request_id": request_id, "deduped": True}
+
+    # Fill in the skeleton reserved by _perm_lookup_or_register (.update, not a
+    # full assign, so created_at / dedupe_key survive).
+    _perm_requests[request_id].update({
         "tool_name": tool_name,
         "tool_input": tool_input,
         "tty": tty,
         "hook_data_full": hook_data_full,
         "permission_suggestions": perm_suggestions,
-        "created_at": time.time(),
         # feishu_root_msg_id is filled below once we know the thread root, so
         # AskUserQuestion's "Other" thread-reply lookup can locate this rid.
         "feishu_root_msg_id": "",
-    }
-    _perm_events[request_id] = threading.Event()
+    })
 
     # Find the Feishu thread to reply in
     session = session_store.get(session_id) if session_id else None
@@ -1821,14 +1937,22 @@ async def get_permission_decision(request_id: str):
     if not event:
         return {"status": "not_found"}
 
+    # Record liveness: a still-polling hook keeps its rid alive against the TTL GC,
+    # so a slow user's valid permission card is never reaped out from under them.
+    with _perm_lock:
+        _perm_last_poll[request_id] = time.time()
+
     loop = asyncio.get_event_loop()
     decided = await loop.run_in_executor(None, event.wait, 30)
 
     if decided:
-        decision = _perm_decisions.pop(request_id, None)
-        _perm_events.pop(request_id, None)
-        _perm_requests.pop(request_id, None)
-        if decision:
+        # Read, don't pop: codex double-fire means two pollers must read the SAME
+        # decision. Mark first read with consumed_at; lazy GC reaps it after GRACE.
+        decision = _perm_decisions.get(request_id)
+        if decision is not None:
+            with _perm_lock:
+                _perm_consumed_at.setdefault(request_id, time.time())
+                _perm_lazy_gc_locked()
             return {"status": "decided", "decision": decision}
 
     return {"status": "pending"}
