@@ -1702,11 +1702,14 @@ async def receive_hook(request: Request):
             text = display_message
             if config.feishu_receive_id:
                 text = f'<at user_id="{config.feishu_receive_id}"></at> {text}'
-            _reply(root_id, text=text, reply_in_thread=True)
-            if session_id:
-                session_store.mark_subscribed(session_id)
-            _remember_delivery(dedupe_key, hook_type, session_id)
-            return {"ok": True, "msg_id": root_id}
+            msg_id = _reply(root_id, text=text, reply_in_thread=True)
+            if msg_id:
+                if session_id:
+                    session_store.mark_subscribed(session_id)
+                # Register dedupe only on a confirmed send (F1 consistency); on
+                # failure fall through so codex's duplicate retries via existing-session.
+                _remember_delivery(dedupe_key, hook_type, session_id)
+                return {"ok": True, "msg_id": root_id}
 
         # User-initiated: send title as thread root, reply with content
         thread_title = _make_title(cwd, session_id, message)
@@ -1717,11 +1720,15 @@ async def receive_hook(request: Request):
             text = display_message
             if config.feishu_receive_id:
                 text = f'<at user_id="{config.feishu_receive_id}"></at> {text}'
-            _reply(root_id, text=text, reply_in_thread=True)
-            if session_id:
-                session_store.mark_subscribed(session_id)
-            _remember_delivery(dedupe_key, hook_type, session_id)
-            return {"ok": True, "msg_id": root_id}
+            msg_id = _reply(root_id, text=text, reply_in_thread=True)
+            if msg_id:
+                if session_id:
+                    session_store.mark_subscribed(session_id)
+                # Register dedupe only on a confirmed send (F1 consistency). The
+                # thread root + session.root_msg_id persist, so a failed content
+                # reply is retried by codex's duplicate via the existing-session path.
+                _remember_delivery(dedupe_key, hook_type, session_id)
+                return {"ok": True, "msg_id": root_id}
 
     return {"ok": False, "error": "send failed"}
 
@@ -1915,10 +1922,24 @@ async def receive_permission_hook(request: Request):
 
     if root_msg_id:
         logger.info(f"[CARD_DEBUG] Replying card in thread root_msg_id={root_msg_id} for {tool_name}")
-        _reply_card(root_msg_id, card, reply_in_thread=True)
+        card_msg_id = _reply_card(root_msg_id, card, reply_in_thread=True)
     else:
         logger.info(f"[CARD_DEBUG] Sending card as root message for {tool_name} (no root_msg_id, session={session_id[:8] if session_id else 'none'}, tty={tty})")
-        _send_card(card)
+        card_msg_id = _send_card(card)
+
+    if not card_msg_id:
+        # The card never reached Feishu. Release the dedupe slot so codex's
+        # duplicate comes through as is_new and re-sends, instead of being deduped
+        # onto a card nobody can see (which would strand both hooks until timeout).
+        with _perm_lock:
+            _perm_requests.pop(request_id, None)
+            _perm_events.pop(request_id, None)
+            _perm_consumed_at.pop(request_id, None)
+            _perm_last_poll.pop(request_id, None)
+            if dedupe_key is not None:
+                _perm_dedupe.pop(dedupe_key, None)
+        logger.error(f"Permission card send failed, released rid={request_id[:8]} tool={tool_name}")
+        return {"ok": False, "error": "card send failed"}
 
     # Track which Feishu thread root this rid belongs to so AskUserQuestion
     # "Other" can match a free-form text reply back to the correct request.
