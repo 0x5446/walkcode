@@ -3,6 +3,7 @@
 import logging
 import os
 import subprocess
+import time
 
 from .i18n import t
 
@@ -10,6 +11,16 @@ logger = logging.getLogger("walkcode")
 
 # Single-key replies that should NOT have a newline appended
 SINGLE_KEYS = {"y", "n", "a", "1", "2", "3", "4", "5", "6", "7", "8", "9", "0"}
+
+# Seconds to wait between delivering message text and pressing Enter. codex CLI
+# >=0.136 detects paste bursts: if the text and the Enter arrive in one stdin
+# read, the Enter is treated as a newline INSIDE the paste instead of a submit.
+# Bracketed paste (below) already separates them on apps that enable the mode;
+# this delay is the fallback for apps that don't.
+_INJECT_ENTER_DELAY = 0.1
+# Named tmux buffer for message delivery — avoids clobbering the user's default
+# paste buffer; deleted right after the paste (`paste-buffer -d`).
+_INJECT_BUFFER = "walkcode-inject"
 
 
 def detect_tmux_session() -> str:
@@ -113,21 +124,47 @@ def inject(session_name: str, text: str, enter: bool | None = None) -> bool:
     if error:
         raise RuntimeError(error)
 
+    stripped = text.strip()
     if enter is None:
-        stripped = text.strip()
         # For multi-character text, always send Enter
         # SINGLE_KEYS logic only applies to single-char replies (y/n/1-9/0)
         enter = len(stripped) > 1 or stripped.lower() not in SINGLE_KEYS
 
-    # Use send-keys -l (literal) to avoid tmux key binding interpretation
-    result = subprocess.run(
-        ["tmux", "send-keys", "-t", session_name, "-l", text],
-        capture_output=True, text=True, timeout=5,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(f"tmux send-keys failed: {result.stderr.strip()}")
+    # A single-key reply (y/n/1-9) is a MENU selection, not a message — it must
+    # go in as a raw keystroke (a permission menu reads "1" as "pick option 1",
+    # not as text). Everything else is a chat message: deliver it via bracketed
+    # paste so codex >=0.136 sees an unambiguous paste boundary and treats the
+    # trailing Enter as a submit rather than a newline inside a paste burst.
+    is_menu_key = len(stripped) == 1 and stripped.lower() in SINGLE_KEYS
+
+    if is_menu_key:
+        # Use send-keys -l (literal) to avoid tmux key binding interpretation
+        result = subprocess.run(
+            ["tmux", "send-keys", "-t", session_name, "-l", text],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"tmux send-keys failed: {result.stderr.strip()}")
+    else:
+        # set-buffer into a named buffer, then paste-buffer -p (bracketed paste
+        # when the app requested the mode) and -d (delete the buffer after).
+        result = subprocess.run(
+            ["tmux", "set-buffer", "-b", _INJECT_BUFFER, "--", text],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"tmux set-buffer failed: {result.stderr.strip()}")
+        result = subprocess.run(
+            ["tmux", "paste-buffer", "-p", "-d", "-b", _INJECT_BUFFER, "-t", session_name],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"tmux paste-buffer failed: {result.stderr.strip()}")
 
     if enter:
+        if not is_menu_key:
+            # Let codex flush the paste before the Enter arrives as its own key.
+            time.sleep(_INJECT_ENTER_DELAY)
         result = subprocess.run(
             ["tmux", "send-keys", "-t", session_name, "Enter"],
             capture_output=True, text=True, timeout=5,
