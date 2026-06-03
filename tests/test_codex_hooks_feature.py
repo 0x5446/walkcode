@@ -14,6 +14,7 @@ import tomllib
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 from walkcode import __main__ as m
 
@@ -79,6 +80,51 @@ class EnsureCodexHooksFeatureTests(unittest.TestCase):
         # tomllib sees features.hooks = True despite the comment → leave untouched.
         initial = "[features]\nhooks = true # keep me\n"
         self.assertEqual(self._run(initial), initial)
+
+    # --- C: header matching must tolerate whitespace / trailing comments ----
+    # A literal "[features]" match misses these legal TOML spellings; the old
+    # code would then write a duplicate [features] table or a duplicate key,
+    # leaving codex with invalid config or hooks still disabled.
+
+    def test_spaced_header_with_hooks_false_is_repaired(self):
+        out = self._run("[ features ]\nhooks = false\n")
+        self.assertIs(tomllib.loads(out)["features"]["hooks"], True)
+        self.assertEqual(out.count("hooks = true"), 1)
+        self.assertEqual(out.count("[ features ]") + out.count("[features]"), 1)
+
+    def test_commented_header_with_hooks_false_is_repaired(self):
+        out = self._run("[features] # codex flags\nhooks = false\n")
+        self.assertIs(tomllib.loads(out)["features"]["hooks"], True)
+        self.assertEqual(out.count("hooks = true"), 1)
+        # the header comment is preserved, no duplicate table
+        self.assertIn("# codex flags", out)
+
+    def test_spaced_header_without_hooks_gets_flag(self):
+        out = self._run("[ features ]\njs_repl = false\n")
+        self.assertIs(tomllib.loads(out)["features"]["hooks"], True)
+        self.assertIn("js_repl = false", out)
+        self.assertEqual(out.count("[ features ]") + out.count("[features]"), 1)
+
+    def test_commented_header_without_hooks_gets_flag(self):
+        out = self._run("[features] # codex flags\n")
+        self.assertIs(tomllib.loads(out)["features"]["hooks"], True)
+        self.assertIn("# codex flags", out)
+
+    def test_refuses_to_corrupt_a_previously_valid_config(self):
+        # The tomllib re-validation guard: if the edit would somehow produce
+        # invalid TOML for a config that originally parsed cleanly, leave the
+        # file untouched rather than break codex's config.
+        import io as _io
+
+        initial = "[features]\nhooks = false\n"
+        with TemporaryDirectory() as d:
+            p = Path(d) / "config.toml"
+            p.write_text(initial)
+            with patch.object(m, "_set_features_hooks_true", lambda c: "x = = broken"), \
+                 patch.object(m.sys, "stderr", _io.StringIO()) as err:
+                m._ensure_codex_hooks_feature(p)
+            self.assertEqual(p.read_text(), initial)  # unchanged
+            self.assertIn("skipped enabling codex hooks", err.getvalue())
 
 
 if __name__ == "__main__":

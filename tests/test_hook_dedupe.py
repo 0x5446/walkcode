@@ -233,6 +233,39 @@ class ReceiveHookDedupeTests(unittest.TestCase):
         self.assertFalse(r2.get("deduped", False))   # second NOT swallowed
         self.assertEqual(len(self.replies), 2)
 
+    def test_pending_reply_success_replies_into_existing_thread(self):
+        # E happy path: a Feishu-initiated (pending) session replies into the
+        # pre-created thread root and registers dedupe once.
+        server.session_store.add_pending("tmux-pending", "pending-root")
+        r = self._post(_stop_body(
+            turn_id="turn-A", session_id="s-pending", tty="tmux-pending"))
+        self.assertTrue(r.get("ok"))
+        self.assertEqual(r.get("msg_id"), "pending-root")
+        self.assertEqual(self.replies[0][0], "pending-root")  # replied to the root
+        # the session now owns the root for any duplicate to retry against
+        self.assertEqual(server.session_store.get("s-pending").root_msg_id, "pending-root")
+
+    def test_pending_reply_failure_does_not_fall_through_to_new_thread(self):
+        # E (Critical): if the reply to the pending root fails, we must NOT fall
+        # through and _send a brand-new thread — the first reply would land in
+        # the wrong place. Return ok:False; the session keeps its root_msg_id so
+        # codex's duplicate retries into the SAME thread via existing-session.
+        server.session_store.add_pending("tmux-pending", "pending-root")
+        self._reply_results = [None, "ok-2"]  # 1st (pending) fails, 2nd (existing) ok
+        sends = []
+        with patch.object(server, "_send",
+                          lambda text: sends.append(text) or "should-not-be-used"):
+            r1 = self._post(_stop_body(
+                turn_id="turn-A", session_id="s-pending", tty="tmux-pending"))
+            r2 = self._post(_stop_body(
+                turn_id="turn-A", session_id="s-pending", tty="tmux-pending"))
+        self.assertFalse(r1.get("ok"))               # pending reply failed
+        self.assertEqual(sends, [])                  # never created a new thread
+        self.assertFalse(r2.get("deduped", False))   # duplicate NOT swallowed
+        self.assertTrue(r2.get("ok"))                # retried via existing-session
+        self.assertEqual(r2.get("thread"), "pending-root")  # same thread, right place
+        self.assertEqual(len(self.replies), 2)
+
 
 class CmdHookTurnIdForwardingTests(unittest.TestCase):
     """cmd_hook must forward turn_id into the POST body (tests ISSUE_2): the

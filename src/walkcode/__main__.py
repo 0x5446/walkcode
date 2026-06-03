@@ -564,16 +564,22 @@ def _install_codex_hooks(_args):
     print(t("install_hooks.restart_hint"))
 
 
+# Match the [features] table header tolerantly: leading whitespace, spaces inside
+# the brackets ([ features ]), and a trailing comment ([features] # x) are all
+# valid TOML that a literal "[features]" match would miss.
+_FEATURES_HEADER = re.compile(r"^\s*\[\s*features\s*\]\s*(?:#.*)?$")
+_TABLE_HEADER = re.compile(r"^\s*\[[^\[\]]*\]\s*(?:#.*)?$")
+_HOOKS_ASSIGN = re.compile(r"^\s*hooks\s*=")
+
+
 def _ensure_codex_hooks_feature(config_toml: Path):
     """Ensure [features] hooks = true in Codex config.toml.
 
-    Codex 0.135+ gates hooks behind ``hooks = true``; older builds used
-    ``codex_hooks``. Parse with tomllib (robust to trailing comments, whitespace,
-    and the unrelated ``[hooks.state]`` table) and then:
-      - already true   → no-op
-      - present, wrong → replace the value INSIDE [features] (never a dup key)
-      - absent         → insert into [features], or append the table
-    Any legacy ``codex_hooks`` flag is left untouched.
+    Codex 0.135+ gates hooks behind ``hooks = true`` (older builds used
+    ``codex_hooks``, left untouched). tomllib decides whether it's already on;
+    _set_features_hooks_true does the edit, tolerant of spaced/commented headers.
+    If the original parsed cleanly we re-validate the result and refuse to write a
+    file we'd corrupt.
     """
     if not config_toml.exists():
         config_toml.parent.mkdir(parents=True, exist_ok=True)
@@ -583,45 +589,70 @@ def _ensure_codex_hooks_feature(config_toml: Path):
     content = config_toml.read_text()
     try:
         parsed = tomllib.loads(content)
+        orig_ok = True
     except Exception:
-        parsed = None  # corrupt TOML → fall through to best-effort insert
+        parsed, orig_ok = None, False  # corrupt TOML → best-effort edit
 
     features = parsed.get("features", {}) if isinstance(parsed, dict) else {}
     if features.get("hooks") is True:
         return  # already enabled
 
-    if "hooks" in features:
-        # present but not true → replace the value in-place, no duplicate key
-        content = _replace_features_hooks_true(content)
-    elif "[features]" in content:
-        content = content.replace("[features]", "[features]\nhooks = true", 1)
-    else:
-        content += "\n[features]\nhooks = true\n"
-    config_toml.write_text(content)
+    new_content = _set_features_hooks_true(content)
+
+    if orig_ok:
+        # Never turn a previously-valid config into a broken one.
+        try:
+            check = tomllib.loads(new_content)
+        except Exception:
+            check = None
+        if not isinstance(check, dict) or check.get("features", {}).get("hooks") is not True:
+            print(
+                f"[walkcode] skipped enabling codex hooks flag: editing {config_toml} "
+                "would not yield a valid [features] hooks = true; please set it manually",
+                file=sys.stderr,
+            )
+            return
+    config_toml.write_text(new_content)
 
 
-def _replace_features_hooks_true(content: str) -> str:
-    """Set ``hooks = true`` on the existing hooks line within the [features] table.
+def _set_features_hooks_true(content: str) -> str:
+    """Return content with [features] hooks = true.
 
-    Only the [features] table is touched — sub-tables like [hooks.state] and other
-    sections are left alone.
+    Tolerant of spaced/commented headers. Replaces an existing hooks line inside
+    [features]; if [features] exists without one, inserts right after the header;
+    if there's no [features] table, appends one. Other tables (e.g. [hooks.state])
+    are never touched.
     """
-    out = []
+    out: list[str] = []
     in_features = False
     replaced = False
+    header_pos = None  # index in `out` of the [features] header line
     for line in content.splitlines(keepends=True):
-        stripped = line.strip()
-        if stripped.startswith("[") and stripped.endswith("]"):
-            in_features = (stripped == "[features]")
+        if _FEATURES_HEADER.match(line):
+            in_features = True
+            header_pos = len(out)
             out.append(line)
             continue
-        if in_features and not replaced and re.match(r"\s*hooks\s*=", line):
+        if _TABLE_HEADER.match(line):
+            # entering another table; if we were in [features] without a hooks
+            # line, insert one right after its header before leaving.
+            if in_features and not replaced and header_pos is not None:
+                out.insert(header_pos + 1, "hooks = true\n")
+                replaced = True
+            in_features = False
+            out.append(line)
+            continue
+        if in_features and not replaced and _HOOKS_ASSIGN.match(line):
             out.append("hooks = true\n" if line.endswith("\n") else "hooks = true")
             replaced = True
             continue
         out.append(line)
     if not replaced:
-        return content.replace("[features]", "[features]\nhooks = true", 1)
+        if header_pos is not None:
+            out.insert(header_pos + 1, "hooks = true\n")
+        else:
+            sep = "" if (not out or out[-1].endswith("\n")) else "\n"
+            out.append(sep + "[features]\nhooks = true\n")
     return "".join(out)
 
 

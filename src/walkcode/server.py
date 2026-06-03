@@ -1706,10 +1706,13 @@ async def receive_hook(request: Request):
             if msg_id:
                 if session_id:
                     session_store.mark_subscribed(session_id)
-                # Register dedupe only on a confirmed send (F1 consistency); on
-                # failure fall through so codex's duplicate retries via existing-session.
                 _remember_delivery(dedupe_key, hook_type, session_id)
                 return {"ok": True, "msg_id": root_id}
+            # E: reply to the pending root failed — do NOT fall through to creating
+            # a new thread (the first reply would land in the wrong place). The
+            # session was upserted with root_msg_id above, so codex's duplicate
+            # retries into the same thread via the existing-session branch.
+            return {"ok": False, "error": "reply to pending root failed"}
 
         # User-initiated: send title as thread root, reply with content
         thread_title = _make_title(cwd, session_id, message)
