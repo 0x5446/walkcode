@@ -287,6 +287,10 @@ _T: dict[str, tuple[str, str]] = {
         "Request expired",
         "请求已过期",
     ),
+    "feishu.perm.already_decided": (
+        "Already answered — keeping the first decision",
+        "已经回复过了，保留首次的决定",
+    ),
     "feishu.perm.suggestion_label": (
         "📋 Will allow",
         "📋 将允许的范围",
