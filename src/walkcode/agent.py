@@ -23,9 +23,21 @@ class AgentAdapter:
         escaped = prompt.replace("'", "'\\''")
         parts = [f"cd '{cwd}'", "&&", self.command, self.permission_mode_flag]
         parts.extend(self.extra_start_flags)
-        if image_path and self.image_flag:
+        has_image = bool(image_path and self.image_flag)
+        if has_image:
             parts.extend([self.image_flag, f"'{image_path}'"])
-        parts.append(f"'{escaped}'")
+        # The positional prompt must NOT be appended when empty: codex's
+        # `--image <FILE>...` is variadic, so a trailing '' is parsed as a second
+        # (empty) image path and codex aborts at startup
+        # ("a value is required for '--image <FILE>...' but none was supplied"),
+        # killing the single-command tmux session. An image-only message has an
+        # empty prompt, so this was every image message. When a prompt IS present
+        # alongside an image, separate it from the variadic --image with `--`,
+        # otherwise the prompt is swallowed as another image path.
+        if prompt:
+            if has_image:
+                parts.append("--")
+            parts.append(f"'{escaped}'")
         return " ".join(parts)
 
     def build_resume_cmd(self, session_id: str, cwd: str) -> str:
