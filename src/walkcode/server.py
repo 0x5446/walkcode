@@ -42,6 +42,7 @@ from fastapi import FastAPI, Request
 from .agent import AgentAdapter, get_agent
 from .config import Config
 from .i18n import t
+from .permreg import CardStatus, PermissionRegistry
 from .state import Session, SessionStore
 from .tty import inject, validate_target, get_session_activity, kill_session, capture_pane, is_agent_alive
 
@@ -60,31 +61,13 @@ _REAPER_INTERVAL = 600  # 10min — how often the idle reaper runs
 
 
 # --- Permission request state ---
-
-_perm_requests: dict[str, dict] = {}   # request_id → {tool_name, tool_input, ...}
-_perm_decisions: dict[str, dict] = {}  # request_id → {behavior, tool_name, always}
-_perm_events: dict[str, threading.Event] = {}  # request_id → Event for signaling
-
-# --- Permission-request dedupe (codex 0.135 double-fire) ---
-# codex 0.135 double-fires PreToolUse too (same as stop/notification): two
-# processes POST /hook/permission for ONE tool call → two cards, two long-polls.
-# Dedupe by tool_use_id (NOT turn_id — a turn holds dozens of tool calls): the
-# duplicate reuses the first request_id, so one card is sent and BOTH pollers read
-# the SAME decision (codex's two PreToolUse returns then can't diverge).
-# Unlike the one-shot pop model, the decision is read-not-popped and reaped lazily
-# (GRACE after first read, or a TTL backstop for a codex rid no poller drains).
-# AskUserQuestion is Claude-only (no tool_use_id) → key is None → never deduped,
-# so its multi-step / Other flow is untouched.
-_perm_lock = threading.Lock()
-_perm_dedupe: dict[tuple, str] = {}       # (session_id, tool_use_id) → request_id
-_perm_consumed_at: dict[str, float] = {}  # request_id → ts first poller read the decision
-_perm_last_poll: dict[str, float] = {}    # request_id → ts of last long-poll (liveness)
-# Backstop for a codex rid whose hook PROCESS died: reaped only after no poll for
-# this long. Must exceed one poll cycle (hook waits 30s then sleeps 2s ≈ 32s) so a
-# slow user whose hooks are still polling is never reaped; a dead hook stops
-# polling and gets cleaned ~one cycle later.
-_PERM_DEDUPE_TTL = 90.0
-_PERM_GC_GRACE = 5.0                       # s — keep a read decision this long for the 2nd poller
+# All permission state lives in one PermissionRegistry behind a single lock (see
+# permreg.py): write-once decisions (no allow→deny tearing), mutually-exclusive
+# poll-vs-tmux-fallback, and codex 0.135 double-fire dedupe by tool_use_id (the
+# duplicate reuses the first request_id; both pollers read the SAME decision).
+# AskUserQuestion is Claude-only (no tool_use_id → key None) → never deduped, so
+# its multi-step / Other flow is untouched.
+registry = PermissionRegistry()
 
 
 # --- Inject delivery confirmation ---
@@ -777,16 +760,15 @@ def _finalize_askuser_answer(
     question_index: int,
     total_questions: int,
     final_answer,
-    current_decision: dict,
 ):
     """Persist the answer for question_index and either show next question or
     finalize the decision (signal the hook process)."""
-    answers_list = current_decision.setdefault("answers", [])
-    while len(answers_list) <= question_index:
-        answers_list.append(None)
-    answers_list[question_index] = final_answer
-    # Clear any awaiting_other marker since this question is done
-    current_decision.pop("awaiting_other", None)
+    answers_list = registry.askuser_record_answer(request_id, question_index, final_answer)
+    if answers_list is None:
+        resp.toast = CallBackToast()
+        resp.toast.type = "info"
+        resp.toast.content = t("feishu.perm.expired")
+        return resp
 
     logger.info(f"AskUserQuestion answer[{question_index}]: {final_answer!r} (rid={request_id[:8]})")
 
@@ -801,16 +783,13 @@ def _finalize_askuser_answer(
         resp.toast.content = f"Q{question_index + 1}/{total_questions} answered"
         return resp
 
-    # All answered → build final decision with updatedInput
+    # All answered → build final decision with updatedInput (write-once)
     final_decision = {
         "behavior": "allow",
         "answers": answers_list,
         "updatedInput": _build_askuser_updated_input(questions, answers_list),
     }
-    _perm_decisions[request_id] = final_decision
-    perm_event = _perm_events.get(request_id)
-    if perm_event:
-        perm_event.set()
+    registry.set_decision_once(request_id, final_decision)
 
     resp.card = CallBackCard()
     resp.card.type = "raw"
@@ -859,27 +838,17 @@ def _build_askuser_updated_input(questions: list, answers: list) -> dict:
 def _maybe_tmux_fallback(request_id: str, behavior: str, req_data: dict):
     """Inject the decision via tmux iff NO poller consumed it (hook died/timed out).
 
-    Decisions are now read-not-popped, so they linger after a poller reads them —
-    the old `rid in _perm_decisions` test would always fire and wrongly inject.
-    Gate on consumed_at instead: codex's double-fire is read by at least one
-    poller within 5s → consumed → skip injection.
+    claim_fallback atomically settles the poll-vs-fallback race: it succeeds only
+    when no poller has consumed the decision AND the request has been quiet (no
+    poll) for _FALLBACK_QUIESCE, so an actively-polling hook is never raced. Once
+    claimed, try_consume can no longer hand the decision to a late poller, so the
+    decision is never both delivered AND injected.
     """
-    with _perm_lock:
-        consumed = request_id in _perm_consumed_at
-        alive = request_id in _perm_requests
-    if not alive or consumed:
+    if not registry.claim_fallback(request_id):
         return
     logger.info(f"Hook timed out, tmux fallback (rid={request_id[:8]})")
     _tmux_fallback(request_id, behavior, req_data)
-    with _perm_lock:
-        _perm_decisions.pop(request_id, None)
-        _perm_events.pop(request_id, None)
-        _perm_requests.pop(request_id, None)
-        _perm_consumed_at.pop(request_id, None)
-        _perm_last_poll.pop(request_id, None)
-        k = req_data.get("dedupe_key")
-        if k is not None:
-            _perm_dedupe.pop(k, None)
+    registry.remove(request_id)
 
 
 def _schedule_tmux_fallback(request_id: str, behavior: str, req_data: dict):
@@ -906,14 +875,14 @@ def _on_card_action(data: P2CardActionTrigger) -> P2CardActionTriggerResponse:
         if not request_id:
             return resp
 
-        req_data = _perm_requests.get(request_id)
-        if not req_data:
+        req_data = registry.get(request_id)
+        if req_data is None:
             resp.toast = CallBackToast()
             resp.toast.type = "info"
             resp.toast.content = t("feishu.perm.expired")
             return resp
 
-        tool_name = req_data.get("tool_name", "unknown")
+        tool_name = req_data.tool_name or "unknown"
 
         # Handle AskUserQuestion: select / toggle / submit_multi / request_other
         if tool_name == "AskUserQuestion":
@@ -921,10 +890,7 @@ def _on_card_action(data: P2CardActionTrigger) -> P2CardActionTriggerResponse:
             question_index = value.get("question_index", 0)
             total_questions = value.get("total_questions", 1)
 
-            tool_input = req_data.get("tool_input", {})
-            questions = tool_input.get("questions", [])
-
-            current_decision = _perm_decisions.setdefault(request_id, {})
+            questions = req_data.tool_input.get("questions", [])
 
             if action == "toggle":
                 # multiSelect: toggle option_idx in pending_selections[question_index]
@@ -934,12 +900,12 @@ def _on_card_action(data: P2CardActionTrigger) -> P2CardActionTriggerResponse:
                     resp.toast.type = "warning"
                     resp.toast.content = "Missing option_idx"
                     return resp
-                pending_all = current_decision.setdefault("pending_selections", {})
-                selected = pending_all.setdefault(question_index, [])
-                if option_idx in selected:
-                    selected.remove(option_idx)
-                else:
-                    selected.append(option_idx)
+                selected = registry.askuser_toggle(request_id, question_index, option_idx)
+                if selected is None:
+                    resp.toast = CallBackToast()
+                    resp.toast.type = "info"
+                    resp.toast.content = t("feishu.perm.expired")
+                    return resp
                 logger.info(f"AskUser toggle Q{question_index+1} idx={option_idx} → selected={selected} (rid={request_id[:8]})")
                 resp.card = CallBackCard()
                 resp.card.type = "raw"
@@ -950,10 +916,9 @@ def _on_card_action(data: P2CardActionTrigger) -> P2CardActionTriggerResponse:
 
             if action == "request_other":
                 # Mark this rid+question waiting for a thread text reply.
-                current_decision["awaiting_other"] = {
-                    "question_index": question_index,
-                    "root_msg_id": req_data.get("feishu_root_msg_id", ""),
-                }
+                registry.askuser_set_awaiting_other(
+                    request_id, question_index, req_data.feishu_root_msg_id,
+                )
                 logger.info(f"AskUser request_other Q{question_index+1} (rid={request_id[:8]})")
                 resp.card = CallBackCard()
                 resp.card.type = "raw"
@@ -967,8 +932,7 @@ def _on_card_action(data: P2CardActionTrigger) -> P2CardActionTriggerResponse:
 
             # action == "select" (single-select final) or "submit_multi"
             if action == "submit_multi":
-                pending_all = current_decision.get("pending_selections", {})
-                selected = pending_all.get(question_index, [])
+                selected = registry.askuser_get_selected(request_id, question_index)
                 if not selected:
                     resp.toast = CallBackToast()
                     resp.toast.type = "warning"
@@ -991,7 +955,7 @@ def _on_card_action(data: P2CardActionTrigger) -> P2CardActionTriggerResponse:
 
             return _finalize_askuser_answer(
                 resp, request_id, questions, question_index,
-                total_questions, final_answer, current_decision,
+                total_questions, final_answer,
             )
 
         # Handle permission decisions
@@ -1000,11 +964,14 @@ def _on_card_action(data: P2CardActionTrigger) -> P2CardActionTriggerResponse:
             return resp
 
         decision_behavior = "allow" if behavior in ("allow", "always_allow", "accept_edits", "plan_auto_accept", "plan_manual_approve") else "deny"
-        perm_suggestions = req_data.get("permission_suggestions", [])
+        perm_suggestions = req_data.permission_suggestions
 
-        # Store decision and signal the waiting hook process
+        # Build the decision. `_button` records the clicked button so a later
+        # (losing) click can echo the SAME verdict; clients read only behavior /
+        # updatedPermissions / updatedInput and ignore the extra key.
         decision_dict = {
             "behavior": decision_behavior,
+            "_button": behavior,
         }
         # Include updatedPermissions using original permission_suggestions from Claude Code
         if behavior == "always_allow":
@@ -1014,13 +981,25 @@ def _on_card_action(data: P2CardActionTrigger) -> P2CardActionTriggerResponse:
         elif behavior == "plan_auto_accept":
             decision_dict["updatedPermissions"] = [{"type": "setMode", "mode": "acceptEdits", "destination": "session"}]
 
-        _perm_decisions[request_id] = decision_dict
-        perm_event = _perm_events.get(request_id)
-        if perm_event:
-            perm_event.set()
+        # A (decision tearing): the FIRST click wins and is the only one that runs
+        # side effects (signal hook, schedule fallback, persist rule). A double
+        # click / codex double-fire / re-delivered callback loses and only echoes
+        # the already-decided verdict — never overwrites allow↔deny.
+        won = registry.set_decision_once(request_id, decision_dict)
+        if not won:
+            existing = req_data.decision or {}
+            shown = existing.get("_button") or existing.get("behavior") or behavior
+            logger.info(f"Permission decision ignored (already decided) for {tool_name} (rid={request_id[:8]})")
+            resp.card = CallBackCard()
+            resp.card.type = "raw"
+            resp.card.data = _build_permission_result_card(tool_name, shown)
+            resp.toast = CallBackToast()
+            resp.toast.type = "info"
+            resp.toast.content = t("feishu.perm.already_decided")
+            return resp
 
         # Schedule tmux fallback in case hook already timed out
-        _schedule_tmux_fallback(request_id, behavior, dict(req_data))
+        _schedule_tmux_fallback(request_id, behavior, req_data.snapshot())
 
         logger.info(f"Permission decision: {behavior} for {tool_name} (rid={request_id[:8]})")
 
@@ -1232,36 +1211,28 @@ def _resume_agent(session_id: str, old_session: Session, reply_text: str, messag
 
 
 def _find_askuser_awaiting_other(thread_root: str | None) -> str | None:
-    """Return the request_id whose AskUserQuestion is awaiting a thread-reply
-    Other answer in the given Feishu thread root, or None."""
-    if not thread_root:
-        return None
-    for rid, req_data in _perm_requests.items():
-        if req_data.get("tool_name") != "AskUserQuestion":
-            continue
-        if req_data.get("feishu_root_msg_id") != thread_root:
-            continue
-        decision = _perm_decisions.get(rid, {})
-        if decision.get("awaiting_other"):
-            return rid
-    return None
+    """Return the rid whose AskUserQuestion awaits an Other thread-reply in this
+    Feishu thread root, or None (delegates to the registry)."""
+    return registry.find_awaiting_other(thread_root)
 
 
 def _consume_other_answer(request_id: str, text: str, message_id: str):
     """Use `text` as the AskUserQuestion answer for the question currently
     awaiting Other input. Advances to next question or finalizes."""
-    req_data = _perm_requests.get(request_id, {})
-    questions = req_data.get("tool_input", {}).get("questions", [])
-    decision = _perm_decisions.setdefault(request_id, {})
-    awaiting = decision.get("awaiting_other") or {}
+    req_data = registry.get(request_id)
+    if req_data is None:
+        _add_reaction(message_id, random.choice(_FAILURE_EMOJIS))
+        return
+    questions = req_data.tool_input.get("questions", [])
+    awaiting = req_data.awaiting_other or {}
     qi = awaiting.get("question_index", 0)
     total = len(questions)
 
-    answers_list = decision.setdefault("answers", [])
-    while len(answers_list) <= qi:
-        answers_list.append(None)
-    answers_list[qi] = text
-    decision.pop("awaiting_other", None)
+    # record_answer extends the answers list and clears awaiting_other atomically
+    answers_list = registry.askuser_record_answer(request_id, qi, text)
+    if answers_list is None:
+        _add_reaction(message_id, random.choice(_FAILURE_EMOJIS))
+        return
     logger.info(f"AskUser other answer Q{qi+1}={text!r} (rid={request_id[:8]})")
 
     has_next = qi + 1 < total
@@ -1269,7 +1240,7 @@ def _consume_other_answer(request_id: str, text: str, message_id: str):
         # Send next question card as a fresh thread reply since we don't have a
         # CallBackCard channel for the original card.
         next_card = _build_askuserquestion_card(request_id, questions, qi + 1)
-        root = req_data.get("feishu_root_msg_id")
+        root = req_data.feishu_root_msg_id
         if root:
             _reply_card(root, next_card, reply_in_thread=True)
         _add_reaction(message_id, random.choice(_SUCCESS_EMOJIS))
@@ -1280,10 +1251,7 @@ def _consume_other_answer(request_id: str, text: str, message_id: str):
         "answers": answers_list,
         "updatedInput": _build_askuser_updated_input(questions, answers_list),
     }
-    _perm_decisions[request_id] = final_decision
-    perm_event = _perm_events.get(request_id)
-    if perm_event:
-        perm_event.set()
+    registry.set_decision_once(request_id, final_decision)
     _add_reaction(message_id, random.choice(_SUCCESS_EMOJIS))
 
 
@@ -1786,62 +1754,6 @@ def _perm_dedupe_key(session_id: str, tool_use_id: str) -> tuple | None:
     return (session_id, tool_use_id)
 
 
-def _perm_lazy_gc_locked() -> None:
-    """Reap permission state. Caller MUST hold _perm_lock.
-
-    - a decision already read by a poller is kept GRACE seconds for the 2nd poller
-    - a codex (deduped) request no poller ever drains is dropped after TTL
-    AskUserQuestion (dedupe_key is None) is never TTL-reaped — it may wait minutes
-    for the user to answer a multi-step / Other prompt.
-    """
-    now = time.time()
-    dead = []
-    for rid, req in _perm_requests.items():
-        consumed = _perm_consumed_at.get(rid)
-        if consumed is not None and now - consumed > _PERM_GC_GRACE:
-            dead.append(rid)
-        elif (req.get("dedupe_key") is not None
-              and rid not in _perm_decisions
-              and now - max(req.get("created_at", now),
-                            _perm_last_poll.get(rid, 0.0)) > _PERM_DEDUPE_TTL):
-            # No decision AND no poll for a full TTL → the hook process is gone,
-            # not a slow user (whose hooks keep refreshing _perm_last_poll).
-            dead.append(rid)
-    for rid in dead:
-        _perm_requests.pop(rid, None)
-        _perm_events.pop(rid, None)
-        _perm_decisions.pop(rid, None)
-        _perm_consumed_at.pop(rid, None)
-        _perm_last_poll.pop(rid, None)
-    live = set(_perm_requests)
-    for k in [k for k, r in _perm_dedupe.items() if r not in live]:
-        del _perm_dedupe[k]
-
-
-def _perm_lookup_or_register(key: tuple | None) -> tuple[str, bool]:
-    """Return (request_id, is_new). For a live duplicate (same key) return the
-    existing rid and DON'T send a second card. Atomically reserves the event +
-    a request skeleton (created_at/dedupe_key) inside the lock so a
-    near-simultaneous duplicate can't slip past the dedupe before the event exists.
-    """
-    if key is None:
-        rid = str(uuid.uuid4())
-        with _perm_lock:
-            _perm_events[rid] = threading.Event()
-            _perm_requests[rid] = {"created_at": time.time(), "dedupe_key": None}
-        return rid, True
-    with _perm_lock:
-        _perm_lazy_gc_locked()
-        existing = _perm_dedupe.get(key)
-        if existing and existing in _perm_requests:
-            return existing, False
-        rid = str(uuid.uuid4())
-        _perm_dedupe[key] = rid
-        _perm_events[rid] = threading.Event()
-        _perm_requests[rid] = {"created_at": time.time(), "dedupe_key": key}
-        return rid, True
-
-
 @app.post("/hook/permission")
 async def receive_permission_hook(request: Request):
     """Receive a PermissionRequest hook, send Feishu card, return request_id."""
@@ -1873,110 +1785,110 @@ async def receive_permission_hook(request: Request):
     # same decision. AskUserQuestion has no tool_use_id → key None → not deduped.
     tool_use_id = body.get("tool_use_id") or hook_data_full.get("tool_use_id") or ""
     dedupe_key = _perm_dedupe_key(session_id, tool_use_id)
-    request_id, is_new = _perm_lookup_or_register(dedupe_key)
-    if not is_new:
-        logger.info(f"Permission dedupe: reuse rid={request_id[:8]} tool={tool_name} (codex double-fire)")
-        return {"ok": True, "request_id": request_id, "deduped": True}
 
-    # Fill in the skeleton reserved by _perm_lookup_or_register (.update, not a
-    # full assign, so created_at / dedupe_key survive).
-    _perm_requests[request_id].update({
-        "tool_name": tool_name,
-        "tool_input": tool_input,
-        "tty": tty,
-        "hook_data_full": hook_data_full,
-        "permission_suggestions": perm_suggestions,
-        # feishu_root_msg_id is filled below once we know the thread root, so
-        # AskUserQuestion's "Other" thread-reply lookup can locate this rid.
-        "feishu_root_msg_id": "",
-    })
+    # Two passes at most: a duplicate that finds the first sender's card FAILED
+    # takes over as the sender (register_or_get released the key on card_failed).
+    # With synchronous lark IO the first sender always finishes before the
+    # duplicate runs, so await_send_result returns immediately.
+    for _attempt in (0, 1):
+        req, is_new = registry.register_or_get(dedupe_key)
+        request_id = req.rid
 
-    # Find the Feishu thread to reply in
-    session = session_store.get(session_id) if session_id else None
-    root_msg_id = None
+        if not is_new:
+            status = registry.await_send_result(request_id)
+            if status is CardStatus.READY:
+                logger.info(f"Permission dedupe: reuse rid={request_id[:8]} tool={tool_name} (codex double-fire)")
+                return {"ok": True, "request_id": request_id, "deduped": True}
+            # The first sender's card FAILED and its key is released → loop and
+            # re-register as the new sender.
+            continue
 
-    if session and session.root_msg_id:
-        root_msg_id = session.root_msg_id
-        session_store.upsert(session_id, tty=tty, cwd=cwd)
-    else:
-        pending_root, reply_id = session_store.pop_pending(tty)
-        if pending_root:
-            root_msg_id = pending_root
-            if session_id:
-                session_store.upsert(session_id, tty=tty, cwd=cwd, root_msg_id=root_msg_id)
-                if reply_id:
-                    _edit_message(reply_id, t("feishu.started_with_session", agent=agent_adapter.name.title(), session_id=session_id[:8], tmux=tty))
+        # We are the sender. Fill request-side fields (feishu_root_msg_id is set
+        # after the thread root is known, so AskUserQuestion "Other" can locate us).
+        registry.fill_request(
+            request_id,
+            tool_name=tool_name, tool_input=tool_input, tty=tty,
+            hook_data_full=hook_data_full, permission_suggestions=perm_suggestions,
+            feishu_root_msg_id="",
+        )
 
-    # Generate appropriate card based on tool type and permission_suggestions
-    permission_mode = hook_data_full.get("permission_mode", "")
-    if tool_name == "AskUserQuestion":
-        questions = tool_input.get("questions", [])
-        card = _build_askuserquestion_card(request_id, questions)
-    else:
-        # Determine perm_type for unified card builder
-        if permission_mode == "plan" and not perm_suggestions:
-            perm_type = "plan"
-        elif perm_suggestions and perm_suggestions[0].get("type") == "setMode":
-            perm_type = "setMode"
+        # Find the Feishu thread to reply in
+        session = session_store.get(session_id) if session_id else None
+        root_msg_id = None
+        if session and session.root_msg_id:
+            root_msg_id = session.root_msg_id
+            session_store.upsert(session_id, tty=tty, cwd=cwd)
         else:
-            perm_type = "addRules"
-        logger.info(f"[PERM_DEBUG] perm_type={perm_type} suggestions={len(perm_suggestions)}")
-        card = _build_permission_card(request_id, perm_type, tool_name, tool_input, perm_suggestions)
+            pending_root, reply_id = session_store.pop_pending(tty)
+            if pending_root:
+                root_msg_id = pending_root
+                if session_id:
+                    session_store.upsert(session_id, tty=tty, cwd=cwd, root_msg_id=root_msg_id)
+                    if reply_id:
+                        _edit_message(reply_id, t("feishu.started_with_session", agent=agent_adapter.name.title(), session_id=session_id[:8], tmux=tty))
 
-    if root_msg_id:
-        logger.info(f"[CARD_DEBUG] Replying card in thread root_msg_id={root_msg_id} for {tool_name}")
-        card_msg_id = _reply_card(root_msg_id, card, reply_in_thread=True)
-    else:
-        logger.info(f"[CARD_DEBUG] Sending card as root message for {tool_name} (no root_msg_id, session={session_id[:8] if session_id else 'none'}, tty={tty})")
-        card_msg_id = _send_card(card)
+        # Generate appropriate card based on tool type and permission_suggestions
+        permission_mode = hook_data_full.get("permission_mode", "")
+        if tool_name == "AskUserQuestion":
+            questions = tool_input.get("questions", [])
+            card = _build_askuserquestion_card(request_id, questions)
+        else:
+            if permission_mode == "plan" and not perm_suggestions:
+                perm_type = "plan"
+            elif perm_suggestions and perm_suggestions[0].get("type") == "setMode":
+                perm_type = "setMode"
+            else:
+                perm_type = "addRules"
+            logger.info(f"[PERM_DEBUG] perm_type={perm_type} suggestions={len(perm_suggestions)}")
+            card = _build_permission_card(request_id, perm_type, tool_name, tool_input, perm_suggestions)
 
-    if not card_msg_id:
-        # The card never reached Feishu. Release the dedupe slot so codex's
-        # duplicate comes through as is_new and re-sends, instead of being deduped
-        # onto a card nobody can see (which would strand both hooks until timeout).
-        with _perm_lock:
-            _perm_requests.pop(request_id, None)
-            _perm_events.pop(request_id, None)
-            _perm_consumed_at.pop(request_id, None)
-            _perm_last_poll.pop(request_id, None)
-            if dedupe_key is not None:
-                _perm_dedupe.pop(dedupe_key, None)
-        logger.error(f"Permission card send failed, released rid={request_id[:8]} tool={tool_name}")
-        return {"ok": False, "error": "card send failed"}
+        if root_msg_id:
+            logger.info(f"[CARD_DEBUG] Replying card in thread root_msg_id={root_msg_id} for {tool_name}")
+            card_msg_id = _reply_card(root_msg_id, card, reply_in_thread=True)
+        else:
+            logger.info(f"[CARD_DEBUG] Sending card as root message for {tool_name} (no root_msg_id, session={session_id[:8] if session_id else 'none'}, tty={tty})")
+            card_msg_id = _send_card(card)
 
-    # Track which Feishu thread root this rid belongs to so AskUserQuestion
-    # "Other" can match a free-form text reply back to the correct request.
-    if root_msg_id:
-        _perm_requests[request_id]["feishu_root_msg_id"] = root_msg_id
+        if not card_msg_id:
+            # The card never reached Feishu. card_failed releases the dedupe slot so
+            # codex's duplicate comes through as is_new and re-sends, instead of
+            # being deduped onto a card nobody can see (which would strand both
+            # hooks until timeout). This sender's own client fails open.
+            registry.card_failed(request_id)
+            logger.error(f"Permission card send failed, released rid={request_id[:8]} tool={tool_name}")
+            return {"ok": False, "error": "card send failed"}
 
-    project = basename(cwd) if cwd else "unknown"
-    logger.info(f"Permission request: {tool_name} | rid={request_id[:8]} tmux={tty} ({project})")
-    return {"ok": True, "request_id": request_id}
+        if root_msg_id:
+            registry.fill_request(request_id, feishu_root_msg_id=root_msg_id)
+        registry.card_sent(request_id)
+
+        project = basename(cwd) if cwd else "unknown"
+        logger.info(f"Permission request: {tool_name} | rid={request_id[:8]} tmux={tty} ({project})")
+        return {"ok": True, "request_id": request_id}
+
+    return {"ok": False, "error": "card send failed after retry"}
 
 
 @app.get("/hook/permission/{request_id}/decision")
 async def get_permission_decision(request_id: str):
     """Long-poll for a permission decision (up to 30s per call)."""
-    event = _perm_events.get(request_id)
-    if not event:
+    req = registry.get(request_id)
+    if req is None:
         return {"status": "not_found"}
 
     # Record liveness: a still-polling hook keeps its rid alive against the TTL GC,
     # so a slow user's valid permission card is never reaped out from under them.
-    with _perm_lock:
-        _perm_last_poll[request_id] = time.time()
+    registry.mark_poll(request_id)
 
     loop = asyncio.get_event_loop()
-    decided = await loop.run_in_executor(None, event.wait, 30)
+    decided = await loop.run_in_executor(None, req.decided.wait, 30)
 
     if decided:
-        # Read, don't pop: codex double-fire means two pollers must read the SAME
-        # decision. Mark first read with consumed_at; lazy GC reaps it after GRACE.
-        decision = _perm_decisions.get(request_id)
+        # try_consume reads (not pops) the decision so codex's two pollers both get
+        # the SAME verdict; it stamps consumed_at (lazy GC reaps after GRACE) and is
+        # mutually exclusive with the tmux fallback's claim.
+        decision = registry.try_consume(request_id)
         if decision is not None:
-            with _perm_lock:
-                _perm_consumed_at.setdefault(request_id, time.time())
-                _perm_lazy_gc_locked()
             return {"status": "decided", "decision": decision}
 
     return {"status": "pending"}

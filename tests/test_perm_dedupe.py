@@ -7,10 +7,12 @@ request_id (one card), and both pollers read the SAME decision (read-not-pop +
 lazy GC). AskUserQuestion is Claude-only (no tool_use_id) → key None → never
 deduped, so its multi-step / Other flow is untouched.
 
-These tests pin: the key, single-card dedupe, no over-merging by turn/tool, the
+State now lives in a PermissionRegistry (see test_perm_registry.py for the
+state-machine unit + concurrency tests); these tests pin the /hook/permission and
+/decision endpoints end-to-end: single-card dedupe, no over-merging by tool, the
 no-turn degradation, two-poller decision sharing, lazy GC (grace + TTL backstop +
-AskUserQuestion exemption), tmux-fallback gating on consumed_at, and cmd-side
-tool_use_id/turn_id forwarding.
+AskUserQuestion exemption), tmux-fallback gating, card-send-failure retry, and
+cmd-side tool_use_id/turn_id forwarding.
 """
 
 import argparse
@@ -26,17 +28,16 @@ from unittest.mock import patch
 from walkcode import server
 from walkcode import __main__ as m
 from walkcode.config import Config
+from walkcode.permreg import CardStatus, PermissionRegistry
 from walkcode.state import SessionStore
 
 
-def _clear_perm_state():
-    with server._perm_lock:
-        server._perm_requests.clear()
-        server._perm_decisions.clear()
-        server._perm_events.clear()
-        server._perm_dedupe.clear()
-        server._perm_consumed_at.clear()
-        server._perm_last_poll.clear()
+class _Clock:
+    def __init__(self, t=1000.0):
+        self.t = t
+
+    def __call__(self):
+        return self.t
 
 
 class PermDedupeKeyTests(unittest.TestCase):
@@ -76,6 +77,7 @@ class ReceivePermDedupeTests(unittest.TestCase):
         self.addCleanup(self._tmp.cleanup)
         self._orig_config = server.config
         self._orig_store = server.session_store
+        self._orig_registry = server.registry
         server.config = Config(
             feishu_app_id="x", feishu_app_secret="y",
             feishu_receive_id="", feishu_receive_id_type="open_id",
@@ -84,12 +86,16 @@ class ReceivePermDedupeTests(unittest.TestCase):
         # existing thread → receive replies card via _reply_card
         server.session_store.upsert("s1", tty="tmux1", cwd="/tmp/proj", root_msg_id="root1")
 
+        # Fresh registry on a controllable clock so GC timing is deterministic.
+        self.clock = _Clock(1000.0)
+        server.registry = PermissionRegistry(now=self.clock)
+
         def _restore():
             server.config = self._orig_config
             server.session_store = self._orig_store
+            server.registry = self._orig_registry
         self.addCleanup(_restore)
 
-        _clear_perm_state()
         self.cards = []
         p1 = patch.object(server, "_reply_card",
                           lambda mid, card, reply_in_thread=False: self.cards.append(("reply", mid)) or "cardmsg")
@@ -110,7 +116,6 @@ class ReceivePermDedupeTests(unittest.TestCase):
         self.assertEqual(len(self.cards), 1)  # only ONE card sent
 
     def test_distinct_tool_use_ids_two_cards(self):
-        # same session/tool but different tool calls → must NOT merge
         self._post(_perm_body(tool_use_id="tu-1"))
         self._post(_perm_body(tool_use_id="tu-2"))
         self.assertEqual(len(self.cards), 2)
@@ -123,8 +128,7 @@ class ReceivePermDedupeTests(unittest.TestCase):
 
     def test_two_pollers_get_same_decision(self):
         rid = self._post(_perm_body(tool_use_id="tu-1"))["request_id"]
-        server._perm_decisions[rid] = {"behavior": "allow"}
-        server._perm_events[rid].set()
+        server.registry.set_decision_once(rid, {"behavior": "allow"})
         d1 = asyncio.run(server.get_permission_decision(rid))
         d2 = asyncio.run(server.get_permission_decision(rid))
         self.assertEqual(d1["status"], "decided")
@@ -133,79 +137,67 @@ class ReceivePermDedupeTests(unittest.TestCase):
 
     def test_decision_gc_after_grace(self):
         rid = self._post(_perm_body(tool_use_id="tu-1"))["request_id"]
-        server._perm_decisions[rid] = {"behavior": "allow"}
-        server._perm_events[rid].set()
-        with patch.object(server, "time") as mt:
-            mt.time.return_value = 1000.0
-            asyncio.run(server.get_permission_decision(rid))  # consumed_at = 1000
-            self.assertIn(rid, server._perm_requests)
-            mt.time.return_value = 1000.0 + server._PERM_GC_GRACE + 1
-            with server._perm_lock:
-                server._perm_lazy_gc_locked()
-        self.assertNotIn(rid, server._perm_requests)
-        self.assertNotIn(rid, server._perm_consumed_at)
+        server.registry.set_decision_once(rid, {"behavior": "allow"})
+        server.registry.try_consume(rid)  # consumed_at = 1000
+        self.assertIsNotNone(server.registry.get(rid))
+        self.clock.t = 1000.0 + server.registry._grace + 1
+        server.registry.gc()
+        self.assertIsNone(server.registry.get(rid))
 
     def test_unconsumed_codex_req_gc_after_ttl(self):
         rid = self._post(_perm_body(tool_use_id="tu-1"))["request_id"]
-        key = ("s1", "tu-1")
-        self.assertEqual(server._perm_dedupe.get(key), rid)
-        created = server._perm_requests[rid]["created_at"]
-        with patch.object(server, "time") as mt:
-            mt.time.return_value = created + server._PERM_DEDUPE_TTL + 1
-            with server._perm_lock:
-                server._perm_lazy_gc_locked()
-        self.assertNotIn(rid, server._perm_requests)
-        self.assertNotIn(key, server._perm_dedupe)  # dedupe key cleaned too
+        self.clock.t = 1000.0 + server.registry._ttl + 1
+        server.registry.gc()
+        self.assertIsNone(server.registry.get(rid))
+        # dedupe key freed too → a later same-key request is new (sends a card)
+        r2, is_new = server.registry.register_or_get(("s1", "tu-1"))
+        self.assertTrue(is_new)
 
     def test_none_key_request_survives_ttl(self):
         # no tool_use_id → dedupe_key None → never TTL-reaped (AskUserQuestion may
-        # wait minutes for the user). Only consumed_at GRACE would reap it.
+        # wait minutes for the user). Only consumed grace would reap it.
         rid = self._post(_perm_body(tool_use_id=""))["request_id"]
-        created = server._perm_requests[rid]["created_at"]
-        with patch.object(server, "time") as mt:
-            mt.time.return_value = created + server._PERM_DEDUPE_TTL + 100
-            with server._perm_lock:
-                server._perm_lazy_gc_locked()
-        self.assertIn(rid, server._perm_requests)
+        self.clock.t = 1000.0 + server.registry._ttl + 100
+        server.registry.gc()
+        self.assertIsNotNone(server.registry.get(rid))
 
     def test_active_poller_survives_ttl(self):
         # Slow user: past the TTL, but a hook is still long-polling (fresh
-        # _perm_last_poll) → the valid card must NOT be reaped out from under them.
+        # last_poll) → the valid card must NOT be reaped out from under them.
         rid = self._post(_perm_body(tool_use_id="tu-1"))["request_id"]
-        created = server._perm_requests[rid]["created_at"]
-        with patch.object(server, "time") as mt:
-            mt.time.return_value = created + server._PERM_DEDUPE_TTL + 50
-            server._perm_last_poll[rid] = created + server._PERM_DEDUPE_TTL + 49
-            with server._perm_lock:
-                server._perm_lazy_gc_locked()
-        self.assertIn(rid, server._perm_requests)
+        self.clock.t = 1000.0 + server.registry._ttl + 49
+        server.registry.mark_poll(rid)
+        self.clock.t = 1000.0 + server.registry._ttl + 50
+        server.registry.gc()
+        self.assertIsNotNone(server.registry.get(rid))
 
     def test_fallback_skipped_when_consumed(self):
         rid = self._post(_perm_body(tool_use_id="tu-1"))["request_id"]
-        server._perm_decisions[rid] = {"behavior": "allow"}
-        server._perm_consumed_at[rid] = 123.0  # a poller already read it
+        server.registry.set_decision_once(rid, {"behavior": "allow"})
+        server.registry.try_consume(rid)  # a poller already read it
+        self.clock.t = 1000.0 + 100  # well past quiesce
+        snap = server.registry.get(rid).snapshot()
         with patch.object(server, "_tmux_fallback") as ftmux:
-            server._maybe_tmux_fallback(rid, "allow", dict(server._perm_requests[rid]))
+            server._maybe_tmux_fallback(rid, "allow", snap)
         ftmux.assert_not_called()
 
     def test_fallback_fires_when_never_consumed(self):
         rid = self._post(_perm_body(tool_use_id="tu-1"))["request_id"]
-        server._perm_decisions[rid] = {"behavior": "allow"}
-        # no consumed_at → hook died → inject backstop
+        server.registry.set_decision_once(rid, {"behavior": "allow"})
+        self.clock.t = 1000.0 + 10  # past quiesce, no poll → hook died → inject backstop
+        snap = server.registry.get(rid).snapshot()
         with patch.object(server, "_tmux_fallback") as ftmux:
-            server._maybe_tmux_fallback(rid, "allow", dict(server._perm_requests[rid]))
+            server._maybe_tmux_fallback(rid, "allow", snap)
         ftmux.assert_called_once()
-        self.assertNotIn(rid, server._perm_requests)  # cleaned after injection
-        self.assertNotIn(("s1", "tu-1"), server._perm_dedupe)
+        self.assertIsNone(server.registry.get(rid))  # cleaned after injection
 
     def test_card_send_failure_releases_slot(self):
-        # ISSUE_2: if the card never reaches Feishu, the dedupe slot is released so
-        # codex's duplicate comes through as is_new and re-sends (not stranded).
+        # If the card never reaches Feishu the dedupe slot is released so codex's
+        # duplicate comes through as is_new and re-sends (not stranded).
         with patch.object(server, "_reply_card",
                           lambda mid, card, reply_in_thread=False: None):
             r1 = self._post(_perm_body(tool_use_id="tu-1"))
         self.assertFalse(r1.get("ok"))
-        self.assertNotIn(("s1", "tu-1"), server._perm_dedupe)  # slot released
         # retry with a working card (setUp's mock) → is_new, sends exactly one card
         r2 = self._post(_perm_body(tool_use_id="tu-1"))
         self.assertFalse(r2.get("deduped", False))
