@@ -115,6 +115,60 @@ def capture_pane(session_name: str, lines: int = 30) -> str:
     return ""
 
 
+# Resume readiness: how long to wait for a (re)launched agent's TUI to settle
+# before injecting, how long the pane must stay unchanged to count as "ready",
+# and how often to poll. See wait_until_input_ready for the rationale.
+_READY_TIMEOUT = 120.0   # absolute cap (huge sessions take a while to re-render)
+_READY_STABLE = 2.0      # pane unchanged this long ⇒ render/compaction finished
+_READY_POLL = 0.5        # s between pane captures
+
+
+def wait_until_input_ready(
+    session_name: str,
+    timeout: float = _READY_TIMEOUT,
+    stable_for: float = _READY_STABLE,
+    poll: float = _READY_POLL,
+) -> bool:
+    """Block until a (re)launched agent's TUI can accept a submitted prompt.
+
+    Resuming a session replays/re-renders its whole history (and may auto-compact
+    at 100% context) before the input prompt appears. Injecting during that
+    window lands text in a not-yet-ready TUI: the paste may stick in the box but
+    the Enter is dropped, so nothing is submitted — the bug that made a freshly
+    resumed session report "not delivered". A fixed sleep can't cover this: small
+    sessions are ready in ~1s, a maxed-out one takes a minute-plus.
+
+    We detect readiness structurally rather than guessing a delay: the agent
+    process is running AND the pane has stopped changing. While history replays
+    or a spinner runs, the screen keeps repainting; once it lands on the idle
+    input prompt it goes static (verified: idle Claude/Codex panes are byte-stable
+    across captures, no footer animation).
+
+    Returns True once readiness is observed, False on timeout — in which case the
+    caller should inject anyway as a last resort and let delivery confirmation
+    (the UserPromptSubmit hook) report the real outcome.
+    """
+    deadline = time.time() + timeout
+    prev: str | None = None
+    stable_since: float | None = None
+    while time.time() < deadline:
+        if not is_agent_alive(session_name):
+            # Process not up yet (or already gone): reset and keep waiting.
+            prev, stable_since = None, None
+            time.sleep(poll)
+            continue
+        snap = capture_pane(session_name, lines=40)
+        if snap.strip() and snap == prev:
+            if stable_since is None:
+                stable_since = time.time()
+            elif time.time() - stable_since >= stable_for:
+                return True
+        else:
+            prev, stable_since = snap, None
+        time.sleep(poll)
+    return False
+
+
 def inject(session_name: str, text: str, enter: bool | None = None) -> bool:
     """Inject text into a tmux session via send-keys.
 

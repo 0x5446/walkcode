@@ -44,7 +44,7 @@ from .config import Config
 from .i18n import t
 from .permreg import CardStatus, PermissionRegistry
 from .state import Session, SessionStore
-from .tty import inject, validate_target, get_session_activity, kill_session, capture_pane, is_agent_alive
+from .tty import inject, validate_target, get_session_activity, kill_session, capture_pane, is_agent_alive, wait_until_input_ready
 
 logger = logging.getLogger("walkcode")
 
@@ -1198,7 +1198,16 @@ def _resume_agent(session_id: str, old_session: Session, reply_text: str, messag
 
     if reply_text.strip():
         def _delayed_inject():
-            time.sleep(3)
+            # Wait for the resumed TUI to finish replaying/re-rendering its
+            # history (a 100%-context session can take a minute-plus) before
+            # injecting. A fixed sleep raced the render: the paste landed but the
+            # Enter was dropped, so the message was never submitted and got
+            # reported as "not delivered". See wait_until_input_ready.
+            if not wait_until_input_ready(tmux_name):
+                logger.warning(
+                    f"Resume {tmux_name}: TUI not confirmed input-ready within "
+                    f"timeout; injecting anyway (delivery confirmation will judge)"
+                )
             try:
                 inject(tmux_name, reply_text)
             except Exception as e:
