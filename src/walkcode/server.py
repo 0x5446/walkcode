@@ -1203,11 +1203,18 @@ def _resume_agent(session_id: str, old_session: Session, reply_text: str, messag
             # injecting. A fixed sleep raced the render: the paste landed but the
             # Enter was dropped, so the message was never submitted and got
             # reported as "not delivered". See wait_until_input_ready.
-            if not wait_until_input_ready(tmux_name):
+            ready = wait_until_input_ready(tmux_name)
+            if not ready:
                 logger.warning(
                     f"Resume {tmux_name}: TUI not confirmed input-ready within "
                     f"timeout; injecting anyway (delivery confirmation will judge)"
                 )
+            else:
+                # The TUI settled at an idle prompt, so this inject goes into an
+                # idle session — clear any stale busy state carried over from the
+                # session that died mid-turn, so it isn't mislabeled "queued"
+                # (and confirmation uses the normal idle grace).
+                _mark_session_idle(session_id)
             try:
                 inject(tmux_name, reply_text)
             except Exception as e:
@@ -1298,7 +1305,15 @@ def _register_pending_inject(session_id: str | None, tty: str, text: str, messag
 
     The success/failure emoji is deferred until we either see a matching
     UserPromptSubmit (delivered) or the wait window expires (swallowed).
+
+    When the inject lands mid-turn (the agent is busy), Claude Code queues it and
+    won't submit it until the current turn ends — so confirmation can be minutes
+    away. Without a signal the sender just sees silence and assumes the message
+    was swallowed. Acknowledge immediately with a "queued" receipt so the wait is
+    explained; the eventual ✅/⚠️ still lands when the queued prompt resolves.
     """
+    busy = _session_last_ups.get(session_id or "", 0.0) \
+        > _session_last_stop.get(session_id or "", 0.0)
     with _pending_lock:
         _pending_injects.append({
             "session_id": session_id or "",
@@ -1306,9 +1321,15 @@ def _register_pending_inject(session_id: str | None, tty: str, text: str, messag
             "text": text,
             "message_id": message_id,
             "injected_at": time.time(),
-            "busy_at_inject": _session_last_ups.get(session_id or "", 0.0)
-            > _session_last_stop.get(session_id or "", 0.0),
+            "busy_at_inject": busy,
         })
+    # Network call — keep it outside the lock. Best-effort: a failed receipt must
+    # not stop the message from being tracked/delivered.
+    if busy:
+        try:
+            _reply(message_id, t("feishu.inject_queued"), reply_in_thread=True)
+        except Exception as e:
+            logger.error(f"Failed to send queued receipt: {e}")
 
 
 def _confirm_pending_inject(session_id: str, tty: str, prompt: str):

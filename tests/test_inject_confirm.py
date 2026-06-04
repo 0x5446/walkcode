@@ -103,7 +103,8 @@ class InjectConfirmTests(unittest.TestCase):
         server._sweep_pending_injects()
         self.assertEqual(len(server._pending_injects), 1,
                          "queued inject must not be failed while the session is busy")
-        self.assertEqual(self.replies, [])
+        # The only feedback so far is the immediate "queued" receipt — no failure.
+        self.assertEqual(self.replies, [("msg1", t("feishu.inject_queued"))])
         # turn ends; the queued prompt fires its UserPromptSubmit
         server._mark_session_idle("sess1")
         server._confirm_pending_inject("sess1", "tty1", "queued msg")
@@ -120,7 +121,11 @@ class InjectConfirmTests(unittest.TestCase):
             server._session_last_stop["sess1"] = now - (server._INJECT_CONFIRM_GRACE + 1)
         server._sweep_pending_injects()
         self.assertEqual(len(server._pending_injects), 0)
-        self.assertEqual(self.replies, [("msg1", t("feishu.inject_swallowed"))])
+        # First the queued receipt (busy at inject), then the swallowed notice.
+        self.assertEqual(self.replies, [
+            ("msg1", t("feishu.inject_queued")),
+            ("msg1", t("feishu.inject_swallowed")),
+        ])
 
     def test_legacy_session_without_hook_assumed_delivered(self):
         """A session that never emits UserPromptSubmit (predates the hook) must not
@@ -146,7 +151,24 @@ class InjectConfirmTests(unittest.TestCase):
                 time.time() - (server._INJECT_CONFIRM_MAX + 1)
         server._sweep_pending_injects()
         self.assertEqual(len(server._pending_injects), 0)
-        self.assertEqual(len(self.replies), 1)
+        # queued receipt (busy at inject) + the eventual swallowed notice
+        self.assertEqual(self.replies[-1], ("msg1", t("feishu.inject_swallowed")))
+
+    # --- queued receipt (immediate busy ack) ---
+
+    def test_busy_inject_sends_immediate_queued_receipt(self):
+        """A mid-turn inject is acknowledged at once so the sender isn't left in
+        silence; no reaction yet (delivery verdict still deferred)."""
+        server._mark_session_busy("sess1")
+        server._register_pending_inject("sess1", "tty1", "while busy", "msg1")
+        self.assertEqual(self.replies, [("msg1", t("feishu.inject_queued"))])
+        self.assertEqual(self.reactions, [])
+        self.assertEqual(len(server._pending_injects), 1)
+
+    def test_idle_inject_sends_no_queued_receipt(self):
+        """An idle inject submits immediately — no need for a 'queued' receipt."""
+        server._register_pending_inject("sess1", "tty1", "while idle", "msg1")
+        self.assertEqual(self.replies, [])
 
     # --- busy/idle helper ---
 

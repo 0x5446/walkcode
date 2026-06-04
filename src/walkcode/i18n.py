@@ -437,6 +437,12 @@ _T: dict[str, tuple[str, str]] = {
         "(tmux is busy, or the session has exited). Please retry shortly.",
         "⚠️ 没送达：终端无响应（tmux 繁忙或会话已退出）。请稍后重发。",
     ),
+    "feishu.inject_queued": (
+        "📥 Received — the agent is mid-task. Your message is queued and will be "
+        "picked up when the current turn ends (a ✅ will follow once it lands).",
+        "📥 已收到 —— agent 正忙着当前任务，这条已排队，等它结束就会处理"
+        "（送达后会再补一个 ✅）。",
+    ),
     "feishu.session_not_found": (
         "⚠️ Session not found, wait for next notification to reply",
         "⚠️ 找不到对应会话，请等待下一条通知后再回复",
