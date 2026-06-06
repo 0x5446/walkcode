@@ -1,7 +1,21 @@
 """Agent adapters for Claude Code and Codex CLI."""
 
 import os
+import shlex
 from dataclasses import dataclass
+
+
+def _safe_flags(raw: str) -> str:
+    """Split a user-supplied flag fragment and re-quote each token.
+
+    WALKCODE_EXTRA_ARGS / WALKCODE_PERMISSION_FLAG come from the instance .env
+    and get spliced into the `tmux new-session -d -s NAME "<cmd>"` string that a
+    shell then executes. Re-quoting every token means a value can only ever be
+    parsed as agent arguments, never as shell syntax (`;`, `$(...)`, backticks).
+    Valid flags like `--settings /p/x.json` or `--yolo` are quote-invariant, so
+    the emitted command is unchanged for normal config.
+    """
+    return " ".join(shlex.quote(tok) for tok in shlex.split(raw))
 
 
 @dataclass(frozen=True)
@@ -21,7 +35,20 @@ class AgentAdapter:
 
     def build_start_cmd(self, prompt: str, cwd: str, image_path: str | None = None) -> str:
         escaped = prompt.replace("'", "'\\''")
-        parts = [f"cd '{cwd}'", "&&", self.command, self.permission_mode_flag]
+        # Per-instance routing overrides, read from the instance env file
+        # (loaded into os.environ by Config.load). Each walkcode instance is
+        # single-agent, so these are unprefixed:
+        #   WALKCODE_EXTRA_ARGS     extra flags inserted right after the agent
+        #                           command, e.g. "--settings .../vertex.json"
+        #                           to route Claude through Vertex (the `ccv` route).
+        #   WALKCODE_PERMISSION_FLAG  replaces the default permission/approval
+        #                           flag, e.g. "--yolo" for fully autonomous codex.
+        perm_flag = os.environ.get("WALKCODE_PERMISSION_FLAG") or self.permission_mode_flag
+        extra_args = os.environ.get("WALKCODE_EXTRA_ARGS", "").strip()
+        parts = [f"cd '{cwd}'", "&&", self.command]
+        if extra_args:
+            parts.append(_safe_flags(extra_args))
+        parts.append(_safe_flags(perm_flag))
         parts.extend(self.extra_start_flags)
         has_image = bool(image_path and self.image_flag)
         if has_image:
@@ -42,12 +69,20 @@ class AgentAdapter:
 
     def build_resume_cmd(self, session_id: str, cwd: str) -> str:
         escaped_sid = session_id.replace("'", "'\\''")
+        # Same per-instance routing overrides as build_start_cmd, so a resumed
+        # session keeps the same auth/approval routing as a fresh one.
+        perm_override = os.environ.get("WALKCODE_PERMISSION_FLAG")
+        extra_args = os.environ.get("WALKCODE_EXTRA_ARGS", "").strip()
+        extra = f" {_safe_flags(extra_args)}" if extra_args else ""
         if self.resume_is_subcommand:
-            # codex resume '<sid>'
-            return f"cd '{cwd}' && {self.command} {self.resume_flag} '{escaped_sid}'"
+            # codex resume '<sid>'. Global flags (e.g. --yolo) must precede the
+            # `resume` subcommand: codex --yolo resume '<sid>'.
+            perm = f" {_safe_flags(perm_override)}" if perm_override else ""
+            return f"cd '{cwd}' && {self.command}{extra}{perm} {self.resume_flag} '{escaped_sid}'"
         else:
-            # claude --resume '<sid>' --permission-mode default
-            return f"cd '{cwd}' && {self.command} {self.resume_flag} '{escaped_sid}' {self.permission_mode_flag}"
+            # claude --settings <file> --resume '<sid>' --permission-mode default
+            perm = _safe_flags(perm_override) if perm_override else self.permission_mode_flag
+            return f"cd '{cwd}' && {self.command}{extra} {self.resume_flag} '{escaped_sid}' {perm}"
 
     def build_hook_response(
         self,
