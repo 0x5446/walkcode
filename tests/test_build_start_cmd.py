@@ -24,15 +24,35 @@ The fix: never append an empty positional, and separate a real prompt from the
 variadic --image with `--`. These tests pin both.
 """
 
+import os
 import unittest
 
 from walkcode.agent import CLAUDE, CODEX
 
 CWD = "/Users/alpha/.walkcode/workspace"
 IMG = "/Users/alpha/.walkcode/images/x.jpg"
+_ROUTING_ENV = ("WALKCODE_EXTRA_ARGS", "WALKCODE_PERMISSION_FLAG")
 
 
-class TestCodexBuildStartCmd(unittest.TestCase):
+class _CmdTestBase(unittest.TestCase):
+    """Isolate every command-building test from ambient routing env vars.
+
+    Without this, a shell that exports WALKCODE_PERMISSION_FLAG / WALKCODE_EXTRA_ARGS
+    (e.g. a dev box or CI runner) would make the default-behavior assertions fail.
+    All test classes that call build_start_cmd/build_resume_cmd inherit this.
+    """
+
+    def setUp(self):
+        self._saved_routing = {k: os.environ.pop(k, None) for k in _ROUTING_ENV}
+
+    def tearDown(self):
+        for k in _ROUTING_ENV:
+            os.environ.pop(k, None)
+            if self._saved_routing.get(k) is not None:
+                os.environ[k] = self._saved_routing[k]
+
+
+class TestCodexBuildStartCmd(_CmdTestBase):
     def test_image_only_no_trailing_empty_positional(self):
         # The exact incident: image, no prompt. Must NOT emit a trailing '' that
         # codex's variadic --image would choke on.
@@ -75,7 +95,7 @@ class TestCodexBuildStartCmd(unittest.TestCase):
         self.assertTrue(cmd.startswith(f"cd '{CWD}' && codex"))
 
 
-class TestClaudeBuildStartCmd(unittest.TestCase):
+class TestClaudeBuildStartCmd(_CmdTestBase):
     def test_claude_has_no_image_flag_so_no_dashdash(self):
         # Claude delivers images via path injection, not a native flag
         # (image_flag is None), so even with an image_path there is no --image
@@ -85,6 +105,116 @@ class TestClaudeBuildStartCmd(unittest.TestCase):
         self.assertNotIn(IMG, cmd)
         self.assertNotIn(" -- ", cmd)
         self.assertTrue(cmd.rstrip().endswith("'hi'"))
+
+
+class TestPerInstanceRoutingOverrides(_CmdTestBase):
+    """Per-instance env overrides for the Feishu→agent launch command.
+
+    Each walkcode instance is single-agent, so routing is configured with two
+    unprefixed env vars read at command-build time (loaded from the instance
+    .env by Config.load):
+      WALKCODE_EXTRA_ARGS      flags inserted right after the agent command,
+                               e.g. `--settings .../vertex.json` to route Claude
+                               through Vertex (the `ccv` route).
+      WALKCODE_PERMISSION_FLAG replaces the default permission/approval flag,
+                               e.g. `--yolo` for fully autonomous codex.
+
+    Env isolation is provided by _CmdTestBase.setUp/tearDown.
+    """
+
+    # --- defaults unchanged when env is unset (backward compat) ---
+    def test_claude_default_unchanged(self):
+        cmd = CLAUDE.build_start_cmd("hi", CWD, None)
+        self.assertEqual(cmd, f"cd '{CWD}' && claude --permission-mode default 'hi'")
+
+    def test_codex_default_unchanged(self):
+        cmd = CODEX.build_start_cmd("hi", CWD, None)
+        self.assertEqual(
+            cmd, f"cd '{CWD}' && codex --ask-for-approval untrusted --no-alt-screen 'hi'"
+        )
+
+    # --- claude ccv: --settings inserted after `claude`, before permission flag ---
+    def test_claude_extra_args_routes_to_vertex(self):
+        os.environ["WALKCODE_EXTRA_ARGS"] = "--settings /p/vertex.json"
+        cmd = CLAUDE.build_start_cmd("hi", CWD, None)
+        self.assertEqual(
+            cmd,
+            f"cd '{CWD}' && claude --settings /p/vertex.json --permission-mode default 'hi'",
+        )
+        # order: settings must come before --permission-mode
+        self.assertLess(cmd.index("--settings"), cmd.index("--permission-mode"))
+
+    def test_claude_extra_args_applied_on_resume(self):
+        os.environ["WALKCODE_EXTRA_ARGS"] = "--settings /p/vertex.json"
+        cmd = CLAUDE.build_resume_cmd("SID", CWD)
+        self.assertEqual(
+            cmd,
+            f"cd '{CWD}' && claude --settings /p/vertex.json --resume 'SID' --permission-mode default",
+        )
+
+    # --- codex yolo: permission flag replaces --ask-for-approval untrusted ---
+    def test_codex_permission_flag_replaces_approval(self):
+        os.environ["WALKCODE_PERMISSION_FLAG"] = "--yolo"
+        cmd = CODEX.build_start_cmd("hi", CWD, None)
+        self.assertEqual(cmd, f"cd '{CWD}' && codex --yolo --no-alt-screen 'hi'")
+        self.assertNotIn("--ask-for-approval", cmd)
+
+    def test_codex_yolo_keeps_image_dashdash_invariant(self):
+        # The variadic --image guard must survive the permission override.
+        os.environ["WALKCODE_PERMISSION_FLAG"] = "--yolo"
+        cmd = CODEX.build_start_cmd("", CWD, IMG)
+        self.assertIn(f"--image '{IMG}'", cmd)
+        self.assertNotIn("''", cmd)
+
+    def test_codex_yolo_resume_puts_global_flag_before_subcommand(self):
+        os.environ["WALKCODE_PERMISSION_FLAG"] = "--yolo"
+        cmd = CODEX.build_resume_cmd("SID", CWD)
+        self.assertEqual(cmd, f"cd '{CWD}' && codex --yolo resume 'SID'")
+        # --yolo is a global flag, must precede `resume`
+        self.assertLess(cmd.index("--yolo"), cmd.index("resume"))
+
+    def test_codex_resume_default_has_no_permission_flag(self):
+        # Without an override, codex resume stays bare (pre-existing behavior).
+        cmd = CODEX.build_resume_cmd("SID", CWD)
+        self.assertEqual(cmd, f"cd '{CWD}' && codex resume 'SID'")
+
+    def test_claude_permission_flag_override(self):
+        os.environ["WALKCODE_PERMISSION_FLAG"] = "--permission-mode plan"
+        cmd = CLAUDE.build_start_cmd("hi", CWD, None)
+        self.assertIn("--permission-mode plan", cmd)
+        self.assertEqual(cmd.count("--permission-mode"), 1)
+
+    def test_claude_permission_flag_override_on_resume(self):
+        os.environ["WALKCODE_PERMISSION_FLAG"] = "--permission-mode plan"
+        cmd = CLAUDE.build_resume_cmd("SID", CWD)
+        self.assertIn("--permission-mode plan", cmd)
+        # the default flag must be fully replaced, not appended alongside
+        self.assertNotIn("--permission-mode default", cmd)
+        self.assertEqual(cmd.count("--permission-mode"), 1)
+
+    # --- shell-injection neutralization (values come from a .env fragment) ---
+    def test_extra_args_injection_is_neutralized(self):
+        os.environ["WALKCODE_EXTRA_ARGS"] = "; touch /tmp/pwned"
+        cmd = CLAUDE.build_start_cmd("hi", CWD, None)
+        # the semicolon must be a quoted argument, never a bare command separator
+        self.assertNotIn("&& claude ; touch", cmd)
+        self.assertIn("';'", cmd)
+
+    def test_permission_flag_injection_is_neutralized(self):
+        os.environ["WALKCODE_PERMISSION_FLAG"] = "$(id)"
+        cmd = CODEX.build_start_cmd("hi", CWD, None)
+        # command substitution must be single-quoted, so the shell can't run it
+        self.assertIn("'$(id)'", cmd)
+        self.assertEqual(cmd.count("$(id)"), 1)  # only the quoted occurrence
+
+    def test_valid_flags_are_quote_invariant(self):
+        # normal config must pass through _safe_flags unchanged
+        os.environ["WALKCODE_EXTRA_ARGS"] = "--settings /p/vertex.json"
+        os.environ["WALKCODE_PERMISSION_FLAG"] = "--yolo"
+        cmd = CODEX.build_start_cmd("hi", CWD, None)
+        self.assertEqual(
+            cmd, f"cd '{CWD}' && codex --settings /p/vertex.json --yolo --no-alt-screen 'hi'"
+        )
 
 
 if __name__ == "__main__":
