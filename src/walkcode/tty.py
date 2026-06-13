@@ -1,16 +1,15 @@
 """Terminal injection via tmux send-keys."""
 
+import itertools
 import logging
 import os
 import subprocess
+import threading
 import time
 
 from .i18n import t
 
 logger = logging.getLogger("walkcode")
-
-# Single-key replies that should NOT have a newline appended
-SINGLE_KEYS = {"y", "n", "a", "1", "2", "3", "4", "5", "6", "7", "8", "9", "0"}
 
 # Seconds to wait between delivering message text and pressing Enter. codex CLI
 # >=0.136 detects paste bursts: if the text and the Enter arrive in one stdin
@@ -18,9 +17,20 @@ SINGLE_KEYS = {"y", "n", "a", "1", "2", "3", "4", "5", "6", "7", "8", "9", "0"}
 # Bracketed paste (below) already separates them on apps that enable the mode;
 # this delay is the fallback for apps that don't.
 _INJECT_ENTER_DELAY = 0.1
-# Named tmux buffer for message delivery — avoids clobbering the user's default
-# paste buffer; deleted right after the paste (`paste-buffer -d`).
+# Prefix for the per-call tmux paste buffer. tmux buffers live on the (shared)
+# tmux server, so a single fixed name is a global mutable slot: two concurrent
+# injects — different worker threads, or the separate claude/codex bot processes
+# driving the same user's tmux server — would race on set-buffer/paste-buffer
+# and could paste one session's text into another (cross-session mixup) or drop
+# a message. Each inject gets a unique buffer name instead. Avoids clobbering the
+# user's default paste buffer; deleted right after the paste (`paste-buffer -d`).
 _INJECT_BUFFER = "walkcode-inject"
+_inject_seq = itertools.count()
+
+
+def _unique_inject_buffer() -> str:
+    """A buffer name unique per call across processes and threads."""
+    return f"{_INJECT_BUFFER}-{os.getpid()}-{threading.get_ident()}-{next(_inject_seq)}"
 
 
 def detect_tmux_session() -> str:
@@ -169,8 +179,22 @@ def wait_until_input_ready(
     return False
 
 
-def inject(session_name: str, text: str, enter: bool | None = None) -> bool:
+def inject(session_name: str, text: str, enter: bool | None = None,
+           menu_key: bool = False) -> bool:
     """Inject text into a tmux session via send-keys.
+
+    ``menu_key`` declares the caller's intent, which inject used to guess from
+    content (and got wrong for chat messages that happen to be a single char):
+
+      * ``menu_key=False`` (default) — ``text`` is a chat message. It is
+        delivered via bracketed paste and always submitted with Enter, even when
+        it is a single character like "2" or "y". Sniffing single chars as menu
+        keys is exactly what left a Feishu reply of "2" sitting unsubmitted in
+        the input box.
+      * ``menu_key=True`` — ``text`` is a single-keystroke menu/permission
+        selection (e.g. "2" picks option 2). It goes in as a raw ``send-keys -l``
+        keystroke so the TUI menu reads it as a choice, not as typed text. The
+        only such caller is the permission hook-timeout fallback.
 
     Returns True on success. Raises RuntimeError on failure.
     """
@@ -178,20 +202,12 @@ def inject(session_name: str, text: str, enter: bool | None = None) -> bool:
     if error:
         raise RuntimeError(error)
 
-    stripped = text.strip()
     if enter is None:
-        # For multi-character text, always send Enter
-        # SINGLE_KEYS logic only applies to single-char replies (y/n/1-9/0)
-        enter = len(stripped) > 1 or stripped.lower() not in SINGLE_KEYS
+        # Chat messages are always submitted; the menu fallback passes enter
+        # explicitly when it needs it.
+        enter = not menu_key
 
-    # A single-key reply (y/n/1-9) is a MENU selection, not a message — it must
-    # go in as a raw keystroke (a permission menu reads "1" as "pick option 1",
-    # not as text). Everything else is a chat message: deliver it via bracketed
-    # paste so codex >=0.136 sees an unambiguous paste boundary and treats the
-    # trailing Enter as a submit rather than a newline inside a paste burst.
-    is_menu_key = len(stripped) == 1 and stripped.lower() in SINGLE_KEYS
-
-    if is_menu_key:
+    if menu_key:
         # Use send-keys -l (literal) to avoid tmux key binding interpretation
         result = subprocess.run(
             ["tmux", "send-keys", "-t", session_name, "-l", text],
@@ -200,23 +216,36 @@ def inject(session_name: str, text: str, enter: bool | None = None) -> bool:
         if result.returncode != 0:
             raise RuntimeError(f"tmux send-keys failed: {result.stderr.strip()}")
     else:
-        # set-buffer into a named buffer, then paste-buffer -p (bracketed paste
+        # A chat message is delivered via bracketed paste so codex >=0.136 sees
+        # an unambiguous paste boundary and treats the trailing Enter as a submit
+        # rather than a newline inside a paste burst.
+        # set-buffer into a per-call buffer, then paste-buffer -p (bracketed paste
         # when the app requested the mode) and -d (delete the buffer after).
+        buf = _unique_inject_buffer()
         result = subprocess.run(
-            ["tmux", "set-buffer", "-b", _INJECT_BUFFER, "--", text],
+            ["tmux", "set-buffer", "-b", buf, "--", text],
             capture_output=True, text=True, timeout=5,
         )
         if result.returncode != 0:
             raise RuntimeError(f"tmux set-buffer failed: {result.stderr.strip()}")
-        result = subprocess.run(
-            ["tmux", "paste-buffer", "-p", "-d", "-b", _INJECT_BUFFER, "-t", session_name],
-            capture_output=True, text=True, timeout=5,
-        )
-        if result.returncode != 0:
-            raise RuntimeError(f"tmux paste-buffer failed: {result.stderr.strip()}")
+        try:
+            result = subprocess.run(
+                ["tmux", "paste-buffer", "-p", "-d", "-b", buf, "-t", session_name],
+                capture_output=True, text=True, timeout=5,
+            )
+            if result.returncode != 0:
+                raise RuntimeError(f"tmux paste-buffer failed: {result.stderr.strip()}")
+        except BaseException:
+            # paste-buffer -d deletes the buffer on success; if we got here it may
+            # not have, so don't leak the per-call buffer on the tmux server.
+            subprocess.run(
+                ["tmux", "delete-buffer", "-b", buf],
+                capture_output=True, text=True, timeout=5,
+            )
+            raise
 
     if enter:
-        if not is_menu_key:
+        if not menu_key:
             # Let codex flush the paste before the Enter arrives as its own key.
             time.sleep(_INJECT_ENTER_DELAY)
         result = subprocess.run(
