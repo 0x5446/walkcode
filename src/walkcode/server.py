@@ -747,7 +747,7 @@ def _tmux_fallback(request_id: str, behavior: str, req_data: dict):
         return
 
     try:
-        inject(tty, key, enter=True)
+        inject(tty, key, enter=True, menu_key=True)
         logger.info(f"tmux fallback: sent '{key}' to {tty} for {tool_name} behavior={behavior} (rid={request_id[:8]})")
     except Exception as e:
         logger.error(f"tmux fallback failed: {e} (rid={request_id[:8]})")

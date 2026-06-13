@@ -191,6 +191,23 @@ class ReceivePermDedupeTests(unittest.TestCase):
         ftmux.assert_called_once()
         self.assertIsNone(server.registry.get(rid))  # cleaned after injection
 
+    def test_tmux_fallback_injects_menu_choice_as_menu_key(self):
+        # v0.10.30 contract: the hook-timeout fallback selects a permission menu
+        # option, so it must inject a raw keystroke (menu_key=True), NOT a chat
+        # message. Otherwise "1"/"2" gets pasted as text instead of picking the
+        # option, and the permission prompt is never answered. The other fallback
+        # tests mock _tmux_fallback wholesale, so nothing else pins this arg.
+        req_data = {
+            "tty": "sess1",
+            "tool_name": "Bash",
+            "permission_suggestions": [],          # → addRules: allow/always_allow/deny
+            "hook_data_full": {"permission_mode": ""},
+        }
+        with patch.object(server, "validate_target", return_value=None), \
+             patch.object(server, "inject") as finj:
+            server._tmux_fallback("rid-xyz", "allow", req_data)  # "allow" → key "1"
+        finj.assert_called_once_with("sess1", "1", enter=True, menu_key=True)
+
     def test_card_send_failure_releases_slot(self):
         # If the card never reaches Feishu the dedupe slot is released so codex's
         # duplicate comes through as is_new and re-sends (not stranded).
