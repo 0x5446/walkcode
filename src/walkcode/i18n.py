@@ -451,6 +451,14 @@ _T: dict[str, tuple[str, str]] = {
         "⏰ Session closed due to inactivity, reply to resume",
         "⏰ 会话因长时间无活动已关闭，回复任意消息可恢复",
     ),
+    "feishu.stuck_warning": (
+        "⏳ This turn has been running for {minutes} min with no result — the agent "
+        "may be stuck (e.g. a browser/login step that never returns). Take a look:\n"
+        "tmux attach -t {tmux}",
+        "⏳ 当前这步已经跑了 {minutes} 分钟还没出结果，agent 可能卡住了"
+        "（比如卡在一个一直返回不了的浏览器/登录操作）。去看看：\n"
+        "tmux attach -t {tmux}",
+    ),
 }
 
 

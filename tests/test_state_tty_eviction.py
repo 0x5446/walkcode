@@ -63,6 +63,40 @@ class TtyEvictionTests(unittest.TestCase):
         self.assertEqual(reloaded.get("sid-old").tty, "")
         self.assertEqual(reloaded.get("sid-new").tty, "tmux-a")
 
+    def test_can_evict_false_refuses_takeover(self):
+        # A guard returning False protects the current owner: the incoming session
+        # does NOT get the tty, and the owner keeps it. This is how a nested child
+        # agent is stopped from displacing a live parent (see _can_evict_tty).
+        self.store.upsert("sid-old", tty="tmux-a", cwd="/x", root_msg_id="root-old")
+        self.store.upsert(
+            "sid-new", tty="tmux-a", cwd="/y", root_msg_id="root-new",
+            can_evict=lambda oid, o: False,
+        )
+        self.assertEqual(self.store.get("sid-old").tty, "tmux-a", "owner keeps tty")
+        self.assertEqual(self.store.get("sid-new").tty, "", "claimant gets no tty")
+
+    def test_can_evict_true_allows_takeover(self):
+        # A guard returning True keeps the legacy handoff behavior intact.
+        self.store.upsert("sid-old", tty="tmux-a", cwd="/x", root_msg_id="root-old")
+        self.store.upsert(
+            "sid-new", tty="tmux-a", cwd="/y", root_msg_id="root-new",
+            can_evict=lambda oid, o: True,
+        )
+        self.assertEqual(self.store.get("sid-old").tty, "")
+        self.assertEqual(self.store.get("sid-new").tty, "tmux-a")
+
+    def test_can_evict_receives_the_current_owner(self):
+        self.store.upsert("sid-old", tty="tmux-a", cwd="/x", root_msg_id="root-old")
+        seen = {}
+
+        def guard(oid, o):
+            seen["id"], seen["root"] = oid, o.root_msg_id
+            return True
+
+        self.store.upsert("sid-new", tty="tmux-a", cwd="/y", can_evict=guard)
+        self.assertEqual(seen["id"], "sid-old")
+        self.assertEqual(seen["root"], "root-old")
+
 
 if __name__ == "__main__":
     unittest.main()

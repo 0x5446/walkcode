@@ -14,7 +14,7 @@ import urllib.request
 from pathlib import Path
 
 from .i18n import t
-from .tty import detect_tmux_session
+from .tty import detect_tmux_session, is_tmux_pane_owner
 
 _RUNTIME_DIR = Path.home() / ".walkcode"
 
@@ -343,6 +343,21 @@ def cmd_hook(args):
     tmux_session = detect_tmux_session()
     if not tmux_session:
         print(t("hook.not_in_tmux"), file=sys.stderr)
+        return
+
+    # Ownership gate. A nested child agent (e.g. a deep-review sub-agent in the
+    # parent's background terminal) inherits $TMUX and would otherwise fire hooks
+    # reporting the PARENT's tmux — hijacking the parent's Feishu thread, orphaning
+    # it, and double-resuming the parent. A non-owner's hooks must never touch tty
+    # ownership, so we drop them here at the source (see tty.is_tmux_pane_owner).
+    if not is_tmux_pane_owner():
+        # permission-request is the one type that needs a resolution or the agent's
+        # tool call hangs: exit 0 without emitting a decision so the child falls
+        # back to its OWN sandbox/approval rather than walkcode's. Everything else
+        # (sync/stop/notification/user-prompt-submit) is simply not reported — the
+        # child has no Feishu thread of its own.
+        kind = "permission" if args.hook_type == "permission-request" else args.hook_type
+        print(f"[walkcode] non-owner {kind} hook (nested child), not reported", file=sys.stderr)
         return
 
     cwd = hook_data.get("cwd", "") or os.getcwd()
