@@ -49,6 +49,59 @@ def detect_tmux_session() -> str:
     return ""
 
 
+def _ctty_owns_pane(my_ctty: str, pane_tty: str) -> bool:
+    """Pure predicate: does controlling-tty ``my_ctty`` (as ``ps -o tty=`` prints
+    it, e.g. ``ttys047`` or ``??``) belong to tmux ``pane_tty`` (``/dev/ttys047``)?
+    """
+    if not my_ctty or my_ctty in ("?", "??"):
+        return False
+    return bool(pane_tty) and pane_tty.endswith("/" + my_ctty)
+
+
+def is_tmux_pane_owner() -> bool:
+    """True if THIS process is the foreground agent of its tmux pane — the pane's
+    real owner — not a nested child that merely inherited ``$TMUX`` (e.g. a
+    deep-review sub-agent running in the parent agent's background terminal).
+
+    A tmux pane's foreground process has the pane's pty as its controlling
+    terminal, and that ctty is inherited by the hook processes it spawns. A nested
+    child runs under a different pty (or none), so its ctty won't match the pane's.
+    Verified empirically: a foreground ``sh -c`` hook's ctty == pane_tty; a
+    pty.fork child gets a different pts; a process holding ``$TMUX`` but no
+    controlling terminal reports ctty ``??``.
+
+    Fail-open: if anything is indeterminate, return True so a real owner's hooks
+    are never wrongly suppressed (this preserves legacy behavior on platforms
+    where the probe doesn't work). Set ``WALKCODE_OWNER_CHECK=0`` to disable the
+    gate entirely.
+    """
+    if os.environ.get("WALKCODE_OWNER_CHECK", "1") == "0":
+        return True
+    if not os.environ.get("TMUX"):
+        return True  # not under tmux → the gate doesn't apply
+    try:
+        my_p = subprocess.run(
+            ["ps", "-o", "tty=", "-p", str(os.getpid())],
+            capture_output=True, text=True, timeout=2,
+        )
+        pane_p = subprocess.run(
+            ["tmux", "display-message", "-p", "#{pane_tty}"],
+            capture_output=True, text=True, timeout=2,
+        )
+    except Exception:
+        return True  # probe crashed → fail open
+    # Any UNSUCCESSFUL or empty probe → fail OPEN (treat as owner). Only a probe
+    # that succeeds AND clearly shows a different/absent controlling terminal marks
+    # a non-owner: wrongly dropping a real owner's hooks would silently disconnect
+    # the parent's Feishu thread — worse than the takeover this guards against.
+    if my_p.returncode != 0 or pane_p.returncode != 0:
+        return True
+    pane = pane_p.stdout.strip()
+    if not pane:
+        return True
+    return _ctty_owns_pane(my_p.stdout.strip(), pane)
+
+
 def validate_target(session_name: str) -> str | None:
     """Check if tmux session exists. Returns error message or None."""
     if not session_name:

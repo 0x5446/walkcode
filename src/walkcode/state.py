@@ -5,6 +5,7 @@ import logging
 import tempfile
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -125,11 +126,33 @@ class SessionStore:
         tty: str,
         cwd: str,
         root_msg_id: str | None = None,
+        *,
+        can_evict: Callable[[str, "Session"], bool] | None = None,
     ) -> Session:
+        """Create or update a session's tty/cwd mapping.
+
+        ``can_evict`` guards tty takeover. When another session already owns
+        ``tty``, it is called as ``can_evict(other_id, other_session)``; returning
+        False refuses the takeover — the incoming session does NOT claim ``tty``
+        (its tty is cleared) and the existing owner keeps its mapping. This stops
+        a nested child agent — one that merely inherited the parent's ``$TMUX`` and
+        fires its own SessionStart/Stop hooks — from displacing a live,
+        Feishu-bound parent session and orphaning its thread. Default (None) keeps
+        the legacy "last writer wins" behavior (used by resume, where the new tmux
+        name never collides).
+        """
         with self._lock:
             if tty:
                 for other_id, other in self._sessions.items():
                     if other_id != session_id and other.tty == tty:
+                        if can_evict is not None and not can_evict(other_id, other):
+                            logger.info(
+                                "Refusing tty takeover: session=%s keeps tty=%s "
+                                "(claimed by session=%s, likely nested child)",
+                                other_id[:8], tty, session_id[:8],
+                            )
+                            tty = ""  # incoming session must not claim this tty
+                            break
                         logger.info(
                             "Evicting stale tty mapping: session=%s tty=%s (taken over by session=%s)",
                             other_id[:8], tty, session_id[:8],

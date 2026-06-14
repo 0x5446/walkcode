@@ -58,6 +58,11 @@ session_store: SessionStore = None  # type: ignore
 agent_adapter: AgentAdapter = None  # type: ignore
 _IDLE_TIMEOUT = 7200  # 2h — kill tmux sessions idle longer than this
 _REAPER_INTERVAL = 600  # 10min — how often the idle reaper runs
+_WATCHDOG_INTERVAL = 120  # 2min — how often the stuck-turn watchdog scans
+# Warn on the Feishu thread when a turn has been "Working" this long with no
+# result (the agent may be wedged on an interactive step, e.g. a browser/login
+# that never returns). Env-overridable for tuning without a code change.
+_STUCK_THRESHOLD = int(os.environ.get("WALKCODE_STUCK_THRESHOLD", "1800"))  # 30min
 
 
 # --- Permission request state ---
@@ -1173,6 +1178,25 @@ def _start_agent(prompt: str, message_id: str, image_path: str | None = None):
 
 def _resume_agent(session_id: str, old_session: Session, reply_text: str, message_id: str):
     """Resume a dead agent session in a new tmux, reusing the Feishu thread."""
+    # Double-instance guard: only resume if the old tmux is really gone. If it is
+    # still alive with an agent running, the "dead" verdict was wrong (e.g. a tty
+    # mapping cleared by a nested child) and spawning a fresh `resume` would create
+    # a SECOND instance writing the same session rollout. Deliver into the live
+    # window instead — which is what the caller actually wanted.
+    if old_session.tty and validate_target(old_session.tty) is None and is_agent_alive(old_session.tty):
+        logger.warning(
+            "Resume aborted: session=%s tmux=%s still alive; injecting instead of double-resuming",
+            session_id[:8], old_session.tty,
+        )
+        if reply_text.strip():
+            try:
+                inject(old_session.tty, reply_text)
+                _register_pending_inject(session_id, old_session.tty, reply_text, message_id)
+            except Exception as e:
+                logger.error(f"Resume-guard inject failed: {e}")
+                _reply(message_id, t("feishu.inject_timeout"), reply_in_thread=True)
+                _add_reaction(message_id, random.choice(_FAILURE_EMOJIS))
+        return
     cwd = old_session.cwd or config.default_cwd
     tmux_name = f"walkcode-{int(time.time())}"
     env_exports = agent_adapter.build_env_exports()
@@ -1290,6 +1314,10 @@ def _mark_session_idle(session_id: str):
     if session_id:
         with _pending_lock:
             _session_last_stop[session_id] = time.time()
+        # Turn ended → clear any stuck-turn alert state so the next turn that
+        # wedges alerts fresh (covers turns that start and stall between scans).
+        with _stuck_lock:
+            _stuck_alerted.pop(session_id, None)
 
 
 def _is_session_busy(session_id: str) -> bool:
@@ -1980,6 +2008,131 @@ def _start_idle_reaper():
     logger.info("Idle reaper started (timeout=%ds, interval=%ds)", _IDLE_TIMEOUT, _REAPER_INTERVAL)
 
 
+# --- Stuck-turn watchdog ---
+# A turn that runs very long with no Stop is usually wedged on an interactive step
+# the agent can't get past (the incident: codex sat 6.5h on a Playwright Google
+# login that never returned). There is no "still working" hook (codex has no
+# UserPromptSubmit hook at all), so detect it from the TUI: both Claude and Codex
+# render an "(… esc to interrupt)" footer with an elapsed timer while a turn runs.
+# Parse that elapsed time; once it crosses the threshold, warn on the Feishu
+# thread so a human can attach and unstick it.
+_INTERRUPT_TIME_RE = re.compile(
+    r"\((?:(\d+)h\s+)?(?:(\d+)m\s+)?(\d+)s\b[^)]*esc to interrupt",
+    re.IGNORECASE,
+)
+# session_id → {"alerted": bool, "last_secs": int}. One warning per stuck turn:
+# a turn is "new" when the elapsed timer drops below last_secs (it restarts each
+# turn); idle/dead clears the entry; the flag flips only after a confirmed send.
+_stuck_alerted: dict[str, dict] = {}
+_stuck_lock = threading.Lock()
+
+
+# How many trailing non-blank pane lines count as the live footer. The active
+# "esc to interrupt" timer sits on the bottom line(s); scanning the whole capture
+# would match a stale timer left in scrollback and read an idle pane as busy.
+_FOOTER_LINES = 6
+
+
+def _parse_working_seconds(pane: str) -> int | None:
+    """Elapsed seconds of the *current* turn from the live TUI footer, or None.
+
+    Both Claude and Codex render an "(Xh Ym Zs … esc to interrupt)" timer on the
+    bottom line while a turn runs. Only the last few non-blank lines are scanned,
+    so a stale timer further up in scrollback isn't mistaken for the current turn.
+    """
+    lines = [ln for ln in pane.splitlines() if ln.strip()]
+    for ln in reversed(lines[-_FOOTER_LINES:]):
+        m = _INTERRUPT_TIME_RE.search(ln)
+        if m:
+            return int(m.group(1) or 0) * 3600 + int(m.group(2) or 0) * 60 + int(m.group(3))
+    return None
+
+
+def _check_stuck_sessions():
+    """Warn on the Feishu thread for any turn stuck past _STUCK_THRESHOLD.
+
+    One warning per stuck turn. Per-session state is {"alerted", "last_secs"}: a
+    new turn is detected when the elapsed timer drops below last_secs (it restarts
+    each turn), and idle/dead clears the entry. The alert flag flips only after a
+    confirmed Feishu send, so a failed send is retried on the next scan instead of
+    being silently swallowed.
+    """
+    for session_id, session in session_store.items():
+        # Only Feishu-bound, walkcode-managed, live sessions are watched.
+        if not session.root_msg_id or not session.tty:
+            continue
+        if not session.tty.startswith("walkcode-"):
+            continue
+        if validate_target(session.tty) is not None or not is_agent_alive(session.tty):
+            with _stuck_lock:
+                _stuck_alerted.pop(session_id, None)
+            continue
+        pane = capture_pane(session.tty, lines=40)
+        if not pane.strip():
+            # Capture failed / empty (a tmux hiccup) — NOT proof of idle. Keep the
+            # alert state so one transient failure doesn't reset dedup and fire a
+            # duplicate alert next scan. Skip this round.
+            continue
+        secs = _parse_working_seconds(pane)
+        if secs is None:
+            # Readable pane with no live timer → genuinely idle / between turns;
+            # reset so the next stuck turn alerts fresh.
+            with _stuck_lock:
+                _stuck_alerted.pop(session_id, None)
+            continue
+        with _stuck_lock:
+            st = _stuck_alerted.get(session_id)
+            if st is not None and secs < st["last_secs"]:
+                st = None  # timer went backwards → a new turn started; reset
+            if st is None:
+                st = {"alerted": False, "last_secs": secs}
+                _stuck_alerted[session_id] = st
+            st["last_secs"] = secs
+            already = st["alerted"]
+        if secs < _STUCK_THRESHOLD or already:
+            continue
+        msg_id = None
+        try:
+            msg_id = _reply(
+                session.root_msg_id,
+                t("feishu.stuck_warning", minutes=secs // 60, tmux=session.tty),
+                reply_in_thread=True,
+            )
+        except Exception as e:
+            logger.error(f"Stuck watchdog alert failed: {e}")
+        if msg_id:
+            with _stuck_lock:
+                cur = _stuck_alerted.get(session_id)
+                if cur is not None:
+                    cur["alerted"] = True
+            logger.warning(
+                "Stuck watchdog: session=%s tmux=%s working=%ds — warned",
+                session_id[:8], session.tty, secs,
+            )
+        else:
+            logger.error(
+                "Stuck watchdog: alert NOT delivered for session=%s tmux=%s working=%ds; will retry",
+                session_id[:8], session.tty, secs,
+            )
+
+
+def _start_stuck_watchdog():
+    """Background thread that warns about turns wedged past _STUCK_THRESHOLD."""
+    def _loop():
+        while True:
+            time.sleep(_WATCHDOG_INTERVAL)
+            try:
+                _check_stuck_sessions()
+            except Exception as e:
+                logger.error(f"Stuck watchdog error: {e}")
+
+    threading.Thread(target=_loop, daemon=True).start()
+    logger.info(
+        "Stuck watchdog started (threshold=%ds, interval=%ds)",
+        _STUCK_THRESHOLD, _WATCHDOG_INTERVAL,
+    )
+
+
 # --- Init ---
 
 def init(cfg: Config):
@@ -2016,4 +2169,5 @@ def start_ws_client(cfg: Config):
     logger.info("Feishu WebSocket client started")
 
     _start_idle_reaper()
+    _start_stuck_watchdog()
     _start_inject_sweeper()
