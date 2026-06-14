@@ -14,6 +14,7 @@ reached by walking up from the hook past its shell to the firing agent. These
 tests drive that walk with a fake process table so the scenarios are explicit.
 """
 
+import json
 import os
 import unittest
 from unittest import mock
@@ -96,15 +97,50 @@ class AncestorOwnsPaneTests(unittest.TestCase):
         }
         self.assertIs(self._run(table), True)
 
-    def test_main_agent_with_ctty_is_owner(self):
-        # agent differs from pane_pid (e.g. launched inside the pane's shell) but
-        # holds the pane's controlling terminal — the ctty fallback covers it.
+    def test_interactive_shell_launch_is_owner(self):
+        # The agent was launched inside the pane's shell (pane_pid is the shell),
+        # so agent != pane_pid; the ctty-match fallback recognises it as owner.
         table = {
             1000: (900, "??", "python"),
             900:  (201, "??", "sh"),
             201:  (200, "ttys053", "node"),  # agent, ctty == pane_tty
+            200:  (10, "ttys053", "zsh"),    # pane_pid IS the pane's shell
         }
         self.assertIs(self._run(table), True)
+
+    def test_same_terminal_nested_subagent_is_foreign(self):
+        # The hijack the review caught: a sub-agent that inherits the pane's
+        # controlling terminal (same ctty) but is NOT pane_pid. pane_pid is itself
+        # an agent, so the firing sub-agent is nested → must NOT be owner even
+        # though its ctty matches.
+        table = {
+            1000: (900, "??", "python"),
+            900:  (300, "??", "sh"),
+            300:  (200, "ttys053", "claude"),  # sub-agent, ctty == pane_tty
+            200:  (10, "ttys053", "claude"),   # pane_pid is the real agent
+        }
+        self.assertIs(self._run(table), False)
+
+    def test_nested_under_intermediate_agent_when_pane_is_shell_is_foreign(self):
+        # pane_pid is a shell, but there is a main agent between the firing
+        # sub-agent and the pane shell → the sub-agent is nested → not owner.
+        table = {
+            1000: (900, "??", "python"),
+            900:  (300, "??", "sh"),
+            300:  (250, "ttys053", "claude"),  # sub-agent (firing)
+            250:  (200, "ttys053", "claude"),  # main agent in between
+            200:  (10, "ttys053", "zsh"),      # pane shell
+        }
+        self.assertIs(self._run(table), False)
+
+    def test_pane_pid_process_gone_is_indeterminate(self):
+        # agent != pane_pid and pane_pid's process can't be read → fail open.
+        table = {
+            1000: (900, "??", "python"),
+            900:  (201, "??", "sh"),
+            201:  (202, "ttys053", "node"),  # agent; pane_pid 200 absent from table
+        }
+        self.assertIsNone(self._run(table))
 
     def test_multiple_shells_are_transparent(self):
         # comm here is already normalised (basename, lower-cased) — that is what
@@ -203,6 +239,82 @@ class IsTmuxPaneOwnerTests(unittest.TestCase):
             200:  (10, "ttys053", "claude"),
         }
         self.assertFalse(self._owner(table))
+
+
+class PaneIdentityTests(unittest.TestCase):
+    """_pane_identity targets $TMUX_PANE and requires a numeric pane_pid."""
+
+    def _with_tmux(self, returncode, stdout):
+        fake = mock.Mock(returncode=returncode, stdout=stdout)
+        return mock.patch.object(tty.subprocess, "run", return_value=fake)
+
+    def test_targets_inherited_tmux_pane(self):
+        captured = {}
+
+        def fake_run(cmd, **kw):
+            captured["cmd"] = cmd
+            return mock.Mock(returncode=0, stdout="/dev/ttys053\t24612\n")
+
+        with mock.patch.dict(os.environ, {"TMUX_PANE": "%127"}, clear=True), \
+             mock.patch.object(tty.subprocess, "run", side_effect=fake_run):
+            self.assertEqual(tty._pane_identity(), ("/dev/ttys053", "24612"))
+        self.assertIn("-t", captured["cmd"])
+        self.assertIn("%127", captured["cmd"])
+
+    def test_non_numeric_pane_pid_is_none(self):
+        with mock.patch.dict(os.environ, {}, clear=True), \
+             self._with_tmux(0, "/dev/ttys053\t\n"):
+            self.assertIsNone(tty._pane_identity())
+        with mock.patch.dict(os.environ, {}, clear=True), \
+             self._with_tmux(0, "/dev/ttys053\tabc\n"):
+            self.assertIsNone(tty._pane_identity())
+
+    def test_empty_tty_is_none(self):
+        with mock.patch.dict(os.environ, {}, clear=True), \
+             self._with_tmux(0, "\t24612\n"):
+            self.assertIsNone(tty._pane_identity())
+
+    def test_probe_failure_is_none(self):
+        with mock.patch.dict(os.environ, {}, clear=True), self._with_tmux(1, ""):
+            self.assertIsNone(tty._pane_identity())
+
+
+class CmdHookOwnerGateContractTests(unittest.TestCase):
+    """The gate's value is in cmd_hook: a non-owner must report NOTHING — no POST
+    to the server, no permission handling — for every hook type. This guards
+    against the gate being silently bypassed (e.g. moved below a fast path)."""
+
+    def _run_hook(self, hook_type, owner):
+        import io
+        import types
+        from tempfile import TemporaryDirectory
+        from pathlib import Path
+        from walkcode import __main__ as m
+
+        payload = json.dumps({
+            "session_id": "s1", "cwd": "/tmp", "prompt": "p",
+            "last_assistant_message": "done", "transcript_path": "",
+        })
+        args = types.SimpleNamespace(hook_type=hook_type)
+        with TemporaryDirectory() as d, \
+             mock.patch.object(m.sys, "stdin", io.StringIO(payload)), \
+             mock.patch.object(m, "detect_tmux_session", return_value="sess"), \
+             mock.patch.object(m, "is_tmux_pane_owner", return_value=owner), \
+             mock.patch.object(m.Path, "home", return_value=Path(d)), \
+             mock.patch.object(m.urllib.request, "urlopen") as urlopen, \
+             mock.patch.object(m, "_handle_permission_request") as handle_perm:
+            m.cmd_hook(args)
+        return urlopen, handle_perm
+
+    def test_non_owner_reports_nothing_for_every_hook_type(self):
+        for ht in ("sync", "stop", "notification",
+                   "user-prompt-submit", "permission-request"):
+            with self.subTest(hook=ht):
+                urlopen, handle_perm = self._run_hook(ht, owner=False)
+                self.assertFalse(urlopen.called,
+                                 f"{ht}: non-owner must not POST to the server")
+                self.assertFalse(handle_perm.called,
+                                 f"{ht}: non-owner must not handle permission")
 
 
 if __name__ == "__main__":

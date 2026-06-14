@@ -358,6 +358,23 @@ def cmd_hook(args):
         # child has no Feishu thread of its own.
         kind = "permission" if args.hook_type == "permission-request" else args.hook_type
         print(f"[walkcode] non-owner {kind} hook (nested child), not reported", file=sys.stderr)
+        # Record the drop. A dropped hook reports nothing to the server, so without
+        # this the only trace is the child agent's transcript — which is exactly why
+        # the v0.10.31 false-positive (claude detached hooks wrongly dropped) was so
+        # hard to diagnose. Best-effort; never block the hook.
+        try:
+            import datetime as _dt
+            _dbg_path = Path.home() / ".walkcode" / "hook_debug.jsonl"
+            with open(_dbg_path, "a") as _f:
+                _f.write(json.dumps({
+                    "ts": _dt.datetime.now().isoformat(),
+                    "hook_type": args.hook_type,
+                    "tmux": tmux_session,
+                    "session_id": hook_data.get("session_id", ""),
+                    "dropped": "non-owner",
+                }, ensure_ascii=False) + "\n")
+        except Exception:
+            pass
         return
 
     cwd = hook_data.get("cwd", "") or os.getcwd()

@@ -92,18 +92,25 @@ def _proc_info(pid: int) -> tuple[int, str, str] | None:
 
 
 def _pane_identity() -> tuple[str, str] | None:
-    """Return ``(pane_tty, pane_pid)`` of the tmux pane this process belongs to
-    (resolved via the inherited ``$TMUX_PANE``), or None if the probe fails.
+    """Return ``(pane_tty, pane_pid)`` of the tmux pane this process belongs to,
+    or None if the probe is unusable (caller fails open).
 
-    ``pane_pid`` is the pid tmux spawned for the pane — i.e. the pane's foreground
-    agent itself (``tmux new-session "claude …"`` makes claude the pane process).
-    Returned as a string; "" when tmux reports no pid.
+    The pane is targeted explicitly by the inherited ``$TMUX_PANE`` so we read the
+    hook's OWN pane, not whatever pane happens to be active in the client (a bare
+    ``display-message`` resolves to the active pane, which drifts as the user
+    switches focus). ``pane_pid`` is the pid tmux spawned for the pane — the pane's
+    foreground process (``tmux new-session "claude …"`` makes claude the pane
+    process). A missing or non-numeric ``pane_pid`` is treated as an unusable probe
+    (None → fail open) rather than silently falling back to a weaker test: the
+    pane_pid anchor is what lets a detached main hook (no ctty) be recognised.
     """
+    cmd = ["tmux", "display-message", "-p"]
+    tmux_pane = os.environ.get("TMUX_PANE")
+    if tmux_pane:
+        cmd += ["-t", tmux_pane]
+    cmd += ["#{pane_tty}\t#{pane_pid}"]
     try:
-        r = subprocess.run(
-            ["tmux", "display-message", "-p", "#{pane_tty}\t#{pane_pid}"],
-            capture_output=True, text=True, timeout=2,
-        )
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=2)
     except Exception:
         return None
     if r.returncode != 0:
@@ -113,54 +120,99 @@ def _pane_identity() -> tuple[str, str] | None:
         return None
     pane_tty, _, pane_pid = out.partition("\t")
     pane_tty = pane_tty.strip()
-    if not pane_tty:
+    pane_pid = pane_pid.strip()
+    if not pane_tty or not pane_pid.isdigit():
         return None
-    return pane_tty, pane_pid.strip()
+    return pane_tty, pane_pid
 
 
 # Process names treated as transparent when walking up to the firing agent: the
 # hook runs under a shell (`sh -c "afplay … & walkcode hook …"`), so the agent is
-# the shell's parent, not the shell.
+# the shell's parent, not the shell. Shared with is_agent_alive below.
 _SHELLS = {"zsh", "bash", "sh", "fish", "dash", "csh", "tcsh", "ksh"}
+
+
+def _first_agent_ancestor(start_pid: int, max_hops: int) -> tuple[int, str, int] | None:
+    """Walk up from ``start_pid``'s parent, skipping shells; return
+    ``(pid, ctty, ppid)`` of the first non-shell ancestor — the process that
+    spawned the hook's shell, i.e. the agent that fired the hook. None if the
+    chain breaks / cycles / hits init / exceeds ``max_hops`` (indeterminate)."""
+    self_info = _proc_info(start_pid)
+    if self_info is None:
+        return None
+    pid = self_info[0]  # the hook's parent (its shell); self is skipped
+    seen: set[int] = set()
+    for _ in range(max_hops):
+        if pid <= 1 or pid in seen:
+            return None
+        seen.add(pid)
+        info = _proc_info(pid)
+        if info is None:
+            return None
+        ppid, ctty, comm = info
+        if comm in _SHELLS:
+            pid = ppid
+            continue
+        return pid, ctty, ppid
+    return None
 
 
 def _ancestor_owns_pane(start_pid: int, pane_tty: str, pane_pid: str,
                         max_hops: int = 16) -> bool | None:
     """Decide pane ownership by walking up from ``start_pid`` (the hook process).
 
-    The hook's *firing agent* is its nearest ancestor that is not a shell — the
-    process that spawned the hook's ``sh -c``. That agent owns the pane iff it IS
-    the pane's process (``pane_pid``) or its controlling terminal is the pane's
-    (``pane_tty``). Anything else is a nested child (a sub-agent in its own/absent
-    terminal) and must be dropped.
+    Returns True (owner), False (foreign / nested), or None (indeterminate → the
+    caller fails open). ``pane_pid`` is the authoritative anchor — tmux's pane
+    process — which is what makes this robust to agents that spawn hooks *detached*
+    (claude >=2.1.x gives its hooks no controlling terminal, ctty ``??``, so the
+    hook's own ctty can't be compared).
 
-    Returns True (owner), False (foreign), or None (indeterminate → fail open).
-    Anchoring on ``pane_pid`` is what makes this robust to agents that spawn hooks
-    *detached*: claude (>=2.1.x) gives its hook processes no controlling terminal
-    (ctty ``??``), so the hook's own ctty can no longer be compared — but the
-    agent is still ``pane_pid``. A nested sub-agent, even one that likewise has no
-    ctty, is a descendant of the pane agent and so is never ``pane_pid`` itself.
+    Decision:
+      1. Find the firing agent = first non-shell ancestor of the hook.
+      2. agent IS ``pane_pid``  → owner (the pane runs the agent directly; covers
+         the detached-hook case where ctty is useless).
+      3. agent is NOT ``pane_pid`` → it depends on what ``pane_pid`` is:
+         - ``pane_pid`` is itself an agent (non-shell): the firing agent is a
+           DIFFERENT non-shell process under it → a nested sub-agent → NOT owner.
+           (This closes the same-terminal hijack: a sub-agent that inherits the
+           pane's ctty must not pass just because ctty matches.)
+         - ``pane_pid`` is a shell: the pane runs a shell that launched the agent.
+           The legitimate foreground agent is the FIRST non-shell under that shell.
+           Owner iff the firing agent reaches ``pane_pid`` through only shells AND
+           shares the pane terminal; another agent in between → nested → NOT owner.
     """
-    self_info = _proc_info(start_pid)
-    if self_info is None:
-        return None  # can't even read self → indeterminate
-    pid = self_info[0]  # start at the hook's parent (the shell); skip self
-    seen: set[int] = set()
+    agent = _first_agent_ancestor(start_pid, max_hops)
+    if agent is None:
+        return None  # indeterminate → fail open
+    agent_pid, agent_ctty, agent_ppid = agent
+    if str(agent_pid) == pane_pid:
+        return True
+    # The firing agent is not the pane process. Classify by pane_pid's nature.
+    if not pane_pid.isdigit():
+        return None  # no usable anchor → fail open
+    pane_info = _proc_info(int(pane_pid))
+    if pane_info is None:
+        return None  # pane process gone/unreadable → fail open
+    if pane_info[2] not in _SHELLS:
+        # pane_pid is itself an agent; a different non-shell descendant is nested.
+        return False
+    # pane_pid is a shell: confirm the firing agent is its direct foreground agent
+    # (only shells between them) and shares the pane terminal — else it's nested.
+    pid = agent_ppid
+    seen: set[int] = {agent_pid}
     for _ in range(max_hops):
         if pid <= 1 or pid in seen:
-            return None  # reached init / cycle without finding an agent
+            return None
+        if str(pid) == pane_pid:
+            return _ctty_owns_pane(agent_ctty, pane_tty)
         seen.add(pid)
         info = _proc_info(pid)
         if info is None:
-            return None  # ancestry broke (reparented mid-walk) → fail open
-        ppid, ctty, comm = info
-        if comm in _SHELLS:
-            pid = ppid
-            continue  # shells are transparent
-        # First non-shell ancestor = the agent that fired this hook.
-        if pane_pid and str(pid) == pane_pid:
-            return True
-        return _ctty_owns_pane(ctty, pane_tty)
+            return None
+        ppid, _ctty, comm = info
+        if comm not in _SHELLS:
+            return False  # another agent between candidate and pane shell → nested
+        pid = ppid
     return None
 
 
@@ -238,9 +290,6 @@ def kill_session(session_name: str) -> bool:
         return result.returncode == 0
     except Exception:
         return False
-
-
-_SHELLS = {"zsh", "bash", "sh", "fish", "dash", "csh", "tcsh", "ksh"}
 
 
 def is_agent_alive(session_name: str) -> bool:
