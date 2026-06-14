@@ -293,7 +293,7 @@ class CmdHookTurnIdForwardingTests(unittest.TestCase):
 
         with patch.object(m.sys, "stdin", io.StringIO(json.dumps(hook_data))), \
              patch.object(m, "detect_tmux_session", lambda: "tmux1"), \
-             patch.object(m, "is_tmux_pane_owner", lambda: True), \
+             patch.object(m, "owner_check", lambda: (True, "owner")), \
              patch.object(m.urllib.request, "urlopen", fake_urlopen), \
              patch.dict(os.environ, {"WALKCODE_PORT": "3999"}, clear=False):
             m.cmd_hook(argparse.Namespace(hook_type=hook_type))
