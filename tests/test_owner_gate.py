@@ -72,6 +72,12 @@ class ProcInfoParseTests(unittest.TestCase):
         with self._with_ps(0, "10 ?? claude\n"):
             self.assertEqual(tty._proc_info(200), (10, "??", "claude"))
 
+    def test_login_shell_dash_stripped(self):
+        # ps prints a login shell as "-zsh"; the leading dash must be stripped so
+        # it still matches _SHELLS.
+        with self._with_ps(0, "1 ttys053 -zsh\n"):
+            self.assertEqual(tty._proc_info(200), (1, "ttys053", "zsh"))
+
     def test_nonzero_returncode_is_none(self):
         with self._with_ps(1, ""):
             self.assertIsNone(tty._proc_info(123))
@@ -132,6 +138,32 @@ class AncestorOwnsPaneTests(unittest.TestCase):
             200:  (10, "ttys053", "zsh"),      # pane shell
         }
         self.assertIs(self._run(table), False)
+
+    def test_shell_pane_orphaned_subagent_without_pane_ctty_is_foreign(self):
+        # pane is a shell; an orphaned sub-agent (reparented to init, ppid=1) has
+        # no/foreign ctty. The ctty negative-gate must reject it BEFORE the broken
+        # ancestry walk would otherwise fail open. (The orphan bypass the review
+        # flagged.)
+        table = {
+            1000: (900, "??", "python"),
+            900:  (300, "??", "sh"),
+            300:  (1, "??", "claude"),     # sub-agent, no ctty, reparented to init
+            200:  (10, "ttys053", "zsh"),  # pane shell
+        }
+        self.assertIs(self._run(table), False)
+
+    def test_shell_pane_same_ctty_orphan_fails_open(self):
+        # Documented residual: a sub-agent that BOTH shares the pane terminal AND
+        # orphans its hook under a shell pane is indistinguishable from the pane's
+        # own foreground agent by terminal alone → fail open (None). Accepted: the
+        # threat model is accidental nesting, not adversarial self-orphaning.
+        table = {
+            1000: (900, "??", "python"),
+            900:  (300, "??", "sh"),
+            300:  (1, "ttys053", "claude"),  # shares pane ctty, reparented to init
+            200:  (10, "ttys053", "zsh"),    # pane shell
+        }
+        self.assertIsNone(self._run(table))
 
     def test_pane_pid_process_gone_is_indeterminate(self):
         # agent != pane_pid and pane_pid's process can't be read → fail open.
@@ -240,6 +272,19 @@ class IsTmuxPaneOwnerTests(unittest.TestCase):
         }
         self.assertFalse(self._owner(table))
 
+    def test_indeterminate_ancestry_fails_open(self):
+        # The public fail-open contract: when _ancestor_owns_pane can't decide
+        # (self unreadable, broken chain, pane process gone), the gate must deliver
+        # (True), never silently drop a possibly-real main hook.
+        self.assertTrue(self._owner({}))  # empty table → self unreadable → None
+        self.assertTrue(self._owner({1000: (900, "??", "python")}))  # parent missing
+        gone_pane = {  # agent != pane_pid and pane_pid's process absent
+            1000: (900, "??", "python"),
+            900:  (201, "??", "sh"),
+            201:  (202, "ttys053", "node"),
+        }
+        self.assertTrue(self._owner(gone_pane))
+
 
 class PaneIdentityTests(unittest.TestCase):
     """_pane_identity targets $TMUX_PANE and requires a numeric pane_pid."""
@@ -261,22 +306,69 @@ class PaneIdentityTests(unittest.TestCase):
         self.assertIn("-t", captured["cmd"])
         self.assertIn("%127", captured["cmd"])
 
-    def test_non_numeric_pane_pid_is_none(self):
+    def test_missing_tmux_pane_is_none(self):
+        # No $TMUX_PANE → can't identify our own pane → None (caller fails open),
+        # never falls back to the active pane.
         with mock.patch.dict(os.environ, {}, clear=True), \
+             self._with_tmux(0, "/dev/ttys053\t24612\n"):
+            self.assertIsNone(tty._pane_identity())
+
+    def test_non_numeric_pane_pid_is_none(self):
+        with mock.patch.dict(os.environ, {"TMUX_PANE": "%1"}, clear=True), \
              self._with_tmux(0, "/dev/ttys053\t\n"):
             self.assertIsNone(tty._pane_identity())
-        with mock.patch.dict(os.environ, {}, clear=True), \
+        with mock.patch.dict(os.environ, {"TMUX_PANE": "%1"}, clear=True), \
              self._with_tmux(0, "/dev/ttys053\tabc\n"):
             self.assertIsNone(tty._pane_identity())
 
     def test_empty_tty_is_none(self):
-        with mock.patch.dict(os.environ, {}, clear=True), \
+        with mock.patch.dict(os.environ, {"TMUX_PANE": "%1"}, clear=True), \
              self._with_tmux(0, "\t24612\n"):
             self.assertIsNone(tty._pane_identity())
 
     def test_probe_failure_is_none(self):
-        with mock.patch.dict(os.environ, {}, clear=True), self._with_tmux(1, ""):
+        with mock.patch.dict(os.environ, {"TMUX_PANE": "%1"}, clear=True), \
+             self._with_tmux(1, ""):
             self.assertIsNone(tty._pane_identity())
+
+
+class OwnerCheckReasonTests(unittest.TestCase):
+    """owner_check returns a stable reason tag alongside the decision (logged on
+    drops/fail-opens for diagnosability)."""
+
+    def _check(self, table, env=None, pane=(PANE_TTY, PANE_PID)):
+        base = {"TMUX": "x"}
+        if env:
+            base.update(env)
+        with mock.patch.dict(os.environ, base, clear=True), \
+             mock.patch.object(tty.os, "getpid", return_value=1000), \
+             mock.patch.object(tty, "_pane_identity", return_value=pane), \
+             mock.patch.object(tty, "_proc_info", _fake_proc_info(table)):
+            return tty.owner_check()
+
+    def test_disabled(self):
+        self.assertEqual(self._check({}, env={"WALKCODE_OWNER_CHECK": "0"}),
+                         (True, "disabled"))
+
+    def test_not_tmux(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(tty.owner_check(), (True, "not_tmux"))
+
+    def test_owner(self):
+        table = {1000: (900, "??", "python"), 900: (200, "??", "sh"),
+                 200: (10, "??", "claude")}
+        self.assertEqual(self._check(table), (True, "owner"))
+
+    def test_non_owner(self):
+        table = {1000: (900, "??", "python"), 900: (300, "??", "sh"),
+                 300: (200, "??", "claude"), 200: (10, "ttys053", "claude")}
+        self.assertEqual(self._check(table), (False, "non_owner"))
+
+    def test_failopen_pane_probe(self):
+        self.assertEqual(self._check({}, pane=None), (True, "failopen:pane_probe"))
+
+    def test_failopen_indeterminate(self):
+        self.assertEqual(self._check({}), (True, "failopen:indeterminate"))
 
 
 class CmdHookOwnerGateContractTests(unittest.TestCase):
@@ -296,10 +388,11 @@ class CmdHookOwnerGateContractTests(unittest.TestCase):
             "last_assistant_message": "done", "transcript_path": "",
         })
         args = types.SimpleNamespace(hook_type=hook_type)
+        verdict = (owner, "owner" if owner else "non_owner")
         with TemporaryDirectory() as d, \
              mock.patch.object(m.sys, "stdin", io.StringIO(payload)), \
              mock.patch.object(m, "detect_tmux_session", return_value="sess"), \
-             mock.patch.object(m, "is_tmux_pane_owner", return_value=owner), \
+             mock.patch.object(m, "owner_check", return_value=verdict), \
              mock.patch.object(m.Path, "home", return_value=Path(d)), \
              mock.patch.object(m.urllib.request, "urlopen") as urlopen, \
              mock.patch.object(m, "_handle_permission_request") as handle_perm:

@@ -87,7 +87,10 @@ def _proc_info(pid: int) -> tuple[int, str, str] | None:
     except ValueError:
         return None
     ctty = parts[1]
-    comm = os.path.basename(parts[2]).lower() if len(parts) > 2 else ""
+    # ps prints a login shell as "-zsh"/"-bash"; strip the leading dash so it
+    # still matches _SHELLS (else the pane's login shell looks like an agent and
+    # a main hook launched from it would be wrongly dropped).
+    comm = os.path.basename(parts[2]).lower().lstrip("-") if len(parts) > 2 else ""
     return ppid, ctty, comm
 
 
@@ -104,11 +107,10 @@ def _pane_identity() -> tuple[str, str] | None:
     (None → fail open) rather than silently falling back to a weaker test: the
     pane_pid anchor is what lets a detached main hook (no ctty) be recognised.
     """
-    cmd = ["tmux", "display-message", "-p"]
     tmux_pane = os.environ.get("TMUX_PANE")
-    if tmux_pane:
-        cmd += ["-t", tmux_pane]
-    cmd += ["#{pane_tty}\t#{pane_pid}"]
+    if not tmux_pane:
+        return None  # can't identify our own pane → caller fails open
+    cmd = ["tmux", "display-message", "-t", tmux_pane, "-p", "#{pane_tty}\t#{pane_pid}"]
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=2)
     except Exception:
@@ -196,15 +198,22 @@ def _ancestor_owns_pane(start_pid: int, pane_tty: str, pane_pid: str,
     if pane_info[2] not in _SHELLS:
         # pane_pid is itself an agent; a different non-shell descendant is nested.
         return False
-    # pane_pid is a shell: confirm the firing agent is its direct foreground agent
-    # (only shells between them) and shares the pane terminal — else it's nested.
+    # pane_pid is a shell. The legitimate foreground agent shares the pane
+    # terminal, so a firing agent whose ctty is NOT the pane's is foreign — decide
+    # that NOW, before walking ancestry. This closes the orphan bypass: a nested
+    # sub-agent that detaches (double-fork → reparented to init) would otherwise
+    # break the ancestry walk into an indeterminate (None → fail-open) result.
+    if not _ctty_owns_pane(agent_ctty, pane_tty):
+        return False
+    # ctty matches; confirm the firing agent is the pane shell's direct foreground
+    # agent (only shells between them) — another agent in between → nested.
     pid = agent_ppid
     seen: set[int] = {agent_pid}
     for _ in range(max_hops):
         if pid <= 1 or pid in seen:
-            return None
+            return None  # ctty matched but ancestry incomplete → fail open
         if str(pid) == pane_pid:
-            return _ctty_owns_pane(agent_ctty, pane_tty)
+            return True  # reached the pane shell through shells only; ctty already ok
         seen.add(pid)
         info = _proc_info(pid)
         if info is None:
@@ -216,36 +225,43 @@ def _ancestor_owns_pane(start_pid: int, pane_tty: str, pane_pid: str,
     return None
 
 
-def is_tmux_pane_owner() -> bool:
-    """True if this hook was fired by the foreground agent of its tmux pane — the
-    pane's real owner — not a nested child that merely inherited ``$TMUX`` (e.g. a
-    deep-review sub-agent running in the parent agent's background terminal).
+def owner_check() -> tuple[bool, str]:
+    """Decide pane ownership and return ``(is_owner, reason)``.
 
-    Identity is decided from the pane tmux reports for the inherited
-    ``$TMUX_PANE``: its ``pane_pid`` (the agent process itself) and ``pane_tty``.
-    We walk up from the hook to its firing agent (the nearest non-shell ancestor)
-    and confirm that agent is ``pane_pid``, or controls ``pane_tty``. See
-    :func:`_ancestor_owns_pane` for why ``pane_pid`` — not the hook's own ctty — is
-    the anchor: agents that spawn hooks detached leave them with no controlling
-    terminal, so the earlier "hook ctty == pane_tty" test dropped every legitimate
-    hook.
+    ``reason`` is a short stable tag for diagnostics (logged on drops and
+    fail-opens): ``disabled`` / ``not_tmux`` / ``owner`` / ``non_owner`` /
+    ``failopen:pane_probe`` / ``failopen:indeterminate``. Identity comes from the
+    pane tmux reports for the inherited ``$TMUX_PANE`` — its ``pane_pid`` (the pane
+    process) and ``pane_tty`` — anchored on ``pane_pid`` rather than the hook's own
+    controlling terminal, since agents that spawn hooks detached leave them with no
+    ctty (the bug the earlier "hook ctty == pane_tty" test caused).
 
-    Fail-open: if anything is indeterminate, return True so a real owner's hooks
+    Fail-open: any indeterminate result returns ``True`` so a real owner's hooks
     are never wrongly suppressed. Set ``WALKCODE_OWNER_CHECK=0`` to disable the
     gate entirely.
     """
     if os.environ.get("WALKCODE_OWNER_CHECK", "1") == "0":
-        return True
+        return True, "disabled"
     if not os.environ.get("TMUX"):
-        return True  # not under tmux → the gate doesn't apply
+        return True, "not_tmux"  # not under tmux → the gate doesn't apply
     pane = _pane_identity()
     if pane is None:
-        return True  # probe failed/empty → fail open
+        return True, "failopen:pane_probe"  # can't identify our pane → fail open
     pane_tty, pane_pid = pane
     verdict = _ancestor_owns_pane(os.getpid(), pane_tty, pane_pid)
-    if verdict is None:
-        return True  # indeterminate → fail open
-    return verdict
+    if verdict is True:
+        return True, "owner"
+    if verdict is False:
+        return False, "non_owner"
+    return True, "failopen:indeterminate"  # ancestry probe inconclusive → fail open
+
+
+def is_tmux_pane_owner() -> bool:
+    """True if this hook was fired by the foreground agent of its tmux pane — the
+    pane's real owner — not a nested child that merely inherited ``$TMUX`` (e.g. a
+    deep-review sub-agent running in the parent agent's background terminal). Thin
+    boolean wrapper over :func:`owner_check`."""
+    return owner_check()[0]
 
 
 def validate_target(session_name: str) -> str | None:

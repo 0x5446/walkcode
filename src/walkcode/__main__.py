@@ -14,7 +14,7 @@ import urllib.request
 from pathlib import Path
 
 from .i18n import t
-from .tty import detect_tmux_session, is_tmux_pane_owner
+from .tty import detect_tmux_session, owner_check
 
 _RUNTIME_DIR = Path.home() / ".walkcode"
 
@@ -332,6 +332,30 @@ def _read_last_assistant_text(path: str, max_chars: int = 28000) -> str:
     return ""
 
 
+def _record_owner_event(hook_type: str, tmux: str, session_id: str, reason: str) -> None:
+    """Best-effort append of an owner-gate decision to ~/.walkcode/hook_debug.jsonl.
+
+    Called when a hook is dropped (non_owner) or delivered via fail-open — both are
+    cases the server never sees, so without this trace they are invisible to
+    post-hoc diagnosis (the exact gap that made the v0.10.31 regression hard to
+    find). Creates the directory if missing; never raises.
+    """
+    try:
+        import datetime as _dt
+        _dbg_path = Path.home() / ".walkcode" / "hook_debug.jsonl"
+        _dbg_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(_dbg_path, "a") as _f:
+            _f.write(json.dumps({
+                "ts": _dt.datetime.now().isoformat(),
+                "hook_type": hook_type,
+                "tmux": tmux,
+                "session_id": session_id,
+                "owner_reason": reason,
+            }, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
 def cmd_hook(args):
     """Handle an agent hook event: read stdin, POST to server."""
     # Read hook data from stdin (agent pipes JSON)
@@ -350,7 +374,8 @@ def cmd_hook(args):
     # reporting the PARENT's tmux — hijacking the parent's Feishu thread, orphaning
     # it, and double-resuming the parent. A non-owner's hooks must never touch tty
     # ownership, so we drop them here at the source (see tty.is_tmux_pane_owner).
-    if not is_tmux_pane_owner():
+    owner, owner_reason = owner_check()
+    if not owner:
         # permission-request is the one type that needs a resolution or the agent's
         # tool call hangs: exit 0 without emitting a decision so the child falls
         # back to its OWN sandbox/approval rather than walkcode's. Everything else
@@ -361,21 +386,14 @@ def cmd_hook(args):
         # Record the drop. A dropped hook reports nothing to the server, so without
         # this the only trace is the child agent's transcript — which is exactly why
         # the v0.10.31 false-positive (claude detached hooks wrongly dropped) was so
-        # hard to diagnose. Best-effort; never block the hook.
-        try:
-            import datetime as _dt
-            _dbg_path = Path.home() / ".walkcode" / "hook_debug.jsonl"
-            with open(_dbg_path, "a") as _f:
-                _f.write(json.dumps({
-                    "ts": _dt.datetime.now().isoformat(),
-                    "hook_type": args.hook_type,
-                    "tmux": tmux_session,
-                    "session_id": hook_data.get("session_id", ""),
-                    "dropped": "non-owner",
-                }, ensure_ascii=False) + "\n")
-        except Exception:
-            pass
+        # hard to diagnose.
+        _record_owner_event(args.hook_type, tmux_session, hook_data.get("session_id", ""), owner_reason)
         return
+    if owner_reason.startswith("failopen"):
+        # Delivered, but the gate could NOT confirm ownership (the pane/ancestry
+        # probe was inconclusive). Leave a trace so a later false-drop or hijack via
+        # this fail-open path is diagnosable instead of silent.
+        _record_owner_event(args.hook_type, tmux_session, hook_data.get("session_id", ""), owner_reason)
 
     cwd = hook_data.get("cwd", "") or os.getcwd()
     session_id = hook_data.get("session_id", "")
