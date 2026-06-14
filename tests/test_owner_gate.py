@@ -345,6 +345,34 @@ class PaneIdentityTests(unittest.TestCase):
              self._with_tmux(1, ""):
             self.assertIsNone(tty._pane_identity())
 
+    def test_probe_exception_is_none(self):
+        # tmux missing / subprocess raising must not propagate → None (fail open).
+        with mock.patch.dict(os.environ, {"TMUX_PANE": "%1"}, clear=True), \
+             mock.patch.object(tty.subprocess, "run", side_effect=OSError("boom")):
+            self.assertIsNone(tty._pane_identity())
+
+
+class DetectTmuxSessionTests(unittest.TestCase):
+    """detect_tmux_session targets $TMUX_PANE so it names the same pane the owner
+    gate decides on (else the payload tty could be a different, active pane)."""
+
+    def test_targets_inherited_pane_when_set(self):
+        captured = {}
+
+        def fake_run(cmd, **kw):
+            captured["cmd"] = cmd
+            return mock.Mock(returncode=0, stdout="sess-A\n")
+
+        with mock.patch.dict(os.environ, {"TMUX": "x", "TMUX_PANE": "%127"}, clear=True), \
+             mock.patch.object(tty.subprocess, "run", side_effect=fake_run):
+            self.assertEqual(tty.detect_tmux_session(), "sess-A")
+        self.assertIn("-t", captured["cmd"])
+        self.assertIn("%127", captured["cmd"])
+
+    def test_not_under_tmux_is_empty(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(tty.detect_tmux_session(), "")
+
 
 class OwnerCheckReasonTests(unittest.TestCase):
     """owner_check returns a stable reason tag alongside the decision (logged on
