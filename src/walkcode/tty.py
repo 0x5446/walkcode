@@ -58,48 +58,142 @@ def _ctty_owns_pane(my_ctty: str, pane_tty: str) -> bool:
     return bool(pane_tty) and pane_tty.endswith("/" + my_ctty)
 
 
+def _proc_info(pid: int) -> tuple[int, str, str] | None:
+    """Return ``(ppid, ctty, comm)`` for ``pid`` via ``ps``, or None on failure.
+
+    ``ctty`` is the controlling terminal as ``ps -o tty=`` prints it (``ttys053``
+    or ``??``). ``comm`` is the executable basename, lower-cased (``ps -o comm=``
+    prints either a bare name like ``claude`` or a full path like ``/bin/zsh``).
+    """
+    try:
+        r = subprocess.run(
+            ["ps", "-o", "ppid=,tty=,comm=", "-p", str(pid)],
+            capture_output=True, text=True, timeout=2,
+        )
+    except Exception:
+        return None
+    if r.returncode != 0:
+        return None
+    line = r.stdout.strip()
+    if not line:
+        return None
+    # ppid<sp>tty<sp>comm — comm (the path) may itself contain spaces, so keep it
+    # as the remainder after the first two whitespace-separated fields.
+    parts = line.split(None, 2)
+    if len(parts) < 2:
+        return None
+    try:
+        ppid = int(parts[0])
+    except ValueError:
+        return None
+    ctty = parts[1]
+    comm = os.path.basename(parts[2]).lower() if len(parts) > 2 else ""
+    return ppid, ctty, comm
+
+
+def _pane_identity() -> tuple[str, str] | None:
+    """Return ``(pane_tty, pane_pid)`` of the tmux pane this process belongs to
+    (resolved via the inherited ``$TMUX_PANE``), or None if the probe fails.
+
+    ``pane_pid`` is the pid tmux spawned for the pane — i.e. the pane's foreground
+    agent itself (``tmux new-session "claude …"`` makes claude the pane process).
+    Returned as a string; "" when tmux reports no pid.
+    """
+    try:
+        r = subprocess.run(
+            ["tmux", "display-message", "-p", "#{pane_tty}\t#{pane_pid}"],
+            capture_output=True, text=True, timeout=2,
+        )
+    except Exception:
+        return None
+    if r.returncode != 0:
+        return None
+    out = r.stdout.strip()
+    if not out:
+        return None
+    pane_tty, _, pane_pid = out.partition("\t")
+    pane_tty = pane_tty.strip()
+    if not pane_tty:
+        return None
+    return pane_tty, pane_pid.strip()
+
+
+# Process names treated as transparent when walking up to the firing agent: the
+# hook runs under a shell (`sh -c "afplay … & walkcode hook …"`), so the agent is
+# the shell's parent, not the shell.
+_SHELLS = {"zsh", "bash", "sh", "fish", "dash", "csh", "tcsh", "ksh"}
+
+
+def _ancestor_owns_pane(start_pid: int, pane_tty: str, pane_pid: str,
+                        max_hops: int = 16) -> bool | None:
+    """Decide pane ownership by walking up from ``start_pid`` (the hook process).
+
+    The hook's *firing agent* is its nearest ancestor that is not a shell — the
+    process that spawned the hook's ``sh -c``. That agent owns the pane iff it IS
+    the pane's process (``pane_pid``) or its controlling terminal is the pane's
+    (``pane_tty``). Anything else is a nested child (a sub-agent in its own/absent
+    terminal) and must be dropped.
+
+    Returns True (owner), False (foreign), or None (indeterminate → fail open).
+    Anchoring on ``pane_pid`` is what makes this robust to agents that spawn hooks
+    *detached*: claude (>=2.1.x) gives its hook processes no controlling terminal
+    (ctty ``??``), so the hook's own ctty can no longer be compared — but the
+    agent is still ``pane_pid``. A nested sub-agent, even one that likewise has no
+    ctty, is a descendant of the pane agent and so is never ``pane_pid`` itself.
+    """
+    self_info = _proc_info(start_pid)
+    if self_info is None:
+        return None  # can't even read self → indeterminate
+    pid = self_info[0]  # start at the hook's parent (the shell); skip self
+    seen: set[int] = set()
+    for _ in range(max_hops):
+        if pid <= 1 or pid in seen:
+            return None  # reached init / cycle without finding an agent
+        seen.add(pid)
+        info = _proc_info(pid)
+        if info is None:
+            return None  # ancestry broke (reparented mid-walk) → fail open
+        ppid, ctty, comm = info
+        if comm in _SHELLS:
+            pid = ppid
+            continue  # shells are transparent
+        # First non-shell ancestor = the agent that fired this hook.
+        if pane_pid and str(pid) == pane_pid:
+            return True
+        return _ctty_owns_pane(ctty, pane_tty)
+    return None
+
+
 def is_tmux_pane_owner() -> bool:
-    """True if THIS process is the foreground agent of its tmux pane — the pane's
-    real owner — not a nested child that merely inherited ``$TMUX`` (e.g. a
+    """True if this hook was fired by the foreground agent of its tmux pane — the
+    pane's real owner — not a nested child that merely inherited ``$TMUX`` (e.g. a
     deep-review sub-agent running in the parent agent's background terminal).
 
-    A tmux pane's foreground process has the pane's pty as its controlling
-    terminal, and that ctty is inherited by the hook processes it spawns. A nested
-    child runs under a different pty (or none), so its ctty won't match the pane's.
-    Verified empirically: a foreground ``sh -c`` hook's ctty == pane_tty; a
-    pty.fork child gets a different pts; a process holding ``$TMUX`` but no
-    controlling terminal reports ctty ``??``.
+    Identity is decided from the pane tmux reports for the inherited
+    ``$TMUX_PANE``: its ``pane_pid`` (the agent process itself) and ``pane_tty``.
+    We walk up from the hook to its firing agent (the nearest non-shell ancestor)
+    and confirm that agent is ``pane_pid``, or controls ``pane_tty``. See
+    :func:`_ancestor_owns_pane` for why ``pane_pid`` — not the hook's own ctty — is
+    the anchor: agents that spawn hooks detached leave them with no controlling
+    terminal, so the earlier "hook ctty == pane_tty" test dropped every legitimate
+    hook.
 
     Fail-open: if anything is indeterminate, return True so a real owner's hooks
-    are never wrongly suppressed (this preserves legacy behavior on platforms
-    where the probe doesn't work). Set ``WALKCODE_OWNER_CHECK=0`` to disable the
+    are never wrongly suppressed. Set ``WALKCODE_OWNER_CHECK=0`` to disable the
     gate entirely.
     """
     if os.environ.get("WALKCODE_OWNER_CHECK", "1") == "0":
         return True
     if not os.environ.get("TMUX"):
         return True  # not under tmux → the gate doesn't apply
-    try:
-        my_p = subprocess.run(
-            ["ps", "-o", "tty=", "-p", str(os.getpid())],
-            capture_output=True, text=True, timeout=2,
-        )
-        pane_p = subprocess.run(
-            ["tmux", "display-message", "-p", "#{pane_tty}"],
-            capture_output=True, text=True, timeout=2,
-        )
-    except Exception:
-        return True  # probe crashed → fail open
-    # Any UNSUCCESSFUL or empty probe → fail OPEN (treat as owner). Only a probe
-    # that succeeds AND clearly shows a different/absent controlling terminal marks
-    # a non-owner: wrongly dropping a real owner's hooks would silently disconnect
-    # the parent's Feishu thread — worse than the takeover this guards against.
-    if my_p.returncode != 0 or pane_p.returncode != 0:
-        return True
-    pane = pane_p.stdout.strip()
-    if not pane:
-        return True
-    return _ctty_owns_pane(my_p.stdout.strip(), pane)
+    pane = _pane_identity()
+    if pane is None:
+        return True  # probe failed/empty → fail open
+    pane_tty, pane_pid = pane
+    verdict = _ancestor_owns_pane(os.getpid(), pane_tty, pane_pid)
+    if verdict is None:
+        return True  # indeterminate → fail open
+    return verdict
 
 
 def validate_target(session_name: str) -> str | None:
