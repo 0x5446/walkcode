@@ -34,12 +34,21 @@ def _unique_inject_buffer() -> str:
 
 
 def detect_tmux_session() -> str:
-    """Return the tmux session name of the current environment, or empty string."""
+    """Return the tmux session name of the current environment, or empty string.
+
+    Targets the inherited ``$TMUX_PANE`` when present so the reported session
+    matches the pane the owner gate decides on (a bare ``display-message`` would
+    resolve to the active pane, which can differ from this hook's pane).
+    """
     if not os.environ.get("TMUX"):
         return ""
+    cmd = ["tmux", "display-message", "-p", "#{session_name}"]
+    tmux_pane = os.environ.get("TMUX_PANE")
+    if tmux_pane:
+        cmd = ["tmux", "display-message", "-t", tmux_pane, "-p", "#{session_name}"]
     try:
         result = subprocess.run(
-            ["tmux", "display-message", "-p", "#{session_name}"],
+            cmd,
             capture_output=True, text=True, timeout=2,
         )
         if result.returncode == 0:
@@ -210,19 +219,26 @@ def _ancestor_owns_pane(start_pid: int, pane_tty: str, pane_pid: str,
     pid = agent_ppid
     seen: set[int] = {agent_pid}
     for _ in range(max_hops):
-        if pid <= 1 or pid in seen:
-            return None  # ctty matched but ancestry incomplete → fail open
         if str(pid) == pane_pid:
             return True  # reached the pane shell through shells only; ctty already ok
+        if pid <= 1:
+            # ctty matched but the chain to the pane shell is severed: the firing
+            # agent was reparented to init, i.e. it detached. A real foreground
+            # agent is never orphaned from its own pane process, so this is a
+            # detached nested sub-agent → foreign. (Only genuine probe errors below
+            # fail open; a structural orphan does not.)
+            return False
+        if pid in seen:
+            return None  # cycle (corrupt read) → fail open
         seen.add(pid)
         info = _proc_info(pid)
         if info is None:
-            return None
+            return None  # transient ps failure → fail open (don't drop a real hook)
         ppid, _ctty, comm = info
         if comm not in _SHELLS:
             return False  # another agent between candidate and pane shell → nested
         pid = ppid
-    return None
+    return None  # exceeded max_hops → fail open
 
 
 def owner_check() -> tuple[bool, str]:

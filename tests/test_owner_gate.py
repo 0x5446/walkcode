@@ -152,15 +152,29 @@ class AncestorOwnsPaneTests(unittest.TestCase):
         }
         self.assertIs(self._run(table), False)
 
-    def test_shell_pane_same_ctty_orphan_fails_open(self):
-        # Documented residual: a sub-agent that BOTH shares the pane terminal AND
-        # orphans its hook under a shell pane is indistinguishable from the pane's
-        # own foreground agent by terminal alone → fail open (None). Accepted: the
-        # threat model is accidental nesting, not adversarial self-orphaning.
+    def test_shell_pane_same_ctty_orphan_is_foreign(self):
+        # A sub-agent that shares the pane terminal but has detached (reparented to
+        # init, ppid=1) is NOT the pane's foreground agent: a real foreground agent
+        # is never orphaned from its pane process. The severed chain (pid<=1) is a
+        # structural orphan signal → foreign, not a fail-open. Only genuine probe
+        # errors (below) fail open.
         table = {
             1000: (900, "??", "python"),
             900:  (300, "??", "sh"),
             300:  (1, "ttys053", "claude"),  # shares pane ctty, reparented to init
+            200:  (10, "ttys053", "zsh"),    # pane shell
+        }
+        self.assertIs(self._run(table), False)
+
+    def test_shell_pane_probe_error_mid_walk_fails_open(self):
+        # In contrast to the orphan above: if an intermediate ancestor can't be
+        # read (transient ps failure, not a severed chain), fail open so a real
+        # main hook isn't dropped on a flaky probe.
+        table = {
+            1000: (900, "??", "python"),
+            900:  (250, "??", "sh"),
+            250:  (240, "ttys053", "node"),  # firing agent, ctty matches
+            # 240 deliberately absent → _proc_info returns None mid-walk
             200:  (10, "ttys053", "zsh"),    # pane shell
         }
         self.assertIsNone(self._run(table))
