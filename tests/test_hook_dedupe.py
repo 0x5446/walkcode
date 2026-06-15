@@ -266,6 +266,24 @@ class ReceiveHookDedupeTests(unittest.TestCase):
         self.assertEqual(r2.get("thread"), "pending-root")  # same thread, right place
         self.assertEqual(len(self.replies), 2)
 
+    def test_pending_hook_establishes_launch_cwd_not_runtime(self):
+        # Feishu-initiated: pending carries the launch cwd. The hook's runtime cwd
+        # (_stop_body uses /tmp/proj, as if the agent had cd'd) must NOT become the
+        # session's launch cwd — otherwise resume would later cd into the wrong dir.
+        server.session_store.add_pending("tmux-pending", "pending-root", cwd="/launch")
+        self._post(_stop_body(turn_id="t1", session_id="s-pending", tty="tmux-pending"))
+        self.assertEqual(server.session_store.get("s-pending").cwd, "/launch")
+
+    def test_pending_without_cwd_falls_back_to_default_not_runtime(self):
+        # Old state.json upgraded in-flight: the pending record predates the cwd
+        # field. Must fall back to config.default_cwd (the Feishu launch dir),
+        # never this hook's runtime cwd.
+        server.session_store.add_pending("tmux-pending", "pending-root")  # no cwd
+        self._post(_stop_body(turn_id="t1", session_id="s-pending", tty="tmux-pending"))
+        sess = server.session_store.get("s-pending")
+        self.assertEqual(sess.cwd, server.config.default_cwd)
+        self.assertNotEqual(sess.cwd, "/tmp/proj")  # not the runtime cwd
+
 
 class CmdHookTurnIdForwardingTests(unittest.TestCase):
     """cmd_hook must forward turn_id into the POST body (tests ISSUE_2): the
