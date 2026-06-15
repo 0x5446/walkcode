@@ -339,6 +339,41 @@ def is_agent_alive(session_name: str) -> bool:
     return False
 
 
+def probe_agent_liveness(session_name: str) -> str:
+    """Three-state liveness for a queued inject whose turn hasn't ended yet.
+
+    Unlike is_agent_alive — which collapses every failure (timeout, tmux error,
+    exception) into False — this keeps "the probe itself failed" separate from
+    "the session is gone", so the caller never reclaims a still-deliverable
+    message on a transient tmux hiccup:
+
+      - 'alive'   : an agent process (not a shell) is running the pane → keep waiting
+      - 'dead'    : positive proof the turn can never end — the tmux target is gone,
+                    or the pane fell back to a shell (the agent process exited)
+      - 'unknown' : the probe was inconclusive (tmux timeout / exception / empty
+                    read) → caller must keep waiting, NOT treat this as death
+    """
+    try:
+        result = subprocess.run(
+            ["tmux", "list-panes", "-t", session_name, "-F", "#{pane_current_command}"],
+            capture_output=True, text=True, timeout=2,
+        )
+    except Exception:
+        return "unknown"            # timeout / tmux missing / OS error — inconclusive
+    if result.returncode != 0:
+        # Nonzero isn't always death: a missing session/server is genuine proof the
+        # turn can never end, but a transient tmux error (permission, server hiccup)
+        # is only a failed probe → 'unknown' so the caller keeps waiting.
+        err = (result.stderr or "").lower()
+        if any(s in err for s in ("can't find", "no server", "no such", "not found")):
+            return "dead"
+        return "unknown"
+    cmd = result.stdout.strip().split("\n")[0]
+    if cmd == "":
+        return "unknown"            # couldn't read the pane command — inconclusive
+    return "dead" if cmd in _SHELLS else "alive"
+
+
 def capture_pane(session_name: str, lines: int = 30) -> str:
     """Capture last N lines of tmux pane output. Returns empty string on failure."""
     try:
