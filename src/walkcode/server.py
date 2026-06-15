@@ -44,7 +44,7 @@ from .config import Config
 from .i18n import t
 from .permreg import CardStatus, PermissionRegistry
 from .state import Session, SessionStore
-from .tty import inject, validate_target, get_session_activity, kill_session, capture_pane, is_agent_alive, probe_agent_liveness, wait_until_input_ready
+from .tty import inject, validate_target, get_session_activity, kill_session, capture_pane, is_agent_alive, wait_until_input_ready
 
 logger = logging.getLogger("walkcode")
 
@@ -75,37 +75,21 @@ _STUCK_THRESHOLD = int(os.environ.get("WALKCODE_STUCK_THRESHOLD", "1800"))  # 30
 registry = PermissionRegistry()
 
 
-# --- Inject delivery confirmation ---
-# A successful `tmux send-keys` only means the bytes reached the pane — NOT that
-# Claude accepted them as a prompt. A modal/dialog (/status, /model, permission
-# prompt), copy-mode, or a 100%-context state silently swallows the keystrokes.
-# We confirm REAL delivery via the UserPromptSubmit hook: after injecting we wait
-# for that session to report a matching prompt. If it never arrives the message
-# was swallowed, and we tell the user instead of faking success with an emoji.
+# --- Feishu reply injection observation ---
+# For user-visible delivery, the boundary is tmux accepting paste+Enter. Claude
+# Code may process it immediately or queue it behind the current turn; WalkCode
+# should not second-guess that with its own busy/idle model.
 #
-# Busy/idle is derived purely from hooks (no screen scraping): UserPromptSubmit
-# marks a turn start (busy), Stop marks a turn end (idle). An inject during a
-# busy turn is queued (modals can't coexist with active generation) and confirms
-# when the queued prompt fires its UserPromptSubmit after the turn ends.
+# UserPromptSubmit/Stop still provide useful observability, so we keep a small
+# in-memory pending list for debug logs. It never drives a user-visible
+# "swallowed" or "queued" verdict.
 _session_last_ups: dict[str, float] = {}   # session_id → ts of last UserPromptSubmit
 _session_last_stop: dict[str, float] = {}  # session_id → ts of last Stop
 _ups_capable_sessions: set[str] = set()    # sessions seen to emit UserPromptSubmit
-_pending_injects: list[dict] = []          # see _register_pending_inject for shape
+_pending_injects: list[dict] = []          # optional observations only
 _pending_lock = threading.Lock()
-_INJECT_CONFIRM_GRACE = 4.0    # s to wait for UserPromptSubmit after the session is idle
-# Leak-guard backstop for a queued inject whose turn NEVER ends AND whose session
-# stays alive (stuck in a modal we can't distinguish from a genuinely long turn).
-# A long-but-progressing turn must NOT trip this — it confirms when the queued
-# prompt finally fires its UserPromptSubmit — so this is hours, not minutes.
-_INJECT_CONFIRM_MAX = 3600.0   # s absolute leak-guard for an ever-busy, still-alive session
-# A queued inject older than this with no Stop yet starts liveness-probing the
-# session (tmux) so a dead session is reclaimed promptly without false "swallowed".
-_INJECT_LIVENESS_AFTER = 120.0    # s before a still-busy inject begins liveness probes
-_INJECT_LIVENESS_INTERVAL = 30.0  # s minimum between probes per pending inject
-# Consecutive 'dead' probes required before reclaiming a queued inject — one tmux
-# blip must not steal a message that is still deliverable. 'unknown'/'alive' reset it.
-_INJECT_DEAD_PROBES = 2
-_SWEEPER_INTERVAL = 1.0        # s between pending-inject sweeps
+_INJECT_OBSERVATION_TTL = 3600.0
+_SWEEPER_INTERVAL = 60.0       # s between observation cleanup sweeps
 
 
 # --- Hook delivery dedupe ---
@@ -1202,6 +1186,11 @@ def _resume_agent(session_id: str, old_session: Session, reply_text: str, messag
         if reply_text.strip():
             try:
                 inject(old_session.tty, reply_text)
+                logger.info(
+                    "Resume-guard injected '%s' -> %s; tmux accepted",
+                    reply_text[:50], old_session.tty,
+                )
+                _ack_inject_accepted(message_id)
                 _register_pending_inject(session_id, old_session.tty, reply_text, message_id)
             except Exception as e:
                 logger.error(f"Resume-guard inject failed: {e}")
@@ -1242,7 +1231,7 @@ def _resume_agent(session_id: str, old_session: Session, reply_text: str, messag
             if not ready:
                 logger.warning(
                     f"Resume {tmux_name}: TUI not confirmed input-ready within "
-                    f"timeout; injecting anyway (delivery confirmation will judge)"
+                    f"timeout; injecting anyway"
                 )
             else:
                 # The TUI settled at an idle prompt, so this inject goes into an
@@ -1257,6 +1246,11 @@ def _resume_agent(session_id: str, old_session: Session, reply_text: str, messag
                 _reply(message_id, t("feishu.inject_timeout"), reply_in_thread=True)
                 _add_reaction(message_id, random.choice(_FAILURE_EMOJIS))
                 return
+            logger.info(
+                "Delayed inject after resume '%s' -> %s; tmux accepted",
+                reply_text[:50], tmux_name,
+            )
+            _ack_inject_accepted(message_id)
             _register_pending_inject(session_id, tmux_name, reply_text, message_id)
         threading.Thread(target=_delayed_inject, daemon=True).start()
 
@@ -1339,20 +1333,25 @@ def _is_session_busy(session_id: str) -> bool:
         return _session_last_ups.get(session_id, 0.0) > _session_last_stop.get(session_id, 0.0)
 
 
-def _register_pending_inject(session_id: str | None, tty: str, text: str, message_id: str):
-    """Record an injected message awaiting UserPromptSubmit confirmation.
+def _ack_inject_accepted(message_id: str):
+    """Mark a Feishu reply as handed to tmux.
 
-    The success/failure emoji is deferred until we either see a matching
-    UserPromptSubmit (delivered) or the wait window expires (swallowed).
-
-    When the inject lands mid-turn (the agent is busy), Claude Code queues it and
-    won't submit it until the current turn ends — so confirmation can be minutes
-    away. Without a signal the sender just sees silence and assumes the message
-    was swallowed. Acknowledge immediately with a "queued" receipt so the wait is
-    explained; the eventual ✅/⚠️ still lands when the queued prompt resolves.
+    This is the user-visible delivery boundary. Anything after this is Claude
+    Code's own prompt queue / TUI state, not a WalkCode delivery failure.
     """
-    busy = _session_last_ups.get(session_id or "", 0.0) \
-        > _session_last_stop.get(session_id or "", 0.0)
+    try:
+        _add_reaction(message_id, random.choice(_SUCCESS_EMOJIS))
+    except Exception as e:
+        logger.error(f"Failed to mark inject accepted: {e}")
+
+
+def _register_pending_inject(session_id: str | None, tty: str, text: str, message_id: str):
+    """Record an injected message for optional UserPromptSubmit observation.
+
+    This state is intentionally not authoritative. tmux accepting the inject is
+    the delivery boundary; missing or late UserPromptSubmit hooks must not create
+    user-visible "queued" or "swallowed" notices.
+    """
     with _pending_lock:
         _pending_injects.append({
             "session_id": session_id or "",
@@ -1360,21 +1359,11 @@ def _register_pending_inject(session_id: str | None, tty: str, text: str, messag
             "text": text,
             "message_id": message_id,
             "injected_at": time.time(),
-            "busy_at_inject": busy,
-            "last_liveness_check": 0.0,
-            "dead_probes": 0,
         })
-    # Network call — keep it outside the lock. Best-effort: a failed receipt must
-    # not stop the message from being tracked/delivered.
-    if busy:
-        try:
-            _reply(message_id, t("feishu.inject_queued"), reply_in_thread=True)
-        except Exception as e:
-            logger.error(f"Failed to send queued receipt: {e}")
 
 
 def _confirm_pending_inject(session_id: str, tty: str, prompt: str):
-    """Match an incoming UserPromptSubmit against pending injects; confirm delivery."""
+    """Match UserPromptSubmit against an observed inject and log it."""
     np = _norm(prompt)
     if not np:
         return
@@ -1393,146 +1382,31 @@ def _confirm_pending_inject(session_id: str, tty: str, prompt: str):
             _pending_injects.remove(hit)
     if hit:
         sid = (session_id or "")[:8]
-        logger.info(f"Inject confirmed delivered: '{hit['text'][:40]}' session={sid or '-'} tty={tty}")
-        _add_reaction(hit["message_id"], random.choice(_SUCCESS_EMOJIS))
+        logger.info(f"Inject observed by UserPromptSubmit: '{hit['text'][:40]}' session={sid or '-'} tty={tty}")
 
 
 def _sweep_pending_injects():
-    """Resolve pending injects: confirm arrives elsewhere; here we only FAIL ones
-    that are genuinely undeliverable. A busy (Claude-Code-queued) inject is never
-    failed for "running too long": a long turn legitimately keeps the message
-    queued until it ends, at which point the queued prompt fires its own
-    UserPromptSubmit and confirms (possibly many minutes later). A queued inject
-    fails only when:
-      - the turn ended (a Stop after the inject) but no matching UserPromptSubmit
-        arrived within GRACE → swallowed (e.g. the queued keys hit a modal), or
-      - the session is dead (tmux/agent gone) so the turn can never end → timeout
-        (detected by a throttled liveness probe once the inject is old enough), or
-      - the absolute leak-guard MAX is exceeded (session stuck alive in a modal we
-        cannot distinguish from a genuinely long turn) → timeout.
-    An idle inject still fails GRACE seconds after injection (a modal / copy-mode
-    swallowed it on the spot). pending entries are NOT removed while the turn is
-    still legitimately in progress, so a late UserPromptSubmit can still confirm.
+    """Drop old inject observations.
+
+    This cleanup is silent by design. Lack of a matching UserPromptSubmit is not
+    a WalkCode delivery failure after tmux has accepted the input.
     """
     now = time.time()
-    failed_swallowed = []  # idle modal / busy-after-stop: a real swallow
-    failed_dead = []       # (entry, reason, age): turn can never end → timeout
-    to_probe = []          # busy, still running, due for a liveness probe (lock-free)
+    expired = []
     with _pending_lock:
         for p in list(_pending_injects):
-            if not p["busy_at_inject"]:
-                # Idle inject: should submit at once. No UPS within grace → swallow.
-                if (now - p["injected_at"]) > _INJECT_CONFIRM_GRACE:
-                    _pending_injects.remove(p)
-                    failed_swallowed.append(p)
-                continue
-            last_stop = _session_last_stop.get(p["session_id"], 0.0)
-            if last_stop > p["injected_at"]:
-                # Turn ended after the inject → the queued prompt should have
-                # submitted by now. No matching UPS within grace → swallowed.
-                if (now - last_stop) > _INJECT_CONFIRM_GRACE:
-                    _pending_injects.remove(p)
-                    failed_swallowed.append(p)
-                continue
-            # Turn still in progress: never fail on elapsed time alone.
-            age = now - p["injected_at"]
-            if age > _INJECT_CONFIRM_MAX:
-                _pending_injects.remove(p)          # leak-guard backstop
-                failed_dead.append((p, "leak_guard", age))
-            elif age > _INJECT_LIVENESS_AFTER and \
-                    (now - p["last_liveness_check"]) > _INJECT_LIVENESS_INTERVAL:
-                p["last_liveness_check"] = now
-                to_probe.append(p)
-            # else: still legitimately queued — keep waiting (confirm will land).
-
-    # Liveness probes run OUTSIDE the lock: probing shells out to tmux and must not
-    # block other inject/hook handling. A session that died can never end its turn,
-    # so its queued message will never confirm → reclaim it as a timeout. But three
-    # things keep this from re-introducing false failures:
-    #   - probe is three-state: an inconclusive probe (tmux timeout/error) is NOT
-    #     death — keep waiting (probe_agent_liveness returns 'unknown').
-    #   - reclaim needs _INJECT_DEAD_PROBES consecutive 'dead' reads; 'unknown' or
-    #     'alive' reset the streak, so one blip can't steal a deliverable message.
-    #   - before reclaiming we re-take the lock and re-read last_stop: if the turn
-    #     ended during the probe, hand the entry back to the Stop-grace path.
-    # Probe each distinct tty ONCE per sweep so a backlog of queued messages on one
-    # session can't fan out into a fork-per-message storm.
-    probe_cache: dict[str, str] = {}
-    for p in to_probe:
-        tty = p["tty"]
-        if tty not in probe_cache:
-            probe_cache[tty] = probe_agent_liveness(tty)
-        state = probe_cache[tty]
-        if state != "dead":
-            p["dead_probes"] = 0                    # 'alive' or inconclusive 'unknown'
-            continue
-        with _pending_lock:
-            cur = next((q for q in _pending_injects if q is p), None)
-            if cur is None:
-                continue                            # confirmed/removed meanwhile
-            last_stop = _session_last_stop.get(cur["session_id"], 0.0)
-            if last_stop > cur["injected_at"]:
-                # Turn ended during the probe → not dead; let the busy-after-stop
-                # grace path judge it next sweep instead of failing as timeout.
-                cur["dead_probes"] = 0
-                continue
-            cur["dead_probes"] = cur.get("dead_probes", 0) + 1
-            if cur["dead_probes"] < _INJECT_DEAD_PROBES:
-                continue                            # need another confirmation
-            _pending_injects.remove(cur)
-            failed_dead.append((cur, "liveness_dead", now - cur["injected_at"]))
-
-    for p in failed_swallowed:
-        sid = p["session_id"]
-        capable = bool(sid) and sid in _ups_capable_sessions
-        if not capable:
-            # This session has never emitted a UserPromptSubmit — it predates the
-            # hook (started before reinstall). We can't confirm delivery, so fall
-            # back to the legacy assume-delivered behavior rather than crying wolf.
-            logger.info(
-                f"Inject unconfirmed (no UserPromptSubmit hook on session "
-                f"{(sid or '-')[:8]}); assuming delivered: '{p['text'][:40]}'"
-            )
-            try:
-                _add_reaction(p["message_id"], random.choice(_SUCCESS_EMOJIS))
-            except Exception as e:
-                logger.error(f"Failed to mark unconfirmed inject: {e}")
-            continue
-        logger.warning(
-            f"Inject NOT delivered (swallowed): '{p['text'][:40]}' "
-            f"tty={p['tty']} session={sid[:8]}"
+            if (now - p["injected_at"]) > _INJECT_OBSERVATION_TTL:
+                _pending_injects.remove(p)
+                expired.append(p)
+    for p in expired:
+        logger.info(
+            "Inject observation expired without UserPromptSubmit: '%s' tty=%s session=%s",
+            p["text"][:40], p["tty"], (p["session_id"] or "-")[:8],
         )
-        try:
-            _reply(p["message_id"], t("feishu.inject_swallowed"), reply_in_thread=True)
-            _add_reaction(p["message_id"], random.choice(_FAILURE_EMOJIS))
-        except Exception as e:
-            logger.error(f"Failed to notify inject failure: {e}")
-
-    for p, reason, age in failed_dead:
-        # The turn can never end, so the message truly didn't land → report a
-        # terminal-unresponsive timeout (not the modal-swallowed text), regardless
-        # of legacy capability. Distinguish the two causes in the log so triage
-        # doesn't chase a tmux exit when the real cause is a stuck-but-alive session.
-        if reason == "leak_guard":
-            logger.warning(
-                f"Inject NOT delivered (leak-guard backstop, age={age:.0f}s > "
-                f"max={_INJECT_CONFIRM_MAX:.0f}s): '{p['text'][:40]}' "
-                f"tty={p['tty']} session={(p['session_id'] or '-')[:8]}"
-            )
-        else:
-            logger.warning(
-                f"Inject NOT delivered (session dead, age={age:.0f}s): "
-                f"'{p['text'][:40]}' tty={p['tty']} session={(p['session_id'] or '-')[:8]}"
-            )
-        try:
-            _reply(p["message_id"], t("feishu.inject_timeout"), reply_in_thread=True)
-            _add_reaction(p["message_id"], random.choice(_FAILURE_EMOJIS))
-        except Exception as e:
-            logger.error(f"Failed to notify inject failure: {e}")
 
 
 def _start_inject_sweeper():
-    """Background thread that resolves pending injects (delivered vs swallowed)."""
+    """Background thread that cleans up inject observation entries."""
     def _loop():
         while True:
             time.sleep(_SWEEPER_INTERVAL)
@@ -1541,8 +1415,7 @@ def _start_inject_sweeper():
             except Exception as e:
                 logger.error(f"Inject sweeper error: {e}")
     threading.Thread(target=_loop, daemon=True).start()
-    logger.info("Inject delivery sweeper started (grace=%.0fs, max=%.0fs)",
-                _INJECT_CONFIRM_GRACE, _INJECT_CONFIRM_MAX)
+    logger.info("Inject observation sweeper started (ttl=%.0fs)", _INJECT_OBSERVATION_TTL)
 
 
 def _on_message(data: P2ImMessageReceiveV1):
@@ -1679,11 +1552,10 @@ def _handle_message(data: P2ImMessageReceiveV1):
         _reply(message_id, t("feishu.inject_timeout"), reply_in_thread=True)
         _add_reaction(message_id, random.choice(_FAILURE_EMOJIS))
         return
-    # tmux accepted the keys, but that is NOT proof Claude received them: a modal
-    # (/status, /model, permission prompt), copy-mode, or 100%-context state
-    # silently swallows input. Defer the verdict until the UserPromptSubmit hook
-    # confirms delivery (or the wait window expires → reported as not delivered).
-    logger.info(f"Injected '{text[:50]}' -> {tty} ({project}); awaiting delivery confirmation")
+    # tmux accepted paste+Enter. From WalkCode's perspective this is delivered;
+    # Claude Code owns whether the prompt runs immediately or waits behind a turn.
+    logger.info(f"Injected '{text[:50]}' -> {tty} ({project}); tmux accepted")
+    _ack_inject_accepted(message_id)
     _register_pending_inject(session_id, tty, text, message_id)
 
 
@@ -1761,9 +1633,9 @@ async def receive_hook(request: Request):
     if not tty:
         return {"ok": False, "error": "missing tty (not in tmux?)"}
 
-    # Stop = turn ended → session is idle (drives inject-delivery confirmation).
-    # Mark idle BEFORE the dedupe gate so the inject-confirmation machinery still
-    # sees every Stop; dedupe only suppresses the duplicate user-facing message.
+    # Stop = turn ended → session is idle. Mark idle BEFORE the dedupe gate so
+    # busy/idle observability still sees every Stop; dedupe only suppresses the
+    # duplicate user-facing message.
     if hook_type == "stop" and session_id:
         _mark_session_idle(session_id)
 
@@ -1884,11 +1756,10 @@ async def receive_sync_hook(request: Request):
 
 @app.post("/hook/prompt")
 async def receive_prompt_hook(request: Request):
-    """UserPromptSubmit hook — confirms a prompt was actually accepted by Claude.
+    """UserPromptSubmit hook — records prompts accepted by Claude.
 
-    Used to verify walkcode's tmux injections really landed (vs being swallowed
-    by a modal / copy-mode), and to track per-session busy state. Best-effort:
-    the hook POSTs with a short timeout and never blocks prompt submission.
+    Used for per-session busy state and best-effort inject observation. It does
+    not decide whether a Feishu reply was delivered; tmux acceptance does.
     """
     body = await request.json()
     tty = body.get("tty", "")

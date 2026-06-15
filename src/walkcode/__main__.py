@@ -207,13 +207,15 @@ def _handle_permission_request(hook_data, port, tmux_session, cwd, session_id):
     import time as _time
     from .agent import get_agent
 
-    # Codex PreToolUse fires for ALL tools, even auto-approved ones.
-    # When permission_mode is "bypassPermissions", just let it proceed.
-    if hook_data.get("permission_mode") == "bypassPermissions":
-        sys.exit(0)
-
     tool_name = hook_data.get("tool_name", "")
     tool_input = hook_data.get("tool_input", {})
+
+    # Codex PreToolUse fires for ALL tools, even auto-approved ones.
+    # When permission_mode is "bypassPermissions", just let ordinary tools
+    # proceed. AskUserQuestion is HITL, though: if we short-circuit it here,
+    # Claude still opens its native TUI dialog while Feishu never sees a card.
+    if hook_data.get("permission_mode") == "bypassPermissions" and tool_name != "AskUserQuestion":
+        sys.exit(0)
 
     payload = json.dumps({
         "tty": tmux_session,

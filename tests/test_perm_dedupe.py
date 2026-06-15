@@ -256,12 +256,57 @@ class HandlePermissionForwardingTests(unittest.TestCase):
             "tool_use_id": "tu-9", "turn_id": "turn-9", "permission_mode": "default",
         }
         with patch.object(m.urllib.request, "urlopen", fake_urlopen), \
-             patch.dict(os.environ, {"WALKCODE_AGENT": "claude"}, clear=False):
+             patch.dict(os.environ, {"WALKCODE_AGENT": "claude"}, clear=False), \
+             patch("sys.stdout", io.StringIO()):
             with self.assertRaises(SystemExit):
                 m._handle_permission_request(hook_data, 3999, "tmux1", "/tmp/proj", "s1")
 
         self.assertEqual(captured["body"]["tool_use_id"], "tu-9")
         self.assertEqual(captured["body"]["turn_id"], "turn-9")
+
+    def test_bypass_permissions_non_askuser_short_circuits(self):
+        hook_data = {
+            "tool_name": "Bash", "tool_input": {"command": "ls"},
+            "permission_mode": "bypassPermissions",
+        }
+        with patch.object(m.urllib.request, "urlopen") as urlopen:
+            with self.assertRaises(SystemExit) as cm:
+                m._handle_permission_request(hook_data, 3999, "tmux1", "/tmp/proj", "s1")
+
+        self.assertEqual(cm.exception.code, 0)
+        urlopen.assert_not_called()
+
+    def test_bypass_permissions_askuserquestion_still_posts(self):
+        captured = {}
+        calls = [0]
+
+        def fake_urlopen(req, timeout=None):
+            calls[0] += 1
+            if calls[0] == 1:  # POST /hook/permission
+                captured["body"] = json.loads(req.data.decode())
+                return self._resp({"request_id": "rid-ask"})
+            return self._resp({
+                "status": "decided",
+                "decision": {
+                    "behavior": "allow",
+                    "updatedInput": {"answers": ["范围 A"]},
+                },
+            })
+
+        hook_data = {
+            "tool_name": "AskUserQuestion",
+            "tool_input": {"questions": [{"question": "迁移范围选哪个？"}]},
+            "permission_mode": "bypassPermissions",
+        }
+        with patch.object(m.urllib.request, "urlopen", fake_urlopen), \
+             patch.dict(os.environ, {"WALKCODE_AGENT": "claude"}, clear=False), \
+             patch("sys.stdout", io.StringIO()):
+            with self.assertRaises(SystemExit) as cm:
+                m._handle_permission_request(hook_data, 3999, "tmux1", "/tmp/proj", "s1")
+
+        self.assertEqual(cm.exception.code, 0)
+        self.assertEqual(captured["body"]["tool_name"], "AskUserQuestion")
+        self.assertEqual(captured["body"]["tool_input"], hook_data["tool_input"])
 
 
 if __name__ == "__main__":

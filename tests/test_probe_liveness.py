@@ -1,11 +1,4 @@
-"""Unit tests for tty.probe_agent_liveness — the three-state liveness mapping.
-
-probe_agent_liveness backs _sweep_pending_injects' decision to reclaim a queued
-inject whose turn never ends. Its whole point is keeping "the probe failed"
-(unknown → keep waiting) separate from "the session is gone" (dead → reclaim), so
-a transient tmux hiccup can't resurrect the false "not delivered" bug. These tests
-pin that mapping directly (the server-side tests mock this function out).
-"""
+"""Unit tests for tty.probe_agent_liveness — the three-state liveness mapping."""
 
 import subprocess
 import unittest

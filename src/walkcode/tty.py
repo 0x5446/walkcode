@@ -340,18 +340,17 @@ def is_agent_alive(session_name: str) -> bool:
 
 
 def probe_agent_liveness(session_name: str) -> str:
-    """Three-state liveness for a queued inject whose turn hasn't ended yet.
+    """Three-state liveness for callers that need stronger tmux diagnostics.
 
     Unlike is_agent_alive — which collapses every failure (timeout, tmux error,
     exception) into False — this keeps "the probe itself failed" separate from
-    "the session is gone", so the caller never reclaims a still-deliverable
-    message on a transient tmux hiccup:
+    "the session is gone":
 
-      - 'alive'   : an agent process (not a shell) is running the pane → keep waiting
-      - 'dead'    : positive proof the turn can never end — the tmux target is gone,
-                    or the pane fell back to a shell (the agent process exited)
+      - 'alive'   : an agent process (not a shell) is running the pane
+      - 'dead'    : positive proof the tmux target is gone, or the pane fell back
+                    to a shell (the agent process exited)
       - 'unknown' : the probe was inconclusive (tmux timeout / exception / empty
-                    read) → caller must keep waiting, NOT treat this as death
+                    read)
     """
     try:
         result = subprocess.run(
@@ -418,8 +417,7 @@ def wait_until_input_ready(
     across captures, no footer animation).
 
     Returns True once readiness is observed, False on timeout — in which case the
-    caller should inject anyway as a last resort and let delivery confirmation
-    (the UserPromptSubmit hook) report the real outcome.
+    caller should inject anyway as a last resort.
     """
     deadline = time.time() + timeout
     prev: str | None = None

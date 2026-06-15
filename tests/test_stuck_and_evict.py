@@ -127,13 +127,16 @@ class ResumeGuardTests(unittest.TestCase):
     def test_alive_old_session_injects_instead_of_resuming(self):
         old = Session(tty="walkcode-1", cwd="/x", root_msg_id="root-1")
         injected = []
+        acks = []
         with patch.object(server, "validate_target", lambda t: None), \
              patch.object(server, "is_agent_alive", lambda t: True), \
              patch.object(server, "inject", lambda tty_, text: injected.append((tty_, text))), \
+             patch.object(server, "_ack_inject_accepted", lambda mid: acks.append(mid)), \
              patch.object(server, "_register_pending_inject", lambda *a, **k: None), \
              patch.object(server.subprocess, "run") as mock_run:
             server._resume_agent("sid-1", old, "hello", "msg-1")
         self.assertEqual(injected, [("walkcode-1", "hello")])
+        self.assertEqual(acks, ["msg-1"])
         mock_run.assert_not_called()  # must NOT spawn a second instance
 
 
