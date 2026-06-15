@@ -222,6 +222,65 @@ class ReceivePermDedupeTests(unittest.TestCase):
         self.assertEqual(len(self.cards), 1)
 
 
+class PermNoThreadRootTests(unittest.TestCase):
+    """A HITL (permission / AskUserQuestion) that is a session's FIRST outbound event
+    has no Feishu thread root yet (the root is created by Stop/Notification hooks via
+    /hook). The card must NOT leak into the group's main conversation: walkcode
+    creates the thread root now and replies the card into that thread, and persists
+    the root so the session's later hooks reuse it.
+    """
+
+    def setUp(self):
+        self._tmp = TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self._orig = (server.config, server.session_store, server.registry)
+        server.config = Config(
+            feishu_app_id="x", feishu_app_secret="y",
+            feishu_receive_id="rid", feishu_receive_id_type="open_id",
+        )
+        server.session_store = SessionStore(Path(self._tmp.name) / "state.json")
+        server.registry = PermissionRegistry(now=_Clock(1000.0))
+
+        def _restore():
+            server.config, server.session_store, server.registry = self._orig
+        self.addCleanup(_restore)
+
+        self.cards = []   # ("reply", root) or ("send", None)
+        self.sent = []    # thread-root titles created via _send
+        ps = patch.object(server, "_send", lambda text: self.sent.append(text) or "newroot")
+        pr = patch.object(server, "_reply_card",
+                          lambda mid, card, reply_in_thread=False: self.cards.append(("reply", mid)) or "cardmsg")
+        psc = patch.object(server, "_send_card",
+                           lambda card: self.cards.append(("send", None)) or "cardmsg")
+        # no Feishu-initiated pending root for this tty
+        ppop = patch.object(server.session_store, "pop_pending", lambda tty: (None, None))
+        for p in (ps, pr, psc, ppop):
+            p.start(); self.addCleanup(p.stop)
+
+    def _post(self, body):
+        return asyncio.run(server.receive_permission_hook(_Req(body)))
+
+    def test_first_event_hitl_creates_thread_root_and_replies_in_thread(self):
+        # session is known (SessionStart synced tty/cwd) but has NO thread root yet
+        server.session_store.upsert("s2", tty="tmux2", cwd="/tmp/proj")
+        r = self._post(_perm_body(tool_use_id="", session_id="s2", tty="tmux2"))
+        self.assertTrue(r.get("ok"))
+        self.assertEqual(len(self.sent), 1, "must create a thread root")
+        # card lands in the new thread, NOT the group main conversation
+        self.assertEqual(self.cards, [("reply", "newroot")])
+        # root persisted so the session's later hooks reuse the same thread
+        self.assertEqual(server.session_store.get("s2").root_msg_id, "newroot")
+
+    def test_thread_root_creation_failure_falls_back_to_group(self):
+        # if root creation itself fails (_send returns None), still surface the HITL
+        # rather than dropping it
+        server.session_store.upsert("s3", tty="tmux3", cwd="/tmp/proj")
+        with patch.object(server, "_send", lambda text: None):
+            r = self._post(_perm_body(tool_use_id="", session_id="s3", tty="tmux3"))
+        self.assertTrue(r.get("ok"))
+        self.assertEqual(self.cards, [("send", None)], "fall back to group when root can't be created")
+
+
 class HandlePermissionForwardingTests(unittest.TestCase):
     """_handle_permission_request must forward tool_use_id + turn_id in the POST."""
 

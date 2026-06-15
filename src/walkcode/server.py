@@ -1852,6 +1852,16 @@ async def receive_permission_hook(request: Request):
                     session_store.upsert(session_id, tty=tty, cwd=cwd, root_msg_id=root_msg_id)
                     if reply_id:
                         _edit_message(reply_id, t("feishu.started_with_session", agent=agent_adapter.name.title(), session_id=session_id[:8], tmux=tty))
+            elif session_id:
+                # No thread root yet: this HITL is the session's first outbound event
+                # (a terminal-started session that asked before any Stop/Notification
+                # hook created a thread). Create the thread root NOW so the card lands
+                # in the session's own thread instead of leaking into the group's main
+                # conversation; later hooks for this session reuse the same root.
+                new_root = _send(_make_title(cwd, session_id, tool_name))
+                if new_root:
+                    root_msg_id = new_root
+                    session_store.upsert(session_id, tty=tty, cwd=cwd, root_msg_id=new_root)
 
         # Generate appropriate card based on tool type and permission_suggestions
         permission_mode = hook_data_full.get("permission_mode", "")
