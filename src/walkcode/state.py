@@ -81,6 +81,7 @@ class SessionStore:
                             self._pending[str(tmux_name)] = {
                                 "root_msg_id": str(entry["root_msg_id"]),
                                 "reply_id": str(entry["reply_id"]) if entry.get("reply_id") else None,
+                                "cwd": str(entry["cwd"]) if entry.get("cwd") else "",
                             }
 
             self._rebuild_index_locked()
@@ -128,6 +129,7 @@ class SessionStore:
         root_msg_id: str | None = None,
         *,
         can_evict: Callable[[str, "Session"], bool] | None = None,
+        cwd_is_launch: bool = False,
     ) -> Session:
         """Create or update a session's tty/cwd mapping.
 
@@ -161,15 +163,27 @@ class SessionStore:
 
             session = self._sessions.get(session_id)
             if session is None:
+                # cwd is the session's *launch* dir — where the agent rollout file
+                # lives, the dir `--resume` must cd into. Only a trusted launch
+                # source (SessionStart sync / resume / Feishu pending) may set it.
+                # A runtime hook (Stop/Notification/Permission) that creates the
+                # record first — e.g. the best-effort SessionStart upload was
+                # dropped — reports a possibly-drifted cwd, so it leaves cwd empty
+                # rather than locking the wrong dir; resume then falls back to
+                # config.default_cwd, and a later trusted sync can still fill it.
                 session = Session(
                     tty=tty,
-                    cwd=cwd,
+                    cwd=cwd if cwd_is_launch else "",
                     root_msg_id=root_msg_id,
                 )
                 self._sessions[session_id] = session
             else:
                 session.tty = tty
-                session.cwd = cwd
+                # Never let a runtime hook's drifted cwd overwrite the launch cwd,
+                # nor establish one; a later trusted sync still can while the field
+                # is empty. Mirrors the root_msg_id guard below.
+                if cwd and cwd_is_launch and not session.cwd:
+                    session.cwd = cwd
                 session.created_at = time.time()
                 if root_msg_id is not None:
                     session.root_msg_id = root_msg_id
@@ -218,9 +232,12 @@ class SessionStore:
 
     # --- Pending Feishu-initiated session helpers ---
 
-    def add_pending(self, tmux_name: str, root_msg_id: str, reply_id: str | None = None):
+    def add_pending(self, tmux_name: str, root_msg_id: str, reply_id: str | None = None, cwd: str = ""):
         with self._lock:
-            self._pending[tmux_name] = {"root_msg_id": root_msg_id, "reply_id": reply_id}
+            # cwd is the agent's launch dir (config.default_cwd for Feishu-initiated
+            # starts). Carried so that if SessionStart sync is dropped, the first
+            # runtime hook can still establish the correct launch cwd from here.
+            self._pending[tmux_name] = {"root_msg_id": root_msg_id, "reply_id": reply_id, "cwd": cwd}
             self._pending_msg_to_tty[root_msg_id] = tmux_name
             self._save_locked()
 
@@ -231,14 +248,14 @@ class SessionStore:
                 entry["reply_id"] = reply_id
                 self._save_locked()
 
-    def pop_pending(self, tmux_name: str) -> tuple[str | None, str | None]:
+    def pop_pending(self, tmux_name: str) -> tuple[str | None, str | None, str | None]:
         with self._lock:
             entry = self._pending.pop(tmux_name, None)
             if not entry:
-                return None, None
+                return None, None, None
             self._pending_msg_to_tty.pop(entry["root_msg_id"], None)
             self._save_locked()
-            return entry["root_msg_id"], entry.get("reply_id")
+            return entry["root_msg_id"], entry.get("reply_id"), entry.get("cwd")
 
     def mark_subscribed(self, session_id: str):
         with self._lock:

@@ -1156,7 +1156,7 @@ def _start_agent(prompt: str, message_id: str, image_path: str | None = None):
         _reply(message_id, t("feishu.start_failed", error=e), reply_in_thread=True)
         return
 
-    session_store.add_pending(tmux_name, message_id)
+    session_store.add_pending(tmux_name, message_id, cwd=cwd)
     reply_id = _reply(message_id, t("feishu.started", agent=agent_adapter.name.title(), tmux=tmux_name), reply_in_thread=True)
     if reply_id:
         session_store.update_pending_reply(tmux_name, reply_id)
@@ -1216,7 +1216,7 @@ def _resume_agent(session_id: str, old_session: Session, reply_text: str, messag
         _reply(message_id, t("feishu.resume_failed", error=e))
         return
 
-    session_store.upsert(session_id, tty=tmux_name, cwd=cwd, root_msg_id=old_session.root_msg_id)
+    session_store.upsert(session_id, tty=tmux_name, cwd=cwd, root_msg_id=old_session.root_msg_id, cwd_is_launch=True)
     _reply(message_id, t("feishu.resumed", agent=agent_adapter.name.title(), tmux=tmux_name))
     logger.info(f"Resumed {agent_adapter.name}: session={session_id[:8]} tmux={tmux_name} cwd={cwd}")
 
@@ -1685,12 +1685,18 @@ async def receive_hook(request: Request):
             return {"ok": True, "msg_id": msg_id, "thread": session.root_msg_id}
     else:
         # New session: check if Feishu-initiated (pending root exists)
-        pending_root, reply_id = session_store.pop_pending(tty)
+        pending_root, reply_id, pending_cwd = session_store.pop_pending(tty)
         if pending_root:
-            # Feishu-initiated: reuse existing thread
+            # Feishu-initiated: reuse existing thread. The launch cwd is the one
+            # stashed at start (config.default_cwd), not this hook's runtime cwd.
             root_id = pending_root
             if session_id:
-                session_store.upsert(session_id, tty=tty, cwd=cwd, root_msg_id=root_id)
+                # Launch cwd for a Feishu-initiated session is always the dir
+                # _start_agent used (config.default_cwd). Fall back to it — never
+                # to this hook's runtime cwd — when pending has no cwd (old
+                # state.json upgraded in-flight), so a drifted runtime cwd can't
+                # be mislabeled as the launch cwd.
+                session_store.upsert(session_id, tty=tty, cwd=pending_cwd or config.default_cwd, root_msg_id=root_id, cwd_is_launch=True)
                 # Update the launch reply with session info
                 if reply_id:
                     _edit_message(reply_id, t("feishu.started_with_session", agent=agent_adapter.name.title(), session_id=session_id[:8], tmux=tty))
@@ -1744,11 +1750,11 @@ async def receive_sync_hook(request: Request):
 
     session = session_store.get(session_id)
     if session and session.root_msg_id:
-        session_store.upsert(session_id, tty=tty, cwd=cwd)
+        session_store.upsert(session_id, tty=tty, cwd=cwd, cwd_is_launch=True)
         logger.info(f"Sync: session={session_id[:8]} tty={tty} (updated)")
     else:
         # New session or no Feishu thread yet — store tty+cwd so first hook finds it
-        session_store.upsert(session_id, tty=tty, cwd=cwd)
+        session_store.upsert(session_id, tty=tty, cwd=cwd, cwd_is_launch=True)
         logger.info(f"Sync: session={session_id[:8]} tty={tty} (new, no thread yet)")
 
     return {"ok": True}
@@ -1845,11 +1851,13 @@ async def receive_permission_hook(request: Request):
             root_msg_id = session.root_msg_id
             session_store.upsert(session_id, tty=tty, cwd=cwd)
         else:
-            pending_root, reply_id = session_store.pop_pending(tty)
+            pending_root, reply_id, pending_cwd = session_store.pop_pending(tty)
             if pending_root:
                 root_msg_id = pending_root
                 if session_id:
-                    session_store.upsert(session_id, tty=tty, cwd=cwd, root_msg_id=root_msg_id)
+                    # See receive_hook: fall back to config.default_cwd (the
+                    # Feishu launch dir), never this hook's runtime cwd.
+                    session_store.upsert(session_id, tty=tty, cwd=pending_cwd or config.default_cwd, root_msg_id=root_msg_id, cwd_is_launch=True)
                     if reply_id:
                         _edit_message(reply_id, t("feishu.started_with_session", agent=agent_adapter.name.title(), session_id=session_id[:8], tmux=tty))
             elif session_id:

@@ -253,7 +253,7 @@ class PermNoThreadRootTests(unittest.TestCase):
         psc = patch.object(server, "_send_card",
                            lambda card: self.cards.append(("send", None)) or "cardmsg")
         # no Feishu-initiated pending root for this tty
-        ppop = patch.object(server.session_store, "pop_pending", lambda tty: (None, None))
+        ppop = patch.object(server.session_store, "pop_pending", lambda tty: (None, None, None))
         for p in (ps, pr, psc, ppop):
             p.start(); self.addCleanup(p.stop)
 
