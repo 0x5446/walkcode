@@ -32,6 +32,14 @@ class AgentAdapter:
     image_flag: str | None             # None = path injection, "--image" = native flag
     auth_error_patterns: tuple[str, ...]  # regex patterns to detect auth failure in tmux output
     device_auth_command: tuple[str, ...] | None  # command to run device-auth, None = not supported
+    # PostToolUse hook: register it to invalidate stale Feishu permission cards once a
+    # tool actually runs (the TUI already settled it). "PostToolUse" for claude; None
+    # for codex (yolo emits no permission cards; a future non-yolo codex would set it).
+    post_tool_hook_event: str | None
+    # Future codex non-yolo dual-input: claude is parallel (Feishu via hook stdout +
+    # TUI native menu, no injection); codex is serial, so its dual-input would need to
+    # inject the Feishu decision back into the TUI. claude=False; codex placeholder.
+    supports_inject_decision: bool
 
     def build_start_cmd(self, prompt: str, cwd: str, image_path: str | None = None) -> str:
         escaped = prompt.replace("'", "'\\''")
@@ -159,6 +167,8 @@ CLAUDE = AgentAdapter(
     image_flag=None,
     auth_error_patterns=("Not logged in",),
     device_auth_command=None,
+    post_tool_hook_event="PostToolUse",
+    supports_inject_decision=False,
 )
 
 CODEX = AgentAdapter(
@@ -174,6 +184,8 @@ CODEX = AgentAdapter(
     image_flag="--image",
     auth_error_patterns=("refresh_token_expired", "Please log out and sign in", "unauthorized", "not authenticated"),
     device_auth_command=("codex", "login", "--device-auth"),
+    post_tool_hook_event=None,
+    supports_inject_decision=False,
 )
 
 _AGENTS = {"claude": CLAUDE, "codex": CODEX}

@@ -181,13 +181,38 @@ class GcTests(unittest.TestCase):
         reg.gc()
         self.assertIsNone(reg.get(a.rid))
 
-    def test_none_key_survives_ttl(self):
+    def test_none_key_active_poll_survives_ttl(self):
+        # An AskUserQuestion (None-key) whose hook keeps polling survives the TTL —
+        # liveness is keyed on last_poll activity, not on dedupe_key.
         clock = _Clock(1000.0)
         reg = PermissionRegistry(now=clock, ttl=90.0)
-        a, _ = reg.register_or_get(None)  # AskUserQuestion may wait minutes
-        clock.t = 1000.0 + 300
+        a, _ = reg.register_or_get(None)
+        clock.t = 1000.0 + 89
+        reg.mark_poll(a.rid)  # hook still polling
+        clock.t = 1000.0 + 95
         reg.gc()
         self.assertIsNotNone(reg.get(a.rid))
+
+    def test_none_key_reaped_when_poll_stale(self):
+        # Regression for the None-key leak: the old code exempted None-key requests
+        # from the TTL forever. Now a dead-hook AskUserQuestion (no poll past TTL) is
+        # reaped like any other.
+        clock = _Clock(1000.0)
+        reg = PermissionRegistry(now=clock, ttl=90.0)
+        a, _ = reg.register_or_get(None)
+        clock.t = 1000.0 + 91
+        reg.gc()
+        self.assertIsNone(reg.get(a.rid))
+
+    def test_none_key_registration_triggers_gc(self):
+        # A pure-None-key (claude) workload only triggers GC on registration; a dead
+        # None-key request must be reaped by a later None-key registration.
+        clock = _Clock(1000.0)
+        reg = PermissionRegistry(now=clock, ttl=90.0)
+        dead, _ = reg.register_or_get(None)
+        clock.t = 1000.0 + 91
+        reg.register_or_get(None)  # later None-key registration runs GC
+        self.assertIsNone(reg.get(dead.rid))
 
     def test_active_poller_survives_ttl(self):
         clock = _Clock(1000.0)
@@ -208,6 +233,71 @@ class GcTests(unittest.TestCase):
         # the key is free again → a later request with the same key is new
         b, nb = reg.register_or_get(("s", "t1"))
         self.assertTrue(nb)
+
+
+class InvalidationTests(unittest.TestCase):
+    def test_invalidate_marks_and_wakes(self):
+        reg = PermissionRegistry(now=_Clock(1000.0))
+        a, _ = reg.register_or_get(None)
+        reg.fill_request(a.rid, session_id="s1", card_msg_id="c1")
+        snaps = reg.invalidate_session("s1")
+        self.assertEqual(len(snaps), 1)
+        self.assertEqual(snaps[0]["card_msg_id"], "c1")
+        self.assertTrue(reg.is_invalidated(a.rid))
+        self.assertTrue(a.decided.is_set())  # a parked poller is woken
+
+    def test_set_decision_rejected_after_invalidate(self):
+        # Closes the check-then-act race: once invalidated, set_decision_once must
+        # refuse even if a late click slips past the lock-free gate.
+        reg = PermissionRegistry(now=_Clock(1000.0))
+        a, _ = reg.register_or_get(None)
+        reg.fill_request(a.rid, session_id="s1")
+        reg.invalidate_session("s1")
+        self.assertFalse(reg.set_decision_once(a.rid, {"behavior": "allow"}))
+        self.assertIsNone(reg.get(a.rid).decision)
+
+    def test_invalidate_write_once(self):
+        reg = PermissionRegistry(now=_Clock(1000.0))
+        a, _ = reg.register_or_get(None)
+        reg.fill_request(a.rid, session_id="s1")
+        self.assertEqual(len(reg.invalidate_session("s1")), 1)
+        self.assertEqual(len(reg.invalidate_session("s1")), 0)  # idempotent
+
+    def test_invalidate_skips_decided(self):
+        reg = PermissionRegistry(now=_Clock(1000.0))
+        a, _ = reg.register_or_get(None)
+        reg.fill_request(a.rid, session_id="s1")
+        reg.set_decision_once(a.rid, {"behavior": "allow"})
+        self.assertEqual(len(reg.invalidate_session("s1")), 0)  # already decided
+        self.assertFalse(reg.is_invalidated(a.rid))
+
+    def test_invalidate_empty_session_noop(self):
+        reg = PermissionRegistry(now=_Clock(1000.0))
+        a, _ = reg.register_or_get(None)
+        reg.fill_request(a.rid, session_id="s1")
+        self.assertEqual(len(reg.invalidate_session("")), 0)  # no session_id → no-op
+        self.assertFalse(reg.is_invalidated(a.rid))
+
+    def test_invalidated_reaped_after_grace(self):
+        clock = _Clock(1000.0)
+        reg = PermissionRegistry(now=clock, grace=5.0)
+        a, _ = reg.register_or_get(None)
+        reg.fill_request(a.rid, session_id="s1")
+        reg.invalidate_session("s1")
+        clock.t = 1000.0 + 6
+        reg.gc()
+        self.assertIsNone(reg.get(a.rid))
+
+    def test_poll_age(self):
+        clock = _Clock(1000.0)
+        reg = PermissionRegistry(now=clock)
+        a, _ = reg.register_or_get(None)
+        clock.t = 1000.0 + 10
+        self.assertAlmostEqual(reg.poll_age(a.rid), 10.0)  # never polled → since created
+        reg.mark_poll(a.rid)
+        clock.t = 1000.0 + 13
+        self.assertAlmostEqual(reg.poll_age(a.rid), 3.0)
+        self.assertIsNone(reg.poll_age("nonexistent"))
 
 
 class CardDeliveryTests(unittest.TestCase):

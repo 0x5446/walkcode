@@ -295,6 +295,12 @@ def _handle_permission_request(hook_data, port, tmux_session, cwd, session_id):
                     print(json.dumps(hook_response), flush=True)
                 sys.exit(agent.hook_exit_code(behavior))
 
+            if result.get("status") == "invalidated":
+                # The TUI already handled this (PostToolUse invalidated the card) →
+                # fail-open: the terminal decision stands, stop polling.
+                print("[walkcode] permission handled in terminal, fail-open", file=sys.stderr)
+                sys.exit(0)
+
             # status == "pending" or "not_found", keep polling
         except Exception as e:
             print(f"[walkcode] poll error: {e}", file=sys.stderr)
@@ -421,6 +427,29 @@ def cmd_hook(args):
             urllib.request.urlopen(req, timeout=1)
         except Exception:
             pass  # best-effort; never block prompt submission
+        return
+
+    # --- PostToolUse: a tool finished executing → tell the server to invalidate this
+    # session's still-open permission cards (its TUI already settled them). Fires per
+    # tool call, so keep it cheap and skip the debug dump, like user-prompt-submit. ---
+    if args.hook_type == "post-tool":
+        payload = json.dumps({
+            "tty": tmux_session,
+            "cwd": cwd,
+            "session_id": session_id,
+        }).encode()
+        try:
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{port}/hook/post-tool",
+                data=payload,
+                headers={"Content-Type": "application/json"},
+            )
+            urllib.request.urlopen(req, timeout=2)
+        except Exception as e:
+            # best-effort; never block the tool result. Log so a failed invalidation
+            # (card won't grey out → click falls back to the server's last_poll gate)
+            # is diagnosable instead of silent.
+            print(f"[walkcode] post-tool hook failed (card invalidation skipped): {e}", file=sys.stderr)
         return
 
     # DEBUG: dump full hook_data to file for analysis
@@ -557,6 +586,11 @@ def _install_claude_hooks(_args):
         ]}],
         "PermissionRequest": [{"matcher": "", "hooks": [
             {"type": "command", "command": "afplay /System/Library/Sounds/Ping.aiff & walkcode hook permission-request", "timeout": 1800000}
+        ]}],
+        # PostToolUse: a tool actually ran → invalidate this session's stale Feishu
+        # permission cards (the TUI already settled them). No sound/timeout needed.
+        "PostToolUse": [{"matcher": "", "hooks": [
+            {"type": "command", "command": "walkcode hook post-tool"}
         ]}],
     }
 
@@ -940,7 +974,7 @@ def main():
     sub.add_parser("status", help="Check if server is running")
 
     hp = sub.add_parser("hook", help="Handle an agent hook event (reads stdin)")
-    hp.add_argument("hook_type", choices=["stop", "notification", "permission-request", "sync", "user-prompt-submit"], help="Hook event type")
+    hp.add_argument("hook_type", choices=["stop", "notification", "permission-request", "sync", "user-prompt-submit", "post-tool"], help="Hook event type")
 
     ihp = sub.add_parser("install-hooks", help="Install agent hooks")
     ihp.add_argument("--agent", choices=["claude", "codex"], default=None, help="Agent type (default: from WALKCODE_AGENT or claude)")

@@ -42,8 +42,7 @@ class CardActionTests(unittest.TestCase):
         server.registry = PermissionRegistry()
         self.addCleanup(lambda: setattr(server, "registry", self._orig_registry))
 
-        # Never spawn the real tmux-fallback thread or touch ~/.claude/settings.json.
-        p1 = patch.object(server, "_schedule_tmux_fallback", lambda *a, **k: None)
+        # Never touch ~/.claude/settings.json during the test.
         p2 = patch.object(server, "_add_permission_rule", lambda *a, **k: None)
         self.cards = []
         p3 = patch.object(server, "_reply_card",
@@ -51,7 +50,7 @@ class CardActionTests(unittest.TestCase):
         self.reactions = []
         p4 = patch.object(server, "_add_reaction",
                           lambda mid, emoji: self.reactions.append(emoji))
-        for p in (p1, p2, p3, p4):
+        for p in (p2, p3, p4):
             p.start()
             self.addCleanup(p.stop)
 
@@ -73,6 +72,26 @@ class CardActionTests(unittest.TestCase):
         self.assertEqual(server.registry.get(rid).decision["behavior"], "allow")  # unchanged
         self.assertEqual(resp2.toast.type, "info")  # already-decided notice, not success
 
+    # --- E: stale / invalidated clicks are gated, never injected ----------
+    def test_invalidated_click_rejected(self):
+        # PostToolUse invalidated the card (TUI already handled it) → a late click
+        # writes no decision and is told it's expired.
+        rid = self._register()
+        server.registry.fill_request(rid, session_id="sess-x")
+        server.registry.invalidate_session("sess-x")
+        resp = _click({"rid": rid, "b": "allow"})
+        self.assertIsNone(server.registry.get(rid).decision)
+        self.assertEqual(resp.toast.type, "info")
+
+    def test_stale_poll_click_rejected(self):
+        # The hook stopped polling long ago (TUI deny/Esc killed it) → stale click,
+        # no decision written, no fallback injection (there is none anymore).
+        rid = self._register()
+        server.registry.get(rid).created_at -= server._PERM_POLL_STALE + 10
+        resp = _click({"rid": rid, "b": "allow"})
+        self.assertIsNone(server.registry.get(rid).decision)
+        self.assertEqual(resp.toast.type, "info")
+
     def test_both_pollers_read_the_won_decision(self):
         import asyncio
         rid = self._register()
@@ -86,6 +105,17 @@ class CardActionTests(unittest.TestCase):
     def _askq(self, questions):
         return self._register(tool_name="AskUserQuestion",
                               tool_input={"questions": questions}, key=None)
+
+    def test_askq_click_rejected_after_invalidate(self):
+        # AskUserQuestion clicks are gated too (top-of-handler gate): after PostToolUse
+        # invalidates the session, a late answer writes no decision.
+        rid = self._askq([{"question": "Pick", "options": [{"label": "A"}, {"label": "B"}]}])
+        server.registry.fill_request(rid, session_id="s1")
+        server.registry.invalidate_session("s1")
+        resp = _click({"rid": rid, "action": "select", "answer": "A",
+                       "question_index": 0, "total_questions": 1})
+        self.assertIsNone(server.registry.get(rid).decision)
+        self.assertEqual(resp.toast.type, "info")
 
     def test_single_select_finalizes(self):
         rid = self._askq([{"question": "Pick", "options": [{"label": "A"}, {"label": "B"}]}])

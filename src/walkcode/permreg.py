@@ -66,8 +66,12 @@ class PermissionRequest:
     hook_data_full: dict = field(default_factory=dict)
     permission_suggestions: list = field(default_factory=list)
     feishu_root_msg_id: str = ""
+    session_id: str = ""  # PostToolUse-invalidation key (claude perms carry no tool_use_id)
+    card_msg_id: str = ""  # feishu card message id, for _edit_card on invalidation
     # decision side — `decision` is the final, write-once verdict
     decision: dict | None = None
+    # invalidation — TUI handled this request (PostToolUse) → card no longer actionable
+    invalidated_at: float | None = None
     # AskUserQuestion accumulation (mutable mid-flight, distinct from `decision`)
     answers: list = field(default_factory=list)
     pending_selections: dict = field(default_factory=dict)
@@ -94,6 +98,8 @@ class PermissionRequest:
             "hook_data_full": dict(self.hook_data_full),
             "permission_suggestions": list(self.permission_suggestions),
             "feishu_root_msg_id": self.feishu_root_msg_id,
+            "session_id": self.session_id,
+            "card_msg_id": self.card_msg_id,
         }
 
 
@@ -124,11 +130,16 @@ class PermissionRegistry:
         for rid, req in self._by_rid.items():
             if req.consumed_at is not None and now - req.consumed_at > self._grace:
                 dead.append(rid)  # decision read; keep GRACE for a 2nd poller, then drop
-            elif (req.dedupe_key is not None and req.decision is None
+            elif req.invalidated_at is not None and now - req.invalidated_at > self._grace:
+                dead.append(rid)  # TUI handled it; keep GRACE so a late click reads "expired"
+            elif (req.decision is None and req.invalidated_at is None
                   and now - max(req.created_at, req.last_poll) > self._ttl):
-                # No decision AND no poll for a full TTL → the hook process is gone,
-                # not a slow user (whose polls keep refreshing last_poll). A
-                # None-key request (AskUserQuestion) is exempt — it may wait minutes.
+                # Polled-then-silent (or never polled) for a full TTL → the hook
+                # process is gone, not a slow user (a live hook — incl. AskUserQuestion
+                # — refreshes last_poll ~every 32s). Keyed on poll activity, NOT
+                # dedupe_key, so None-key claude requests (no tool_use_id) are reaped
+                # once their hook dies — fixes the None-key leak — while an actively
+                # polled one survives.
                 dead.append(rid)
         for rid in dead:
             self._drop_locked(rid)
@@ -144,8 +155,12 @@ class PermissionRegistry:
         else build a new request, reserve the key, card_status=SENDING."""
         now = self._now()
         with self._lock:
+            # Unconditional GC: claude permission requests are all None-key (no
+            # tool_use_id), so gating GC on `key is not None` meant a pure-claude
+            # workload never reaped dead None-key requests on registration. Run it
+            # every registration so the None-key TTL/invalidated reaping actually fires.
+            self._gc_locked()
             if key is not None:
-                self._gc_locked()
                 existing_rid = self._dedupe.get(key)
                 existing = self._by_rid.get(existing_rid) if existing_rid else None
                 if existing is not None and existing.card_status is not CardStatus.FAILED:
@@ -185,11 +200,58 @@ class PermissionRegistry:
         or codex double-fire — get False and MUST NOT overwrite."""
         with self._lock:
             req = self._by_rid.get(rid)
-            if req is None or req.decision is not None:
+            # Reject if already decided OR invalidated (TUI already handled it). The
+            # invalidated_at check closes the card-click gate's check-then-act race:
+            # invalidate_session may stamp invalidated_at AFTER the lock-free gate in
+            # _on_card_action passed but BEFORE we reach here, so the authoritative
+            # refusal must live inside this lock, not only at the gate.
+            if req is None or req.decision is not None or req.invalidated_at is not None:
                 return False
             req.decision = decision
             req.decided.set()
             return True
+
+    # --- invalidation: TUI handled the request --------------------------
+    def invalidate_session(self, session_id: str) -> list[dict]:
+        """Mark every still-open request of `session_id` as invalidated (its TUI was
+        handled, signalled by PostToolUse) and wake any parked poller. Write-once per
+        request (invalidated_at guard) so a repeated PostToolUse is idempotent. Returns
+        snapshots of the just-invalidated requests so the caller can edit their feishu
+        cards (IO done outside the lock).
+
+        Scope note: this invalidates ALL still-open requests of the session, not one
+        specific tool call — claude's PermissionRequest carries no tool_use_id to match
+        on. In practice claude runs tools serially, so a session has at most one open
+        card when its PostToolUse fires; a stale/delayed PostToolUse racing a freshly
+        created next card is the known (narrow) edge of this coarse, session-level key."""
+        if not session_id:
+            return []
+        now = self._now()
+        snaps = []
+        with self._lock:
+            for req in self._by_rid.values():
+                if (req.session_id == session_id and req.decision is None
+                        and req.invalidated_at is None):
+                    req.invalidated_at = now
+                    req.decided.set()  # wake a hook parked in decided.wait()
+                    snaps.append(req.snapshot())
+        return snaps
+
+    def is_invalidated(self, rid: str) -> bool:
+        with self._lock:
+            req = self._by_rid.get(rid)
+            return req is not None and req.invalidated_at is not None
+
+    def poll_age(self, rid: str) -> float | None:
+        """Seconds since the hook last polled (since creation if never polled). None if
+        the rid is gone. The card-click gate uses this to reject a click whose hook has
+        stopped polling (TUI deny/Esc killed it)."""
+        now = self._now()
+        with self._lock:
+            req = self._by_rid.get(rid)
+            if req is None:
+                return None
+            return now - max(req.created_at, req.last_poll)
 
     # --- consume vs fallback: mutually exclusive (B) ---------------------
     def try_consume(self, rid: str) -> dict | None:

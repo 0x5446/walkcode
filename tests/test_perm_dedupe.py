@@ -153,13 +153,15 @@ class ReceivePermDedupeTests(unittest.TestCase):
         r2, is_new = server.registry.register_or_get(("s1", "tu-1"))
         self.assertTrue(is_new)
 
-    def test_none_key_request_survives_ttl(self):
-        # no tool_use_id → dedupe_key None → never TTL-reaped (AskUserQuestion may
-        # wait minutes for the user). Only consumed grace would reap it.
+    def test_none_key_request_reaped_when_poll_stale(self):
+        # A None-key request (no tool_use_id, e.g. AskUserQuestion) whose hook never
+        # polls / has died is reaped past the TTL. Liveness is now keyed on last_poll
+        # activity, not dedupe_key — this fixes the old None-key leak (a slow user
+        # whose hook keeps polling stays protected, see test_active_poller_*).
         rid = self._post(_perm_body(tool_use_id=""))["request_id"]
         self.clock.t = 1000.0 + server.registry._ttl + 100
         server.registry.gc()
-        self.assertIsNotNone(server.registry.get(rid))
+        self.assertIsNone(server.registry.get(rid))
 
     def test_active_poller_survives_ttl(self):
         # Slow user: past the TTL, but a hook is still long-polling (fresh
@@ -171,42 +173,23 @@ class ReceivePermDedupeTests(unittest.TestCase):
         server.registry.gc()
         self.assertIsNotNone(server.registry.get(rid))
 
-    def test_fallback_skipped_when_consumed(self):
-        rid = self._post(_perm_body(tool_use_id="tu-1"))["request_id"]
-        server.registry.set_decision_once(rid, {"behavior": "allow"})
-        server.registry.try_consume(rid)  # a poller already read it
-        self.clock.t = 1000.0 + 100  # well past quiesce
-        snap = server.registry.get(rid).snapshot()
-        with patch.object(server, "_tmux_fallback") as ftmux:
-            server._maybe_tmux_fallback(rid, "allow", snap)
-        ftmux.assert_not_called()
+    def test_post_tool_invalidates_session_cards(self):
+        # End-to-end: an open permission card, then PostToolUse fires for the session
+        # → the card is invalidated (edited grey) and the decision long-poll returns
+        # "invalidated" so the hook fails open instead of waiting to 1800s.
+        edits = []
+        with patch.object(server, "_edit_card", lambda mid, card: edits.append(mid)):
+            rid = self._post(_perm_body(tool_use_id="tu-1"))["request_id"]
+            res = asyncio.run(server.receive_post_tool_hook(_Req({"session_id": "s1"})))
+        self.assertEqual(res["invalidated"], 1)
+        self.assertEqual(edits, ["cardmsg"])  # the card_msg_id was edited to the grey card
+        self.assertTrue(server.registry.is_invalidated(rid))
+        dec = asyncio.run(server.get_permission_decision(rid))
+        self.assertEqual(dec["status"], "invalidated")
 
-    def test_fallback_fires_when_never_consumed(self):
-        rid = self._post(_perm_body(tool_use_id="tu-1"))["request_id"]
-        server.registry.set_decision_once(rid, {"behavior": "allow"})
-        self.clock.t = 1000.0 + 10  # past quiesce, no poll → hook died → inject backstop
-        snap = server.registry.get(rid).snapshot()
-        with patch.object(server, "_tmux_fallback") as ftmux:
-            server._maybe_tmux_fallback(rid, "allow", snap)
-        ftmux.assert_called_once()
-        self.assertIsNone(server.registry.get(rid))  # cleaned after injection
-
-    def test_tmux_fallback_injects_menu_choice_as_menu_key(self):
-        # v0.10.30 contract: the hook-timeout fallback selects a permission menu
-        # option, so it must inject a raw keystroke (menu_key=True), NOT a chat
-        # message. Otherwise "1"/"2" gets pasted as text instead of picking the
-        # option, and the permission prompt is never answered. The other fallback
-        # tests mock _tmux_fallback wholesale, so nothing else pins this arg.
-        req_data = {
-            "tty": "sess1",
-            "tool_name": "Bash",
-            "permission_suggestions": [],          # → addRules: allow/always_allow/deny
-            "hook_data_full": {"permission_mode": ""},
-        }
-        with patch.object(server, "validate_target", return_value=None), \
-             patch.object(server, "inject") as finj:
-            server._tmux_fallback("rid-xyz", "allow", req_data)  # "allow" → key "1"
-        finj.assert_called_once_with("sess1", "1", enter=True, menu_key=True)
+    def test_post_tool_missing_session_noop(self):
+        res = asyncio.run(server.receive_post_tool_hook(_Req({})))
+        self.assertFalse(res["ok"])
 
     def test_card_send_failure_releases_slot(self):
         # If the card never reaches Feishu the dedupe slot is released so codex's
