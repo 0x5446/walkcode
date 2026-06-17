@@ -10,7 +10,6 @@ import re
 import subprocess
 import threading
 import time
-import uuid
 from concurrent.futures import ThreadPoolExecutor
 from os.path import basename
 from pathlib import Path
@@ -115,6 +114,13 @@ _HOOK_DEDUPE_TTL_TURN = 30.0
 # only collapses near-simultaneous re-delivery, never two genuine identical replies
 # minutes apart. Claude never duplicates anyway, so this is pure defense.
 _HOOK_DEDUPE_TTL_HASH = 2.0
+
+# A live permission hook refreshes last_poll ~every 32s (30s decided.wait + 2s sleep).
+# A card click whose request has been un-polled longer than this means the hook has
+# stopped (TUI deny/Esc killed it) → the click is stale and is rejected, never acted
+# on. Must stay >= ~45s to avoid racing a live hook between two polls; < GC TTL (90s)
+# so a stale click is told "expired" before the request is physically reaped.
+_PERM_POLL_STALE = float(os.environ.get("WALKCODE_PERM_POLL_STALE", "50"))
 
 
 # --- Unified permission card builder ---
@@ -387,6 +393,9 @@ def _build_permission_result_card(tool_name: str, behavior: str) -> dict:
     elif behavior in ("allow", "plan_auto_accept", "plan_manual_approve"):
         label = t("feishu.perm.allowed")
         template = "green"
+    elif behavior == "invalidated":
+        label = t("feishu.perm.invalidated")
+        template = "grey"
     else:
         label = t("feishu.perm.denied")
         template = "red"
@@ -715,44 +724,6 @@ def _edit_card(message_id: str, card: dict):
         logger.error(f"Edit card failed: {resp.code} {resp.msg}")
 
 
-# --- tmux send-keys fallback ---
-
-def _tmux_fallback(request_id: str, behavior: str, req_data: dict):
-    """Fallback: if hook process timed out, send key via tmux to answer terminal prompt."""
-    tty = req_data.get("tty", "")
-    if not tty:
-        return
-
-    tool_name = req_data.get("tool_name", "")
-    perm_suggestions = req_data.get("permission_suggestions", [])
-    suggestion_type = perm_suggestions[0].get("type") if perm_suggestions else "addRules"
-    hook_data_full = req_data.get("hook_data_full", {})
-    permission_mode = hook_data_full.get("permission_mode", "")
-
-    # Determine perm_type → build key_map from _PERM_BEHAVIORS
-    if permission_mode == "plan" and not perm_suggestions:
-        perm_type = "plan"
-    elif suggestion_type == "setMode":
-        perm_type = "setMode"
-    else:
-        perm_type = "addRules"
-    behaviors = _PERM_BEHAVIORS.get(perm_type, _PERM_BEHAVIORS["addRules"])
-    key_map = {b: str(i + 1) for i, b in enumerate(behaviors)}
-
-    key = key_map.get(behavior, "3")
-
-    error = validate_target(tty)
-    if error:
-        logger.warning(f"tmux fallback: session {tty} not found (rid={request_id[:8]})")
-        return
-
-    try:
-        inject(tty, key, enter=True, menu_key=True)
-        logger.info(f"tmux fallback: sent '{key}' to {tty} for {tool_name} behavior={behavior} (rid={request_id[:8]})")
-    except Exception as e:
-        logger.error(f"tmux fallback failed: {e} (rid={request_id[:8]})")
-
-
 def _finalize_askuser_answer(
     resp,
     request_id: str,
@@ -835,28 +806,13 @@ def _build_askuser_updated_input(questions: list, answers: list) -> dict:
     return {"questions": questions, "answers": answers_map}
 
 
-def _maybe_tmux_fallback(request_id: str, behavior: str, req_data: dict):
-    """Inject the decision via tmux iff NO poller consumed it (hook died/timed out).
-
-    claim_fallback atomically settles the poll-vs-fallback race: it succeeds only
-    when no poller has consumed the decision AND the request has been quiet (no
-    poll) for _FALLBACK_QUIESCE, so an actively-polling hook is never raced. Once
-    claimed, try_consume can no longer hand the decision to a late poller, so the
-    decision is never both delivered AND injected.
-    """
-    if not registry.claim_fallback(request_id):
-        return
-    logger.info(f"Hook timed out, tmux fallback (rid={request_id[:8]})")
-    _tmux_fallback(request_id, behavior, req_data)
-    registry.remove(request_id)
-
-
-def _schedule_tmux_fallback(request_id: str, behavior: str, req_data: dict):
-    """Wait 5s, then run the tmux fallback backstop if still unconsumed."""
-    def _check():
-        time.sleep(5)
-        _maybe_tmux_fallback(request_id, behavior, req_data)
-    threading.Thread(target=_check, daemon=True).start()
+def _perm_click_stale(rid: str) -> bool:
+    """True when the hook for this request has stopped polling past the stale
+    threshold. A live hook refreshes last_poll ~every 32s, so age >= _PERM_POLL_STALE
+    means the terminal side (TUI deny/Esc) already settled it → the Feishu click is
+    stale. Replaces the old tmux fallback: a stale click is rejected, never injected."""
+    age = registry.poll_age(rid)
+    return age is not None and age > _PERM_POLL_STALE
 
 
 # --- Card action handler ---
@@ -883,6 +839,22 @@ def _on_card_action(data: P2CardActionTrigger) -> P2CardActionTriggerResponse:
             return resp
 
         tool_name = req_data.tool_name or "unknown"
+
+        # Gate BOTH AskUserQuestion and permission clicks up front: a stale click —
+        # the TUI already handled this (PostToolUse invalidated it) or the hook stopped
+        # polling (TUI deny/Esc killed it). Reject before any state mutation (toggle /
+        # answer / decision). set_decision_once also re-checks invalidated_at inside its
+        # lock to close the check-then-act race.
+        if registry.is_invalidated(request_id) or _perm_click_stale(request_id):
+            reason = "invalidated" if registry.is_invalidated(request_id) else "stale_poll"
+            logger.info(f"Stale card click ignored: {reason} tool={tool_name} rid={request_id[:8]}")
+            resp.card = CallBackCard()
+            resp.card.type = "raw"
+            resp.card.data = _build_permission_result_card(tool_name, "invalidated")
+            resp.toast = CallBackToast()
+            resp.toast.type = "info"
+            resp.toast.content = t("feishu.perm.expired")
+            return resp
 
         # Handle AskUserQuestion: select / toggle / submit_multi / request_other
         if tool_name == "AskUserQuestion":
@@ -958,7 +930,7 @@ def _on_card_action(data: P2CardActionTrigger) -> P2CardActionTriggerResponse:
                 total_questions, final_answer,
             )
 
-        # Handle permission decisions
+        # Handle permission decisions (stale/invalidated already gated at the top)
         behavior = value.get("b", "")
         if not behavior:
             return resp
@@ -997,9 +969,6 @@ def _on_card_action(data: P2CardActionTrigger) -> P2CardActionTriggerResponse:
             resp.toast.type = "info"
             resp.toast.content = t("feishu.perm.already_decided")
             return resp
-
-        # Schedule tmux fallback in case hook already timed out
-        _schedule_tmux_fallback(request_id, behavior, req_data.snapshot())
 
         logger.info(f"Permission decision: {behavior} for {tool_name} (rid={request_id[:8]})")
 
@@ -1841,7 +1810,7 @@ async def receive_permission_hook(request: Request):
             request_id,
             tool_name=tool_name, tool_input=tool_input, tty=tty,
             hook_data_full=hook_data_full, permission_suggestions=perm_suggestions,
-            feishu_root_msg_id="",
+            feishu_root_msg_id="", session_id=session_id,
         )
 
         # Find the Feishu thread to reply in
@@ -1903,7 +1872,9 @@ async def receive_permission_hook(request: Request):
             return {"ok": False, "error": "card send failed"}
 
         if root_msg_id:
-            registry.fill_request(request_id, feishu_root_msg_id=root_msg_id)
+            registry.fill_request(request_id, feishu_root_msg_id=root_msg_id, card_msg_id=card_msg_id)
+        else:
+            registry.fill_request(request_id, card_msg_id=card_msg_id)
         registry.card_sent(request_id)
 
         project = basename(cwd) if cwd else "unknown"
@@ -1929,13 +1900,38 @@ async def get_permission_decision(request_id: str):
 
     if decided:
         # try_consume reads (not pops) the decision so codex's two pollers both get
-        # the SAME verdict; it stamps consumed_at (lazy GC reaps after GRACE) and is
-        # mutually exclusive with the tmux fallback's claim.
+        # the SAME verdict; it stamps consumed_at (lazy GC reaps after GRACE).
         decision = registry.try_consume(request_id)
         if decision is not None:
             return {"status": "decided", "decision": decision}
+        # decided set without a decision → the TUI handled it (PostToolUse invalidated
+        # the card). Tell the hook to fail-open instead of polling to the 1800s ceiling.
+        if registry.is_invalidated(request_id):
+            return {"status": "invalidated"}
 
     return {"status": "pending"}
+
+
+@app.post("/hook/post-tool")
+async def receive_post_tool_hook(request: Request):
+    """PostToolUse (claude only): a tool actually executed → its TUI permission was
+    already settled (claude shows a parallel native menu; PostToolUse only fires when
+    the tool ran). Invalidate this session's still-open permission cards so a late
+    Feishu click is a harmless no-op, and grey out the cards. Keyed on session_id
+    because claude's PermissionRequest carries no tool_use_id. Idempotent via
+    invalidate_session's write-once guard."""
+    body = await request.json()
+    session_id = body.get("session_id", "")
+    if not session_id:
+        return {"ok": False, "error": "missing session_id"}
+    snaps = registry.invalidate_session(session_id)
+    for snap in snaps:
+        card_msg_id = snap.get("card_msg_id")
+        if card_msg_id:
+            _edit_card(card_msg_id, _build_permission_result_card(snap.get("tool_name", ""), "invalidated"))
+    if snaps:
+        logger.info(f"PostToolUse invalidated {len(snaps)} card(s) for session {session_id[:8]}")
+    return {"ok": True, "invalidated": len(snaps)}
 
 
 @app.get("/health")
