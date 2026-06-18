@@ -92,10 +92,26 @@ class TestCodexBuildStartCmd(_CmdTestBase):
         cmd = CODEX.build_start_cmd("hello", CWD, None)
         self.assertIn("--ask-for-approval untrusted", cmd)
         self.assertIn("--no-alt-screen", cmd)
-        self.assertTrue(cmd.startswith(f"cd '{CWD}' && codex"))
+        self.assertTrue(cmd.startswith(f"cd '{CWD}' && WALKCODE_OWNER_CHECK=0 codex"))
+
+    def test_codex_opts_out_of_owner_gate_via_inline_env(self):
+        # codex (>=0.140) detaches its hooks, which walkcode's pane-ownership gate
+        # would drop as a nested sub-agent. The launch command must set
+        # WALKCODE_OWNER_CHECK=0 immediately before `codex` so codex and every hook
+        # it spawns inherit it. Both start and resume paths must carry it.
+        start = CODEX.build_start_cmd("hi", CWD, None)
+        self.assertIn("&& WALKCODE_OWNER_CHECK=0 codex", start)
+        resume = CODEX.build_resume_cmd("SID", CWD)
+        self.assertIn("&& WALKCODE_OWNER_CHECK=0 codex", resume)
 
 
 class TestClaudeBuildStartCmd(_CmdTestBase):
+    def test_claude_keeps_owner_gate_no_inline_env(self):
+        # claude runs hooks synchronously (intact ancestry), so it keeps the gate:
+        # no WALKCODE_OWNER_CHECK override in its launch/resume commands.
+        self.assertNotIn("WALKCODE_OWNER_CHECK", CLAUDE.build_start_cmd("hi", CWD, None))
+        self.assertNotIn("WALKCODE_OWNER_CHECK", CLAUDE.build_resume_cmd("SID", CWD))
+
     def test_claude_has_no_image_flag_so_no_dashdash(self):
         # Claude delivers images via path injection, not a native flag
         # (image_flag is None), so even with an image_path there is no --image
@@ -130,7 +146,8 @@ class TestPerInstanceRoutingOverrides(_CmdTestBase):
     def test_codex_default_unchanged(self):
         cmd = CODEX.build_start_cmd("hi", CWD, None)
         self.assertEqual(
-            cmd, f"cd '{CWD}' && codex --ask-for-approval untrusted --no-alt-screen 'hi'"
+            cmd,
+            f"cd '{CWD}' && WALKCODE_OWNER_CHECK=0 codex --ask-for-approval untrusted --no-alt-screen 'hi'",
         )
 
     # --- claude ccv: --settings inserted after `claude`, before permission flag ---
@@ -156,7 +173,7 @@ class TestPerInstanceRoutingOverrides(_CmdTestBase):
     def test_codex_permission_flag_replaces_approval(self):
         os.environ["WALKCODE_PERMISSION_FLAG"] = "--yolo"
         cmd = CODEX.build_start_cmd("hi", CWD, None)
-        self.assertEqual(cmd, f"cd '{CWD}' && codex --yolo --no-alt-screen 'hi'")
+        self.assertEqual(cmd, f"cd '{CWD}' && WALKCODE_OWNER_CHECK=0 codex --yolo --no-alt-screen 'hi'")
         self.assertNotIn("--ask-for-approval", cmd)
 
     def test_codex_yolo_keeps_image_dashdash_invariant(self):
@@ -169,14 +186,14 @@ class TestPerInstanceRoutingOverrides(_CmdTestBase):
     def test_codex_yolo_resume_puts_global_flag_before_subcommand(self):
         os.environ["WALKCODE_PERMISSION_FLAG"] = "--yolo"
         cmd = CODEX.build_resume_cmd("SID", CWD)
-        self.assertEqual(cmd, f"cd '{CWD}' && codex --yolo resume 'SID'")
+        self.assertEqual(cmd, f"cd '{CWD}' && WALKCODE_OWNER_CHECK=0 codex --yolo resume 'SID'")
         # --yolo is a global flag, must precede `resume`
         self.assertLess(cmd.index("--yolo"), cmd.index("resume"))
 
     def test_codex_resume_default_has_no_permission_flag(self):
         # Without an override, codex resume stays bare (pre-existing behavior).
         cmd = CODEX.build_resume_cmd("SID", CWD)
-        self.assertEqual(cmd, f"cd '{CWD}' && codex resume 'SID'")
+        self.assertEqual(cmd, f"cd '{CWD}' && WALKCODE_OWNER_CHECK=0 codex resume 'SID'")
 
     def test_claude_permission_flag_override(self):
         os.environ["WALKCODE_PERMISSION_FLAG"] = "--permission-mode plan"
@@ -213,7 +230,8 @@ class TestPerInstanceRoutingOverrides(_CmdTestBase):
         os.environ["WALKCODE_PERMISSION_FLAG"] = "--yolo"
         cmd = CODEX.build_start_cmd("hi", CWD, None)
         self.assertEqual(
-            cmd, f"cd '{CWD}' && codex --settings /p/vertex.json --yolo --no-alt-screen 'hi'"
+            cmd,
+            f"cd '{CWD}' && WALKCODE_OWNER_CHECK=0 codex --settings /p/vertex.json --yolo --no-alt-screen 'hi'",
         )
 
 
