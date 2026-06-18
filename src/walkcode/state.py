@@ -11,6 +11,10 @@ from pathlib import Path
 
 logger = logging.getLogger("walkcode.state")
 
+# Cap stashed-but-undelivered replies per session so a long Feishu outage can't
+# grow state.json without bound. Oldest entries are dropped past this.
+_MAX_REDELIVERY = 20
+
 
 @dataclass
 class Session:
@@ -19,16 +23,36 @@ class Session:
     root_msg_id: str | None = None
     subscribed: bool = False  # user @mentioned for thread subscription
     created_at: float = field(default_factory=time.time)
+    # Replies whose Feishu delivery failed (e.g. a DNS/connection blip): stashed
+    # here and re-sent on the session's next hook, so a transient outage drops no
+    # agent output (the silent-drop bug behind "answered in tmux but never on
+    # Feishu"). Each entry is {"key": <dedupe-key list>|None, "text": str}; the key
+    # lets redelivery register dedupe so codex's duplicate Stop for the same turn
+    # isn't sent twice.
+    pending_redelivery: list[dict] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, data: dict) -> "Session":
         root_msg_id = data.get("root_msg_id")
+        pending: list[dict] = []
+        raw_pending = data.get("pending_redelivery")
+        if isinstance(raw_pending, list):
+            for item in raw_pending:
+                if isinstance(item, dict) and item.get("text") is not None:
+                    key = item.get("key")
+                    pending.append({
+                        "key": [str(k) for k in key] if isinstance(key, list) else None,
+                        "text": str(item["text"]),
+                    })
+                elif isinstance(item, str):  # legacy list[str] form
+                    pending.append({"key": None, "text": item})
         return cls(
             tty=str(data.get("tty", "")),
             cwd=str(data.get("cwd", "")),
             root_msg_id=str(root_msg_id) if root_msg_id else None,
             subscribed=bool(data.get("subscribed", False)),
             created_at=float(data.get("created_at", time.time())),
+            pending_redelivery=pending,
         )
 
     def to_dict(self) -> dict:
@@ -38,6 +62,10 @@ class Session:
             "root_msg_id": self.root_msg_id,
             "subscribed": self.subscribed,
             "created_at": self.created_at,
+            "pending_redelivery": [
+                {"key": list(x["key"]) if x.get("key") else None, "text": x["text"]}
+                for x in self.pending_redelivery
+            ],
         }
 
 
@@ -267,3 +295,46 @@ class SessionStore:
     def resolve_pending_tty(self, msg_id: str) -> str | None:
         with self._lock:
             return self._pending_msg_to_tty.get(msg_id)
+
+    # --- Failed-delivery redelivery queue ---
+
+    def add_redelivery(self, session_id: str, text: str, key: tuple | None = None):
+        """Stash a reply whose Feishu delivery failed, to retry on the next hook.
+
+        No-op if the session is unknown (nothing to anchor a thread on). A repeat
+        stash of the same dedupe ``key`` (codex fires Stop twice per turn, so a
+        network blip stashes both) is collapsed so redelivery sends it once. The
+        backlog is bounded to the most recent ``_MAX_REDELIVERY`` entries.
+        """
+        key_list = [str(k) for k in key] if key else None
+        with self._lock:
+            session = self._sessions.get(session_id)
+            if session is None:
+                return
+            if key_list is not None and any(
+                e.get("key") == key_list for e in session.pending_redelivery
+            ):
+                return  # same turn already stashed
+            session.pending_redelivery.append({"key": key_list, "text": text})
+            if len(session.pending_redelivery) > _MAX_REDELIVERY:
+                dropped = len(session.pending_redelivery) - _MAX_REDELIVERY
+                session.pending_redelivery = session.pending_redelivery[-_MAX_REDELIVERY:]
+                logger.warning(
+                    "Redelivery backlog for session %s exceeded %d; dropped %d oldest reply(ies)",
+                    session_id[:8], _MAX_REDELIVERY, dropped,
+                )
+            self._save_locked()
+
+    def take_redelivery(self, session_id: str) -> list[dict]:
+        """Remove and return all stashed replies for a session, oldest first.
+
+        Each entry is ``{"key": list|None, "text": str}``.
+        """
+        with self._lock:
+            session = self._sessions.get(session_id)
+            if session is None or not session.pending_redelivery:
+                return []
+            items = [dict(x) for x in session.pending_redelivery]
+            session.pending_redelivery = []
+            self._save_locked()
+            return items

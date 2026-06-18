@@ -605,42 +605,109 @@ def _post_content(text: str) -> str:
     return json.dumps({"zh_cn": {"content": [[{"tag": "md", "text": text}]]}})
 
 
+# A Feishu send can transiently fail on a network/DNS/TLS blip — the SDK raises.
+# A dropped Stop-hook reply loses the agent's whole turn on Feishu while it
+# believes it answered (the "answered in tmux but never on Feishu" bug). So:
+#   - network exception → retry with bounded backoff, then report "transient"
+#     (caller stashes for redelivery on a later hook);
+#   - a returned-but-rejected response (.success() False — bad param, message too
+#     long) is "permanent": retrying the same payload fails identically and would
+#     wedge the redelivery queue, so the caller must NOT stash it;
+#   - a programming error (AttributeError/TypeError/…) is a real bug, never a
+#     network blip — re-raised so it surfaces instead of masquerading as transient.
+_SEND_RETRY_ATTEMPTS = 3
+_SEND_RETRY_BASE_DELAY = 0.6
+_NON_RETRYABLE_EXC = (
+    AttributeError, TypeError, NameError, KeyError, IndexError, ImportError, AssertionError,
+)
+# Lark IM error codes that are permanent — caused by the request content itself, so
+# retrying the same payload fails identically and would wedge the redelivery queue.
+# Everything else (rate limit, 5xx, gateway, unknown) is treated as transient and
+# retried/redelivered. Conservative on purpose: when unsure, prefer retry over
+# dropping agent output. Add codes here only when confirmed content-caused.
+_PERMANENT_LARK_CODES = frozenset({
+    230001,  # invalid request parameter (malformed payload)
+})
+
+
+def _send_with_status(call, what: str) -> tuple[str, str | None]:
+    """Send via Lark with bounded retry. Returns ``(status, message_id)``:
+    ``"sent"`` (+id) / ``"transient"`` (retries exhausted) / ``"permanent"`` (API
+    rejected the payload). Programming errors are re-raised, not swallowed."""
+    last = ""
+    for attempt in range(_SEND_RETRY_ATTEMPTS):
+        try:
+            resp = call()
+        except _NON_RETRYABLE_EXC:
+            raise  # our bug building the request, not a network blip
+        except Exception as e:  # network/DNS/TLS/transport — transient, retry
+            last = repr(e)
+            logger.warning(
+                f"{what}: network exception (attempt {attempt + 1}/{_SEND_RETRY_ATTEMPTS}): {e}"
+            )
+            if attempt < _SEND_RETRY_ATTEMPTS - 1:
+                time.sleep(_SEND_RETRY_BASE_DELAY * (2 ** attempt))
+            continue
+        if resp.success():
+            return "sent", resp.data.message_id
+        # Response returned but rejected. A known bad-payload code is permanent
+        # (retrying fails identically and would wedge the queue); everything else —
+        # rate limit, 5xx, gateway, unknown — is transient: retry, then redeliver.
+        if resp.code in _PERMANENT_LARK_CODES:
+            logger.error(f"{what} failed (permanent): {resp.code} {resp.msg}")
+            return "permanent", None
+        last = f"{resp.code} {resp.msg}"
+        logger.warning(
+            f"{what}: transient API failure {last} (attempt {attempt + 1}/{_SEND_RETRY_ATTEMPTS})"
+        )
+        if attempt < _SEND_RETRY_ATTEMPTS - 1:
+            time.sleep(_SEND_RETRY_BASE_DELAY * (2 ** attempt))
+        continue
+    logger.error(f"{what} failed after {_SEND_RETRY_ATTEMPTS} attempts ({last})")
+    return "transient", None
+
+
 def _send(text: str) -> str | None:
     if not config.feishu_receive_id:
         logger.warning("Cannot send: FEISHU_RECEIVE_ID not configured")
         return None
-    body = CreateMessageRequestBody.builder() \
-        .receive_id(config.feishu_receive_id) \
-        .msg_type("post") \
-        .content(_post_content(text)) \
-        .build()
-    req = CreateMessageRequest.builder() \
-        .receive_id_type(config.feishu_receive_id_type) \
-        .request_body(body) \
-        .build()
-    resp = lark_client.im.v1.message.create(req)
-    if not resp.success():
-        logger.error(f"Send failed: {resp.code} {resp.msg}")
-        return None
-    return resp.data.message_id
+
+    def _call():
+        body = CreateMessageRequestBody.builder() \
+            .receive_id(config.feishu_receive_id) \
+            .msg_type("post") \
+            .content(_post_content(text)) \
+            .build()
+        req = CreateMessageRequest.builder() \
+            .receive_id_type(config.feishu_receive_id_type) \
+            .request_body(body) \
+            .build()
+        return lark_client.im.v1.message.create(req)
+
+    return _send_with_status(_call, "Send")[1]
+
+
+def _reply_status(message_id: str, text: str, reply_in_thread: bool = False) -> tuple[str, str | None]:
+    """Like :func:`_reply` but exposes the send status (sent/transient/permanent)
+    so the hook handler can stash only transient failures, never permanent ones."""
+    def _call():
+        builder = ReplyMessageRequestBody.builder() \
+            .msg_type("post") \
+            .content(_post_content(text))
+        if reply_in_thread:
+            builder = builder.reply_in_thread(True)
+        body = builder.build()
+        req = ReplyMessageRequest.builder() \
+            .message_id(message_id) \
+            .request_body(body) \
+            .build()
+        return lark_client.im.v1.message.reply(req)
+
+    return _send_with_status(_call, "Reply")
 
 
 def _reply(message_id: str, text: str, reply_in_thread: bool = False) -> str | None:
-    builder = ReplyMessageRequestBody.builder() \
-        .msg_type("post") \
-        .content(_post_content(text))
-    if reply_in_thread:
-        builder = builder.reply_in_thread(True)
-    body = builder.build()
-    req = ReplyMessageRequest.builder() \
-        .message_id(message_id) \
-        .request_body(body) \
-        .build()
-    resp = lark_client.im.v1.message.reply(req)
-    if not resp.success():
-        logger.error(f"Reply failed: {resp.code} {resp.msg}")
-        return None
-    return resp.data.message_id
+    return _reply_status(message_id, text, reply_in_thread)[1]
 
 
 def _edit_message(message_id: str, text: str):
@@ -1581,6 +1648,58 @@ def _remember_delivery(dedupe_key: tuple | None, hook_type: str, session_id: str
     )
 
 
+def _flush_redelivery(session_id: str, root_msg_id: str) -> tuple[set, bool]:
+    """Re-send replies stashed by an earlier failed delivery, oldest first.
+
+    Called at the start of an existing-session Stop, before the current reply, so a
+    transient Feishu outage (e.g. a DNS blip) drops nothing: the lost turn is
+    recovered on the session's next hook, in order, ahead of the new content.
+
+    Returns ``(flushed_keys, drained)``:
+      - ``flushed_keys``: dedupe keys successfully redelivered (and marked
+        delivered), so the caller can skip re-sending the current hook when it is
+        the same turn just recovered (codex's duplicate Stop).
+      - ``drained``: True if the queue is now empty (every stashed reply was either
+        delivered or permanently dropped). False means a transient failure stopped
+        the flush with replies still queued — the caller MUST NOT send the current
+        reply ahead of them (it would jump the queue and break ordering), and
+        stashes the current turn behind the backlog instead.
+
+    A permanent failure (bad payload, e.g. too long) is dropped with an error log
+    rather than re-stashed, so one poison reply can't wedge the queue forever.
+    """
+    pending = session_store.take_redelivery(session_id)
+    if not pending:
+        return set(), True
+    logger.info(f"Redelivering {len(pending)} stashed reply(ies) session={session_id[:8]}")
+    flushed: set = set()
+    for i, item in enumerate(pending):
+        status, _ = _reply_status(root_msg_id, item["text"], reply_in_thread=True)
+        if status == "sent":
+            key = tuple(item["key"]) if item.get("key") else None
+            if key is not None:
+                _hook_mark_delivered(key)
+                flushed.add(key)
+        elif status == "permanent":
+            # Poison reply: retrying never succeeds and would block everything
+            # behind it. Drop it (logged) and keep draining the rest.
+            logger.error(
+                f"Dropping undeliverable stashed reply session={session_id[:8]} "
+                f"(permanent send error); {len(item['text'])} chars lost"
+            )
+            continue
+        else:  # transient — stop, preserve the unsent remainder in order
+            for remaining in pending[i:]:
+                rkey = tuple(remaining["key"]) if remaining.get("key") else None
+                session_store.add_redelivery(session_id, remaining["text"], rkey)
+            logger.warning(
+                f"Redelivery still failing session={session_id[:8]}; "
+                f"re-stashed {len(pending) - i} reply(ies)"
+            )
+            return flushed, False
+    return flushed, True
+
+
 @app.post("/hook")
 async def receive_hook(request: Request):
     body = await request.json()
@@ -1640,18 +1759,40 @@ async def receive_hook(request: Request):
     if session and session.root_msg_id:
         # Existing session: reply to thread root
         session_store.upsert(session_id, tty=tty, cwd=cwd)
+        # Recover any earlier reply that failed to deliver (transient Feishu
+        # outage) before sending the current one, preserving order.
+        flushed, drained = _flush_redelivery(session_id, session.root_msg_id)
+        if dedupe_key is not None and dedupe_key in flushed:
+            # This Stop is the same turn just recovered via redelivery (codex's
+            # duplicate Stop) — already delivered. Return BEFORE the blocked-backlog
+            # check, so a still-blocked tail (other replies) can't cause this
+            # already-sent turn to be re-queued (duplicate + reorder).
+            return {"ok": True, "redelivered": True, "thread": session.root_msg_id}
+        if not drained:
+            # Backlog still blocked (network down): queue the current turn BEHIND it
+            # rather than jumping ahead and breaking order. Recovered on a later hook.
+            if hook_type == "stop":
+                session_store.add_redelivery(session_id, display_message, dedupe_key)
+            return {"ok": False, "error": "redelivery blocked; stashed for order"}
         text = display_message
         need_subscribe = not session.subscribed and config.feishu_receive_id
         if need_subscribe:
             text = f'<at user_id="{config.feishu_receive_id}"></at> {text}'
-        msg_id = _reply(session.root_msg_id, text=text, reply_in_thread=True)
-        if msg_id:
+        status, msg_id = _reply_status(session.root_msg_id, text, reply_in_thread=True)
+        if status == "sent":
             if need_subscribe:
                 session_store.mark_subscribed(session_id)
             # Register dedupe ONLY now that the send succeeded (F1: a failed
             # _reply must leave the slot open for codex's duplicate to retry).
             _remember_delivery(dedupe_key, hook_type, session_id)
             return {"ok": True, "msg_id": msg_id, "thread": session.root_msg_id}
+        # transient → stash this turn's output (without the @mention prefix) so the
+        # next hook redelivers it; permanent → drop (retrying the same payload is
+        # futile). Dedupe is NOT registered either way, so codex's duplicate retries.
+        if status == "transient" and hook_type == "stop":
+            session_store.add_redelivery(session_id, display_message, dedupe_key)
+            return {"ok": False, "error": "reply failed; stashed for redelivery"}
+        return {"ok": False, "error": f"reply {status}"}
     else:
         # New session: check if Feishu-initiated (pending root exists)
         pending_root, reply_id, pending_cwd = session_store.pop_pending(tty)
@@ -1672,17 +1813,20 @@ async def receive_hook(request: Request):
             text = display_message
             if config.feishu_receive_id:
                 text = f'<at user_id="{config.feishu_receive_id}"></at> {text}'
-            msg_id = _reply(root_id, text=text, reply_in_thread=True)
-            if msg_id:
+            status, msg_id = _reply_status(root_id, text, reply_in_thread=True)
+            if status == "sent":
                 if session_id:
                     session_store.mark_subscribed(session_id)
                 _remember_delivery(dedupe_key, hook_type, session_id)
                 return {"ok": True, "msg_id": root_id}
             # E: reply to the pending root failed — do NOT fall through to creating
             # a new thread (the first reply would land in the wrong place). The
-            # session was upserted with root_msg_id above, so codex's duplicate
-            # retries into the same thread via the existing-session branch.
-            return {"ok": False, "error": "reply to pending root failed"}
+            # session was upserted with root_msg_id above, so a transient failure is
+            # redelivered into the same thread on the next hook via the existing-
+            # session branch; a permanent failure is dropped (retry is futile).
+            if status == "transient" and hook_type == "stop" and session_id:
+                session_store.add_redelivery(session_id, display_message, dedupe_key)
+            return {"ok": False, "error": f"reply to pending root {status}"}
 
         # User-initiated: send title as thread root, reply with content
         thread_title = _make_title(cwd, session_id, message)
@@ -1693,15 +1837,19 @@ async def receive_hook(request: Request):
             text = display_message
             if config.feishu_receive_id:
                 text = f'<at user_id="{config.feishu_receive_id}"></at> {text}'
-            msg_id = _reply(root_id, text=text, reply_in_thread=True)
-            if msg_id:
+            status, msg_id = _reply_status(root_id, text, reply_in_thread=True)
+            if status == "sent":
                 if session_id:
                     session_store.mark_subscribed(session_id)
-                # Register dedupe only on a confirmed send (F1 consistency). The
-                # thread root + session.root_msg_id persist, so a failed content
-                # reply is retried by codex's duplicate via the existing-session path.
                 _remember_delivery(dedupe_key, hook_type, session_id)
                 return {"ok": True, "msg_id": root_id}
+            # Root created but the content reply failed. The session now owns
+            # root_msg_id (upserted above), so a transient failure is redelivered
+            # into the same thread on the next hook — stash it so nothing is dropped
+            # (Claude has no duplicate Stop to retry it). Permanent failure: drop.
+            if status == "transient" and hook_type == "stop" and session_id:
+                session_store.add_redelivery(session_id, display_message, dedupe_key)
+            return {"ok": False, "error": f"content reply {status}"}
 
     return {"ok": False, "error": "send failed"}
 

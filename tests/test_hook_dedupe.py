@@ -160,15 +160,18 @@ class ReceiveHookDedupeTests(unittest.TestCase):
             server._session_last_stop.clear()
 
         self.replies = []          # (message_id, text)
-        self._reply_results = []   # successive return values; default "sent-msg"
+        self._reply_results = []   # successive results: str → sent w/ that id;
+                                   # None → transient failure; "__PERMANENT__" → permanent
 
-        def _reply(mid, text, reply_in_thread=False):
+        def _reply_status(mid, text, reply_in_thread=False):
             self.replies.append((mid, text))
-            if self._reply_results:
-                return self._reply_results.pop(0)
-            return "sent-msg"
+            r = self._reply_results.pop(0) if self._reply_results else "sent-msg"
+            if r == "__PERMANENT__":
+                return ("permanent", None)
+            return ("sent", r) if r else ("transient", None)
 
-        p = patch.object(server, "_reply", _reply)
+        # handler + _flush_redelivery both deliver via _reply_status now.
+        p = patch.object(server, "_reply_status", _reply_status)
         p.start()
         self.addCleanup(p.stop)
 
@@ -283,6 +286,172 @@ class ReceiveHookDedupeTests(unittest.TestCase):
         sess = server.session_store.get("s-pending")
         self.assertEqual(sess.cwd, server.config.default_cwd)
         self.assertNotEqual(sess.cwd, "/tmp/proj")  # not the runtime cwd
+
+    def test_failed_stop_is_stashed_and_redelivered_next_hook(self):
+        # The silent-drop bug: a Stop whose Feishu reply fails (network blip) must
+        # be stashed, then redelivered ahead of the next turn's reply — never
+        # dropped while the agent believes it answered.
+        self._reply_results = [None, "redeliver", "current"]  # turn-A fails; next hook flush+current ok
+        r1 = self._post(_stop_body(turn_id="A", message="ANSWER-A"))
+        self.assertFalse(r1.get("ok"))
+        self.assertEqual(len(server.session_store.get("s1").pending_redelivery), 1)
+
+        r2 = self._post(_stop_body(turn_id="B", message="ANSWER-B"))
+        self.assertTrue(r2.get("ok"))
+        # 3 sends total: the failed turn-A, its redelivery, then turn-B.
+        self.assertEqual(len(self.replies), 3)
+        self.assertIn("ANSWER-A", self.replies[1][1])   # redelivered first
+        self.assertIn("ANSWER-B", self.replies[2][1])   # then the new turn
+        self.assertEqual(server.session_store.get("s1").pending_redelivery, [])
+
+    def test_codex_duplicate_failure_stashed_once_not_twice(self):
+        # codex fires Stop twice per turn. If both fail during an outage, the same
+        # turn must be stashed once, so redelivery sends it a single time.
+        key = ("s1", "stop", "turn", "A")
+        server.session_store.add_redelivery("s1", "ANSWER-A", key)
+        server.session_store.add_redelivery("s1", "ANSWER-A", key)  # codex's duplicate
+        self.assertEqual(len(server.session_store.get("s1").pending_redelivery), 1)
+
+    def test_redelivered_turn_not_resent_when_duplicate_arrives(self):
+        # turn-A fails (stashed). codex's duplicate turn-A then arrives: the next
+        # hook redelivers turn-A AND the duplicate must NOT re-send it (dedupe via
+        # the redelivered key), so Feishu sees turn-A exactly once.
+        self._reply_results = [None, "redeliver"]  # turn-A fails; duplicate's flush ok
+        self._post(_stop_body(turn_id="A", message="ANSWER-A"))       # fails, stashed
+        r2 = self._post(_stop_body(turn_id="A", message="ANSWER-A"))  # duplicate
+        self.assertTrue(r2.get("redelivered"))
+        self.assertFalse(r2.get("deduped", False))
+        self.assertEqual(len(self.replies), 2)  # failed send + one redelivery, no third
+
+    def test_user_initiated_reply_failure_is_stashed(self):
+        # B2: a brand-new session (codex started outside Feishu, no pending root).
+        # _send creates the root but the content reply fails → must stash, because
+        # Claude has no duplicate Stop to retry it.
+        self._reply_results = [None]  # content reply transient-fails
+        with patch.object(server, "_send", lambda text: "root-ui"):
+            r = self._post(_stop_body(turn_id="A", session_id="s-ui", tty="tmux-ui"))
+        self.assertFalse(r.get("ok"))
+        self.assertEqual(len(server.session_store.get("s-ui").pending_redelivery), 1)
+
+    def test_permanent_failure_is_not_stashed(self):
+        # A permanent send error (bad payload) must NOT be stashed — retrying the
+        # same payload is futile and would wedge the queue.
+        self._reply_results = ["__PERMANENT__"]
+        r = self._post(_stop_body(turn_id="A", message="X"))
+        self.assertFalse(r.get("ok"))
+        self.assertEqual(server.session_store.get("s1").pending_redelivery, [])
+
+    def test_blocked_backlog_holds_current_for_order(self):
+        # If the backlog can't drain (still failing), the current turn must queue
+        # BEHIND it, not jump ahead — preserving order.
+        server.session_store.add_redelivery("s1", "OLD", ("s1", "stop", "turn", "Z"))
+        self._reply_results = [None]  # flush of OLD transient-fails
+        r = self._post(_stop_body(turn_id="NOW", message="NEW"))
+        self.assertFalse(r.get("ok"))
+        texts = [e["text"] for e in server.session_store.get("s1").pending_redelivery]
+        self.assertEqual(texts[0], "OLD")            # old reply still first
+        self.assertIn("NEW", texts[-1])              # new turn queued behind it
+        self.assertEqual(len(self.replies), 1)       # only the failed flush; current NOT sent
+
+    def test_flush_drops_permanent_and_keeps_draining(self):
+        # A poison stashed reply (permanent) is dropped, not re-stashed, so it can't
+        # block the rest of the queue; the good one and the current turn still send.
+        server.session_store.add_redelivery("s1", "POISON", ("s1", "stop", "turn", "P"))
+        server.session_store.add_redelivery("s1", "GOOD", ("s1", "stop", "turn", "G"))
+        self._reply_results = ["__PERMANENT__", "ok-good", "ok-cur"]
+        r = self._post(_stop_body(turn_id="NOW", message="NEW"))
+        self.assertTrue(r.get("ok"))
+        self.assertEqual(server.session_store.get("s1").pending_redelivery, [])  # fully drained
+        texts = [t for _, t in self.replies]
+        self.assertTrue(any("GOOD" in t for t in texts))
+        self.assertTrue(any("NEW" in t for t in texts))
+
+    def test_duplicate_current_returned_even_if_backlog_blocked(self):
+        # Backlog [A(sent), B(transient-fail)] and the current hook IS A's duplicate.
+        # Must return redelivered (A already sent), NOT re-queue A behind B — which
+        # would duplicate A and reorder it after B.
+        server.session_store.add_redelivery("s1", "A", ("s1", "stop", "turn", "A"))
+        server.session_store.add_redelivery("s1", "B", ("s1", "stop", "turn", "B"))
+        self._reply_results = ["okA", None]  # A flush sent, B flush transient-fails
+        r = self._post(_stop_body(turn_id="A", message="A"))  # current = A's duplicate
+        self.assertTrue(r.get("redelivered"))
+        pend = [e["text"] for e in server.session_store.get("s1").pending_redelivery]
+        self.assertEqual(pend, ["B"])  # only B re-queued; A not re-added
+
+
+class RetrySendTests(unittest.TestCase):
+    """_send_with_status: retry transient network errors, classify permanent
+    business errors, re-raise programming errors."""
+
+    class _Resp:
+        def __init__(self, ok, mid=None, code=0, msg=""):
+            self._ok = ok
+            self.code = code
+            self.msg = msg
+
+            class _D:
+                message_id = mid
+
+            self.data = _D
+
+        def success(self):
+            return self._ok
+
+    def test_retries_network_exception_then_succeeds(self):
+        calls = {"n": 0}
+
+        def _flaky():
+            calls["n"] += 1
+            if calls["n"] < 3:
+                raise ConnectionError("dns blip")
+            return self._Resp(True, mid="mid")
+
+        with patch.object(server, "time"):  # no real sleep
+            self.assertEqual(server._send_with_status(_flaky, "T"), ("sent", "mid"))
+        self.assertEqual(calls["n"], 3)
+
+    def test_does_not_retry_business_error(self):
+        calls = {"n": 0}
+
+        def _f():
+            calls["n"] += 1
+            return self._Resp(False, code=230001, msg="bad param")
+
+        with patch.object(server, "time"):
+            self.assertEqual(server._send_with_status(_f, "T"), ("permanent", None))
+        self.assertEqual(calls["n"], 1)  # permanent error (230001 whitelisted): no retry
+
+    def test_retries_non_whitelisted_api_code_as_transient(self):
+        # A non-whitelisted API failure (rate limit / 5xx / unknown) is transient:
+        # retried, then reported transient (→ redelivered), NOT dropped as permanent.
+        calls = {"n": 0}
+
+        def _rate_limited():
+            calls["n"] += 1
+            return self._Resp(False, code=99991400, msg="rate limited")
+
+        with patch.object(server, "time"):
+            self.assertEqual(server._send_with_status(_rate_limited, "T"), ("transient", None))
+        self.assertEqual(calls["n"], server._SEND_RETRY_ATTEMPTS)
+
+    def test_gives_up_after_attempts(self):
+        calls = {"n": 0}
+
+        def _always_raise():
+            calls["n"] += 1
+            raise ConnectionError("down")
+
+        with patch.object(server, "time"):
+            self.assertEqual(server._send_with_status(_always_raise, "T"), ("transient", None))
+        self.assertEqual(calls["n"], server._SEND_RETRY_ATTEMPTS)
+
+    def test_programming_error_is_reraised(self):
+        # A bug in request construction (TypeError/AttributeError/…) must surface,
+        # not be swallowed as a transient network failure.
+        def _bug():
+            raise TypeError("our bug")
+        with patch.object(server, "time"), self.assertRaises(TypeError):
+            server._send_with_status(_bug, "T")
 
 
 class CmdHookTurnIdForwardingTests(unittest.TestCase):
