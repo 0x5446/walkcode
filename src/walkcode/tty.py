@@ -3,6 +3,7 @@
 import itertools
 import logging
 import os
+import re
 import subprocess
 import threading
 import time
@@ -483,3 +484,221 @@ def inject(session_name: str, text: str, enter: bool | None = None,
             raise RuntimeError(f"tmux send-keys Enter failed: {result.stderr.strip()}")
 
     return True
+
+
+# --- Inject submission verification (close the loop after inject) ---
+#
+# inject() pastes the text and sends one Enter, but "tmux send-keys returned 0"
+# only means the keystrokes reached the pane's pty — NOT that the TUI consumed the
+# Enter as a submit. A loaded or user-attached TUI can drop that Enter, leaving
+# the text sitting in the input box (observed in the wild: a message stuck for
+# 4.5 minutes on an idle pane until the user pressed Enter by hand, while WalkCode
+# had already reported it delivered). We close the loop: capture the pane, inspect
+# ONLY the bottom-most input box, and if our text is still there re-send a bare
+# Enter. We never re-paste — a redundant Enter on an empty box is a harmless
+# no-op, but a second paste would duplicate the text.
+
+INPUT_EMPTY = "empty"          # bottom input box holds no draft of ours -> submitted/queued
+INPUT_HAS_OURS = "has_ours"    # our text (or a [Pasted text] placeholder) is still in the box
+INPUT_HAS_OTHER = "has_other"  # box holds something else (user typing) -> don't touch it
+INPUT_MENU = "menu"            # bottom is a menu/permission dialog -> NEVER press Enter
+INPUT_UNKNOWN = "unknown"      # couldn't locate a standard input box -> caller falls back
+STUCK = "stuck"                # still HAS_OURS after exhausting Enter retries
+
+_BOX_TOP_CHARS = ("╭", "┌")
+_BOX_BOTTOM_CHARS = ("╰", "┘")
+_BOX_SIDE_CHARS = "│┃|"
+# Current Claude Code frames the input not with a corner box but with two
+# horizontal RULE lines (── … ──) bracketing the ``❯`` prompt; codex/older builds
+# use the corner box. We support both. A rule line is one made only of these.
+_RULE_CHARS = frozenset("─━═")
+_RULE_MIN = 10  # min run length so a short "---" in prose isn't taken as a rule
+# Claude's input prompt is ``❯`` (often followed by U+00A0); codex uses ``›``/``>``.
+_PROMPT_MARKS = ("❯", "›", ">")
+
+# A real menu / permission dialog is matched by its explicit confirm PHRASE only.
+# We deliberately do NOT use a "❯ 1." cursor heuristic: Claude's *input* prompt is
+# also ``❯``, so a user message that starts with "1." would be mistaken for a menu
+# and wrongly skip a legitimate Enter retry. The danger we must avoid (pressing
+# Enter on a real dialog and picking its default) is covered because the HAS_OURS
+# path also requires our text to be in the box, which a dialog won't contain.
+_MENU_RE = re.compile(
+    r"(?i)(\bdo you want to (proceed|continue)\b)"
+    r"|(\ballow (this )?command\b)"
+    r"|(\bwould you like to proceed\b)"
+)
+# Long pastes are folded by the TUI into a placeholder instead of the literal text.
+_PASTED_RE = re.compile(r"(?i)\[pasted text\b|\[image\s*#?\d*\]|\[\d+\s+lines?\s+pasted\]")
+# Idle placeholder hint rendered inside an empty box — codex's ``Try "…"``. Kept
+# narrow (requires the quote) so a real user message starting with "try " is NOT
+# mistaken for an empty box (which would be a false "submitted").
+_PLACEHOLDER_RE = re.compile(r"(?i)^try\s+[\"“'']")
+_FOOTER_SCAN = 10  # trailing non-empty lines scanned for menu signals
+# Below this length, an injected message must match the box content EXACTLY (not
+# as a substring): a reply like "2" must not match a menu option "2. No" and
+# trigger a stray Enter. Longer messages allow substring (tolerates wrap/trunc).
+_MIN_SUBSTR_MATCH = 4
+
+
+def _norm(s: str) -> str:
+    """Collapse whitespace for tolerant matching (mirror of server._norm)."""
+    return " ".join((s or "").split())
+
+
+def _strip_sides(line: str) -> str:
+    """Strip box side borders and surrounding whitespace from a captured line."""
+    return line.strip().strip(_BOX_SIDE_CHARS).strip()
+
+
+def _looks_like_menu(pane: str) -> bool:
+    """True if the bottom of the pane is a selection menu / permission dialog."""
+    lines = [ln for ln in pane.splitlines() if ln.strip()]
+    tail = "\n".join(lines[-_FOOTER_SCAN:])
+    return bool(_MENU_RE.search(tail))
+
+
+def _is_rule_line(line: str) -> bool:
+    """True if ``line`` is a horizontal rule (── …) used to frame the input."""
+    s = line.strip()
+    return len(s) >= _RULE_MIN and set(s) <= _RULE_CHARS
+
+
+def _find_last(lines: list[str], chars, before: int | None = None) -> int | None:
+    """Index of the last line (optionally above ``before``) containing any of ``chars``."""
+    start = (before if before is not None else len(lines)) - 1
+    for i in range(start, -1, -1):
+        if any(c in lines[i] for c in chars):
+            return i
+    return None
+
+
+def _find_last_rule(lines: list[str], before: int | None = None) -> int | None:
+    start = (before if before is not None else len(lines)) - 1
+    for i in range(start, -1, -1):
+        if _is_rule_line(lines[i]):
+            return i
+    return None
+
+
+def _extract_input_box(pane: str) -> list[str] | None:
+    """Return the inner lines of the bottom-most input frame, or None.
+
+    Two framings are supported, both anchored on the BOTTOM-most frame so a
+    submitted prompt echoed back into the transcript above (it also carries a
+    prompt mark and the original text) is never mistaken for an unsent draft:
+
+      * corner box ``╭ … │ … ╰`` (codex / older Claude builds), and
+      * two horizontal rules ``── / ❯ / ──`` bracketing the prompt (current
+        Claude Code v2.1.x).
+    """
+    lines = pane.splitlines()
+    candidates: list[tuple[int, int]] = []  # (bottom_index, top_index)
+    # Corner box candidate.
+    cb = _find_last(lines, _BOX_BOTTOM_CHARS)
+    if cb is not None:
+        ct = _find_last(lines, _BOX_TOP_CHARS, before=cb)
+        if ct is not None:
+            candidates.append((cb, ct))
+    # Rule-bracketed candidate.
+    rb = _find_last_rule(lines)
+    if rb is not None:
+        rt = _find_last_rule(lines, before=rb)
+        if rt is not None:
+            candidates.append((rb, rt))
+    if not candidates:
+        return None
+    # Pick the frame whose BOTTOM border sits lowest on screen — the live input,
+    # not an older corner box left higher up in the transcript.
+    bottom, top = max(candidates, key=lambda c: c[0])
+    return [_strip_sides(ln) for ln in lines[top + 1:bottom]]
+
+
+def classify_input_box(pane: str, injected_text: str) -> str:
+    """Classify what the bottom input region currently holds.
+
+    Only :data:`INPUT_HAS_OURS` should make the caller re-send Enter. Everything
+    else means either the prompt already left the box (submitted/queued) or it is
+    unsafe / impossible to retry — the caller must not press Enter then.
+    """
+    # Menu first: a permission/selection dialog must never receive a stray Enter
+    # (it would pick the default option). Checked before the box test because the
+    # dialog itself is framed and would otherwise parse as an input box.
+    if _looks_like_menu(pane):
+        return INPUT_MENU
+    box = _extract_input_box(pane)
+    if box is None:
+        return INPUT_UNKNOWN
+    # Strip a single leading prompt mark (>, ›, ❯) off the first content line.
+    stripped: list[str] = []
+    prompt_seen = False
+    for ln in box:
+        if not prompt_seen and ln:
+            for mark in _PROMPT_MARKS:
+                if ln.startswith(mark):
+                    ln = ln[len(mark):].strip()
+                    break
+            prompt_seen = True
+        stripped.append(ln)
+    inner = _norm(" ".join(stripped))
+    if inner == "":
+        return INPUT_EMPTY
+    # Our text takes priority over the placeholder check below, so a real message
+    # that happens to start with "try " is never misread as an empty box.
+    nt = _norm(injected_text)
+    if nt:
+        # Exact match works for any length (short replies "2"/"y" rely on it).
+        # Substring is allowed only when BOTH the matched piece is long enough:
+        #   nt in inner  — box holds our text plus extra; guard len(nt)
+        #   inner in nt  — box shows a truncated/wrapped slice of ours; guard len(inner)
+        # so a tiny unrelated draft ("a") can't substring-match a long message.
+        if inner == nt:
+            return INPUT_HAS_OURS
+        if len(nt) >= _MIN_SUBSTR_MATCH and nt in inner:
+            return INPUT_HAS_OURS
+        if len(inner) >= _MIN_SUBSTR_MATCH and inner in nt:
+            return INPUT_HAS_OURS
+    if _PASTED_RE.search(inner):
+        return INPUT_HAS_OURS
+    if _PLACEHOLDER_RE.match(inner):
+        return INPUT_EMPTY
+    return INPUT_HAS_OTHER
+
+
+def send_enter(session_name: str) -> bool:
+    """Send a bare Enter (submit) to the pane. Never pastes. True on success."""
+    try:
+        result = subprocess.run(
+            ["tmux", "send-keys", "-t", session_name, "Enter"],
+            capture_output=True, text=True, timeout=5,
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
+def verify_submitted(session_name: str, injected_text: str, *,
+                     attempts: int = 3, settle: float = 0.4,
+                     initial_settle: float = 0.2) -> str:
+    """Confirm an inject() actually submitted; re-send Enter if it didn't.
+
+    Returns the final :data:`INPUT_*` classification, or :data:`STUCK` if our
+    text is still in the box after ``attempts`` Enter retries. ``initial_settle``
+    lets the just-sent Enter land before the first capture so a normal submit
+    isn't misread as a dropped Enter (which would cost a redundant Enter). Only
+    ``INPUT_HAS_OURS`` triggers a retry; this function never pastes.
+    """
+    time.sleep(initial_settle)
+    result = classify_input_box(capture_pane(session_name), injected_text)
+    if result != INPUT_HAS_OURS:
+        return result
+    for _ in range(attempts):
+        # A failed Enter means the prompt is still unsubmitted — return STUCK so the
+        # caller decides (idle ⇒ honest failure) instead of silently degrading to a
+        # later INPUT_UNKNOWN that the caller would treat as success.
+        if not send_enter(session_name):
+            return STUCK
+        time.sleep(settle)
+        result = classify_input_box(capture_pane(session_name), injected_text)
+        if result != INPUT_HAS_OURS:
+            return result
+    return STUCK

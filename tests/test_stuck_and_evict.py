@@ -131,6 +131,7 @@ class ResumeGuardTests(unittest.TestCase):
         with patch.object(server, "validate_target", lambda t: None), \
              patch.object(server, "is_agent_alive", lambda t: True), \
              patch.object(server, "inject", lambda tty_, text: injected.append((tty_, text))), \
+             patch.object(server, "verify_submitted", lambda tty_, text, **kw: server.INPUT_EMPTY), \
              patch.object(server, "_ack_inject_accepted", lambda mid: acks.append(mid)), \
              patch.object(server, "_register_pending_inject", lambda *a, **k: None), \
              patch.object(server.subprocess, "run") as mock_run:
