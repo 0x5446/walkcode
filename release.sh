@@ -137,6 +137,15 @@ cmd_publish() {
                                           "publish 必须在 main 上运行（当前 ${cur_branch}）")"
   run git pull --ff-only
 
+  # Gate: HEAD must equal origin/main, so a local-only commit that bypassed the
+  # "merge into main first" review gate can never be tagged + released.
+  if ! $DRY_RUN; then
+    git fetch origin main -q
+    local lh rh; lh=$(git rev-parse HEAD); rh=$(git rev-parse origin/main)
+    [ "$lh" = "$rh" ] || die "$(msg "HEAD ($lh) != origin/main ($rh) — merge into main before publishing" \
+                                    "HEAD ($lh) 与 origin/main ($rh) 不一致 — 先合并进 main 再发布")"
+  fi
+
   local cur; cur=$(pyproject_version)
   [ -n "$version" ] || version="$cur"
   valid_semver "$version" || die "invalid version: $version"

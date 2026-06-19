@@ -252,6 +252,19 @@ def _build_permission_card(
     }
 
 
+def _escape_lark_md(text: str) -> str:
+    """Escape Feishu lark_md structural chars so an option's label/description
+    renders as literal text. These strings come from AskUserQuestion tool_input;
+    a prompt-injected agent could otherwise craft links ([x](url)) or mentions
+    (<at id=..>) that impersonate system UI. Buttons use plain_text and need no
+    escaping; only the lark_md div does."""
+    if not text:
+        return text
+    for ch in ("\\", "[", "]", "(", ")", "<", ">"):
+        text = text.replace(ch, "\\" + ch)
+    return text
+
+
 def _build_askuserquestion_card(
     request_id: str,
     questions: list,
@@ -356,7 +369,9 @@ def _build_askuserquestion_card(
         for j, opt in enumerate(options):
             label = opt.get("label", opt.get("value", ""))
             desc = (opt.get("description") or "").strip()
-            content = f"**{label}**\n{desc}" if desc else f"**{label}**"
+            label_md = _escape_lark_md(label)
+            desc_md = _escape_lark_md(desc)
+            content = f"**{label_md}**\n{desc_md}" if desc_md else f"**{label_md}**"
             option_elements.append(
                 {"tag": "div", "text": {"tag": "lark_md", "content": content}}
             )
