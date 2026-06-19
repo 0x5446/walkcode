@@ -256,11 +256,13 @@ def _escape_lark_md(text: str) -> str:
     """Escape Feishu lark_md structural chars so an option's label/description
     renders as literal text. These strings come from AskUserQuestion tool_input;
     a prompt-injected agent could otherwise craft links ([x](url)) or mentions
-    (<at id=..>) that impersonate system UI. Buttons use plain_text and need no
+    (<at id=..>) that impersonate system UI, or inline format (**bold**, `code`)
+    that closes the bold we wrap the label in. Buttons use plain_text and need no
     escaping; only the lark_md div does."""
     if not text:
         return text
-    for ch in ("\\", "[", "]", "(", ")", "<", ">"):
+    # backslash first, then links/mentions/html and inline-format markers
+    for ch in ("\\", "`", "*", "_", "~", "[", "]", "(", ")", "<", ">", "#", "|"):
         text = text.replace(ch, "\\" + ch)
     return text
 
@@ -369,7 +371,9 @@ def _build_askuserquestion_card(
         for j, opt in enumerate(options):
             label = opt.get("label", opt.get("value", ""))
             desc = (opt.get("description") or "").strip()
-            label_md = _escape_lark_md(label)
+            # label is the bold heading; collapse newlines so a multi-line label
+            # can't break out of the **...** wrapper. desc keeps legit newlines.
+            label_md = _escape_lark_md(label).replace("\r", " ").replace("\n", " ")
             desc_md = _escape_lark_md(desc)
             content = f"**{label_md}**\n{desc_md}" if desc_md else f"**{label_md}**"
             option_elements.append(

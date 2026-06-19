@@ -87,6 +87,23 @@ class CardWithDescriptionTests(unittest.TestCase):
         # button still submits the raw, unescaped label
         self.assertEqual(card["elements"][1]["actions"][0]["value"]["answer"], "ok")
 
+    def test_inline_format_chars_escaped(self):
+        q = [{"question": "q", "options": [
+            {"label": "ok", "description": "`code` **粗** _斜_ ~删~ # h"}]}]
+        card = server._build_askuserquestion_card("rid", q, 0)
+        content = card["elements"][0]["text"]["content"]
+        self.assertNotIn("`code`", content)
+        self.assertNotIn("**粗**", content)
+        self.assertIn("\\`code\\`", content)
+        self.assertIn("\\*\\*", content)
+
+    def test_label_newline_collapsed_keeps_bold(self):
+        q = [{"question": "q", "options": [
+            {"label": "line1\nline2", "description": "d"}]}]
+        card = server._build_askuserquestion_card("rid", q, 0)
+        content = card["elements"][0]["text"]["content"]
+        self.assertEqual(content.split("\n", 1)[0], "**line1 line2**")
+
 
 class CardMultiSelectTests(unittest.TestCase):
     def setUp(self):
