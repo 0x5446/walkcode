@@ -16,6 +16,7 @@ from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from walkcode import server
+from walkcode import tty as tty_mod
 from walkcode.config import Config
 from walkcode.i18n import t
 from walkcode.state import SessionStore
@@ -107,10 +108,16 @@ class FeishuReplyInjectionTests(unittest.TestCase):
         self.injected = []
         self.reactions = []
         self.replies = []
+        # Default: the close-the-loop verify reports a clean submit (box cleared).
+        # Individual tests override self.verify_result to exercise STUCK / menu paths.
+        self.verify_result = server.INPUT_EMPTY
         patches = [
             patch.object(server, "validate_target", lambda tty: None),
             patch.object(server, "is_agent_alive", lambda tty: True),
             patch.object(server, "inject", lambda tty, text: self.injected.append((tty, text))),
+            patch.object(server, "verify_submitted",
+                         lambda tty, text, **kw: self.verify_result),
+            patch.object(server, "capture_pane", lambda tty, lines=30: ""),
             patch.object(server, "_add_reaction",
                          lambda mid, emoji: self.reactions.append((mid, emoji))),
             patch.object(server, "_reply",
@@ -163,6 +170,43 @@ class FeishuReplyInjectionTests(unittest.TestCase):
         self.assertEqual(len(self.reactions), 1)
         self.assertIn(self.reactions[0][1], server._FAILURE_EMOJIS)
         self.assertEqual(len(server._pending_injects), 0)
+
+    def test_stuck_on_idle_session_reports_not_submitted(self):
+        # The 13:50 bug: Enter dropped on an idle pane, text stuck in the box.
+        # tmux accepted the keys (inject succeeds) but the prompt never submitted.
+        self.verify_result = server.STUCK  # idle: no busy mark, capture_pane -> ""
+
+        server._handle_message(self._data("仔细全面的更新adr了吗？"))
+
+        self.assertEqual(self.injected, [("tmux1", "仔细全面的更新adr了吗？")])
+        self.assertEqual(self.replies, [("msg1", t("feishu.inject_not_submitted"))])
+        self.assertEqual(len(self.reactions), 1)
+        self.assertIn(self.reactions[0][1], server._FAILURE_EMOJIS)
+        self.assertEqual(len(server._pending_injects), 0)
+
+    def test_stuck_but_busy_is_treated_as_queued_success(self):
+        # A turn is running: the message is queued, not lost. Don't cry failure.
+        self.verify_result = server.STUCK
+        server._mark_session_busy("sess1")
+
+        server._handle_message(self._data("next prompt"))
+
+        self.assertEqual(self.replies, [])
+        self.assertEqual(len(self.reactions), 1)
+        self.assertIn(self.reactions[0][1], server._SUCCESS_EMOJIS)
+        self.assertEqual(len(server._pending_injects), 1)
+
+    def test_menu_unconfirmed_falls_back_to_accept_boundary(self):
+        # Bottom is a menu/dialog — can't confirm and must not press Enter blindly.
+        # Fall back to the legacy tmux-accept boundary (no worse than before).
+        self.verify_result = tty_mod.INPUT_MENU
+
+        server._handle_message(self._data("hello"))
+
+        self.assertEqual(self.replies, [])
+        self.assertEqual(len(self.reactions), 1)
+        self.assertIn(self.reactions[0][1], server._SUCCESS_EMOJIS)
+        self.assertEqual(len(server._pending_injects), 1)
 
 
 if __name__ == "__main__":

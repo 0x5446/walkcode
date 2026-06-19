@@ -43,7 +43,11 @@ from .config import Config
 from .i18n import t
 from .permreg import CardStatus, PermissionRegistry
 from .state import Session, SessionStore
-from .tty import inject, validate_target, get_session_activity, kill_session, capture_pane, is_agent_alive, wait_until_input_ready
+from .tty import (
+    inject, validate_target, get_session_activity, kill_session, capture_pane,
+    is_agent_alive, wait_until_input_ready, verify_submitted,
+    INPUT_EMPTY, STUCK,
+)
 
 logger = logging.getLogger("walkcode")
 
@@ -89,6 +93,16 @@ _pending_injects: list[dict] = []          # optional observations only
 _pending_lock = threading.Lock()
 _INJECT_OBSERVATION_TTL = 3600.0
 _SWEEPER_INTERVAL = 60.0       # s between observation cleanup sweeps
+
+# --- Inject submission close-the-loop ---
+# After inject() pastes+Enter, verify the TUI actually submitted (the Enter is not
+# guaranteed to register — a loaded/attached pane can drop it). tty.verify_submitted
+# re-sends a bare Enter (never re-pastes) up to this many times.
+_INJECT_VERIFY_ATTEMPTS = int(os.environ.get("WALKCODE_INJECT_VERIFY_ATTEMPTS", "3"))
+_INJECT_VERIFY_SETTLE = float(os.environ.get("WALKCODE_INJECT_VERIFY_SETTLE", "0.4"))
+# Double-instance alert dedupe: one warning per session while the drift persists.
+_double_instance_alerted: set[str] = set()
+_double_instance_lock = threading.Lock()
 
 
 # --- Hook delivery dedupe ---
@@ -1220,18 +1234,7 @@ def _resume_agent(session_id: str, old_session: Session, reply_text: str, messag
             session_id[:8], old_session.tty,
         )
         if reply_text.strip():
-            try:
-                inject(old_session.tty, reply_text)
-                logger.info(
-                    "Resume-guard injected '%s' -> %s; tmux accepted",
-                    reply_text[:50], old_session.tty,
-                )
-                _ack_inject_accepted(message_id)
-                _register_pending_inject(session_id, old_session.tty, reply_text, message_id)
-            except Exception as e:
-                logger.error(f"Resume-guard inject failed: {e}")
-                _reply(message_id, t("feishu.inject_timeout"), reply_in_thread=True)
-                _add_reaction(message_id, random.choice(_FAILURE_EMOJIS))
+            _inject_live(session_id, old_session.tty, reply_text, message_id, "resume-guard")
         return
     cwd = old_session.cwd or config.default_cwd
     tmux_name = f"walkcode-{int(time.time())}"
@@ -1275,19 +1278,9 @@ def _resume_agent(session_id: str, old_session: Session, reply_text: str, messag
                 # session that died mid-turn, so it isn't mislabeled "queued"
                 # (and confirmation uses the normal idle grace).
                 _mark_session_idle(session_id)
-            try:
-                inject(tmux_name, reply_text)
-            except Exception as e:
-                logger.error(f"Delayed inject after resume failed: {e}")
-                _reply(message_id, t("feishu.inject_timeout"), reply_in_thread=True)
-                _add_reaction(message_id, random.choice(_FAILURE_EMOJIS))
-                return
-            logger.info(
-                "Delayed inject after resume '%s' -> %s; tmux accepted",
-                reply_text[:50], tmux_name,
-            )
-            _ack_inject_accepted(message_id)
-            _register_pending_inject(session_id, tmux_name, reply_text, message_id)
+            # Resume's first message is exactly where a dropped Enter bit us
+            # historically — let _inject_live close the loop (verify + retry Enter).
+            _inject_live(session_id, tmux_name, reply_text, message_id, "resume")
         threading.Thread(target=_delayed_inject, daemon=True).start()
 
 
@@ -1396,6 +1389,117 @@ def _register_pending_inject(session_id: str | None, tty: str, text: str, messag
             "message_id": message_id,
             "injected_at": time.time(),
         })
+
+
+def _inject_live(session_id: str | None, tty: str, text: str, message_id: str, project: str = "?"):
+    """Inject into a live session and close the loop on whether it submitted.
+
+    tmux accepting paste+Enter is NOT proof the TUI submitted: a loaded/attached
+    pane can drop the Enter, leaving the text in the input box (the bug this
+    fixes). After inject, verify_submitted re-checks the bottom input box and
+    re-sends a bare Enter if our text is still there (never re-pastes).
+
+    Reaction policy:
+      * submitted/queued (box cleared) → success reaction + register observation
+      * still stuck but a turn is running → success (it is queued/racing), warn-log
+      * still stuck AND idle → honest failure reaction + Feishu notice
+      * menu / other draft / unparseable box → fall back to the old tmux-accept
+        boundary (success reaction) — no worse than before, and never a stray Enter
+    """
+    try:
+        inject(tty, text)
+    except Exception as e:
+        # send-keys timed out / session gone → immediate, honest failure.
+        logger.error(f"Inject failed: {e}")
+        _reply(message_id, t("feishu.inject_timeout"), reply_in_thread=True)
+        _add_reaction(message_id, random.choice(_FAILURE_EMOJIS))
+        return
+
+    result = verify_submitted(
+        tty, text,
+        attempts=_INJECT_VERIFY_ATTEMPTS, settle=_INJECT_VERIFY_SETTLE,
+    )
+
+    if result == STUCK:
+        busy = _is_session_busy(session_id or "") or (_parse_working_seconds(capture_pane(tty)) is not None)
+        if not busy:
+            # The 13:50 case: idle pane, Enter dropped, retries didn't take. Be
+            # honest instead of a false success. We do NOT re-paste — user resends.
+            logger.error(
+                f"Inject NOT submitted (idle, box still holds text after retries): "
+                f"'{text[:50]}' -> {tty} ({project})"
+            )
+            _reply(message_id, t("feishu.inject_not_submitted"), reply_in_thread=True)
+            _add_reaction(message_id, random.choice(_FAILURE_EMOJIS))
+            return
+        logger.warning(
+            f"Inject box not empty but turn busy; treating as queued: "
+            f"'{text[:50]}' -> {tty} ({project})"
+        )
+    elif result != INPUT_EMPTY:
+        # menu / other / unknown — can't confirm and must not press Enter blindly.
+        # Fall back to the legacy tmux-accept boundary (no worse than before).
+        logger.warning(
+            f"Inject submit unconfirmed (result={result}); falling back to "
+            f"tmux-accept boundary: '{text[:50]}' -> {tty} ({project})"
+        )
+
+    logger.info(f"Injected '{text[:50]}' -> {tty} ({project}); submit={result}")
+    _ack_inject_accepted(message_id)
+    _register_pending_inject(session_id, tty, text, message_id)
+
+
+def _alert_double_instance(session_id: str, old_tty: str, old_root: str | None, new_tty: str):
+    """Warn (once) when a session's tty drifts to a new tmux while the OLD one is
+    still a live agent — two processes are likely writing the same session rollout
+    (e.g. a Feishu-launched instance plus a manual `claude --resume` of the same id).
+
+    Runs OFF the asyncio event loop: validate_target / is_agent_alive (subprocess)
+    and _reply (HTTP) all block, so receive_sync_hook offloads this to a thread.
+    The mapping itself is left to upsert (last-writer-wins); this only alerts.
+    """
+    # Dedupe by the exact drift (session + old + new tmux), not just session_id: a
+    # later distinct drift (B→C) must still alert even if (A→B) already did.
+    # Reserve the key under the lock up-front so two concurrent daemon threads for
+    # the same drift can't both pass the check and double-alert; release it below
+    # if we don't actually deliver (so a missing root / transient failure doesn't
+    # permanently suppress the alert).
+    key = (session_id, old_tty, new_tty)
+    with _double_instance_lock:
+        if key in _double_instance_alerted:
+            return
+        _double_instance_alerted.add(key)
+
+    def _release():
+        with _double_instance_lock:
+            _double_instance_alerted.discard(key)
+
+    try:
+        alive = validate_target(old_tty) is None and is_agent_alive(old_tty)
+    except Exception:
+        _release()
+        return
+    if not alive:
+        # Old tmux is gone — this is a normal resume, not a double instance.
+        _release()
+        return
+    logger.warning(
+        "Double-instance: session=%s old_tty=%s still alive; new sync tty=%s "
+        "(two processes may be writing the same rollout)",
+        session_id[:8], old_tty, new_tty,
+    )
+    delivered = False
+    if old_root:
+        try:
+            delivered = bool(_reply(
+                old_root,
+                t("feishu.double_instance", old_tmux=old_tty, new_tmux=new_tty),
+                reply_in_thread=True,
+            ))
+        except Exception as e:
+            logger.error(f"Double-instance alert reply failed: {e}")
+    if not delivered:
+        _release()
 
 
 def _confirm_pending_inject(session_id: str, tty: str, prompt: str):
@@ -1580,19 +1684,7 @@ def _handle_message(data: P2ImMessageReceiveV1):
         _reply(message_id, t("feishu.stale_session"))
         return
 
-    try:
-        inject(tty, text)
-    except Exception as e:
-        # send-keys timed out / session gone → immediate, honest failure
-        logger.error(f"Inject failed: {e}")
-        _reply(message_id, t("feishu.inject_timeout"), reply_in_thread=True)
-        _add_reaction(message_id, random.choice(_FAILURE_EMOJIS))
-        return
-    # tmux accepted paste+Enter. From WalkCode's perspective this is delivered;
-    # Claude Code owns whether the prompt runs immediately or waits behind a turn.
-    logger.info(f"Injected '{text[:50]}' -> {tty} ({project}); tmux accepted")
-    _ack_inject_accepted(message_id)
-    _register_pending_inject(session_id, tty, text, message_id)
+    _inject_live(session_id, tty, text, message_id, project)
 
 
 # --- FastAPI routes ---
@@ -1866,6 +1958,13 @@ async def receive_sync_hook(request: Request):
         return {"ok": False, "error": "missing tty or session_id"}
 
     session = session_store.get(session_id)
+    # Capture the prior mapping BEFORE upsert overwrites it: a tty drift to a new
+    # tmux while the old one is still alive = a likely double instance (same rollout
+    # written by two processes). Detected/alerted off the event loop below.
+    old_tty = session.tty if session else ""
+    old_root = session.root_msg_id if session else None
+    drift = bool(old_tty and old_tty != tty)
+
     if session and session.root_msg_id:
         session_store.upsert(session_id, tty=tty, cwd=cwd, cwd_is_launch=True)
         logger.info(f"Sync: session={session_id[:8]} tty={tty} (updated)")
@@ -1873,6 +1972,13 @@ async def receive_sync_hook(request: Request):
         # New session or no Feishu thread yet — store tty+cwd so first hook finds it
         session_store.upsert(session_id, tty=tty, cwd=cwd, cwd_is_launch=True)
         logger.info(f"Sync: session={session_id[:8]} tty={tty} (new, no thread yet)")
+
+    if drift:
+        threading.Thread(
+            target=_alert_double_instance,
+            args=(session_id, old_tty, old_root, tty),
+            daemon=True,
+        ).start()
 
     return {"ok": True}
 

@@ -142,53 +142,62 @@ Key design decisions:
 
 ## Inject Delivery Confirmation
 
-Feishu replies are delivered into Claude by injecting keystrokes with `tmux
-send-keys`. A successful `send-keys` only proves the bytes reached the pane — it
-is **not** proof Claude accepted them as a prompt. When the TUI is not at a
-ready, empty input box, the keystrokes are routed elsewhere and the message is
-silently lost:
+Feishu replies are delivered into the TUI by injecting keystrokes with `tmux
+send-keys` (bracketed paste + Enter). A successful `send-keys` only proves the
+bytes reached the pane's pty — it is **not** proof the TUI consumed the Enter as
+a submit. A loaded or user-attached pane can drop that Enter, leaving the text
+sitting in the input box (observed in the wild: a message stuck for minutes on an
+idle pane until the user pressed Enter by hand, while walkcode had already shown a
+success emoji).
 
-- a modal/overlay is open (`/status`, `/model`, a permission prompt, the
-  `/resume` picker, autocomplete) — the text is ignored by the dialog and the
-  injected Enter just dismisses it;
-- the pane is in tmux copy-mode (scrollback) — keys go to copy-mode;
-- the context is 100% full — submission is blocked.
-
-Previously walkcode added a success emoji based purely on the `send-keys` exit
-code, so these losses looked delivered. Delivery is now confirmed out-of-band
-via the **`UserPromptSubmit` hook** — no screen scraping:
+Delivery is therefore **closed-loop and synchronous** in `_inject_live`
+(`tty.verify_submitted`), by reading the pane — no reliance on hooks:
 
 ```
-_handle_message
-  → inject(tty, text)                 # send-keys; raise → immediate "not delivered" reply
-  → _register_pending_inject(...)     # await confirmation; NO emoji yet
-
-UserPromptSubmit hook (the prompt was actually accepted)
-  → POST /hook/prompt → _confirm_pending_inject()  → success emoji, clear pending
-
-sweeper (1s tick)
-  → window elapsed with no confirmation → "not delivered" reply + failure emoji
+_inject_live(session_id, tty, text, message_id)
+  → inject(tty, text)                          # paste + one Enter; raise → "not delivered"
+  → verify_submitted(tty, text)                # capture pane, inspect bottom input box:
+       INPUT_HAS_OURS  → re-send a BARE Enter (never re-paste) and recheck, up to 3×
+       INPUT_EMPTY     → submitted/queued
+       INPUT_MENU/OTHER/UNKNOWN → can't confirm, must not press Enter
+  → decision:
+       EMPTY                 → success emoji + register (non-authoritative) observation
+       STUCK and turn busy   → queued/racing → success emoji
+       STUCK and idle        → honest "not submitted" reply + failure emoji
+       MENU/OTHER/UNKNOWN     → fall back to the send-keys boundary (success emoji)
 ```
 
-**Busy/idle is derived from hooks only**, so an inject during generation is
-treated as *queued* (not lost): `UserPromptSubmit` marks a turn busy, `Stop`
-marks it idle.
+Key properties:
 
-| Inject context | Confirmation window | No `UserPromptSubmit` ⇒ |
-|----------------|---------------------|--------------------------|
-| Session idle | `injected_at` + `_INJECT_CONFIRM_GRACE` (4s) | swallowed (modal/copy-mode) → reported failure |
-| Session busy (generating) | first `Stop` after inject, then + grace | queued prompt never landed → reported failure |
-| Never goes idle | `_INJECT_CONFIRM_MAX` (10m) backstop | reported failure |
+- **Only the bottom-most input box is inspected** (`_extract_input_box`), so a
+  submitted prompt echoed back into the transcript above — which also carries a
+  `>`/`❯` and the original text — is never mistaken for an unsent draft. Two
+  framings are parsed: the corner box `╭ │ ╰` (codex / older builds) and the two
+  horizontal rules `── / ❯ / ──` bracketing the prompt (current Claude Code).
+- **A redundant Enter is harmless** (an empty box submit is a no-op) but a second
+  paste would duplicate text, so the retry path only ever sends a bare Enter.
+- **A real menu/permission dialog must never get a stray Enter** (it would pick
+  the default). Menus are detected by their confirm phrase, and short replies
+  (e.g. `2`) require an exact box match so `2` can't substring-match a `2. No`
+  option.
+- **Busy ≠ lost.** A turn running (footer `… esc to interrupt`, or hook-derived
+  busy state) means a still-occupied box is a *queued* prompt, not a failure.
 
-Matching is by `session_id` (falling back to tmux name), with whitespace-tolerant
-substring comparison of the echoed prompt. The single-key permission-answer path
-(`_tmux_fallback`) is **not** confirmed this way — it targets a prompt overlay on
-purpose, not the chat input.
+The `UserPromptSubmit` hook is **kept only as best-effort observation** (logging),
+never as the authoritative delivery verdict. The single-key permission-answer path
+is not verified this way — it targets a prompt overlay on purpose.
 
-The cost: `UserPromptSubmit` fires on **every** prompt in every Claude session,
-so `walkcode hook user-prompt-submit` is a fast path — a short-timeout localhost
-POST with no stdout (hook stdout would be injected into the prompt), returning
-before any debug logging.
+### Double-instance detection
+
+When `SessionStart` (`/hook/sync`) drifts a `session_id`'s tty to a *new* tmux
+while the *old* one is still a live agent (e.g. a manual `claude --resume` of an
+id already running under a Feishu-launched pane), two processes may be writing the
+same rollout. `_alert_double_instance` warns once per distinct `(session_id,
+old_tty, new_tty)` drift on the old thread — it does **not** auto-kill (killing
+the wrong pane loses work). It runs off the asyncio event loop (the liveness probe
+and `_reply` block) and reserves the dedupe key under a lock before delivering, so
+concurrent syncs can't double-alert and a failed/absent delivery doesn't
+permanently suppress the warning.
 
 ---
 
@@ -201,7 +210,7 @@ Claude Code hooks call `walkcode hook {stop|notification|permission-request|sync
 | Hook | Claude Event | Endpoint | Feishu Format | Blocking |
 |------|-------------|----------|---------------|----------|
 | `sync` | SessionStart | POST /hook/sync | None (mapping update only) | No |
-| `user-prompt-submit` | UserPromptSubmit | POST /hook/prompt | None (delivery confirmation + busy state) | No |
+| `user-prompt-submit` | UserPromptSubmit | POST /hook/prompt | None (best-effort observation + busy state) | No |
 | `stop` | Stop | POST /hook | Plain text | No |
 | `notification` | Notification (elicitation_dialog) | POST /hook | Plain text or interactive card (AskUserQuestion) | No |
 | `permission-request` | PermissionRequest | POST /hook/permission → poll GET /hook/permission/{rid}/decision | Interactive card with buttons | Yes (up to 30m) |

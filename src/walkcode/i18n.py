@@ -434,6 +434,24 @@ _T: dict[str, tuple[str, str]] = {
         "(tmux is busy, or the session has exited). Please retry shortly.",
         "⚠️ 没送达：终端无响应（tmux 繁忙或会话已退出）。请稍后重发。",
     ),
+    # --- inject reached the box but was never submitted (Enter dropped, idle) ---
+    "feishu.inject_not_submitted": (
+        "⚠️ Not submitted: your message landed in the input box but the terminal "
+        "didn't accept Enter (the agent may be stuck on a menu/dialog). "
+        "Please check the terminal or resend.",
+        "⚠️ 没提交成功：消息进了输入框但终端没接收回车（agent 可能卡在菜单/弹窗）。"
+        "请到终端确认或重发。",
+    ),
+    # --- same session id reported from two live tmux panes (double instance) ---
+    "feishu.double_instance": (
+        "⚠️ Detected a second instance of this session: the old terminal "
+        "{old_tmux} is still running while a new one {new_tmux} reported in. "
+        "Two processes may be writing the same session — check and close one:\n"
+        "tmux attach -t {old_tmux}",
+        "⚠️ 检测到该会话出现第二个实例：旧终端 {old_tmux} 仍在运行，又有新的 "
+        "{new_tmux} 上报，可能两个进程在写同一会话。请检查并关掉一个：\n"
+        "tmux attach -t {old_tmux}",
+    ),
     "feishu.session_not_found": (
         "⚠️ Session not found, wait for next notification to reply",
         "⚠️ 找不到对应会话，请等待下一条通知后再回复",
