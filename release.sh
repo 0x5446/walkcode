@@ -182,22 +182,25 @@ cmd_publish() {
   valid_semver "$version" || die "invalid version: $version"
   [ "$version" = "$cur" ] || die "$(msg "version $version != merged pyproject $cur — is the bump merged?" \
                                         "版本 $version 与 main 上 pyproject 的 $cur 不一致 — bump 合并了吗？")"
-  # Re-entrant (issue #23 C): an existing tag is not fatal. If it points at HEAD,
-  # skip re-tagging and just ensure the Release exists; if it points elsewhere,
-  # that's a real conflict.
-  local need_tag=true
-  if tag_exists "v$version"; then
-    local tagged_sha; tagged_sha=$(git rev-parse -q --verify "refs/tags/v$version^{commit}" 2>/dev/null)
-    if [ -n "$tagged_sha" ] && [ "$tagged_sha" != "$(git rev-parse HEAD)" ]; then
-      die "$(msg "tag v$version exists but points at $tagged_sha, not HEAD" \
-                  "tag v$version 已存在但指向 ${tagged_sha}，不是 HEAD")"
-    fi
-    need_tag=false
-    info "$(msg "tag v$version already at HEAD — resuming to ensure Release exists" \
-                "tag v$version 已在 HEAD — 续跑以确保 Release 存在")"
+  # Re-entrant publish (issue #23 C). Track local and remote tag state separately
+  # so a half-finished publish (tagged locally but push or Release failed) resumes
+  # correctly instead of skipping the push.
+  local head_sha; head_sha=$(git rev-parse HEAD)
+  local local_tag_sha; local_tag_sha=$(git rev-parse -q --verify "refs/tags/v$version^{commit}" 2>/dev/null || true)
+  local remote_has_tag; remote_has_tag=$(git ls-remote --tags origin "refs/tags/v$version" 2>/dev/null)
+  if [ -n "$local_tag_sha" ] && [ "$local_tag_sha" != "$head_sha" ]; then
+    die "$(msg "tag v$version exists locally but points at $local_tag_sha, not HEAD" \
+                "tag v$version 本地已存在但指向 ${local_tag_sha}，不是 HEAD")"
   fi
 
-  local prev; prev=$(git describe --tags --abbrev=0 2>/dev/null || true)
+  # Notes base = latest tag strictly before this version. Exclude v$version itself,
+  # else a re-run with the tag already at HEAD yields empty notes.
+  local prev
+  if [ -n "$local_tag_sha" ]; then
+    prev=$(git describe --tags --abbrev=0 "v$version^" 2>/dev/null || true)
+  else
+    prev=$(git describe --tags --abbrev=0 2>/dev/null || true)
+  fi
   local notes
   if [ -n "$prev" ]; then
     notes=$(git log "${prev}..HEAD" --oneline)
@@ -205,19 +208,34 @@ cmd_publish() {
     notes=$(git log --oneline -20)
   fi
 
-  if $need_tag; then
+  # Create the local tag if missing; push it whenever the remote lacks it.
+  if [ -z "$local_tag_sha" ]; then
     info "$(msg "Tagging v$version on main" "在 main 打 tag v$version")"
     run git tag -a "v$version" -m "v$version"
+  else
+    info "$(msg "local tag v$version already at HEAD" "本地 tag v$version 已在 HEAD")"
+  fi
+  if [ -z "$remote_has_tag" ]; then
     run git push origin "v$version"
+  else
+    info "$(msg "remote already has tag v$version" "远端已有 tag v$version")"
   fi
 
   if $DRY_RUN; then
     echo "  [dry-run] gh release create v$version --latest --title v$version --notes <<"
     printf '%s\n' "$notes" | sed 's/^/      /'
-  elif gh release view "v$version" >/dev/null 2>&1; then
-    info "$(msg "Release v$version already exists — nothing to do" "Release v$version 已存在 — 无需操作")"
   else
-    gh release create "v$version" --latest --title "v$version" --notes "$notes"
+    # Idempotent + distinguish "not found" from real API/network errors so a
+    # transient failure isn't silently treated as "Release missing".
+    local rv_out rv_rc
+    rv_out=$(gh release view "v$version" 2>&1) && rv_rc=0 || rv_rc=$?
+    if [ "$rv_rc" -eq 0 ]; then
+      info "$(msg "Release v$version already exists — nothing to do" "Release v$version 已存在 — 无需操作")"
+    elif printf '%s' "$rv_out" | grep -qiE 'release not found|not found|404'; then
+      gh release create "v$version" --latest --title "v$version" --notes "$notes"
+    else
+      die "$(msg "gh release view failed (rc $rv_rc): $rv_out" "gh release view 失败 (rc ${rv_rc}): $rv_out")"
+    fi
   fi
   info "$(msg "Release v$version published. Now run ./upgrade.sh locally." \
               "Release v$version 已发布。本地执行 ./upgrade.sh 升级。")"

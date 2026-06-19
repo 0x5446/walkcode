@@ -7,9 +7,11 @@ scripts to assert their gates:
 * account check (must be 0x5446)
 * prepare clean-slate gate: on main, HEAD==origin/main, no untracked files (A)
 * publish HEAD==origin/main gate (B)
-* re-entrant publish on an existing tag at HEAD (C)
+* re-entrant publish: pushes a local-only tag to origin, non-empty notes (C)
+* publish aborts on a non-404 `gh release view` error (C)
 * version checks
 * upgrade requires the codex env file (F)
+* upgrade lock: active lock blocks, stale lock is reclaimed (H)
 
 Everything uses the local bare remote, so nothing touches the network.
 """
@@ -35,8 +37,17 @@ case "$cmd" in
   api)     echo "${FAKE_GH_ACCOUNT:-0x5446}" ;;
   pr)      case "$sub" in create) echo "https://fake/pr/1" ;; *) : ;; esac ;;
   release) case "$sub" in
-             view)   exit "${FAKE_RELEASE_VIEW_RC:-1}" ;;
-             create) echo "release created" ;;
+             view)
+               rc="${FAKE_RELEASE_VIEW_RC:-1}"
+               [ "$rc" != "0" ] && echo "${FAKE_RELEASE_VIEW_MSG:-release not found}" >&2
+               exit "$rc" ;;
+             create)
+               shift 2
+               while [ $# -gt 0 ]; do
+                 [ "$1" = "--notes" ] && printf '%s' "${2:-}" > "${FAKE_GH_NOTES_FILE:-/dev/null}"
+                 shift
+               done
+               echo "release created" ;;
              *) : ;;
            esac ;;
   *) : ;;
@@ -95,8 +106,7 @@ class _ScriptGateBase(unittest.TestCase):
         self._git("init", "--bare", str(self.origin), cwd=self.tmp)
         self._git("-c", "init.defaultBranch=main", "init", str(self.work), cwd=self.tmp)
         self._git("checkout", "-B", "main", cwd=self.work)
-        (self.work / "pyproject.toml").write_text(
-            '[project]\nname = "walkcode"\nversion = "0.10.0"\n')
+        self._set_version("0.10.0")
         (self.work / "tests").mkdir()
         (self.work / "tests" / "keep.txt").write_text("")
         shutil.copy(RELEASE_SH, self.work / "release.sh")
@@ -130,6 +140,17 @@ class _ScriptGateBase(unittest.TestCase):
         (self.work / "pyproject.toml").write_text(
             f'[project]\nname = "walkcode"\nversion = "{v}"\n')
 
+    def _upgrade_env(self, **extra):
+        env = {
+            "WALKCODE_LAUNCHD_LABEL": "fake",
+            "WALKCODE_LAUNCHD_LABEL_CODEX": "fake-codex",
+            "LOG_CLAUDE": str(self.tmp / "c.log"),
+            "LOG_CODEX": str(self.tmp / "x.log"),
+            "TMPDIR": str(self.tmp),
+        }
+        env.update(extra)
+        return env
+
 
 class ReleaseGateTests(_ScriptGateBase):
     def test_wrong_account_rejected(self):
@@ -149,6 +170,17 @@ class ReleaseGateTests(_ScriptGateBase):
         r = self._run("release.sh", "prepare", "0.10.1")
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("main", r.stdout + r.stderr)
+
+    def test_prepare_rejects_stale_main(self):
+        other = self.tmp / "other"
+        self._git("clone", str(self.origin), str(other), cwd=self.tmp)
+        (other / "x.txt").write_text("new")
+        self._git("add", "-A", cwd=other)
+        self._git("commit", "-m", "advance", cwd=other)
+        self._git("push", "origin", "HEAD:main", cwd=other)
+        r = self._run("release.sh", "prepare", "0.10.1")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("origin/main", r.stdout + r.stderr)
 
     def test_prepare_happy_path(self):
         r = self._run("release.sh", "prepare", "0.10.1", "-m", "release v0.10.1")
@@ -174,28 +206,62 @@ class ReleaseGateTests(_ScriptGateBase):
         r = self._run("release.sh", "publish", "0.10.1")
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertIn("v0.10.1", self._git_out("tag"))
+        self.assertIn("v0.10.1", self._git_out("ls-remote", "--tags", "origin"))
 
-    def test_publish_reentrant_existing_tag_at_head(self):
+    def test_publish_reentrant_pushes_remote_tag_and_notes(self):
+        # prior release tag so notes have a base
+        self._git("tag", "-a", "v0.10.0", "-m", "v0.10.0", cwd=self.work)
+        self._git("push", "origin", "v0.10.0", cwd=self.work)
         self._set_version("0.10.1")
         self._git("commit", "-am", "bump 0.10.1", cwd=self.work)
         self._git("push", "origin", "main", cwd=self.work)
+        # half-done publish: local tag at HEAD but NOT pushed to origin
         self._git("tag", "-a", "v0.10.1", "-m", "v0.10.1", cwd=self.work)
-        r = self._run("release.sh", "publish", "0.10.1")  # Release "missing" (rc=1)
+        notes_file = self.tmp / "notes.txt"
+        r = self._run("release.sh", "publish", "0.10.1",
+                      extra_env={"FAKE_GH_NOTES_FILE": str(notes_file)})
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
-        self.assertRegex(r.stdout + r.stderr, r"resuming|续跑")
+        # ISSUE_1: remote tag must now exist
+        self.assertIn("v0.10.1", self._git_out("ls-remote", "--tags", "origin"))
+        # ISSUE_2: notes must not be empty (current tag excluded from base)
+        self.assertIn("bump 0.10.1", notes_file.read_text())
+
+    def test_publish_aborts_on_release_view_error(self):
+        self._set_version("0.10.1")
+        self._git("commit", "-am", "bump 0.10.1", cwd=self.work)
+        self._git("push", "origin", "main", cwd=self.work)
+        r = self._run("release.sh", "publish", "0.10.1",
+                      extra_env={"FAKE_RELEASE_VIEW_RC": "1",
+                                 "FAKE_RELEASE_VIEW_MSG": "HTTP 500 internal error"})
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("release view", (r.stdout + r.stderr).lower())
 
 
 class UpgradeGateTests(_ScriptGateBase):
     def test_missing_codex_env_fails(self):
-        r = self._run("upgrade.sh", extra_env={
-            "WALKCODE_CODEX_ENV": str(self.tmp / "nope.env"),
-            "WALKCODE_LAUNCHD_LABEL": "fake",
-            "WALKCODE_LAUNCHD_LABEL_CODEX": "fake-codex",
-            "LOG_CLAUDE": str(self.tmp / "c.log"),
-            "LOG_CODEX": str(self.tmp / "x.log"),
-        })
+        r = self._run("upgrade.sh", extra_env=self._upgrade_env(
+            WALKCODE_CODEX_ENV=str(self.tmp / "nope.env")))
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("codex env", (r.stdout + r.stderr).lower())
+
+    def test_active_lock_blocks(self):
+        lock = self.tmp / "walkcode-upgrade.lock"
+        lock.mkdir()
+        (lock / "pid").write_text(str(os.getpid()))  # alive
+        r = self._run("upgrade.sh", extra_env=self._upgrade_env(
+            WALKCODE_CODEX_ENV=str(self.tmp / "codex.env")))
+        self.assertNotEqual(r.returncode, 0)
+        self.assertRegex(r.stdout + r.stderr, r"another upgrade is running|已有升级在运行")
+
+    def test_stale_lock_reclaimed(self):
+        lock = self.tmp / "walkcode-upgrade.lock"
+        lock.mkdir()
+        (lock / "pid").write_text("999999")  # dead pid
+        (self.tmp / "codex.env").write_text("X=1")
+        r = self._run("upgrade.sh", extra_env=self._upgrade_env(
+            WALKCODE_CODEX_ENV=str(self.tmp / "codex.env")))
+        self.assertNotRegex(r.stdout + r.stderr, r"another upgrade is running|已有升级在运行")
+        self.assertRegex(r.stdout + r.stderr, r"stale|残留")
 
 
 if __name__ == "__main__":

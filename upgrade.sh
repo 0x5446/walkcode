@@ -37,11 +37,22 @@ run()   { if $DRY_RUN; then printf '  [dry-run] %s\n' "$*"; else "$@"; fi; }
 command -v walkcode >/dev/null 2>&1 || die "$(msg "walkcode not found in PATH" "PATH 中找不到 walkcode")"
 
 # Single-flight (issue #23 H): serialize concurrent upgrades so two runs don't
-# interleave kickstarts and mis-read each other's PID churn as a crash-loop.
+# interleave kickstarts and mis-read each other's PID churn as a crash-loop. The
+# lock records its owner PID so a stale lock (script killed before EXIT) can be
+# reclaimed instead of wedging every future upgrade.
 LOCK_DIR="${TMPDIR:-/tmp}/walkcode-upgrade.lock"
 if ! $DRY_RUN; then
-  mkdir "$LOCK_DIR" 2>/dev/null || die "$(msg "another upgrade is running (lock: $LOCK_DIR)" "已有升级在运行（锁: ${LOCK_DIR}）")"
-  trap 'rmdir "$LOCK_DIR" 2>/dev/null' EXIT
+  if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+    lock_owner=$(cat "$LOCK_DIR/pid" 2>/dev/null || true)
+    if [ -n "$lock_owner" ] && kill -0 "$lock_owner" 2>/dev/null; then
+      die "$(msg "another upgrade is running (pid $lock_owner, lock: $LOCK_DIR)" "已有升级在运行（pid ${lock_owner}，锁: ${LOCK_DIR}）")"
+    fi
+    warn "$(msg "removing stale upgrade lock (owner ${lock_owner:-unknown} gone)" "清理残留升级锁（owner ${lock_owner:-未知} 已退出）")"
+    rm -rf "$LOCK_DIR"
+    mkdir "$LOCK_DIR" 2>/dev/null || die "$(msg "cannot acquire lock $LOCK_DIR" "无法获取锁 ${LOCK_DIR}")"
+  fi
+  echo "$$" > "$LOCK_DIR/pid"
+  trap 'rm -rf "$LOCK_DIR" 2>/dev/null' INT TERM HUP EXIT
 fi
 
 wc_version() {  # just the X.Y.Z (walkcode --version prints "walkcode X.Y.Z")
