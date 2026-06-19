@@ -315,12 +315,11 @@ def _build_askuserquestion_card(
 
     selected = set(selected_indices or [])
 
-    # Each option = a button. For multiSelect, prefix selected ones with ✓ and
-    # use a different button type so the toggle state is visible. The button
-    # value's `action` field tells _on_card_action whether this is a final
-    # selection (single-select) or a toggle (multi-select).
-    buttons = []
-    for j, opt in enumerate(options):
+    def _option_button(j: int, opt: dict) -> dict:
+        """Build one option button. For multiSelect, prefix selected ones with ✓
+        and use a different button type so the toggle state is visible. The
+        value's `action` field tells _on_card_action whether this is a final
+        selection (single-select) or a toggle (multi-select)."""
         idx = j + 1  # 1-based option position (kept stable across turns)
         label = opt.get("label", opt.get("value", ""))
         if multi_select:
@@ -332,7 +331,7 @@ def _build_askuserquestion_card(
             text = label
             btn_type = "primary"
             action = "select"
-        buttons.append({
+        return {
             "tag": "button",
             "text": {"tag": "plain_text", "content": text},
             "type": btn_type,
@@ -344,6 +343,30 @@ def _build_askuserquestion_card(
                 "question_index": question_index,
                 "total_questions": total_questions,
             },
+        }
+
+    # If any option carries a description, render each option as a block:
+    # a div (label + description, mirroring the TUI) followed by its button.
+    # Buttons can only hold single-line plain_text, so descriptions live in the
+    # div. Otherwise fall back to the compact single-row-of-buttons layout.
+    has_desc = any((opt.get("description") or "").strip() for opt in options)
+
+    option_elements: list[dict] = []
+    if has_desc:
+        for j, opt in enumerate(options):
+            label = opt.get("label", opt.get("value", ""))
+            desc = (opt.get("description") or "").strip()
+            content = f"**{label}**\n{desc}" if desc else f"**{label}**"
+            option_elements.append(
+                {"tag": "div", "text": {"tag": "lark_md", "content": content}}
+            )
+            option_elements.append(
+                {"tag": "action", "actions": [_option_button(j, opt)]}
+            )
+    else:
+        option_elements.append({
+            "tag": "action",
+            "actions": [_option_button(j, opt) for j, opt in enumerate(options)],
         })
 
     # Bottom row: per-question control buttons.
@@ -381,7 +404,7 @@ def _build_askuserquestion_card(
             "template": "blue",
         },
         "elements": [
-            {"tag": "action", "actions": buttons},
+            *option_elements,
             {"tag": "hr"},
             {"tag": "action", "actions": control_buttons},
         ],
