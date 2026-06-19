@@ -104,8 +104,35 @@ class TestCodexBuildStartCmd(_CmdTestBase):
         resume = CODEX.build_resume_cmd("SID", CWD)
         self.assertIn("&& WALKCODE_OWNER_CHECK=0 codex", resume)
 
+    def test_codex_bypasses_hook_trust_on_start_and_resume(self):
+        # codex 0.141 gates each hook behind a per-command trusted_hash; a changed
+        # hooks.json command (e.g. an added afplay sound prefix) flips the Feishu
+        # Stop hook to "needs review" and it silently stops firing. --yolo does NOT
+        # cover this, so codex carries --dangerously-bypass-hook-trust as a global
+        # flag on BOTH paths, before any subcommand.
+        start = CODEX.build_start_cmd("hi", CWD, None)
+        self.assertIn("--dangerously-bypass-hook-trust", start)
+        resume = CODEX.build_resume_cmd("SID", CWD)
+        self.assertIn("--dangerously-bypass-hook-trust", resume)
+        # global flag must precede the `resume` subcommand
+        self.assertLess(
+            resume.index("--dangerously-bypass-hook-trust"), resume.index("resume")
+        )
+        # image start path: the global flag must still lead — before the variadic
+        # --image and before the `-- 'prompt'` separator — so it is never swallowed
+        # as an image value nor pushed past the positional.
+        img_start = CODEX.build_start_cmd("hello", CWD, IMG)
+        self.assertIn("--dangerously-bypass-hook-trust", img_start)
+        self.assertLess(img_start.index("--dangerously-bypass-hook-trust"), img_start.index("--image"))
+        self.assertLess(img_start.index("--dangerously-bypass-hook-trust"), img_start.index(" -- 'hello'"))
+
 
 class TestClaudeBuildStartCmd(_CmdTestBase):
+    def test_claude_has_no_hook_trust_bypass(self):
+        # claude has no such gate; global_flags stays empty for it.
+        self.assertNotIn("--dangerously-bypass-hook-trust", CLAUDE.build_start_cmd("hi", CWD, None))
+        self.assertNotIn("--dangerously-bypass-hook-trust", CLAUDE.build_resume_cmd("SID", CWD))
+
     def test_claude_keeps_owner_gate_no_inline_env(self):
         # claude runs hooks synchronously (intact ancestry), so it keeps the gate:
         # no WALKCODE_OWNER_CHECK override in its launch/resume commands.
@@ -147,7 +174,7 @@ class TestPerInstanceRoutingOverrides(_CmdTestBase):
         cmd = CODEX.build_start_cmd("hi", CWD, None)
         self.assertEqual(
             cmd,
-            f"cd '{CWD}' && WALKCODE_OWNER_CHECK=0 codex --ask-for-approval untrusted --no-alt-screen 'hi'",
+            f"cd '{CWD}' && WALKCODE_OWNER_CHECK=0 codex --dangerously-bypass-hook-trust --ask-for-approval untrusted --no-alt-screen 'hi'",
         )
 
     # --- claude ccv: --settings inserted after `claude`, before permission flag ---
@@ -173,7 +200,7 @@ class TestPerInstanceRoutingOverrides(_CmdTestBase):
     def test_codex_permission_flag_replaces_approval(self):
         os.environ["WALKCODE_PERMISSION_FLAG"] = "--yolo"
         cmd = CODEX.build_start_cmd("hi", CWD, None)
-        self.assertEqual(cmd, f"cd '{CWD}' && WALKCODE_OWNER_CHECK=0 codex --yolo --no-alt-screen 'hi'")
+        self.assertEqual(cmd, f"cd '{CWD}' && WALKCODE_OWNER_CHECK=0 codex --dangerously-bypass-hook-trust --yolo --no-alt-screen 'hi'")
         self.assertNotIn("--ask-for-approval", cmd)
 
     def test_codex_yolo_keeps_image_dashdash_invariant(self):
@@ -186,14 +213,14 @@ class TestPerInstanceRoutingOverrides(_CmdTestBase):
     def test_codex_yolo_resume_puts_global_flag_before_subcommand(self):
         os.environ["WALKCODE_PERMISSION_FLAG"] = "--yolo"
         cmd = CODEX.build_resume_cmd("SID", CWD)
-        self.assertEqual(cmd, f"cd '{CWD}' && WALKCODE_OWNER_CHECK=0 codex --yolo resume 'SID'")
+        self.assertEqual(cmd, f"cd '{CWD}' && WALKCODE_OWNER_CHECK=0 codex --dangerously-bypass-hook-trust --yolo resume 'SID'")
         # --yolo is a global flag, must precede `resume`
         self.assertLess(cmd.index("--yolo"), cmd.index("resume"))
 
     def test_codex_resume_default_has_no_permission_flag(self):
         # Without an override, codex resume stays bare (pre-existing behavior).
         cmd = CODEX.build_resume_cmd("SID", CWD)
-        self.assertEqual(cmd, f"cd '{CWD}' && WALKCODE_OWNER_CHECK=0 codex resume 'SID'")
+        self.assertEqual(cmd, f"cd '{CWD}' && WALKCODE_OWNER_CHECK=0 codex --dangerously-bypass-hook-trust resume 'SID'")
 
     def test_claude_permission_flag_override(self):
         os.environ["WALKCODE_PERMISSION_FLAG"] = "--permission-mode plan"
@@ -231,7 +258,7 @@ class TestPerInstanceRoutingOverrides(_CmdTestBase):
         cmd = CODEX.build_start_cmd("hi", CWD, None)
         self.assertEqual(
             cmd,
-            f"cd '{CWD}' && WALKCODE_OWNER_CHECK=0 codex --settings /p/vertex.json --yolo --no-alt-screen 'hi'",
+            f"cd '{CWD}' && WALKCODE_OWNER_CHECK=0 codex --dangerously-bypass-hook-trust --settings /p/vertex.json --yolo --no-alt-screen 'hi'",
         )
 
 

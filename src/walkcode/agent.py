@@ -50,6 +50,12 @@ class AgentAdapter:
     # method cannot work for an agent that detaches its hooks, so codex opts out;
     # claude keeps the gate (synchronous hooks, intact ancestry → correctly owned).
     inline_env: tuple[tuple[str, str], ...] = ()
+    # Global flags inserted right after the agent command — before any subcommand
+    # (codex `resume`) and before the positional prompt — on BOTH start and resume.
+    # Unlike extra_start_flags (start-only, placed after the permission flag), these
+    # must lead so they also apply to subcommands. codex uses it for
+    # --dangerously-bypass-hook-trust (see the CODEX adapter below).
+    global_flags: tuple[str, ...] = ()
 
     def _command_with_inline_env(self) -> str:
         """The agent command, prefixed with any inline env assignments so the
@@ -72,6 +78,7 @@ class AgentAdapter:
         perm_flag = os.environ.get("WALKCODE_PERMISSION_FLAG") or self.permission_mode_flag
         extra_args = os.environ.get("WALKCODE_EXTRA_ARGS", "").strip()
         parts = [f"cd '{cwd}'", "&&", self._command_with_inline_env()]
+        parts.extend(self.global_flags)
         if extra_args:
             parts.append(_safe_flags(extra_args))
         parts.append(_safe_flags(perm_flag))
@@ -101,15 +108,18 @@ class AgentAdapter:
         extra_args = os.environ.get("WALKCODE_EXTRA_ARGS", "").strip()
         extra = f" {_safe_flags(extra_args)}" if extra_args else ""
         cmd = self._command_with_inline_env()
+        # Adapter global flags (e.g. codex --dangerously-bypass-hook-trust) lead so
+        # they precede the `resume` subcommand, mirroring build_start_cmd.
+        gflags = f" {' '.join(self.global_flags)}" if self.global_flags else ""
         if self.resume_is_subcommand:
             # codex resume '<sid>'. Global flags (e.g. --yolo) must precede the
             # `resume` subcommand: codex --yolo resume '<sid>'.
             perm = f" {_safe_flags(perm_override)}" if perm_override else ""
-            return f"cd '{cwd}' && {cmd}{extra}{perm} {self.resume_flag} '{escaped_sid}'"
+            return f"cd '{cwd}' && {cmd}{gflags}{extra}{perm} {self.resume_flag} '{escaped_sid}'"
         else:
             # claude --settings <file> --resume '<sid>' --permission-mode default
             perm = _safe_flags(perm_override) if perm_override else self.permission_mode_flag
-            return f"cd '{cwd}' && {cmd}{extra} {self.resume_flag} '{escaped_sid}' {perm}"
+            return f"cd '{cwd}' && {cmd}{gflags}{extra} {self.resume_flag} '{escaped_sid}' {perm}"
 
     def build_hook_response(
         self,
@@ -209,6 +219,14 @@ CODEX = AgentAdapter(
     # would misclassify them as a nested sub-agent and drop every Feishu reply. Opt
     # codex out of the gate (claude keeps it). See the inline_env field docstring.
     inline_env=(("WALKCODE_OWNER_CHECK", "0"),),
+    # codex 0.141 added a per-hook trust gate ([hooks.state] trusted_hash in
+    # config.toml): any change to a hooks.json command (e.g. adding an afplay sound
+    # prefix) invalidates the hash, and codex refuses to run that hook until it is
+    # re-reviewed in the TUI — so the Stop hook that posts replies to Feishu silently
+    # stops firing. --yolo does NOT cover this (it only skips approvals + sandbox).
+    # Pass --dangerously-bypass-hook-trust so codex runs walkcode's own (vetted)
+    # hooks without the per-change review prompt. Applied on start AND resume.
+    global_flags=("--dangerously-bypass-hook-trust",),
 )
 
 _AGENTS = {"claude": CLAUDE, "codex": CODEX}
