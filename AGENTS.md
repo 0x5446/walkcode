@@ -42,3 +42,6 @@ scripts; orchestration and gates live in the skill.
 - Hard rules: use the **0x5446** GitHub account; tests + `/deep-review` (no Critical)
   must pass before merging the PR; version's single source of truth is `pyproject.toml`
   (`__init__.py` derives from installed metadata — don't hand-edit it).
+- `prepare` runs only on a clean `main` (== `origin/main`, no untracked files; `git add`
+  new files first). **Don't share one checkout across parallel agents** — `git add -A`
+  will sweep in another session's files; use a separate git worktree per task.

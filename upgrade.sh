@@ -36,6 +36,32 @@ run()   { if $DRY_RUN; then printf '  [dry-run] %s\n' "$*"; else "$@"; fi; }
 
 command -v walkcode >/dev/null 2>&1 || die "$(msg "walkcode not found in PATH" "PATH 中找不到 walkcode")"
 
+# Single-flight (issue #23 H): serialize concurrent upgrades so two runs don't
+# interleave kickstarts and mis-read each other's PID churn as a crash-loop. The
+# lock records its owner PID so a stale lock (script killed before EXIT) can be
+# reclaimed instead of wedging every future upgrade.
+LOCK_DIR="${TMPDIR:-/tmp}/walkcode-upgrade.lock"
+if ! $DRY_RUN; then
+  if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+    lock_owner=$(cat "$LOCK_DIR/pid" 2>/dev/null || true)
+    if [ -n "$lock_owner" ] && kill -0 "$lock_owner" 2>/dev/null; then
+      die "$(msg "another upgrade is running (pid $lock_owner, lock: $LOCK_DIR)" "已有升级在运行（pid ${lock_owner}，锁: ${LOCK_DIR}）")"
+    fi
+    # Stale lock (owner gone). Claim it atomically: rename is atomic, so among
+    # concurrent reclaimers exactly one wins the mv; the losers bail. Only the
+    # winner clears the old dir and recreates the lock.
+    stale="$LOCK_DIR.stale.$$"
+    mv "$LOCK_DIR" "$stale" 2>/dev/null || die "$(msg "lost stale-lock reclaim race; another upgrade is running" "抢占残留锁失败；已有升级在运行")"
+    rm -rf "$stale"
+    warn "$(msg "reclaimed stale upgrade lock (owner ${lock_owner:-unknown} gone)" "已回收残留升级锁（owner ${lock_owner:-未知} 已退出）")"
+    mkdir "$LOCK_DIR" 2>/dev/null || die "$(msg "cannot acquire lock $LOCK_DIR" "无法获取锁 ${LOCK_DIR}")"
+  fi
+  echo "$$" > "$LOCK_DIR/pid"
+  # Only remove the lock if we still own it (avoid deleting a lock another run
+  # legitimately acquired after a reclaim).
+  trap 'if [ "$(cat "$LOCK_DIR/pid" 2>/dev/null)" = "$$" ]; then rm -rf "$LOCK_DIR" 2>/dev/null; fi' INT TERM HUP EXIT
+fi
+
 wc_version() {  # just the X.Y.Z (walkcode --version prints "walkcode X.Y.Z")
   walkcode --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true
 }
@@ -82,7 +108,7 @@ rc_hooks=0
 if $DRY_RUN; then
   echo "  [dry-run] WALKCODE_ENV_FILE=$CODEX_ENV walkcode install-hooks --agent codex"
 elif [ ! -f "$CODEX_ENV" ]; then
-  error "$(msg "codex env file not found: $CODEX_ENV (set WALKCODE_CODEX_ENV)" "codex env 文件不存在: $CODEX_ENV（用 WALKCODE_CODEX_ENV 指定）")"
+  error "$(msg "codex env file not found: $CODEX_ENV (set WALKCODE_CODEX_ENV)" "codex env 文件不存在: ${CODEX_ENV}（用 WALKCODE_CODEX_ENV 指定）")"
   rc_hooks=1
 elif ! WALKCODE_ENV_FILE="$CODEX_ENV" walkcode install-hooks --agent codex; then
   error "$(msg "codex install-hooks failed" "codex install-hooks 失败")"
