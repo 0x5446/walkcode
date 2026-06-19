@@ -47,12 +47,19 @@ if ! $DRY_RUN; then
     if [ -n "$lock_owner" ] && kill -0 "$lock_owner" 2>/dev/null; then
       die "$(msg "another upgrade is running (pid $lock_owner, lock: $LOCK_DIR)" "已有升级在运行（pid ${lock_owner}，锁: ${LOCK_DIR}）")"
     fi
-    warn "$(msg "removing stale upgrade lock (owner ${lock_owner:-unknown} gone)" "清理残留升级锁（owner ${lock_owner:-未知} 已退出）")"
-    rm -rf "$LOCK_DIR"
+    # Stale lock (owner gone). Claim it atomically: rename is atomic, so among
+    # concurrent reclaimers exactly one wins the mv; the losers bail. Only the
+    # winner clears the old dir and recreates the lock.
+    stale="$LOCK_DIR.stale.$$"
+    mv "$LOCK_DIR" "$stale" 2>/dev/null || die "$(msg "lost stale-lock reclaim race; another upgrade is running" "抢占残留锁失败；已有升级在运行")"
+    rm -rf "$stale"
+    warn "$(msg "reclaimed stale upgrade lock (owner ${lock_owner:-unknown} gone)" "已回收残留升级锁（owner ${lock_owner:-未知} 已退出）")"
     mkdir "$LOCK_DIR" 2>/dev/null || die "$(msg "cannot acquire lock $LOCK_DIR" "无法获取锁 ${LOCK_DIR}")"
   fi
   echo "$$" > "$LOCK_DIR/pid"
-  trap 'rm -rf "$LOCK_DIR" 2>/dev/null' INT TERM HUP EXIT
+  # Only remove the lock if we still own it (avoid deleting a lock another run
+  # legitimately acquired after a reclaim).
+  trap 'if [ "$(cat "$LOCK_DIR/pid" 2>/dev/null)" = "$$" ]; then rm -rf "$LOCK_DIR" 2>/dev/null; fi' INT TERM HUP EXIT
 fi
 
 wc_version() {  # just the X.Y.Z (walkcode --version prints "walkcode X.Y.Z")
