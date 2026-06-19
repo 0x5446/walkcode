@@ -340,6 +340,180 @@ def _read_last_assistant_text(path: str, max_chars: int = 28000) -> str:
     return ""
 
 
+def _is_user_turn_start(rec: dict) -> bool:
+    """True if a Claude transcript ``user`` record is a real prompt (a turn
+    boundary), not a tool_result echo.
+
+    Tool results are also ``user`` records, but their content is an array carrying
+    a ``tool_result`` block; a genuine prompt is a plain string or a text/image
+    array. Used to scope a turn to "everything since the last real user input".
+    """
+    msg = rec.get("message")
+    if not isinstance(msg, dict):  # message can arrive as JSON null → not a dict
+        return False
+    content = msg.get("content")
+    if isinstance(content, str):
+        return True
+    if isinstance(content, list):
+        return not any(
+            isinstance(b, dict) and b.get("type") == "tool_result" for b in content
+        )
+    return False
+
+
+def _join_turn_segments(segments: list[str], max_chars: int) -> str:
+    """Join a turn's text segments, preserving the TAIL when over budget.
+
+    The final segment is the turn's conclusion — the part the old
+    ``last_assistant_message`` path always delivered. So when the joined turn
+    exceeds the cap we drop the *leading* narration, never the answer, and mark the
+    cut at the front.
+    """
+    joined = "\n\n".join(segments)
+    if len(joined) > max_chars:
+        joined = "…(truncated)\n" + joined[-max_chars:]
+    return joined
+
+
+def _read_turn_assistant_texts(path: str, max_chars: int = 28000) -> str:
+    """Tail a Claude transcript JSONL; return EVERY assistant text segment of the
+    latest turn, joined in order.
+
+    A turn runs from the most recent real user prompt to the end. Claude emits a
+    separate assistant message for each text block that precedes a tool call, so a
+    turn with tool use produces several text segments. The Stop hook's
+    ``last_assistant_message`` keeps only the final one — dropping all the narration
+    interleaved with tools, which is why Feishu showed only the tail of what the TUI
+    displayed. This walks the whole turn and concatenates the segments (tool I/O is
+    omitted) so Feishu mirrors the TUI.
+
+    Returns "" if no real user prompt is found in the file (e.g. a compacted or
+    truncated transcript). Without that guard the loop would treat the whole file
+    as one turn and forward *all* historical replies — worse than the original bug.
+    The caller then falls back to the single ``last_assistant_message``.
+    """
+    if not path:
+        return ""
+    try:
+        lines = Path(path).read_text().splitlines()
+    except OSError:
+        return ""
+    segments: list[str] = []
+    seen_turn_start = False
+    for line in lines:
+        try:
+            rec = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if not isinstance(rec, dict):
+            continue
+        # Subagent (Task) chatter lives in the same file under isSidechain; it's not
+        # this session's main thread, so it must not pollute or reset the turn.
+        if rec.get("isSidechain"):
+            continue
+        rtype = rec.get("type")
+        if rtype == "user":
+            # A real prompt starts a new turn → drop prior turns' segments. Skip
+            # hook-injected meta records (isMeta) so they can't truncate the turn.
+            if not rec.get("isMeta") and _is_user_turn_start(rec):
+                seen_turn_start = True
+                segments = []
+            continue
+        if rtype != "assistant":
+            continue
+        msg = rec.get("message")
+        if not isinstance(msg, dict):  # null/garbage message → skip, don't crash
+            continue
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        parts = [b.get("text", "") for b in content
+                 if isinstance(b, dict) and b.get("type") == "text"
+                 and isinstance(b.get("text"), str)]
+        text = "".join(parts).strip()
+        if text:
+            segments.append(text)
+    if not seen_turn_start:
+        return ""
+    return _join_turn_segments(segments, max_chars)
+
+
+# A codex session id is a plain token (UUID-ish). Reject anything else before it
+# reaches a glob pattern, so a value containing * ? [ can't widen the match to
+# another session's rollout.
+_CODEX_SESSION_ID_RE = re.compile(r"[A-Za-z0-9._-]+")
+
+
+def _find_codex_rollout(session_id: str) -> str:
+    """Locate a Codex rollout JSONL by session id.
+
+    The rollout is named ``rollout-<ts>-<session_id>.jsonl`` under
+    ``~/.codex/sessions/<Y>/<M>/<D>/``. ``session_id`` comes from hook input, so it
+    is validated to a plain token first (no glob metacharacters) and matched on the
+    exact ``-<session_id>.jsonl`` suffix. Returns the newest match (mtime) or "".
+    """
+    if not session_id or not _CODEX_SESSION_ID_RE.fullmatch(session_id):
+        return ""
+    base = Path.home() / ".codex" / "sessions"
+    try:
+        matches = [p for p in base.rglob(f"rollout-*-{session_id}.jsonl")]
+    except OSError:
+        return ""
+    if not matches:
+        return ""
+    try:
+        return str(max(matches, key=lambda p: p.stat().st_mtime))
+    except OSError:
+        return str(matches[0])
+
+
+def _read_codex_turn_messages(session_id: str, path: str = "", max_chars: int = 28000) -> str:
+    """Codex counterpart of ``_read_turn_assistant_texts``.
+
+    Codex also emits several ``agent_message`` segments per turn (preambles between
+    tool batches), and its Stop hook likewise reports only the last one. Joins every
+    ``agent_message`` since the last real ``user_message`` (the turn boundary). The
+    ``message``/``role`` response_item records duplicate the ``agent_message``
+    events, so only the latter are counted to avoid doubling each segment.
+
+    Prefers the hook-provided ``path`` when it names a rollout file (avoids scanning
+    the whole sessions tree on every Stop); otherwise locates the rollout by
+    ``session_id``. Returns "" if no real ``user_message`` boundary is present, so
+    the caller falls back to ``last_assistant_message`` rather than dumping history.
+    """
+    rollout = path if (path and Path(path).name.startswith("rollout-")) else _find_codex_rollout(session_id)
+    if not rollout:
+        return ""
+    try:
+        lines = Path(rollout).read_text().splitlines()
+    except OSError:
+        return ""
+    segments: list[str] = []
+    seen_turn_start = False
+    for line in lines:
+        try:
+            rec = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        payload = rec.get("payload") if isinstance(rec, dict) else None
+        if not isinstance(payload, dict):
+            continue
+        ptype = payload.get("type")
+        if ptype == "user_message":
+            seen_turn_start = True
+            segments = []  # real user input → new turn
+        elif ptype == "agent_message":
+            text = payload.get("message")
+            if not isinstance(text, str):
+                text = payload.get("text")
+            text = text.strip() if isinstance(text, str) else ""
+            if text:
+                segments.append(text)
+    if not seen_turn_start:
+        return ""
+    return _join_turn_segments(segments, max_chars)
+
+
 def _record_owner_event(hook_type: str, tmux: str, session_id: str, reason: str) -> None:
     """Best-effort append of an owner-gate decision to ~/.walkcode/hook_debug.jsonl.
 
@@ -502,16 +676,45 @@ def cmd_hook(args):
         title = hook_data.get("title", "")
         matcher = hook_data.get("notification_type", "") or os.environ.get("CLAUDE_NOTIFICATION_TYPE", "")
     else:
-        # Stop hook: prefer last_assistant_message; fallback to transcript_path
-        # when the final message is a pure tool_use block (no text).
-        message = hook_data.get("last_assistant_message", "")
+        # Stop hook: forward the WHOLE turn's assistant text, not just the final
+        # segment. A turn with tool calls emits several text segments (the narration
+        # between tools); last_assistant_message keeps only the last one, so Feishu
+        # used to lose everything before it — the TUI showed N segments, Feishu got
+        # the Nth. Read the transcript and concatenate the turn's segments instead.
         title = ""
         matcher = ""
         _SKIP = {"no response requested.", ""}
+        transcript_path = hook_data.get("transcript_path", "") or ""
+        if os.environ.get("WALKCODE_AGENT", "claude") == "codex":
+            message = _read_codex_turn_messages(session_id, transcript_path)
+        else:
+            message = _read_turn_assistant_texts(transcript_path)
+        source = "transcript"
+        lam = (hook_data.get("last_assistant_message") or "").strip()
         if message.strip().lower() in _SKIP:
-            message = _read_last_assistant_text(hook_data.get("transcript_path", ""))
+            # Transcript unreadable / yielded no text → fall back to the single
+            # last_assistant_message the hook provided, then to empty (label only).
+            message = lam
+            source = "last_assistant_message"
             if message.strip().lower() in _SKIP:
                 message = ""
+                source = "empty"
+        elif lam and lam.lower() not in _SKIP and lam not in message:
+            # The transcript read can catch a still-flushing file (codex double-fires
+            # Stop and we may read a growing rollout) and miss the final segment. The
+            # hook's last_assistant_message is the authoritative conclusion, so append
+            # it when absent — the server dedupes the duplicate Stop by turn_id, and
+            # otherwise the incomplete first read would be frozen in Feishu.
+            message = f"{message}\n\n{lam}" if message else lam
+            source = "transcript+tail"
+        # Diagnostic trace: the fix silently degrades to the last segment when the
+        # transcript can't be read, so leave a breadcrumb (stderr → hook log) to tell
+        # "only the final segment" (a real one-segment turn) apart from a regression.
+        print(
+            f"[walkcode] stop message: source={source} chars={len(message)} "
+            f"truncated={message.startswith('…(truncated)')}",
+            file=sys.stderr,
+        )
 
     payload = json.dumps({
         "type": args.hook_type,

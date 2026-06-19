@@ -500,5 +500,111 @@ class CmdHookTurnIdForwardingTests(unittest.TestCase):
         self.assertEqual(cap["body"]["turn_id"], "")
 
 
+class CmdHookStopMessageTests(unittest.TestCase):
+    """cmd_hook's Stop branch must forward the WHOLE turn (not just the last
+    segment), and degrade safely. The helper-function unit tests don't prove the
+    wiring — a broken branch (wrong reader, dropped transcript_path, codex env not
+    honored, fallback missing) would slip past them."""
+
+    def _run(self, hook_data, env=None):
+        captured = {}
+
+        def fake_urlopen(req, timeout=None):
+            captured["body"] = json.loads(req.data.decode())
+
+            class _Resp:
+                def read(self_inner):
+                    return b"{}"
+
+                def __enter__(self_inner):
+                    return self_inner
+
+                def __exit__(self_inner, *a):
+                    return False
+
+            return _Resp()
+
+        envd = {"WALKCODE_PORT": "3999"}
+        envd.update(env or {})
+        with patch.object(m.sys, "stdin", io.StringIO(json.dumps(hook_data))), \
+             patch.object(m, "detect_tmux_session", lambda: "tmux1"), \
+             patch.object(m, "owner_check", lambda: (True, "owner")), \
+             patch.object(m.urllib.request, "urlopen", fake_urlopen), \
+             patch.dict(os.environ, envd, clear=False):
+            m.cmd_hook(argparse.Namespace(hook_type="stop"))
+        return captured
+
+    def _transcript(self, d, records):
+        p = Path(d) / "t.jsonl"
+        p.write_text("\n".join(json.dumps(r) for r in records) + "\n")
+        return str(p)
+
+    def test_claude_forwards_whole_turn(self):
+        with TemporaryDirectory() as d:
+            tp = self._transcript(d, [
+                {"type": "user", "message": {"content": "do it"}},
+                {"type": "assistant", "message": {"content": [
+                    {"type": "text", "text": "step one"},
+                    {"type": "tool_use", "name": "Bash", "input": {}}]}},
+                {"type": "user", "message": {"content": [
+                    {"type": "tool_result", "tool_use_id": "x", "content": "ok"}]}},
+                {"type": "assistant", "message": {"content": [
+                    {"type": "text", "text": "final answer"}]}},
+            ])
+            cap = self._run({
+                "session_id": "s1", "cwd": "/tmp", "transcript_path": tp,
+                "last_assistant_message": "final answer",
+            })
+            self.assertEqual(cap["body"]["message"], "step one\n\nfinal answer")
+
+    def test_claude_falls_back_to_last_assistant_message(self):
+        # No transcript_path → reader returns "" → fall back to the single segment.
+        cap = self._run({
+            "session_id": "s1", "cwd": "/tmp",
+            "last_assistant_message": "only this",
+        })
+        self.assertEqual(cap["body"]["message"], "only this")
+
+    def test_appends_final_segment_when_transcript_lags(self):
+        # Transcript missing the final segment (e.g. still-flushing) → the
+        # authoritative last_assistant_message is appended so the conclusion lands.
+        with TemporaryDirectory() as d:
+            tp = self._transcript(d, [
+                {"type": "user", "message": {"content": "q"}},
+                {"type": "assistant", "message": {"content": [
+                    {"type": "text", "text": "partial so far"}]}},
+            ])
+            cap = self._run({
+                "session_id": "s1", "cwd": "/tmp", "transcript_path": tp,
+                "last_assistant_message": "the real conclusion",
+            })
+            self.assertEqual(
+                cap["body"]["message"], "partial so far\n\nthe real conclusion")
+
+    def test_no_duplicate_when_transcript_already_has_final(self):
+        with TemporaryDirectory() as d:
+            tp = self._transcript(d, [
+                {"type": "user", "message": {"content": "q"}},
+                {"type": "assistant", "message": {"content": [
+                    {"type": "text", "text": "the answer"}]}},
+            ])
+            cap = self._run({
+                "session_id": "s1", "cwd": "/tmp", "transcript_path": tp,
+                "last_assistant_message": "the answer",
+            })
+            self.assertEqual(cap["body"]["message"], "the answer")
+
+    def test_codex_branch_uses_rollout_reader(self):
+        with patch.object(m, "_read_codex_turn_messages",
+                          return_value="codex seg 1\n\ncodex seg 2") as reader:
+            cap = self._run(
+                {"session_id": "019ed-sid", "cwd": "/tmp",
+                 "turn_id": "t1", "last_assistant_message": "codex seg 2"},
+                env={"WALKCODE_AGENT": "codex"},
+            )
+        reader.assert_called_once()
+        self.assertEqual(cap["body"]["message"], "codex seg 1\n\ncodex seg 2")
+
+
 if __name__ == "__main__":
     unittest.main()
