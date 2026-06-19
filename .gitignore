@@ -12,3 +12,6 @@ dist/
 .claude/
 AGENTS.md
 .envrc
+
+# deep-review local reports (not shipped)
+.review/

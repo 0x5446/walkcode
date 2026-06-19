@@ -65,8 +65,20 @@ run() {  # echo + run, or just echo under --dry-run (simple commands only, no pi
   if $DRY_RUN; then printf '  [dry-run] %s\n' "$*"; else "$@"; fi
 }
 
-tag_exists() { git rev-parse -q --verify "refs/tags/$1" >/dev/null 2>&1 \
-               || git ls-remote --exit-code --tags origin "$1" >/dev/null 2>&1; }
+# 0 = tag exists (local or remote), 1 = absent. ls-remote exit codes: 0=found,
+# 2=ran-but-absent, anything else = network/auth error → fatal (never silently
+# treat a failed lookup as "absent" and let publish double-tag). issue #23 D.
+tag_exists() {
+  git rev-parse -q --verify "refs/tags/$1" >/dev/null 2>&1 && return 0
+  local rc=0
+  git ls-remote --exit-code --tags origin "refs/tags/$1" >/dev/null 2>&1 || rc=$?
+  case "$rc" in
+    0) return 0 ;;
+    2) return 1 ;;
+    *) die "$(msg "git ls-remote failed (exit $rc) checking tag $1 — network/auth?" \
+                  "git ls-remote 查 tag $1 失败（exit ${rc}）— 网络/认证问题？")" ;;
+  esac
+}
 
 # --- prepare ---
 cmd_prepare() {
@@ -82,6 +94,25 @@ cmd_prepare() {
 
   need git; need gh; need uv
   require_account
+
+  # Clean-slate gate: prepare must start from an up-to-date main with no stray
+  # untracked files, so `git add -A` below can't sweep in another session's files
+  # or debris. This actually happened (issue #23 A). Tracked edits (your feature
+  # changes) are fine; new files you intend to ship must be `git add`-ed first.
+  if ! $DRY_RUN; then
+    local cur_branch; cur_branch=$(git rev-parse --abbrev-ref HEAD)
+    [ "$cur_branch" = "main" ] || die "$(msg "prepare must run on main (now on $cur_branch)" \
+                                            "prepare 必须在 main 上运行（当前 ${cur_branch}）")"
+    git fetch origin main -q
+    local lh rh; lh=$(git rev-parse HEAD); rh=$(git rev-parse origin/main)
+    [ "$lh" = "$rh" ] || die "$(msg "local main ($lh) != origin/main ($rh) — sync first" \
+                                    "本地 main ($lh) 与 origin/main ($rh) 不一致 — 先同步")"
+    local untracked; untracked=$(git ls-files --others --exclude-standard)
+    [ -z "$untracked" ] || die "$(msg "untracked files present — git add what to ship, remove the rest:
+$untracked" \
+                                      "存在未跟踪文件 — 要发布的先 git add，其余清理掉：
+$untracked")"
+  fi
 
   local cur; cur=$(pyproject_version)
   [ -n "$cur" ] || die "cannot read current version from $PYPROJECT"
@@ -140,7 +171,7 @@ cmd_publish() {
   # Gate: HEAD must equal origin/main, so a local-only commit that bypassed the
   # "merge into main first" review gate can never be tagged + released.
   if ! $DRY_RUN; then
-    git fetch origin main -q
+    git fetch origin main --tags -q
     local lh rh; lh=$(git rev-parse HEAD); rh=$(git rev-parse origin/main)
     [ "$lh" = "$rh" ] || die "$(msg "HEAD ($lh) != origin/main ($rh) — merge into main before publishing" \
                                     "HEAD ($lh) 与 origin/main ($rh) 不一致 — 先合并进 main 再发布")"
@@ -151,7 +182,20 @@ cmd_publish() {
   valid_semver "$version" || die "invalid version: $version"
   [ "$version" = "$cur" ] || die "$(msg "version $version != merged pyproject $cur — is the bump merged?" \
                                         "版本 $version 与 main 上 pyproject 的 $cur 不一致 — bump 合并了吗？")"
-  tag_exists "v$version" && die "tag v$version already exists"
+  # Re-entrant (issue #23 C): an existing tag is not fatal. If it points at HEAD,
+  # skip re-tagging and just ensure the Release exists; if it points elsewhere,
+  # that's a real conflict.
+  local need_tag=true
+  if tag_exists "v$version"; then
+    local tagged_sha; tagged_sha=$(git rev-parse -q --verify "refs/tags/v$version^{commit}" 2>/dev/null)
+    if [ -n "$tagged_sha" ] && [ "$tagged_sha" != "$(git rev-parse HEAD)" ]; then
+      die "$(msg "tag v$version exists but points at $tagged_sha, not HEAD" \
+                  "tag v$version 已存在但指向 ${tagged_sha}，不是 HEAD")"
+    fi
+    need_tag=false
+    info "$(msg "tag v$version already at HEAD — resuming to ensure Release exists" \
+                "tag v$version 已在 HEAD — 续跑以确保 Release 存在")"
+  fi
 
   local prev; prev=$(git describe --tags --abbrev=0 2>/dev/null || true)
   local notes
@@ -161,13 +205,17 @@ cmd_publish() {
     notes=$(git log --oneline -20)
   fi
 
-  info "$(msg "Tagging v$version on main" "在 main 打 tag v$version")"
-  run git tag -a "v$version" -m "v$version"
-  run git push origin "v$version"
+  if $need_tag; then
+    info "$(msg "Tagging v$version on main" "在 main 打 tag v$version")"
+    run git tag -a "v$version" -m "v$version"
+    run git push origin "v$version"
+  fi
 
   if $DRY_RUN; then
     echo "  [dry-run] gh release create v$version --latest --title v$version --notes <<"
     printf '%s\n' "$notes" | sed 's/^/      /'
+  elif gh release view "v$version" >/dev/null 2>&1; then
+    info "$(msg "Release v$version already exists — nothing to do" "Release v$version 已存在 — 无需操作")"
   else
     gh release create "v$version" --latest --title "v$version" --notes "$notes"
   fi

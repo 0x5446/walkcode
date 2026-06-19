@@ -36,6 +36,14 @@ run()   { if $DRY_RUN; then printf '  [dry-run] %s\n' "$*"; else "$@"; fi; }
 
 command -v walkcode >/dev/null 2>&1 || die "$(msg "walkcode not found in PATH" "PATH 中找不到 walkcode")"
 
+# Single-flight (issue #23 H): serialize concurrent upgrades so two runs don't
+# interleave kickstarts and mis-read each other's PID churn as a crash-loop.
+LOCK_DIR="${TMPDIR:-/tmp}/walkcode-upgrade.lock"
+if ! $DRY_RUN; then
+  mkdir "$LOCK_DIR" 2>/dev/null || die "$(msg "another upgrade is running (lock: $LOCK_DIR)" "已有升级在运行（锁: ${LOCK_DIR}）")"
+  trap 'rmdir "$LOCK_DIR" 2>/dev/null' EXIT
+fi
+
 wc_version() {  # just the X.Y.Z (walkcode --version prints "walkcode X.Y.Z")
   walkcode --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true
 }
@@ -82,7 +90,7 @@ rc_hooks=0
 if $DRY_RUN; then
   echo "  [dry-run] WALKCODE_ENV_FILE=$CODEX_ENV walkcode install-hooks --agent codex"
 elif [ ! -f "$CODEX_ENV" ]; then
-  error "$(msg "codex env file not found: $CODEX_ENV (set WALKCODE_CODEX_ENV)" "codex env 文件不存在: $CODEX_ENV（用 WALKCODE_CODEX_ENV 指定）")"
+  error "$(msg "codex env file not found: $CODEX_ENV (set WALKCODE_CODEX_ENV)" "codex env 文件不存在: ${CODEX_ENV}（用 WALKCODE_CODEX_ENV 指定）")"
   rc_hooks=1
 elif ! WALKCODE_ENV_FILE="$CODEX_ENV" walkcode install-hooks --agent codex; then
   error "$(msg "codex install-hooks failed" "codex install-hooks 失败")"
