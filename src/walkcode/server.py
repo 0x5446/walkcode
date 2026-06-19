@@ -252,6 +252,21 @@ def _build_permission_card(
     }
 
 
+def _escape_lark_md(text: str) -> str:
+    """Escape Feishu lark_md structural chars so an option's label/description
+    renders as literal text. These strings come from AskUserQuestion tool_input;
+    a prompt-injected agent could otherwise craft links ([x](url)) or mentions
+    (<at id=..>) that impersonate system UI, or inline format (**bold**, `code`)
+    that closes the bold we wrap the label in. Buttons use plain_text and need no
+    escaping; only the lark_md div does."""
+    if not text:
+        return text
+    # backslash first, then links/mentions/html and inline-format markers
+    for ch in ("\\", "`", "*", "_", "~", "[", "]", "(", ")", "<", ">", "#", "|"):
+        text = text.replace(ch, "\\" + ch)
+    return text
+
+
 def _build_askuserquestion_card(
     request_id: str,
     questions: list,
@@ -315,12 +330,11 @@ def _build_askuserquestion_card(
 
     selected = set(selected_indices or [])
 
-    # Each option = a button. For multiSelect, prefix selected ones with ✓ and
-    # use a different button type so the toggle state is visible. The button
-    # value's `action` field tells _on_card_action whether this is a final
-    # selection (single-select) or a toggle (multi-select).
-    buttons = []
-    for j, opt in enumerate(options):
+    def _option_button(j: int, opt: dict) -> dict:
+        """Build one option button. For multiSelect, prefix selected ones with ✓
+        and use a different button type so the toggle state is visible. The
+        value's `action` field tells _on_card_action whether this is a final
+        selection (single-select) or a toggle (multi-select)."""
         idx = j + 1  # 1-based option position (kept stable across turns)
         label = opt.get("label", opt.get("value", ""))
         if multi_select:
@@ -332,7 +346,7 @@ def _build_askuserquestion_card(
             text = label
             btn_type = "primary"
             action = "select"
-        buttons.append({
+        return {
             "tag": "button",
             "text": {"tag": "plain_text", "content": text},
             "type": btn_type,
@@ -344,6 +358,34 @@ def _build_askuserquestion_card(
                 "question_index": question_index,
                 "total_questions": total_questions,
             },
+        }
+
+    # If any option carries a description, render each option as a block:
+    # a div (label + description, mirroring the TUI) followed by its button.
+    # Buttons can only hold single-line plain_text, so descriptions live in the
+    # div. Otherwise fall back to the compact single-row-of-buttons layout.
+    has_desc = any((opt.get("description") or "").strip() for opt in options)
+
+    option_elements: list[dict] = []
+    if has_desc:
+        for j, opt in enumerate(options):
+            label = opt.get("label", opt.get("value", ""))
+            desc = (opt.get("description") or "").strip()
+            # label is the bold heading; collapse newlines so a multi-line label
+            # can't break out of the **...** wrapper. desc keeps legit newlines.
+            label_md = _escape_lark_md(label).replace("\r", " ").replace("\n", " ")
+            desc_md = _escape_lark_md(desc)
+            content = f"**{label_md}**\n{desc_md}" if desc_md else f"**{label_md}**"
+            option_elements.append(
+                {"tag": "div", "text": {"tag": "lark_md", "content": content}}
+            )
+            option_elements.append(
+                {"tag": "action", "actions": [_option_button(j, opt)]}
+            )
+    else:
+        option_elements.append({
+            "tag": "action",
+            "actions": [_option_button(j, opt) for j, opt in enumerate(options)],
         })
 
     # Bottom row: per-question control buttons.
@@ -381,7 +423,7 @@ def _build_askuserquestion_card(
             "template": "blue",
         },
         "elements": [
-            {"tag": "action", "actions": buttons},
+            *option_elements,
             {"tag": "hr"},
             {"tag": "action", "actions": control_buttons},
         ],
