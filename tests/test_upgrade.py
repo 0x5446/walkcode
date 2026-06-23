@@ -41,6 +41,10 @@ class UpgradeReinstallHooksTests(unittest.TestCase):
             any("walkcode[summary]" in c for c in calls),
             f"expected upgrade to keep summary extra installed, got {calls}",
         )
+        self.assertTrue(
+            any("--python 3.13" in c for c in calls),
+            f"expected upgrade to pin a compatible Python, got {calls}",
+        )
         # ordering: uv install happens before install-hooks
         uv_idx = next(i for i, c in enumerate(calls) if "uv tool install" in c)
         hooks_idx = next(i for i, c in enumerate(calls) if "install-hooks" in c)

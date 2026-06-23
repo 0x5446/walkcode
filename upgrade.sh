@@ -106,6 +106,7 @@ info "$(msg "Current version: $old_ver" "当前版本: $old_ver")"
 # not know about newly-required extras.
 GITHUB_REPO="0x5446/walkcode"
 GITHUB_URL="https://github.com/${GITHUB_REPO}.git"
+PYTHON_SPEC="${WALKCODE_PYTHON:-3.13}"
 latest_tag=""
 latest_tag=$(python3 - "$GITHUB_REPO" <<'PY' || true
 import json
@@ -123,10 +124,10 @@ PY
 )
 if [ -n "$latest_tag" ]; then
   info "$(msg "Latest release: $latest_tag" "最新版本: ${latest_tag}")"
-  run uv tool install "walkcode[summary] @ git+${GITHUB_URL}@${latest_tag}" --force
+  run uv tool install --python "$PYTHON_SPEC" "walkcode[summary] @ git+${GITHUB_URL}@${latest_tag}" --force
 else
   warn "$(msg "No release tag detected, installing from main" "未检测到 release tag，从 main 安装")"
-  run uv tool install "walkcode[summary] @ git+${GITHUB_URL}" --force
+  run uv tool install --python "$PYTHON_SPEC" "walkcode[summary] @ git+${GITHUB_URL}" --force
 fi
 run walkcode install-hooks --agent claude
 # 2) codex hooks (step 1 refreshed only the default/claude agent's hooks).
