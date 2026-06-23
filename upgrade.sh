@@ -36,6 +36,7 @@ die()   { error "$1"; exit 1; }
 run()   { if $DRY_RUN; then printf '  [dry-run] %s\n' "$*"; else "$@"; fi; }
 
 command -v walkcode >/dev/null 2>&1 || die "$(msg "walkcode not found in PATH" "PATH 中找不到 walkcode")"
+command -v uv >/dev/null 2>&1 || die "$(msg "uv not found in PATH" "PATH 中找不到 uv")"
 
 # Single-flight (issue #23 H): serialize concurrent upgrades so two runs don't
 # interleave kickstarts and mis-read each other's PID churn as a crash-loop. The
@@ -99,9 +100,36 @@ verify_instance() {  # label log offset -> 0 ok / 1 fail
 old_ver=$(wc_version); old_ver=${old_ver:-unknown}
 info "$(msg "Current version: $old_ver" "当前版本: $old_ver")"
 
-# 1) install latest released code (+ claude hooks); no restart under launchd
-run walkcode upgrade
-# 2) codex hooks (upgrade only refreshed the default/claude agent's hooks).
+# 1) install latest released code with the summary extra, then refresh claude hooks.
+# Do this directly instead of delegating to the currently installed `walkcode
+# upgrade`: during a self-upgrade that command is still the old version, which may
+# not know about newly-required extras.
+GITHUB_REPO="0x5446/walkcode"
+GITHUB_URL="https://github.com/${GITHUB_REPO}.git"
+latest_tag=""
+latest_tag=$(python3 - "$GITHUB_REPO" <<'PY' || true
+import json
+import sys
+import urllib.request
+
+repo = sys.argv[1]
+req = urllib.request.Request(
+    f"https://api.github.com/repos/{repo}/releases/latest",
+    headers={"Accept": "application/vnd.github+json"},
+)
+with urllib.request.urlopen(req, timeout=10) as resp:
+    print(json.loads(resp.read()).get("tag_name", ""))
+PY
+)
+if [ -n "$latest_tag" ]; then
+  info "$(msg "Latest release: $latest_tag" "最新版本: ${latest_tag}")"
+  run uv tool install "walkcode[summary] @ git+${GITHUB_URL}@${latest_tag}" --force
+else
+  warn "$(msg "No release tag detected, installing from main" "未检测到 release tag，从 main 安装")"
+  run uv tool install "walkcode[summary] @ git+${GITHUB_URL}" --force
+fi
+run walkcode install-hooks --agent claude
+# 2) codex hooks (step 1 refreshed only the default/claude agent's hooks).
 #    MUST carry WALKCODE_ENV_FILE=codex.env — otherwise install-hooks writes the
 #    codex hooks pointing at the default port (3001) and without the codex creds,
 #    wiring the codex instance back to the claude instance. Hard error, not warn.
