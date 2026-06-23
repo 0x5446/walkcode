@@ -962,7 +962,8 @@ def cmd_upgrade(_args):
         print(t("upgrade.no_release"))
         source = f"walkcode[summary] @ git+{_GITHUB_URL}"
 
-    _run(f"uv tool install {shlex.quote(source)} --force")
+    python_spec = os.environ.get("WALKCODE_PYTHON", "3.13")
+    _run(f"uv tool install --python {shlex.quote(python_spec)} {shlex.quote(source)} --force")
 
     # Re-run install-hooks via the freshly installed binary — NOT cmd_install_hooks()
     # in-process. This interpreter is still running the OLD code, so an in-process

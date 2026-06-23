@@ -236,7 +236,7 @@ sudo pmset -c sleep 0 && sudo pmset -c disksleep 0 && sudo pmset -c standby 0 &&
 ```bash
 brew install tmux
 curl -LsSf https://astral.sh/uv/install.sh | sh
-uv tool install "walkcode[summary] @ git+https://github.com/0x5446/walkcode.git"
+uv tool install --python 3.13 "walkcode[summary] @ git+https://github.com/0x5446/walkcode.git"
 ```
 
 > `summary` extra 只提供 Codex 健康卡片标题精炼依赖。未配置 `WALKCODE_SUMMARY_*` 时不会调用模型。
