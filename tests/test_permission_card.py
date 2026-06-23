@@ -20,7 +20,9 @@ import unittest
 from walkcode.server import (
     _PERM_BEHAVIORS,
     _PERM_BUTTON_LABELS,
+    _build_askuser_answers_card,
     _build_permission_card,
+    _build_permission_result_card,
     _format_permission_suggestions,
 )
 from walkcode.i18n import t
@@ -39,6 +41,37 @@ def _button_behaviors(card: dict) -> list[str]:
 
 def _card_body(card: dict) -> str:
     return card["elements"][0]["text"]["content"]
+
+
+class ResolvedCardTests(unittest.TestCase):
+    """Cards shown after a request is settled in the terminal: green, and for
+    AskUserQuestion they list the chosen answer."""
+
+    def test_invalidated_permission_card_is_green(self):
+        card = _build_permission_result_card("Bash", "invalidated")
+        self.assertEqual(card["header"]["template"], "green")
+
+    def test_askuser_answers_card_lists_choices(self):
+        questions = [
+            {"question": "Deploy now?", "header": "Deploy",
+             "options": [{"label": "Yes"}, {"label": "No"}]},
+            {"question": "Which region?", "options": [{"label": "us"}, {"label": "eu"}]},
+        ]
+        answers = {"Deploy now?": "Yes", "Which region?": "eu"}
+        card = _build_askuser_answers_card(
+            t("feishu.askuser.terminal_selected"), questions, answers)
+        self.assertEqual(card["header"]["template"], "green")
+        body = _card_body(card)
+        self.assertIn("Yes", body)
+        self.assertIn("eu", body)
+        self.assertIn("Deploy", body)         # header used as heading
+        self.assertIn("Which region?", body)  # no header → falls back to question text
+
+    def test_askuser_answers_card_missing_answer_falls_back(self):
+        questions = [{"question": "Unanswered?", "options": []}]
+        card = _build_askuser_answers_card("t", questions, {})
+        self.assertEqual(card["header"]["template"], "green")
+        self.assertIn(t("feishu.perm.invalidated"), _card_body(card))
 
 
 class ButtonLabelsTest(unittest.TestCase):

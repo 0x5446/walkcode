@@ -451,7 +451,7 @@ def _build_permission_result_card(tool_name: str, behavior: str) -> dict:
         template = "green"
     elif behavior == "invalidated":
         label = t("feishu.perm.invalidated")
-        template = "grey"
+        template = "green"
     else:
         label = t("feishu.perm.denied")
         template = "red"
@@ -463,6 +463,34 @@ def _build_permission_result_card(tool_name: str, behavior: str) -> dict:
         },
         "elements": [
             {"tag": "div", "text": {"tag": "lark_md", "content": f"**Tool:** `{tool_name}`"}},
+        ],
+    }
+
+
+def _build_askuser_answers_card(title: str, questions: list, answers_map: dict) -> dict:
+    """Green result card listing each question and the answer the user chose.
+
+    Shared by both answer paths: the Feishu click finalize (``_finalize_askuser_answer``)
+    and the TUI path (``receive_post_tool_hook``, where the answer comes from
+    PostToolUse's ``tool_response``). ``answers_map`` is ``{question_text: label}``;
+    lookup is by question text so it never depends on card / question ordering."""
+    lines = []
+    for q in questions or []:
+        q_text = q.get("question", "")
+        heading = q.get("header") or q_text or "—"
+        ans = answers_map.get(q_text)
+        if ans is None:
+            ans = t("feishu.perm.invalidated")
+        lines.append(f"**{heading}**\n→ {ans}")
+    content = "\n\n".join(lines) if lines else t("feishu.perm.invalidated")
+    return {
+        "config": {"wide_screen_mode": True},
+        "header": {
+            "title": {"tag": "plain_text", "content": title},
+            "template": "green",
+        },
+        "elements": [
+            {"tag": "div", "text": {"tag": "lark_md", "content": content}},
         ],
     }
 
@@ -887,17 +915,10 @@ def _finalize_askuser_answer(
 
     resp.card = CallBackCard()
     resp.card.type = "raw"
-    resp.card.data = {
-        "config": {"wide_screen_mode": True},
-        "header": {
-            "title": {"tag": "plain_text", "content": "All questions answered"},
-            "template": "green",
-        },
-        "elements": [
-            {"tag": "div", "text": {"tag": "lark_md",
-                                    "content": f"✓ All {total_questions} question(s) answered"}},
-        ],
-    }
+    answers_map = _build_askuser_updated_input(questions, answers_list)["answers"]
+    resp.card.data = _build_askuser_answers_card(
+        t("feishu.askuser.submitted"), questions, answers_map,
+    )
     resp.toast = CallBackToast()
     resp.toast.type = "success"
     resp.toast.content = "All answers submitted"
@@ -2213,18 +2234,32 @@ async def receive_post_tool_hook(request: Request):
     """PostToolUse (claude only): a tool actually executed → its TUI permission was
     already settled (claude shows a parallel native menu; PostToolUse only fires when
     the tool ran). Invalidate this session's still-open permission cards so a late
-    Feishu click is a harmless no-op, and grey out the cards. Keyed on session_id
+    Feishu click is a harmless no-op, and resolve the cards (green; AskUserQuestion
+    cards show the chosen answer). Keyed on session_id
     because claude's PermissionRequest carries no tool_use_id. Idempotent via
     invalidate_session's write-once guard."""
     body = await request.json()
     session_id = body.get("session_id", "")
     if not session_id:
         return {"ok": False, "error": "missing session_id"}
+    # answers is {question_text: chosen_label}, sent by the hook only for AskUserQuestion.
+    # TUI-chosen answers live nowhere in walkcode's memory (req.answers is filled only on a
+    # Feishu click), so they reach us here via PostToolUse's tool_response.
+    answers = body.get("answers")
     snaps = registry.invalidate_session(session_id)
     for snap in snaps:
         card_msg_id = snap.get("card_msg_id")
-        if card_msg_id:
-            _edit_card(card_msg_id, _build_permission_result_card(snap.get("tool_name", ""), "invalidated"))
+        if not card_msg_id:
+            continue
+        if answers and snap.get("tool_name") == "AskUserQuestion":
+            card = _build_askuser_answers_card(
+                t("feishu.askuser.terminal_selected"),
+                snap.get("tool_input", {}).get("questions", []),
+                answers,
+            )
+        else:
+            card = _build_permission_result_card(snap.get("tool_name", ""), "invalidated")
+        _edit_card(card_msg_id, card)
     if snaps:
         logger.info(f"PostToolUse invalidated {len(snaps)} card(s) for session {session_id[:8]}")
     return {"ok": True, "invalidated": len(snaps)}

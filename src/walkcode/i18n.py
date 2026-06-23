@@ -288,8 +288,16 @@ _T: dict[str, tuple[str, str]] = {
         "请求已过期",
     ),
     "feishu.perm.invalidated": (
-        "✓ Handled in terminal",
-        "✓ 已在终端处理",
+        "✅ Allowed in terminal",
+        "✅ 已在终端允许",
+    ),
+    "feishu.askuser.terminal_selected": (
+        "✅ Selected in terminal",
+        "✅ 已在终端选择",
+    ),
+    "feishu.askuser.submitted": (
+        "✅ Submitted",
+        "✅ 已选择",
     ),
     "feishu.perm.already_decided": (
         "Already answered — keeping the first decision",

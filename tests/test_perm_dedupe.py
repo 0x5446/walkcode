@@ -178,14 +178,40 @@ class ReceivePermDedupeTests(unittest.TestCase):
         # → the card is invalidated (edited grey) and the decision long-poll returns
         # "invalidated" so the hook fails open instead of waiting to 1800s.
         edits = []
-        with patch.object(server, "_edit_card", lambda mid, card: edits.append(mid)):
+        with patch.object(server, "_edit_card", lambda mid, card: edits.append((mid, card))):
             rid = self._post(_perm_body(tool_use_id="tu-1"))["request_id"]
             res = asyncio.run(server.receive_post_tool_hook(_Req({"session_id": "s1"})))
         self.assertEqual(res["invalidated"], 1)
-        self.assertEqual(edits, ["cardmsg"])  # the card_msg_id was edited to the grey card
+        self.assertEqual([mid for mid, _ in edits], ["cardmsg"])  # the card_msg_id was edited
+        self.assertEqual(edits[0][1]["header"]["template"], "green")  # resolved green, not grey
         self.assertTrue(server.registry.is_invalidated(rid))
         dec = asyncio.run(server.get_permission_decision(rid))
         self.assertEqual(dec["status"], "invalidated")
+
+    def test_post_tool_askuser_renders_answers(self):
+        # TUI answered an AskUserQuestion → PostToolUse carries the chosen answers
+        # (they live nowhere in walkcode's memory) → the card turns green and lists
+        # each question with the picked label.
+        questions = [{"question": "继续吗？", "header": "确认",
+                      "options": [{"label": "是"}, {"label": "否"}]}]
+        req, _ = server.registry.register_or_get(("s1", "tu-ask"))
+        server.registry.fill_request(
+            req.rid, tool_name="AskUserQuestion",
+            tool_input={"questions": questions}, session_id="s1", card_msg_id="cardmsg",
+        )
+        edits = []
+        with patch.object(server, "_edit_card", lambda mid, card: edits.append(card)):
+            res = asyncio.run(server.receive_post_tool_hook(_Req({
+                "session_id": "s1", "tool_name": "AskUserQuestion",
+                "answers": {"继续吗？": "是"},
+            })))
+        self.assertEqual(res["invalidated"], 1)
+        self.assertEqual(len(edits), 1)
+        card = edits[0]
+        self.assertEqual(card["header"]["template"], "green")
+        body_text = card["elements"][0]["text"]["content"]
+        self.assertIn("是", body_text)     # chosen label
+        self.assertIn("确认", body_text)    # question heading
 
     def test_post_tool_missing_session_noop(self):
         res = asyncio.run(server.receive_post_tool_hook(_Req({})))

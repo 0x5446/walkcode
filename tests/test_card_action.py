@@ -125,6 +125,19 @@ class CardActionTests(unittest.TestCase):
         self.assertEqual(dec["behavior"], "allow")
         self.assertEqual(dec["updatedInput"]["answers"], {"Pick": "A"})
 
+    def test_finalize_card_shows_answer(self):
+        # The Feishu finalize card is green and lists the chosen answer (not just
+        # "all answered").
+        rid = self._askq([{"question": "Pick", "header": "Choice",
+                           "options": [{"label": "A"}, {"label": "B"}]}])
+        resp = _click({"rid": rid, "action": "select", "answer": "A",
+                       "question_index": 0, "total_questions": 1})
+        card = resp.card.data
+        self.assertEqual(card["header"]["template"], "green")
+        text = card["elements"][0]["text"]["content"]
+        self.assertIn("A", text)       # chosen label
+        self.assertIn("Choice", text)  # question heading
+
     def test_multi_question_advances_then_finalizes(self):
         qs = [
             {"question": "Q1", "options": [{"label": "A"}, {"label": "B"}]},

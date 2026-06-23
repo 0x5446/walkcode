@@ -607,11 +607,20 @@ def cmd_hook(args):
     # session's still-open permission cards (its TUI already settled them). Fires per
     # tool call, so keep it cheap and skip the debug dump, like user-prompt-submit. ---
     if args.hook_type == "post-tool":
-        payload = json.dumps({
+        body = {
             "tty": tmux_session,
             "cwd": cwd,
             "session_id": session_id,
-        }).encode()
+            "tool_name": hook_data.get("tool_name", ""),
+        }
+        # Only AskUserQuestion needs its chosen answers echoed onto the Feishu card.
+        # Other tools' tool_response can be huge (command output / file contents) and
+        # this POST runs on a 2s timeout, so never ship those.
+        if body["tool_name"] == "AskUserQuestion":
+            answers = (hook_data.get("tool_response") or {}).get("answers")
+            if answers:
+                body["answers"] = answers
+        payload = json.dumps(body).encode()
         try:
             req = urllib.request.Request(
                 f"http://127.0.0.1:{port}/hook/post-tool",
