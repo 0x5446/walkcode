@@ -37,6 +37,10 @@ class UpgradeReinstallHooksTests(unittest.TestCase):
         in_proc.assert_not_called()
         # …after the package itself was reinstalled
         self.assertTrue(any("uv tool install" in c for c in calls))
+        self.assertTrue(
+            any("walkcode[summary]" in c for c in calls),
+            f"expected upgrade to keep summary extra installed, got {calls}",
+        )
         # ordering: uv install happens before install-hooks
         uv_idx = next(i for i, c in enumerate(calls) if "uv tool install" in c)
         hooks_idx = next(i for i, c in enumerate(calls) if "install-hooks" in c)

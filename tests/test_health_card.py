@@ -77,7 +77,7 @@ class HealthCardStoreTest(unittest.TestCase):
 
 
 class MaybeSummarizeGateTest(unittest.TestCase):
-    """_maybe_summarize is opt-in (summary_enabled + codex + not yet refined)."""
+    """_maybe_summarize is opt-in, codex-only, and event-triggered."""
 
     def setUp(self):
         self._cfg = server.config
@@ -102,11 +102,11 @@ class MaybeSummarizeGateTest(unittest.TestCase):
             server._maybe_summarize("s", self._session(), _stats())
         m.assert_not_called()
 
-    def test_skip_when_already_refined(self):
+    def test_already_refined_can_update_on_later_stop(self):
         server.config = mock.MagicMock(summary_enabled=True, agent="codex")
         with mock.patch("walkcode.server.summarizer.summarize_async") as m:
             server._maybe_summarize("s", self._session(title_source="summary"), _stats())
-        m.assert_not_called()
+        m.assert_called_once()
 
     def test_dispatches_once_for_codex(self):
         server.config = mock.MagicMock(
@@ -114,10 +114,66 @@ class MaybeSummarizeGateTest(unittest.TestCase):
             summary_vertex_project="p", summary_vertex_region="r", summary_sa_path="/sa",
             summary_model="claude-haiku-4-5", summary_timeout=8.0)
         with mock.patch("walkcode.server.summarizer.summarize_async") as m:
-            server._maybe_summarize("scodex", self._session(), _stats(title="首句"))
+            server._maybe_summarize(
+                "scodex", self._session(), _stats(title="首句"), "本轮完成了修复",
+            )
             # second call deduped while first is in-flight
             server._maybe_summarize("scodex", self._session(), _stats(title="首句"))
         m.assert_called_once()
+        self.assertEqual(m.call_args.kwargs["recent_turn"], "本轮完成了修复")
+
+
+class HealthCardRefreshTest(unittest.TestCase):
+    def setUp(self):
+        self._cfg = server.config
+        self._store = server.session_store
+        self._reg = server.registry
+        self._last_stop = dict(server._session_last_stop)
+        self._last_ups = dict(server._session_last_ups)
+        server._session_last_stop.clear()
+        server._session_last_ups.clear()
+        self.addCleanup(lambda: setattr(server, "config", self._cfg))
+        self.addCleanup(lambda: setattr(server, "session_store", self._store))
+        self.addCleanup(lambda: setattr(server, "registry", self._reg))
+        self.addCleanup(lambda: (server._session_last_stop.clear(), server._session_last_stop.update(self._last_stop)))
+        self.addCleanup(lambda: (server._session_last_ups.clear(), server._session_last_ups.update(self._last_ups)))
+
+    def test_poller_refresh_does_not_summarize(self):
+        with tempfile.TemporaryDirectory() as d:
+            server.config = mock.MagicMock(health_card_enabled=True, agent="codex")
+            server.session_store = SessionStore(Path(d) / "state.json")
+            server.session_store.upsert("s", tty="t", cwd="/c", root_msg_id="r")
+            server.session_store.set_health_card("s", "card1")
+            server.registry = mock.MagicMock()
+            server.registry.has_open_request.return_value = False
+
+            with mock.patch("walkcode.server.collect_stats", return_value=_stats()), \
+                 mock.patch("walkcode.server._edit_card", return_value=True), \
+                 mock.patch("walkcode.server._maybe_summarize") as summarize:
+                server._refresh_all_health_cards()
+
+        summarize.assert_not_called()
+
+    def test_event_refresh_summarizes_and_freezes_terminal_stop(self):
+        with tempfile.TemporaryDirectory() as d:
+            server.config = mock.MagicMock(health_card_enabled=True, agent="codex")
+            server.session_store = SessionStore(Path(d) / "state.json")
+            server.session_store.upsert("s", tty="t", cwd="/c", root_msg_id="r")
+            server.session_store.set_health_card("s", "card1")
+            server.registry = mock.MagicMock()
+            server.registry.has_open_request.return_value = False
+            server._session_last_stop["s"] = 100.0
+
+            with mock.patch("walkcode.server.collect_stats", return_value=_stats()), \
+                 mock.patch("walkcode.server._edit_card", return_value=True), \
+                 mock.patch("walkcode.server._maybe_summarize") as summarize:
+                server._refresh_health_card_for_event(
+                    "s", summarize=True, freeze_if_terminal=True,
+                    recent_turn="Stop result",
+                )
+
+            summarize.assert_called_once_with("s", mock.ANY, mock.ANY, "Stop result")
+            self.assertEqual(server.session_store.get("s").last_status, "stopped")
 
 
 if __name__ == "__main__":

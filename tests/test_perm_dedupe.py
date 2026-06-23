@@ -115,6 +115,17 @@ class ReceivePermDedupeTests(unittest.TestCase):
         self.assertTrue(r2.get("deduped"))
         self.assertEqual(len(self.cards), 1)  # only ONE card sent
 
+    def test_permission_card_refreshes_health_card_to_hitl_once(self):
+        calls = []
+        with patch.object(
+            server, "_refresh_health_card_for_event",
+            lambda sid, **kw: calls.append((sid, kw)) or False,
+        ):
+            self._post(_perm_body(tool_use_id="tu-1"))
+            self._post(_perm_body(tool_use_id="tu-1"))
+
+        self.assertEqual(calls, [("s1", {})])
+
     def test_distinct_tool_use_ids_two_cards(self):
         self._post(_perm_body(tool_use_id="tu-1"))
         self._post(_perm_body(tool_use_id="tu-2"))
@@ -282,7 +293,8 @@ class PermNoThreadRootTests(unittest.TestCase):
                            lambda card: self.cards.append(("send", None)) or "cardmsg")
         # no Feishu-initiated pending root for this tty
         ppop = patch.object(server.session_store, "pop_pending", lambda tty: (None, None, None, None))
-        for p in (ps, pr, psc, ppop):
+        prefresh = patch.object(server, "_refresh_health_card_for_event", lambda *a, **kw: False)
+        for p in (ps, pr, psc, ppop, prefresh):
             p.start(); self.addCleanup(p.stop)
 
     def _post(self, body):

@@ -190,6 +190,20 @@ class ReceiveHookDedupeTests(unittest.TestCase):
         self._post(_stop_body(turn_id="turn-B"))
         self.assertEqual(len(self.replies), 2)
 
+    def test_stop_refreshes_health_card_once_after_successful_delivery(self):
+        calls = []
+        with patch.object(
+            server, "_refresh_health_card_for_event",
+            lambda sid, **kw: calls.append((sid, kw)) or False,
+        ):
+            self._post(_stop_body(turn_id="turn-A"))
+            self._post(_stop_body(turn_id="turn-A"))
+
+        self.assertEqual(calls, [(
+            "s1",
+            {"summarize": True, "freeze_if_terminal": True, "recent_turn": "done"},
+        )])
+
     def test_claude_style_no_turn_id_dedupes_on_message(self):
         self._post(_stop_body(turn_id="", message="identical"))
         r2 = self._post(_stop_body(turn_id="", message="identical"))

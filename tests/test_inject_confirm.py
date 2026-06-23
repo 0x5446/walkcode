@@ -149,6 +149,15 @@ class FeishuReplyInjectionTests(unittest.TestCase):
         self.assertIn(self.reactions[0][1], server._SUCCESS_EMOJIS)
         self.assertEqual(len(server._pending_injects), 1)
 
+    def test_inject_success_marks_busy_and_unfreezes_health_card(self):
+        server.session_store.set_status("sess1", "stopped")
+        server._mark_session_idle("sess1")
+
+        server._handle_message(self._data("继续"))
+
+        self.assertTrue(server._is_session_busy("sess1"))
+        self.assertEqual(server.session_store.get("sess1").last_status, "")
+
     def test_busy_session_does_not_send_queued_receipt(self):
         server._mark_session_busy("sess1")
 

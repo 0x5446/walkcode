@@ -961,6 +961,9 @@ def _finalize_askuser_answer(
     resp.toast = CallBackToast()
     resp.toast.type = "success"
     resp.toast.content = "All answers submitted"
+    req_data = registry.get(request_id)
+    if req_data and req_data.session_id:
+        _refresh_health_card_for_event(req_data.session_id)
     return resp
 
 
@@ -1158,6 +1161,8 @@ def _on_card_action(data: P2CardActionTrigger) -> P2CardActionTriggerResponse:
             return resp
 
         logger.info(f"Permission decision: {behavior} for {tool_name} (rid={request_id[:8]})")
+        if req_data.session_id:
+            _refresh_health_card_for_event(req_data.session_id)
 
         result_card = _build_permission_result_card(tool_name, behavior)
 
@@ -1443,6 +1448,8 @@ def _consume_other_answer(request_id: str, text: str, message_id: str):
         "updatedInput": _build_askuser_updated_input(questions, answers_list),
     }
     won = registry.set_decision_once(request_id, final_decision)
+    if won and req_data.session_id:
+        _refresh_health_card_for_event(req_data.session_id)
     # If write-once lost (TUI already settled / PostToolUse invalidated it), don't react
     # success on a reply that never took effect (deep-review ISSUE_3).
     _add_reaction(message_id, random.choice(_SUCCESS_EMOJIS if won else _FAILURE_EMOJIS))
@@ -1568,6 +1575,12 @@ def _inject_live(session_id: str | None, tty: str, text: str, message_id: str, p
         )
 
     logger.info(f"Injected '{text[:50]}' -> {tty} ({project}); submit={result}")
+    if session_id:
+        # tmux accepting paste+Enter is WalkCode's delivery boundary. Codex has no
+        # UserPromptSubmit hook, so remote replies must mark the turn busy here or a
+        # previously frozen health card stays stuck at DONE until Stop.
+        _mark_session_busy(session_id)
+        _refresh_health_card_for_event(session_id)
     _ack_inject_accepted(message_id)
     _register_pending_inject(session_id, tty, text, message_id)
 
@@ -1966,6 +1979,7 @@ async def receive_hook(request: Request):
         display_message = f"{label}\n{message}"
     else:
         display_message = message or label or effective_type
+    summary_context = "\n".join(x for x in (title, message) if x).strip() or display_message
     project = basename(cwd) if cwd else "unknown"
     logger.info(f"Hook: [{project}] {effective_type} | tmux={tty} session={session_id[:8] if session_id else '-'}")
 
@@ -1982,6 +1996,7 @@ async def receive_hook(request: Request):
             # duplicate Stop) — already delivered. Return BEFORE the blocked-backlog
             # check, so a still-blocked tail (other replies) can't cause this
             # already-sent turn to be re-queued (duplicate + reorder).
+            _after_hook_delivered(session_id, hook_type, summary_context)
             return {"ok": True, "redelivered": True, "thread": session.root_msg_id}
         if not drained:
             # Backlog still blocked (network down): queue the current turn BEHIND it
@@ -2000,6 +2015,7 @@ async def receive_hook(request: Request):
             # Register dedupe ONLY now that the send succeeded (F1: a failed
             # _reply must leave the slot open for codex's duplicate to retry).
             _remember_delivery(dedupe_key, hook_type, session_id)
+            _after_hook_delivered(session_id, hook_type, summary_context)
             return {"ok": True, "msg_id": msg_id, "thread": session.root_msg_id}
         # transient → stash this turn's output (without the @mention prefix) so the
         # next hook redelivers it; permanent → drop (retrying the same payload is
@@ -2035,6 +2051,7 @@ async def receive_hook(request: Request):
                 if session_id:
                     session_store.mark_subscribed(session_id)
                 _remember_delivery(dedupe_key, hook_type, session_id)
+                _after_hook_delivered(session_id, hook_type, summary_context)
                 return {"ok": True, "msg_id": root_id}
             # E: reply to the pending root failed — do NOT fall through to creating
             # a new thread (the first reply would land in the wrong place). The
@@ -2068,6 +2085,7 @@ async def receive_hook(request: Request):
                 if session_id:
                     session_store.mark_subscribed(session_id)
                 _remember_delivery(dedupe_key, hook_type, session_id)
+                _after_hook_delivered(session_id, hook_type, summary_context)
                 return {"ok": True, "msg_id": root_id}
             # Root created but the content reply failed. The session now owns
             # root_msg_id (upserted above), so a transient failure is redelivered
@@ -2277,6 +2295,8 @@ async def receive_permission_hook(request: Request):
         else:
             registry.fill_request(request_id, card_msg_id=card_msg_id)
         registry.card_sent(request_id)
+        if session_id:
+            _refresh_health_card_for_event(session_id)
 
         project = basename(cwd) if cwd else "unknown"
         logger.info(f"Permission request: {tool_name} | rid={request_id[:8]} tmux={tty} ({project})")
@@ -2361,6 +2381,7 @@ async def receive_post_tool_hook(request: Request):
         _edit_card(card_msg_id, card)
     if snaps:
         logger.info(f"PostToolUse invalidated {len(snaps)} card(s) for session {session_id[:8]}")
+        _refresh_health_card_for_event(session_id)
     return {"ok": True, "invalidated": len(snaps)}
 
 
@@ -2630,15 +2651,20 @@ _summarizing: set[str] = set()
 _summarizing_lock = threading.Lock()
 
 
-def _maybe_summarize(session_id: str, session: Session, stats: SessionStats) -> None:
-    """Opt-in: refine the title via Haiku once. No-op unless summary is configured
-    (Vertex env set) and this is a codex session not yet refined — codex has no
-    native ai-title, so its title defaults to the first user line; claude already
-    has a good ai-title. Async + locked dedup so it never blocks the poller and
-    runs at most once per session at a time. [R6]"""
+def _maybe_summarize(
+    session_id: str,
+    session: Session,
+    stats: SessionStats,
+    recent_turn: str = "",
+) -> None:
+    """Opt-in: refine the title via Haiku on Stop events.
+
+    No-op unless summary is configured (Vertex env set) and this is a codex
+    session. Claude already has a good ai-title. Async + locked dedup so it never
+    blocks the Stop reply and runs at most once per session at a time. Polling
+    paths must not call this; model calls are event-driven only.
+    """
     if not config.summary_enabled or config.agent != "codex":
-        return
-    if session.title_source == "summary":
         return
     src = (stats.title or "").strip()
     if not src:
@@ -2652,10 +2678,10 @@ def _maybe_summarize(session_id: str, session: Session, stats: SessionStats) -> 
         try:
             if summary:
                 session_store.set_title(sid, summary, "summary")
-                # If the session already froze before summary returned, patch the
-                # card once more so the refined title still lands. [correctness#3]
+                # Patch the card once more so the refined title lands even after
+                # the Stop-triggered refresh already froze the card.
                 s2 = session_store.get(sid)
-                if s2 and s2.health_card_id and s2.last_status == "stopped":
+                if s2 and s2.health_card_id:
                     st = collect_stats(config.agent, sid, cwd)
                     _edit_card(s2.health_card_id,
                                _build_health_card(st, _session_health(sid, st), summary))
@@ -2667,7 +2693,7 @@ def _maybe_summarize(session_id: str, session: Session, stats: SessionStats) -> 
 
     try:
         summarizer.summarize_async(
-            _cb, src,
+            _cb, src, recent_turn=recent_turn,
             project=config.summary_vertex_project, region=config.summary_vertex_region,
             sa_path=config.summary_sa_path, model=config.summary_model,
             timeout=config.summary_timeout,
@@ -2678,7 +2704,13 @@ def _maybe_summarize(session_id: str, session: Session, stats: SessionStats) -> 
         logger.info("summarize dispatch failed: %s", e)
 
 
-def _refresh_health_card(session_id: str, session: Session) -> bool:
+def _refresh_health_card(
+    session_id: str,
+    session: Session,
+    *,
+    summarize: bool = False,
+    recent_turn: str = "",
+) -> bool:
     """Collect stats, rebuild and patch the health card. Returns True if the
     session is now frozen (done/error). Card IO guarded; on patch failure the
     health_card_id is cleared so the poller stops touching a dead card."""
@@ -2687,7 +2719,8 @@ def _refresh_health_card(session_id: str, session: Session) -> bool:
     try:
         stats = collect_stats(config.agent, session_id, session.cwd)
         health = _session_health(session_id, stats)
-        _maybe_summarize(session_id, session, stats)
+        if summarize:
+            _maybe_summarize(session_id, session, stats, recent_turn)
         if session.title_source == "summary" and session.cached_title:
             title = session.cached_title  # AI-refined title wins
         else:
@@ -2702,13 +2735,53 @@ def _refresh_health_card(session_id: str, session: Session) -> bool:
         return False
 
 
+def _refresh_health_card_for_event(
+    session_id: str,
+    *,
+    summarize: bool = False,
+    freeze_if_terminal: bool = False,
+    recent_turn: str = "",
+) -> bool:
+    """Event-driven health-card refresh.
+
+    Unlike the poller, this intentionally ignores last_status="stopped": a new
+    Feishu reply, HITL card, or Stop hook is new evidence and must be able to
+    update a previously frozen card.
+    """
+    if not config or not session_store or not config.health_card_enabled or not session_id:
+        return False
+    session = session_store.get(session_id)
+    if not session or not session.health_card_id:
+        return False
+    frozen = _refresh_health_card(
+        session_id, session,
+        summarize=summarize,
+        recent_turn=recent_turn,
+    )
+    if freeze_if_terminal and frozen:
+        if not _is_session_busy(session_id) and not registry.has_open_request(session_id):
+            session_store.set_status(session_id, "stopped")
+    return frozen
+
+
+def _after_hook_delivered(session_id: str, hook_type: str, recent_turn: str = "") -> None:
+    """Update the health card after the user-visible hook reply is delivered."""
+    if hook_type == "stop":
+        _refresh_health_card_for_event(
+            session_id,
+            summarize=True,
+            freeze_if_terminal=True,
+            recent_turn=recent_turn,
+        )
+
+
 def _refresh_all_health_cards():
     if not config.health_card_enabled:
         return
     for session_id, session in session_store.items():
         if not session.health_card_id or session.last_status == "stopped":
             continue
-        if _refresh_health_card(session_id, session):
+        if _refresh_health_card(session_id, session, summarize=False):
             # Re-check liveness before freezing: a new turn may have started during
             # the refresh; don't let the freeze write clobber a fresh unfreeze. [concurrency#1]
             if not _is_session_busy(session_id) and not registry.has_open_request(session_id):
