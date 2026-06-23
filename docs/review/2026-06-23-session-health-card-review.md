@@ -3,7 +3,7 @@
 **VERDICT**: NEEDS_FIX(1 Critical + 多 Warning)
 **类型**: design(纯方案审查) · **轮次**: 1(--plan-only,不自动改码)
 **Review engine**: codex 0.141.0(host: claude;6 维度并行,medium effort)
-**Repo**: /Users/alpha/Documents/workspace/walkcode · **HeadSHA**: e33724d · **Branch**: feature/session-health-card
+**Repo**: walkcode · **HeadSHA**: e33724d · **Branch**: feature/session-health-card
 **目标**: plans/lazy-bouncing-whisper.md(会话健康卡片设计)
 
 6 维度均 NEEDS_FIX,共 32 条 issue。归并去重 + 用已读源码回证后得 13 个有效问题,基本全 VERIFIED,无明显误报。

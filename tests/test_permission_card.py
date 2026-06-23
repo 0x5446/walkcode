@@ -169,11 +169,11 @@ class PermissionSuggestionsRenderTest(unittest.TestCase):
     def test_addDirectories_renders(self):
         suggestions = [{
             "type": "addDirectories",
-            "directories": ["/Users/alpha/.claude"],
+            "directories": ["/Users/you/.claude"],
             "destination": "session",
         }]
         rendered = _format_permission_suggestions(suggestions)
-        self.assertIn("/Users/alpha/.claude", rendered)
+        self.assertIn("/Users/you/.claude", rendered)
 
     def test_card_body_includes_suggestions(self):
         suggestions = [{
