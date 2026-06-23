@@ -480,6 +480,25 @@ _T: dict[str, tuple[str, str]] = {
         "（比如卡在一个一直返回不了的浏览器/登录操作）。去看看：\n"
         "tmux attach -t {tmux}",
     ),
+    # --- session health card ---
+    "feishu.health.status_running": ("🟢 Running", "🟢 进行中"),
+    "feishu.health.status_hitl": ("🟠 Waiting for you", "🟠 等待确认"),
+    "feishu.health.status_done": ("✅ Done", "✅ 已完成"),
+    "feishu.health.status_error": ("🔴 Error", "🔴 出错"),
+    "feishu.health.field_status": ("Status", "状态"),
+    "feishu.health.field_model": ("Model", "模型"),
+    "feishu.health.field_duration": ("Duration", "时长"),
+    "feishu.health.field_inputs": ("Inputs", "输入"),
+    "feishu.health.tokens_line": (
+        "in {input} / out {output} / cache {cache}",
+        "输入 {input} / 输出 {output} / 缓存 {cache}",
+    ),
+    "feishu.health.duration_min": ("{minutes} min", "{minutes} 分钟"),
+    "feishu.health.inputs_n": ("{n} msgs", "{n} 条"),
+    "feishu.health.footer": ("updated {time} · refreshes every minute", "更新于 {time} · 每分钟刷新"),
+    "feishu.health.footer_frozen": ("updated {time} · stopped", "更新于 {time} · 已停止"),
+    "feishu.health.unavailable": ("stats unavailable", "统计暂不可用"),
+    "feishu.health.title_pending": ("Task starting…", "任务启动中…"),
 }
 
 

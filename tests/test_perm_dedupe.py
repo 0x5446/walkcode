@@ -281,7 +281,7 @@ class PermNoThreadRootTests(unittest.TestCase):
         psc = patch.object(server, "_send_card",
                            lambda card: self.cards.append(("send", None)) or "cardmsg")
         # no Feishu-initiated pending root for this tty
-        ppop = patch.object(server.session_store, "pop_pending", lambda tty: (None, None, None))
+        ppop = patch.object(server.session_store, "pop_pending", lambda tty: (None, None, None, None))
         for p in (ps, pr, psc, ppop):
             p.start(); self.addCleanup(p.stop)
 
@@ -289,19 +289,21 @@ class PermNoThreadRootTests(unittest.TestCase):
         return asyncio.run(server.receive_permission_hook(_Req(body)))
 
     def test_first_event_hitl_creates_thread_root_and_replies_in_thread(self):
-        # session is known (SessionStart synced tty/cwd) but has NO thread root yet
+        # session is known (SessionStart synced tty/cwd) but has NO thread root yet.
+        # Health card on (default): bot creates a CARD root, replies the perm card in it.
         server.session_store.upsert("s2", tty="tmux2", cwd="/tmp/proj")
         r = self._post(_perm_body(tool_use_id="", session_id="s2", tty="tmux2"))
         self.assertTrue(r.get("ok"))
-        self.assertEqual(len(self.sent), 1, "must create a thread root")
-        # card lands in the new thread, NOT the group main conversation
-        self.assertEqual(self.cards, [("reply", "newroot")])
-        # root persisted so the session's later hooks reuse the same thread
-        self.assertEqual(server.session_store.get("s2").root_msg_id, "newroot")
+        self.assertEqual(self.sent, [], "no plain post root when health card is on")
+        # card root created (send), then permission card replied into that thread
+        self.assertEqual(self.cards, [("send", None), ("reply", "cardmsg")])
+        self.assertEqual(server.session_store.get("s2").root_msg_id, "cardmsg")
+        self.assertEqual(server.session_store.get("s2").health_card_id, "cardmsg")
 
     def test_thread_root_creation_failure_falls_back_to_group(self):
-        # if root creation itself fails (_send returns None), still surface the HITL
-        # rather than dropping it
+        # With health card OFF, root creation uses _send; if it fails, still surface
+        # the HITL (card to group) rather than dropping it.
+        server.config.health_card_enabled = False
         server.session_store.upsert("s3", tty="tmux3", cwd="/tmp/proj")
         with patch.object(server, "_send", lambda text: None):
             r = self._post(_perm_body(tool_use_id="", session_id="s3", tty="tmux3"))

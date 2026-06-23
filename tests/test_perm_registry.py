@@ -353,5 +353,65 @@ class AskUserTests(unittest.TestCase):
         self.assertIsNone(reg.find_awaiting_other(None))
 
 
+class HasOpenRequestTests(unittest.TestCase):
+    """has_open_request: only a genuinely-actionable (READY, undecided, not
+    invalidated/failed/fallback-claimed, not TTL-reaped) request counts as
+    HITL_WAITING for the health card."""
+
+    def _ready(self, reg, session_id="s1", key=("s1", "t1")):
+        req, _ = reg.register_or_get(key)
+        reg.fill_request(req.rid, session_id=session_id)
+        reg.card_sent(req.rid)  # → READY
+        return req.rid
+
+    def test_open_ready_true(self):
+        reg = PermissionRegistry(now=_Clock())
+        self._ready(reg)
+        self.assertTrue(reg.has_open_request("s1"))
+
+    def test_other_session_false(self):
+        reg = PermissionRegistry(now=_Clock())
+        self._ready(reg)
+        self.assertFalse(reg.has_open_request("other"))
+
+    def test_empty_session_false(self):
+        self.assertFalse(PermissionRegistry(now=_Clock()).has_open_request(""))
+
+    def test_decided_false(self):
+        reg = PermissionRegistry(now=_Clock())
+        rid = self._ready(reg)
+        reg.set_decision_once(rid, {"behavior": "allow"})
+        self.assertFalse(reg.has_open_request("s1"))
+
+    def test_invalidated_false(self):
+        reg = PermissionRegistry(now=_Clock())
+        self._ready(reg)
+        reg.invalidate_session("s1")
+        self.assertFalse(reg.has_open_request("s1"))
+
+    def test_card_failed_false(self):
+        reg = PermissionRegistry(now=_Clock())
+        req, _ = reg.register_or_get(("s1", "t1"))
+        reg.fill_request(req.rid, session_id="s1")
+        reg.card_failed(req.rid)  # card never reached Feishu → not READY
+        self.assertFalse(reg.has_open_request("s1"))
+
+    def test_fallback_claimed_false(self):
+        clock = _Clock()
+        reg = PermissionRegistry(now=clock)
+        rid = self._ready(reg)
+        clock.t += 6  # past quiesce (5s), within TTL (90s)
+        self.assertTrue(reg.claim_fallback(rid))
+        self.assertFalse(reg.has_open_request("s1"))
+
+    def test_ttl_reaped_false(self):
+        clock = _Clock()
+        reg = PermissionRegistry(now=clock)
+        self._ready(reg)
+        self.assertTrue(reg.has_open_request("s1"))
+        clock.t += 1000  # exceed TTL → gc inside has_open_request reaps the dead req
+        self.assertFalse(reg.has_open_request("s1"))
+
+
 if __name__ == "__main__":
     unittest.main()

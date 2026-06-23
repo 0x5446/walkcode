@@ -193,7 +193,7 @@ class CwdDriftTests(unittest.TestCase):
         self.store.add_pending("tmux-a", "root-1", cwd="/launch")
         reloaded = SessionStore(self.store.path)
         reloaded.load()
-        root, _reply, cwd = reloaded.pop_pending("tmux-a")
+        root, _reply, cwd, _hc = reloaded.pop_pending("tmux-a")
         self.assertEqual(root, "root-1")
         self.assertEqual(cwd, "/launch")
 
