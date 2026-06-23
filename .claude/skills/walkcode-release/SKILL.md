@@ -20,7 +20,7 @@ metadata:
 - **账号必须是 `0x5446`**（脚本会校验 `gh` 当前账号）。
 - **门禁**：单测必须全绿、`/deep-review` 必须过且**无 Critical**，才能合并 PR。
 - **tag 打在合并后的 `main`**，不在分支上发版。
-- **两个 launchd 实例**（claude `com.alpha.walkcode` + codex `com.alpha.walkcode-codex`）都要升、都要验。
+- **两个 launchd 实例**（claude `com.walkcode` + codex `com.walkcode-codex`）都要升、都要验。
 - 版本单一真源是 `pyproject.toml`（`__init__.py` 从安装元数据派生，不要手改）。
 - **prepare 前置**（脚本强制）：当前在 `main`、本地 `main` == `origin/main`、**无未跟踪文件**。本次要发的新文件先 `git add`，其余杂物清掉——否则 `git add -A` 会把别的东西卷进发布分支。**多个 agent 别共用一个 checkout**，并行任务各用独立 git worktree。
 
@@ -49,8 +49,8 @@ metadata:
 
 ```
 uv tool install 'git+https://github.com/0x5446/walkcode@v<上个好版本>' --force
-launchctl kickstart -k gui/$(id -u)/com.alpha.walkcode
-launchctl kickstart -k gui/$(id -u)/com.alpha.walkcode-codex
+launchctl kickstart -k gui/$(id -u)/com.walkcode
+launchctl kickstart -k gui/$(id -u)/com.walkcode-codex
 ```
 
 ## 脚本速查

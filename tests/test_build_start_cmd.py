@@ -29,8 +29,8 @@ import unittest
 
 from walkcode.agent import CLAUDE, CODEX
 
-CWD = "/Users/alpha/.walkcode/workspace"
-IMG = "/Users/alpha/.walkcode/images/x.jpg"
+CWD = "/Users/you/.walkcode/workspace"
+IMG = "/Users/you/.walkcode/images/x.jpg"
 _ROUTING_ENV = ("WALKCODE_EXTRA_ARGS", "WALKCODE_PERMISSION_FLAG")
 
 
