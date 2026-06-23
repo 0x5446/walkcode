@@ -495,7 +495,7 @@ _T: dict[str, tuple[str, str]] = {
     ),
     "feishu.health.duration_min": ("{minutes} min", "{minutes} 分钟"),
     "feishu.health.inputs_n": ("{n} msgs", "{n} 条"),
-    "feishu.health.footer": ("updated {time} · refreshes every minute", "更新于 {time} · 每分钟刷新"),
+    "feishu.health.footer": ("updated {time} · updates on activity", "更新于 {time} · 活动时刷新"),
     "feishu.health.footer_frozen": ("updated {time} · stopped", "更新于 {time} · 已停止"),
     "feishu.health.unavailable": ("stats unavailable", "统计暂不可用"),
     "feishu.health.title_pending": ("Task starting…", "任务启动中…"),

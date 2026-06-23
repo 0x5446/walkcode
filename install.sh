@@ -78,12 +78,12 @@ install_package() {
 
   if [ -n "$tag" ]; then
     info "$(msg "Installing WalkCode ${tag}..." "正在安装 WalkCode ${tag}...")"
-    uv tool install "git+${GITHUB_URL}@${tag}" --force 2>/dev/null \
-      || uv tool install "git+${GITHUB_URL}@${tag}"
+    uv tool install "walkcode[summary] @ git+${GITHUB_URL}@${tag}" --force 2>/dev/null \
+      || uv tool install "walkcode[summary] @ git+${GITHUB_URL}@${tag}"
   else
     info "$(msg "No releases found, installing from main branch..." "未找到正式版本，从 main 分支安装...")"
-    uv tool install "git+${GITHUB_URL}" --force 2>/dev/null \
-      || uv tool install "git+${GITHUB_URL}"
+    uv tool install "walkcode[summary] @ git+${GITHUB_URL}" --force 2>/dev/null \
+      || uv tool install "walkcode[summary] @ git+${GITHUB_URL}"
   fi
 }
 

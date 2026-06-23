@@ -957,12 +957,12 @@ def cmd_upgrade(_args):
     tag = _get_latest_tag()
     if tag:
         print(t("upgrade.latest", tag=tag))
-        source = f"git+{_GITHUB_URL}@{tag}"
+        source = f"walkcode[summary] @ git+{_GITHUB_URL}@{tag}"
     else:
         print(t("upgrade.no_release"))
-        source = f"git+{_GITHUB_URL}"
+        source = f"walkcode[summary] @ git+{_GITHUB_URL}"
 
-    _run(f"uv tool install {source} --force")
+    _run(f"uv tool install {shlex.quote(source)} --force")
 
     # Re-run install-hooks via the freshly installed binary — NOT cmd_install_hooks()
     # in-process. This interpreter is still running the OLD code, so an in-process
