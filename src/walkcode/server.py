@@ -1468,8 +1468,8 @@ def _mark_session_busy(session_id: str):
             # installed — so a *missing* one later is a real swallow, not just a
             # legacy session that predates the hook.
             _ups_capable_sessions.add(session_id)
-        # A new turn started → unfreeze the health card so the poller resumes
-        # refreshing (covers both resume and continued TUI use). [R9]
+        # A new turn started → unfreeze the health card so event refreshes can
+        # move a previously terminal card back to running. [R9]
         if config and config.health_card_enabled and session_store is not None:
             session_store.set_status(session_id, "")
 
@@ -2148,6 +2148,7 @@ async def receive_prompt_hook(request: Request):
     prompt = body.get("prompt", "")
     if session_id:
         _mark_session_busy(session_id)
+        _refresh_health_card_for_event(session_id)
     _confirm_pending_inject(session_id, tty, prompt)
     return {"ok": True}
 
@@ -2568,7 +2569,6 @@ def _start_stuck_watchdog():
 
 # --- Session health card ---
 
-_HEALTH_CHECK_INTERVAL = 60
 _HEALTH_COLOR = {"running": "blue", "hitl": "orange", "done": "grey", "error": "red"}
 _HEALTH_STATUS_KEY = {
     "running": "feishu.health.status_running",
@@ -2645,8 +2645,8 @@ def _build_health_card(stats: SessionStats, health: str, title: str) -> dict:
     }
 
 
-# Sessions with an in-flight summarize call, guarded by a lock so the poller
-# thread and the executor callback don't race on the set. [concurrency#2]
+# Sessions with an in-flight summarize call, guarded by a lock so event refresh
+# paths and the executor callback don't race on the set. [concurrency#2]
 _summarizing: set[str] = set()
 _summarizing_lock = threading.Lock()
 
@@ -2713,7 +2713,7 @@ def _refresh_health_card(
 ) -> bool:
     """Collect stats, rebuild and patch the health card. Returns True if the
     session is now frozen (done/error). Card IO guarded; on patch failure the
-    health_card_id is cleared so the poller stops touching a dead card."""
+    health_card_id is cleared so future event refreshes stop touching a dead card."""
     if not session.health_card_id:
         return False
     try:
@@ -2744,8 +2744,8 @@ def _refresh_health_card_for_event(
 ) -> bool:
     """Event-driven health-card refresh.
 
-    Unlike the poller, this intentionally ignores last_status="stopped": a new
-    Feishu reply, HITL card, or Stop hook is new evidence and must be able to
+    This intentionally ignores last_status="stopped": a new Feishu reply, HITL
+    card, UserPromptSubmit, or Stop hook is new evidence and must be able to
     update a previously frozen card.
     """
     if not config or not session_store or not config.health_card_enabled or not session_id:
@@ -2773,36 +2773,6 @@ def _after_hook_delivered(session_id: str, hook_type: str, recent_turn: str = ""
             freeze_if_terminal=True,
             recent_turn=recent_turn,
         )
-
-
-def _refresh_all_health_cards():
-    if not config.health_card_enabled:
-        return
-    for session_id, session in session_store.items():
-        if not session.health_card_id or session.last_status == "stopped":
-            continue
-        if _refresh_health_card(session_id, session, summarize=False):
-            # Re-check liveness before freezing: a new turn may have started during
-            # the refresh; don't let the freeze write clobber a fresh unfreeze. [concurrency#1]
-            if not _is_session_busy(session_id) and not registry.has_open_request(session_id):
-                session_store.set_status(session_id, "stopped")
-
-
-def _start_health_check_poller():
-    if not config.health_card_enabled:
-        logger.info("Health card disabled (WALKCODE_HEALTH_CARD=0)")
-        return
-
-    def _loop():
-        while True:
-            time.sleep(_HEALTH_CHECK_INTERVAL)
-            try:
-                _refresh_all_health_cards()
-            except Exception as e:
-                logger.error("Health poller error: %s", e)
-
-    threading.Thread(target=_loop, daemon=True).start()
-    logger.info("Health card poller started (interval=%ds)", _HEALTH_CHECK_INTERVAL)
 
 
 # --- Init ---
@@ -2843,4 +2813,5 @@ def start_ws_client(cfg: Config):
     _start_idle_reaper()
     _start_stuck_watchdog()
     _start_inject_sweeper()
-    _start_health_check_poller()
+    if not config.health_card_enabled:
+        logger.info("Health card disabled (WALKCODE_HEALTH_CARD=0)")

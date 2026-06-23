@@ -4,8 +4,8 @@ Pure functions, no network, no mutation — each ``collect_*`` returns a frozen
 ``SessionStats`` snapshot built from an agent's on-disk session files. Everything
 here parses **undocumented internal formats** (Claude transcript JSONL, Codex
 rollout JSONL, Codex ``state_*.sqlite``), so every field access is guarded and any
-failure degrades to ``source="unavailable"`` rather than raising — the poller that
-calls this must never crash on a malformed or half-written file.
+failure degrades to ``source="unavailable"`` rather than raising — health-card
+refresh paths must never crash on a malformed or half-written file.
 
 Token accounting is normalized so Claude and Codex read the same way:
 ``input`` = fresh (non-cached) input tokens, ``cache`` = cached/reused input
@@ -25,9 +25,9 @@ from pathlib import Path
 logger = logging.getLogger("walkcode.stats")
 
 # A session that has parsed a transcript/rollout larger than this is reported as
-# source="unavailable" rather than burning the poller on a multi-MB full parse
+# source="unavailable" rather than burning a refresh on a multi-MB full parse
 # (rollouts have been seen at 8MB+). Tunable; the card then shows "stats
-# unavailable" instead of blocking the 60s loop.
+# unavailable" instead of blocking event handling.
 _MAX_PARSE_BYTES = 12 * 1024 * 1024
 
 # A codex session id is a plain token; reject glob metacharacters before it
@@ -393,8 +393,8 @@ def collect_codex_stats(session_id: str) -> SessionStats:
 # --- dispatch ----------------------------------------------------------------
 
 def collect_stats(agent: str, session_id: str, cwd: str = "") -> SessionStats:
-    """Dispatch to the per-agent collector; catch everything so the poller never
-    throws. Unknown agent or any failure → source="unavailable"."""
+    """Dispatch to the per-agent collector; catch everything so card refreshes
+    never throw. Unknown agent or any failure → source="unavailable"."""
     if not session_id:
         return _unavailable()
     try:
