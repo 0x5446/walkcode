@@ -610,7 +610,7 @@ wheels = [
 
 [[package]]
 name = "walkcode"
-version = "0.10.46"
+version = "0.10.47"
 source = { editable = "." }
 dependencies = [
     { name = "fastapi" },
