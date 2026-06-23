@@ -1,5 +1,6 @@
 """Session health card: state machine, store mutators, and summary gating."""
 
+import asyncio
 import tempfile
 import unittest
 from pathlib import Path
@@ -13,6 +14,14 @@ from walkcode.stats import SessionStats
 def _stats(last_error=None, title="t"):
     return SessionStats(title=title, per_model=(), duration_minutes=1,
                         input_rounds=1, last_error=last_error, source="ok")
+
+
+class _Req:
+    def __init__(self, body):
+        self._body = body
+
+    async def json(self):
+        return self._body
 
 
 class SessionHealthStateMachineTest(unittest.TestCase):
@@ -138,20 +147,29 @@ class HealthCardRefreshTest(unittest.TestCase):
         self.addCleanup(lambda: (server._session_last_stop.clear(), server._session_last_stop.update(self._last_stop)))
         self.addCleanup(lambda: (server._session_last_ups.clear(), server._session_last_ups.update(self._last_ups)))
 
-    def test_poller_refresh_does_not_summarize(self):
+    def test_user_prompt_submit_refreshes_without_summarizing(self):
         with tempfile.TemporaryDirectory() as d:
-            server.config = mock.MagicMock(health_card_enabled=True, agent="codex")
+            server.config = mock.MagicMock(health_card_enabled=True, agent="claude")
             server.session_store = SessionStore(Path(d) / "state.json")
             server.session_store.upsert("s", tty="t", cwd="/c", root_msg_id="r")
             server.session_store.set_health_card("s", "card1")
+            server.session_store.set_status("s", "stopped")
             server.registry = mock.MagicMock()
             server.registry.has_open_request.return_value = False
+            server._session_last_stop["s"] = 100.0
 
-            with mock.patch("walkcode.server.collect_stats", return_value=_stats()), \
-                 mock.patch("walkcode.server._edit_card", return_value=True), \
+            with mock.patch("walkcode.server.collect_stats", return_value=_stats()) as collect, \
+                 mock.patch("walkcode.server._edit_card", return_value=True) as edit_card, \
                  mock.patch("walkcode.server._maybe_summarize") as summarize:
-                server._refresh_all_health_cards()
+                res = asyncio.run(server.receive_prompt_hook(
+                    _Req({"tty": "t", "session_id": "s", "prompt": "继续"}),
+                ))
 
+        self.assertEqual(res, {"ok": True})
+        self.assertTrue(server._is_session_busy("s"))
+        self.assertEqual(server.session_store.get("s").last_status, "")
+        collect.assert_called_once()
+        edit_card.assert_called_once()
         summarize.assert_not_called()
 
     def test_event_refresh_summarizes_and_freezes_terminal_stop(self):
