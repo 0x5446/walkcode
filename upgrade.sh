@@ -11,14 +11,15 @@ set -euo pipefail
 #
 #   ./upgrade.sh [--dry-run]
 #
-# Override the (machine-specific) launchd labels / logs via env if needed:
+# Defaults match the launchd Labels documented in the README (com.walkcode /
+# com.walkcode-codex). If your plists use different Labels, override via env:
 #   WALKCODE_LAUNCHD_LABEL, WALKCODE_LAUNCHD_LABEL_CODEX, LOG_CLAUDE, LOG_CODEX
 
 DRY_RUN=false
 [ "${1:-}" = "--dry-run" ] && DRY_RUN=true
 
-LABEL_CLAUDE="${WALKCODE_LAUNCHD_LABEL:-com.alpha.walkcode}"
-LABEL_CODEX="${WALKCODE_LAUNCHD_LABEL_CODEX:-com.alpha.walkcode-codex}"
+LABEL_CLAUDE="${WALKCODE_LAUNCHD_LABEL:-com.walkcode}"
+LABEL_CODEX="${WALKCODE_LAUNCHD_LABEL_CODEX:-com.walkcode-codex}"
 LOG_CLAUDE="${LOG_CLAUDE:-$HOME/.walkcode/launchd.claude.err.log}"
 LOG_CODEX="${LOG_CODEX:-$HOME/.walkcode/launchd.codex.err.log}"
 CODEX_ENV="${WALKCODE_CODEX_ENV:-$HOME/.walkcode/codex.env}"
