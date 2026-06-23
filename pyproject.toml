@@ -1,6 +1,6 @@
 [project]
 name = "walkcode"
-version = "0.10.44"
+version = "0.10.46"
 description = "Let your AI agent call you when it needs help — human-in-the-loop via Feishu"
 readme = "README.md"
 requires-python = ">=3.13"
@@ -17,6 +17,11 @@ dependencies = [
     "uvicorn>=0.34.0",
     "lark-oapi>=1.4.0",
 ]
+
+[project.optional-dependencies]
+# Title summarization for the session health card (Haiku via Vertex). Optional:
+# summarizer.py imports it lazily and degrades to a first-line title if absent.
+summary = ["anthropic[vertex]>=0.39"]
 
 [project.urls]
 Homepage = "https://github.com/0x5446/walkcode"

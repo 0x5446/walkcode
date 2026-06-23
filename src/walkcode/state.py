@@ -30,6 +30,11 @@ class Session:
     # lets redelivery register dedupe so codex's duplicate Stop for the same turn
     # isn't sent twice.
     pending_redelivery: list[dict] = field(default_factory=list)
+    # --- health card (session health card feature) ---
+    health_card_id: str = ""        # feishu interactive card message id (the thread root)
+    cached_title: str = ""          # AI summary title (when summarizer refines it); else unset
+    title_source: str = ""          # "" | "summary" (summary = haiku-refined, rate-limit gate)
+    last_status: str = ""           # "" while live; "stopped" freezes the card (stops refresh)
 
     @classmethod
     def from_dict(cls, data: dict) -> "Session":
@@ -53,6 +58,10 @@ class Session:
             subscribed=bool(data.get("subscribed", False)),
             created_at=float(data.get("created_at", time.time())),
             pending_redelivery=pending,
+            health_card_id=str(data.get("health_card_id", "")),
+            cached_title=str(data.get("cached_title", "")),
+            title_source=str(data.get("title_source", "")),
+            last_status=str(data.get("last_status", "")),
         )
 
     def to_dict(self) -> dict:
@@ -66,6 +75,10 @@ class Session:
                 {"key": list(x["key"]) if x.get("key") else None, "text": x["text"]}
                 for x in self.pending_redelivery
             ],
+            "health_card_id": self.health_card_id,
+            "cached_title": self.cached_title,
+            "title_source": self.title_source,
+            "last_status": self.last_status,
         }
 
 
@@ -110,6 +123,7 @@ class SessionStore:
                                 "root_msg_id": str(entry["root_msg_id"]),
                                 "reply_id": str(entry["reply_id"]) if entry.get("reply_id") else None,
                                 "cwd": str(entry["cwd"]) if entry.get("cwd") else "",
+                                "health_card_id": str(entry["health_card_id"]) if entry.get("health_card_id") else "",
                             }
 
             self._rebuild_index_locked()
@@ -260,12 +274,16 @@ class SessionStore:
 
     # --- Pending Feishu-initiated session helpers ---
 
-    def add_pending(self, tmux_name: str, root_msg_id: str, reply_id: str | None = None, cwd: str = ""):
+    def add_pending(self, tmux_name: str, root_msg_id: str, reply_id: str | None = None,
+                    cwd: str = "", health_card_id: str = ""):
         with self._lock:
             # cwd is the agent's launch dir (config.default_cwd for Feishu-initiated
             # starts). Carried so that if SessionStart sync is dropped, the first
             # runtime hook can still establish the correct launch cwd from here.
-            self._pending[tmux_name] = {"root_msg_id": root_msg_id, "reply_id": reply_id, "cwd": cwd}
+            # health_card_id: the bot card created as the thread root (Feishu-
+            # initiated), migrated onto the Session by the first hook.
+            self._pending[tmux_name] = {"root_msg_id": root_msg_id, "reply_id": reply_id,
+                                        "cwd": cwd, "health_card_id": health_card_id}
             self._pending_msg_to_tty[root_msg_id] = tmux_name
             self._save_locked()
 
@@ -276,14 +294,15 @@ class SessionStore:
                 entry["reply_id"] = reply_id
                 self._save_locked()
 
-    def pop_pending(self, tmux_name: str) -> tuple[str | None, str | None, str | None]:
+    def pop_pending(self, tmux_name: str) -> tuple[str | None, str | None, str | None, str | None]:
         with self._lock:
             entry = self._pending.pop(tmux_name, None)
             if not entry:
-                return None, None, None
+                return None, None, None, None
             self._pending_msg_to_tty.pop(entry["root_msg_id"], None)
             self._save_locked()
-            return entry["root_msg_id"], entry.get("reply_id"), entry.get("cwd")
+            return (entry["root_msg_id"], entry.get("reply_id"), entry.get("cwd"),
+                    entry.get("health_card_id"))
 
     def mark_subscribed(self, session_id: str):
         with self._lock:
@@ -291,6 +310,34 @@ class SessionStore:
             if session and not session.subscribed:
                 session.subscribed = True
                 self._save_locked()
+
+    # --- health card mutators ([R3]: locked + persisted; callers must NOT mutate
+    # the copies returned by get()/items() — those changes never reach disk) ---
+
+    def set_health_card(self, session_id: str, card_id: str) -> None:
+        with self._lock:
+            session = self._sessions.get(session_id)
+            if session is not None:
+                session.health_card_id = card_id
+                self._save_locked()
+
+    def set_title(self, session_id: str, title: str, source: str) -> None:
+        with self._lock:
+            session = self._sessions.get(session_id)
+            if session is not None:
+                session.cached_title = title
+                session.title_source = source
+                self._save_locked()
+
+    def set_status(self, session_id: str, status: str) -> None:
+        """Set the freeze flag. status="stopped" freezes the card; "" unfreezes
+        (only the resume path should pass "")."""
+        with self._lock:
+            session = self._sessions.get(session_id)
+            if session is not None and session.last_status != status:
+                session.last_status = status
+                self._save_locked()
+
 
     def resolve_pending_tty(self, msg_id: str) -> str | None:
         with self._lock:

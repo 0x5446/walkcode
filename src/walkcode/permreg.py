@@ -242,6 +242,29 @@ class PermissionRegistry:
             req = self._by_rid.get(rid)
             return req is not None and req.invalidated_at is not None
 
+    def has_open_request(self, session_id: str) -> bool:
+        """[R2] True iff ``session_id`` has a permission request the user genuinely
+        still needs to act on — the signal for the HITL_WAITING health state.
+
+        Runs gc first (there is no background reaper, so a request whose hook died
+        is only reaped on access), then requires the request to be undecided, not
+        invalidated, with a READY card (a card that failed to send must NOT show as
+        'waiting'), and not already claimed by the tmux fallback. Without these
+        filters a failed/stale request would masquerade as human-waiting for up to
+        the dedupe TTL."""
+        if not session_id:
+            return False
+        with self._lock:
+            self._gc_locked()
+            for req in self._by_rid.values():
+                if (req.session_id == session_id
+                        and req.decision is None
+                        and req.invalidated_at is None
+                        and req.card_status is CardStatus.READY
+                        and not req.fallback_claimed):
+                    return True
+        return False
+
     def poll_age(self, rid: str) -> float | None:
         """Seconds since the hook last polled (since creation if never polled). None if
         the rid is gone. The card-click gate uses this to reject a click whose hook has

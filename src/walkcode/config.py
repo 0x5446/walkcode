@@ -35,6 +35,19 @@ class Config:
     default_cwd: str = str(Path.home() / ".walkcode" / "workspace")
     agent: str = "claude"
     instance: str = ""
+    # --- session health card feature ---
+    health_card_enabled: bool = True       # WALKCODE_HEALTH_CARD=0 kills the whole feature
+    summary_vertex_project: str = ""
+    summary_vertex_region: str = "global"
+    summary_sa_path: str = ""
+    summary_model: str = "claude-haiku-4-5"
+    summary_timeout: float = 8.0
+
+    @property
+    def summary_enabled(self) -> bool:
+        """Title summarization self-disables unless a Vertex project + SA path are
+        configured (so the feature is opt-in and never blocks startup)."""
+        return bool(self.summary_vertex_project and self.summary_sa_path)
 
     @property
     def instance_name(self) -> str:
@@ -62,6 +75,13 @@ class Config:
         agent = os.environ.get("WALKCODE_AGENT", "claude")
         instance = os.environ.get("WALKCODE_INSTANCE", "")
 
+        # summary is an optional aux feature: a malformed timeout must never block
+        # startup, so degrade to the default instead of letting float() raise.
+        try:
+            summary_timeout = float(os.environ.get("WALKCODE_SUMMARY_TIMEOUT", "8") or "8")
+        except ValueError:
+            summary_timeout = 8.0
+
         # Compute state path with backward compat
         effective_instance = instance or agent
         if agent == "claude" and not instance:
@@ -85,4 +105,10 @@ class Config:
             default_cwd=os.environ.get("WALKCODE_CWD", str(Path.home() / ".walkcode" / "workspace")),
             agent=agent,
             instance=instance,
+            health_card_enabled=os.environ.get("WALKCODE_HEALTH_CARD", "1") != "0",
+            summary_vertex_project=os.environ.get("WALKCODE_SUMMARY_VERTEX_PROJECT", ""),
+            summary_vertex_region=os.environ.get("WALKCODE_SUMMARY_VERTEX_REGION", "global"),
+            summary_sa_path=os.environ.get("WALKCODE_SUMMARY_SA_PATH", ""),
+            summary_model=os.environ.get("WALKCODE_SUMMARY_MODEL", "claude-haiku-4-5"),
+            summary_timeout=summary_timeout,
         )
