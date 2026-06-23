@@ -71,7 +71,23 @@ class ResolvedCardTests(unittest.TestCase):
         questions = [{"question": "Unanswered?", "options": []}]
         card = _build_askuser_answers_card("t", questions, {})
         self.assertEqual(card["header"]["template"], "green")
-        self.assertIn(t("feishu.perm.invalidated"), _card_body(card))
+        # neutral placeholder for an unanswered question, never "allowed" (A/D)
+        self.assertIn("—", _card_body(card))
+        self.assertNotIn(t("feishu.perm.invalidated"), _card_body(card))
+
+    def test_stale_result_card_is_grey(self):
+        # TUI deny/Esc resolved → grey neutral, distinct from green "allowed" (A)
+        card = _build_permission_result_card("Bash", "stale")
+        self.assertEqual(card["header"]["template"], "grey")
+
+    def test_askuser_answers_card_escapes_markdown(self):
+        # question text / labels / Other text are model/user input → must be escaped so
+        # links / mentions / bold can't misrepresent the shown answer (deep-review D)
+        questions = [{"question": "q1", "header": "h1", "options": []}]
+        answers = {"q1": "[x](http://e) **b** `c`"}
+        body = _card_body(_build_askuser_answers_card("t", questions, answers))
+        self.assertNotIn("[x](http://e)", body)   # raw link neutralized
+        self.assertIn("\\[x\\]", body)            # escaped form present
 
 
 class ButtonLabelsTest(unittest.TestCase):

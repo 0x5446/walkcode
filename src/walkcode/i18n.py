@@ -291,6 +291,10 @@ _T: dict[str, tuple[str, str]] = {
         "✅ Allowed in terminal",
         "✅ 已在终端允许",
     ),
+    "feishu.perm.stale": (
+        "⚪️ Expired (settled in terminal)",
+        "⚪️ 已失效（已在终端处理）",
+    ),
     "feishu.askuser.terminal_selected": (
         "✅ Selected in terminal",
         "✅ 已在终端选择",

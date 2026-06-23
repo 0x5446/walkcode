@@ -452,6 +452,9 @@ def _build_permission_result_card(tool_name: str, behavior: str) -> dict:
     elif behavior == "invalidated":
         label = t("feishu.perm.invalidated")
         template = "green"
+    elif behavior == "stale":
+        label = t("feishu.perm.stale")
+        template = "grey"
     else:
         label = t("feishu.perm.denied")
         template = "red"
@@ -477,12 +480,18 @@ def _build_askuser_answers_card(title: str, questions: list, answers_map: dict) 
     lines = []
     for q in questions or []:
         q_text = q.get("question", "")
-        heading = q.get("header") or q_text or "—"
+        raw_heading = q.get("header") or q_text or "—"
+        # Escape lark_md: question text / labels / Other text come from the model or the
+        # user; unescaped they could inject links / mentions / bold and misrepresent the
+        # shown answer (deep-review D). Collapse newlines so the bold heading stays intact.
+        heading = _escape_lark_md(str(raw_heading)).replace("\r", " ").replace("\n", " ")
         ans = answers_map.get(q_text)
         if ans is None:
-            ans = t("feishu.perm.invalidated")
+            ans = "—"
+        else:
+            ans = _escape_lark_md(str(ans)).replace("\r", " ").replace("\n", " ")
         lines.append(f"**{heading}**\n→ {ans}")
-    content = "\n\n".join(lines) if lines else t("feishu.perm.invalidated")
+    content = "\n\n".join(lines) if lines else "—"
     return {
         "config": {"wide_screen_mode": True},
         "header": {
@@ -911,7 +920,19 @@ def _finalize_askuser_answer(
         "answers": answers_list,
         "updatedInput": _build_askuser_updated_input(questions, answers_list),
     }
-    registry.set_decision_once(request_id, final_decision)
+    won = registry.set_decision_once(request_id, final_decision)
+    if not won:
+        # A later click (double-click / replayed callback / race with PostToolUse
+        # invalidation) lost the write-once. The real decision is the first/terminal
+        # one, so never render this click's (losing) answer as if it took effect
+        # (deep-review B). Show a neutral resolved card + already-answered toast.
+        resp.card = CallBackCard()
+        resp.card.type = "raw"
+        resp.card.data = _build_permission_result_card("AskUserQuestion", "invalidated")
+        resp.toast = CallBackToast()
+        resp.toast.type = "info"
+        resp.toast.content = t("feishu.perm.already_decided")
+        return resp
 
     resp.card = CallBackCard()
     resp.card.type = "raw"
@@ -990,11 +1011,15 @@ def _on_card_action(data: P2CardActionTrigger) -> P2CardActionTriggerResponse:
         # answer / decision). set_decision_once also re-checks invalidated_at inside its
         # lock to close the check-then-act race.
         if registry.is_invalidated(request_id) or _perm_click_stale(request_id):
-            reason = "invalidated" if registry.is_invalidated(request_id) else "stale_poll"
+            is_inv = registry.is_invalidated(request_id)
+            reason = "invalidated" if is_inv else "stale_poll"
             logger.info(f"Stale card click ignored: {reason} tool={tool_name} rid={request_id[:8]}")
             resp.card = CallBackCard()
             resp.card.type = "raw"
-            resp.card.data = _build_permission_result_card(tool_name, "invalidated")
+            # PostToolUse invalidation = the tool actually ran (TUI approved) → green
+            # "allowed". A stale poll = the TUI denied/Esc'd (hook stopped polling) →
+            # neutral grey "expired"; never report a denial as allowed (deep-review A).
+            resp.card.data = _build_permission_result_card(tool_name, "invalidated" if is_inv else "stale")
             resp.toast = CallBackToast()
             resp.toast.type = "info"
             resp.toast.content = t("feishu.perm.expired")
@@ -2246,16 +2271,26 @@ async def receive_post_tool_hook(request: Request):
     # TUI-chosen answers live nowhere in walkcode's memory (req.answers is filled only on a
     # Feishu click), so they reach us here via PostToolUse's tool_response.
     answers = body.get("answers")
+    if not isinstance(answers, dict):
+        answers = None
     snaps = registry.invalidate_session(session_id)
+    # PostToolUse represents only the one tool that just ran and carries no tool_use_id
+    # tying it to a specific card. claude can run tools in parallel, so a session may
+    # hold >1 open AskUserQuestion card. Only attribute the answers when there is exactly
+    # one open question card AND its question texts intersect the answers — otherwise show
+    # a neutral resolved card rather than misattributing answers (deep-review C).
+    unique_ask = sum(1 for s in snaps if s.get("tool_name") == "AskUserQuestion") == 1
     for snap in snaps:
         card_msg_id = snap.get("card_msg_id")
         if not card_msg_id:
             continue
-        if answers and snap.get("tool_name") == "AskUserQuestion":
+        tool_input = snap.get("tool_input")
+        questions = tool_input.get("questions", []) if isinstance(tool_input, dict) else []
+        q_texts = {q.get("question") for q in questions if isinstance(q, dict)}
+        matched = answers is not None and unique_ask and bool(set(answers) & q_texts)
+        if snap.get("tool_name") == "AskUserQuestion" and matched:
             card = _build_askuser_answers_card(
-                t("feishu.askuser.terminal_selected"),
-                snap.get("tool_input", {}).get("questions", []),
-                answers,
+                t("feishu.askuser.terminal_selected"), questions, answers,
             )
         else:
             card = _build_permission_result_card(snap.get("tool_name", ""), "invalidated")

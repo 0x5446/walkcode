@@ -213,6 +213,24 @@ class ReceivePermDedupeTests(unittest.TestCase):
         self.assertIn("是", body_text)     # chosen label
         self.assertIn("确认", body_text)    # question heading
 
+    def test_post_tool_multi_askuser_no_misattribution(self):
+        # Two open AskUserQuestion cards in one session → PostToolUse (one tool) must not
+        # attribute its answers to either card; both get neutral resolved cards (ISSUE C).
+        for i, q in enumerate(["问题甲", "问题乙"]):
+            req, _ = server.registry.register_or_get(("s1", f"tu-ask{i}"))
+            server.registry.fill_request(
+                req.rid, tool_name="AskUserQuestion",
+                tool_input={"questions": [{"question": q, "options": []}]},
+                session_id="s1", card_msg_id=f"card{i}")
+        edits = []
+        with patch.object(server, "_edit_card", lambda mid, card: edits.append(card)):
+            asyncio.run(server.receive_post_tool_hook(_Req({
+                "session_id": "s1", "tool_name": "AskUserQuestion",
+                "answers": {"问题甲": "答A"}})))
+        self.assertEqual(len(edits), 2)
+        for card in edits:
+            self.assertNotIn("答A", str(card))  # no misattribution to either card
+
     def test_post_tool_missing_session_noop(self):
         res = asyncio.run(server.receive_post_tool_hook(_Req({})))
         self.assertFalse(res["ok"])

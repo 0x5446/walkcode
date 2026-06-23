@@ -82,6 +82,8 @@ class CardActionTests(unittest.TestCase):
         resp = _click({"rid": rid, "b": "allow"})
         self.assertIsNone(server.registry.get(rid).decision)
         self.assertEqual(resp.toast.type, "info")
+        # PostToolUse invalidation = the tool ran (approved) → green resolved card
+        self.assertEqual(resp.card.data["header"]["template"], "green")
 
     def test_stale_poll_click_rejected(self):
         # The hook stopped polling long ago (TUI deny/Esc killed it) → stale click,
@@ -91,6 +93,8 @@ class CardActionTests(unittest.TestCase):
         resp = _click({"rid": rid, "b": "allow"})
         self.assertIsNone(server.registry.get(rid).decision)
         self.assertEqual(resp.toast.type, "info")
+        # TUI deny/Esc (NOT approval) → neutral grey; must never show green "allowed" (A)
+        self.assertEqual(resp.card.data["header"]["template"], "grey")
 
     def test_both_pollers_read_the_won_decision(self):
         import asyncio
@@ -162,6 +166,21 @@ class CardActionTests(unittest.TestCase):
         dec = server.registry.get(rid).decision
         # multiSelect answer joins labels with comma in updatedInput
         self.assertEqual(dec["updatedInput"]["answers"], {"Pick many": "L1,L2"})
+
+    def test_finalize_loser_does_not_show_its_answer(self):
+        # A later finalize that loses write-once (double-click / race with PostToolUse)
+        # must NOT render its own answer as if it took effect; the first decision stands
+        # and a neutral resolved card + info toast is shown (deep-review B).
+        qs = [{"question": "Pick", "options": [{"label": "A"}, {"label": "B"}]}]
+        rid = self._askq(qs)
+        _click({"rid": rid, "action": "select", "answer": "A",
+                "question_index": 0, "total_questions": 1})
+        resp2 = server.P2CardActionTriggerResponse()
+        server._finalize_askuser_answer(resp2, rid, qs, 0, 1, "B")  # losing late click
+        self.assertEqual(server.registry.get(rid).decision["updatedInput"]["answers"],
+                         {"Pick": "A"})  # first answer kept
+        self.assertNotIn("B", str(resp2.card.data))  # loser's answer never shown
+        self.assertEqual(resp2.toast.type, "info")
 
     def test_other_thread_reply_then_stale_click_is_idempotent(self):
         rid = self._askq([{"question": "Pick", "options": [{"label": "A"}]}])

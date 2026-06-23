@@ -617,8 +617,9 @@ def cmd_hook(args):
         # Other tools' tool_response can be huge (command output / file contents) and
         # this POST runs on a 2s timeout, so never ship those.
         if body["tool_name"] == "AskUserQuestion":
-            answers = (hook_data.get("tool_response") or {}).get("answers")
-            if answers:
+            tr = hook_data.get("tool_response")
+            answers = tr.get("answers") if isinstance(tr, dict) else None
+            if isinstance(answers, dict) and answers:
                 body["answers"] = answers
         payload = json.dumps(body).encode()
         try:
