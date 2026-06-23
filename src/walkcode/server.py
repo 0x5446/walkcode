@@ -43,6 +43,8 @@ from .config import Config
 from .i18n import t
 from .permreg import CardStatus, PermissionRegistry
 from .state import Session, SessionStore
+from .stats import collect_stats, SessionStats, ModelTokens
+from . import summarizer
 from .tty import (
     inject, validate_target, get_session_activity, kill_session, capture_pane,
     is_agent_alive, wait_until_input_ready, verify_submitted,
@@ -817,34 +819,48 @@ def _send_card(card: dict) -> str | None:
         logger.warning("Cannot send card: FEISHU_RECEIVE_ID not configured")
         return None
     content = json.dumps(card)
-    body = CreateMessageRequestBody.builder() \
-        .receive_id(config.feishu_receive_id) \
-        .msg_type("interactive") \
-        .content(content) \
-        .build()
-    req = CreateMessageRequest.builder() \
-        .receive_id_type(config.feishu_receive_id_type) \
-        .request_body(body) \
-        .build()
-    resp = lark_client.im.v1.message.create(req)
+    try:
+        body = CreateMessageRequestBody.builder() \
+            .receive_id(config.feishu_receive_id) \
+            .msg_type("interactive") \
+            .content(content) \
+            .build()
+        req = CreateMessageRequest.builder() \
+            .receive_id_type(config.feishu_receive_id_type) \
+            .request_body(body) \
+            .build()
+        resp = lark_client.im.v1.message.create(req)
+    except Exception as e:
+        # Network/SDK exception must NOT bubble: callers rely on None to fall back
+        # to a plain post root, so a card failure can't break the start/hook path.
+        logger.error(f"Send card exception: {e}")
+        return None
     if not resp.success():
         logger.error(f"Send card failed: {resp.code} {resp.msg}")
         return None
     return resp.data.message_id
 
 
-def _edit_card(message_id: str, card: dict):
-    """Update an interactive card message."""
-    body = PatchMessageRequestBody.builder() \
-        .content(json.dumps(card)) \
-        .build()
-    req = PatchMessageRequest.builder() \
-        .message_id(message_id) \
-        .request_body(body) \
-        .build()
-    resp = lark_client.im.v1.message.patch(req)
+def _edit_card(message_id: str, card: dict) -> bool:
+    """Update an interactive card message. Returns True on success, False on ANY
+    failure including network/SDK exceptions — so the caller can stop refreshing a
+    dead card instead of the exception bubbling and leaving health_card_id set."""
+    try:
+        body = PatchMessageRequestBody.builder() \
+            .content(json.dumps(card)) \
+            .build()
+        req = PatchMessageRequest.builder() \
+            .message_id(message_id) \
+            .request_body(body) \
+            .build()
+        resp = lark_client.im.v1.message.patch(req)
+    except Exception as e:
+        logger.error(f"Edit card exception: {e}")
+        return False
     if not resp.success():
         logger.error(f"Edit card failed: {resp.code} {resp.msg}")
+        return False
+    return True
 
 
 def _finalize_askuser_answer(
@@ -1248,10 +1264,21 @@ def _start_agent(prompt: str, message_id: str, image_path: str | None = None):
         _reply(message_id, t("feishu.start_failed", error=e), reply_in_thread=True)
         return
 
-    session_store.add_pending(tmux_name, message_id, cwd=cwd)
-    reply_id = _reply(message_id, t("feishu.started", agent=agent_adapter.name.title(), tmux=tmux_name), reply_in_thread=True)
-    if reply_id:
-        session_store.update_pending_reply(tmux_name, reply_id)
+    # Health card as the thread root: bot creates a card, the user's input becomes
+    # the first reply under it. Falls back to the original (user message as root +
+    # "started" reply) when the feature is off or the card send fails — never drops.
+    root_id = message_id
+    health_card_id = ""
+    if config.health_card_enabled:
+        card_id = _send_card(_build_health_card(SessionStats(source="unavailable"), "running", (prompt or "").strip()[:40]))
+        if card_id:
+            root_id, health_card_id = card_id, card_id
+            _reply(card_id, prompt, reply_in_thread=True)
+    session_store.add_pending(tmux_name, root_id, cwd=cwd, health_card_id=health_card_id)
+    if not health_card_id:
+        reply_id = _reply(message_id, t("feishu.started", agent=agent_adapter.name.title(), tmux=tmux_name), reply_in_thread=True)
+        if reply_id:
+            session_store.update_pending_reply(tmux_name, reply_id)
     logger.info(f"Started {agent_adapter.name}: tmux={tmux_name} cwd={cwd} prompt={prompt[:50]}")
 
     # Background: detect auth failure and recover via device-auth
@@ -1384,6 +1411,10 @@ def _mark_session_busy(session_id: str):
             # installed — so a *missing* one later is a real swallow, not just a
             # legacy session that predates the hook.
             _ups_capable_sessions.add(session_id)
+        # A new turn started → unfreeze the health card so the poller resumes
+        # refreshing (covers both resume and continued TUI use). [R9]
+        if config and config.health_card_enabled and session_store is not None:
+            session_store.set_status(session_id, "")
 
 
 def _mark_session_idle(session_id: str):
@@ -1929,7 +1960,7 @@ async def receive_hook(request: Request):
         return {"ok": False, "error": f"reply {status}"}
     else:
         # New session: check if Feishu-initiated (pending root exists)
-        pending_root, reply_id, pending_cwd = session_store.pop_pending(tty)
+        pending_root, reply_id, pending_cwd, pending_health_card = session_store.pop_pending(tty)
         if pending_root:
             # Feishu-initiated: reuse existing thread. The launch cwd is the one
             # stashed at start (config.default_cwd), not this hook's runtime cwd.
@@ -1941,6 +1972,8 @@ async def receive_hook(request: Request):
                 # state.json upgraded in-flight), so a drifted runtime cwd can't
                 # be mislabeled as the launch cwd.
                 session_store.upsert(session_id, tty=tty, cwd=pending_cwd or config.default_cwd, root_msg_id=root_id, cwd_is_launch=True)
+                if pending_health_card:
+                    session_store.set_health_card(session_id, pending_health_card)
                 # Update the launch reply with session info
                 if reply_id:
                     _edit_message(reply_id, t("feishu.started_with_session", agent=agent_adapter.name.title(), session_id=session_id[:8], tmux=tty))
@@ -1962,12 +1995,21 @@ async def receive_hook(request: Request):
                 session_store.add_redelivery(session_id, display_message, dedupe_key)
             return {"ok": False, "error": f"reply to pending root {status}"}
 
-        # User-initiated: send title as thread root, reply with content
-        thread_title = _make_title(cwd, session_id, message)
-        root_id = _send(text=thread_title)
+        # New session, no pending → agent-initiated (e.g. a local tmux/TUI session).
+        # Bot creates the thread root: a health card if enabled, else a post title.
+        health_card_id = ""
+        root_id = None
+        if config.health_card_enabled:
+            root_id = _send_card(_build_health_card(SessionStats(source="unavailable"), "running", (message or "").strip()[:40]))
+            health_card_id = root_id or ""
+        if not root_id:  # feature off or card send failed → post-title fallback
+            root_id = _send(text=_make_title(cwd, session_id, message))
+            health_card_id = ""
         if root_id:
             if session_id:
                 session_store.upsert(session_id, tty=tty, cwd=cwd, root_msg_id=root_id)
+                if health_card_id:
+                    session_store.set_health_card(session_id, health_card_id)
             text = display_message
             if config.feishu_receive_id:
                 text = f'<at user_id="{config.feishu_receive_id}"></at> {text}'
@@ -2116,13 +2158,15 @@ async def receive_permission_hook(request: Request):
             root_msg_id = session.root_msg_id
             session_store.upsert(session_id, tty=tty, cwd=cwd)
         else:
-            pending_root, reply_id, pending_cwd = session_store.pop_pending(tty)
+            pending_root, reply_id, pending_cwd, pending_health_card = session_store.pop_pending(tty)
             if pending_root:
                 root_msg_id = pending_root
                 if session_id:
                     # See receive_hook: fall back to config.default_cwd (the
                     # Feishu launch dir), never this hook's runtime cwd.
                     session_store.upsert(session_id, tty=tty, cwd=pending_cwd or config.default_cwd, root_msg_id=root_msg_id, cwd_is_launch=True)
+                    if pending_health_card:
+                        session_store.set_health_card(session_id, pending_health_card)
                     if reply_id:
                         _edit_message(reply_id, t("feishu.started_with_session", agent=agent_adapter.name.title(), session_id=session_id[:8], tmux=tty))
             elif session_id:
@@ -2131,10 +2175,21 @@ async def receive_permission_hook(request: Request):
                 # hook created a thread). Create the thread root NOW so the card lands
                 # in the session's own thread instead of leaking into the group's main
                 # conversation; later hooks for this session reuse the same root.
-                new_root = _send(_make_title(cwd, session_id, tool_name))
+                # Consistent with receive_hook's agent-initiated branch: bot creates
+                # a health card root when the feature is on, else a plain title post.
+                hc = ""
+                new_root = None
+                if config.health_card_enabled:
+                    new_root = _send_card(_build_health_card(SessionStats(source="unavailable"), "running", (tool_name or "").strip()[:40]))
+                    hc = new_root or ""
+                if not new_root:
+                    new_root = _send(_make_title(cwd, session_id, tool_name))
+                    hc = ""
                 if new_root:
                     root_msg_id = new_root
                     session_store.upsert(session_id, tty=tty, cwd=cwd, root_msg_id=new_root)
+                    if hc:
+                        session_store.set_health_card(session_id, hc)
 
         # Generate appropriate card based on tool type and permission_suggestions
         permission_mode = hook_data_full.get("permission_mode", "")
@@ -2411,6 +2466,193 @@ def _start_stuck_watchdog():
     )
 
 
+# --- Session health card ---
+
+_HEALTH_CHECK_INTERVAL = 60
+_HEALTH_COLOR = {"running": "blue", "hitl": "orange", "done": "grey", "error": "red"}
+_HEALTH_STATUS_KEY = {
+    "running": "feishu.health.status_running",
+    "hitl": "feishu.health.status_hitl",
+    "done": "feishu.health.status_done",
+    "error": "feishu.health.status_error",
+}
+
+
+def _human_tokens(n) -> str:
+    n = int(n or 0)
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M"
+    if n >= 1000:
+        return f"{n / 1000:.1f}k"
+    return str(n)
+
+
+def _session_health(session_id: str, stats: SessionStats) -> str:
+    """Return one of: running | hitl | done | error.
+
+    HITL overrides running (the agent process stays alive while a permission card
+    waits, so is_agent_alive can't be the signal — [R1]). A session that has never
+    recorded a Stop is treated as running (starting up), so a freshly created card
+    isn't mislabeled DONE before its first turn ends. Only a session that has
+    stopped AND has a trailing error is ERROR; otherwise DONE."""
+    if registry.has_open_request(session_id):
+        return "hitl"
+    if _is_session_busy(session_id):
+        return "running"
+    with _pending_lock:
+        ever_stopped = session_id in _session_last_stop
+    if not ever_stopped:
+        return "running"
+    return "error" if stats.last_error else "done"
+
+
+def _build_health_card(stats: SessionStats, health: str, title: str) -> dict:
+    color = _HEALTH_COLOR.get(health, "blue")
+    status_txt = t(_HEALTH_STATUS_KEY.get(health, "feishu.health.status_running"))
+    models = "、".join(m.model for m in stats.per_model) or "—"
+    elements = [
+        {"tag": "markdown",
+         "content": f"**{t('feishu.health.field_status')}**: {status_txt}　"
+                    f"**{t('feishu.health.field_model')}**: {models}"},
+        {"tag": "markdown",
+         "content": f"**{t('feishu.health.field_duration')}**: "
+                    f"{t('feishu.health.duration_min', minutes=stats.duration_minutes)}　"
+                    f"**{t('feishu.health.field_inputs')}**: "
+                    f"{t('feishu.health.inputs_n', n=stats.input_rounds)}"},
+    ]
+    if stats.per_model:
+        elements.append({"tag": "hr"})
+        for m in stats.per_model:
+            elements.append({"tag": "markdown",
+                             "content": f"`{m.model}`　" + t(
+                                 'feishu.health.tokens_line',
+                                 input=_human_tokens(m.input),
+                                 output=_human_tokens(m.output),
+                                 cache=_human_tokens(m.cache))})
+    elif stats.source == "unavailable":
+        elements.append({"tag": "markdown", "content": t('feishu.health.unavailable')})
+    frozen = health in ("done", "error")
+    foot = "feishu.health.footer_frozen" if frozen else "feishu.health.footer"
+    elements.append({"tag": "note",
+                     "elements": [{"tag": "plain_text",
+                                   "content": t(foot, time=time.strftime("%H:%M"))}]})
+    return {
+        "config": {"wide_screen_mode": True},
+        "header": {"title": {"tag": "plain_text",
+                             "content": title or t("feishu.health.title_pending")},
+                   "template": color},
+        "elements": elements,
+    }
+
+
+# Sessions with an in-flight summarize call, guarded by a lock so the poller
+# thread and the executor callback don't race on the set. [concurrency#2]
+_summarizing: set[str] = set()
+_summarizing_lock = threading.Lock()
+
+
+def _maybe_summarize(session_id: str, session: Session, stats: SessionStats) -> None:
+    """Opt-in: refine the title via Haiku once. No-op unless summary is configured
+    (Vertex env set) and this is a codex session not yet refined — codex has no
+    native ai-title, so its title defaults to the first user line; claude already
+    has a good ai-title. Async + locked dedup so it never blocks the poller and
+    runs at most once per session at a time. [R6]"""
+    if not config.summary_enabled or config.agent != "codex":
+        return
+    if session.title_source == "summary":
+        return
+    src = (stats.title or "").strip()
+    if not src:
+        return
+    with _summarizing_lock:
+        if session_id in _summarizing:
+            return
+        _summarizing.add(session_id)
+
+    def _cb(summary, sid=session_id, cwd=session.cwd):
+        try:
+            if summary:
+                session_store.set_title(sid, summary, "summary")
+                # If the session already froze before summary returned, patch the
+                # card once more so the refined title still lands. [correctness#3]
+                s2 = session_store.get(sid)
+                if s2 and s2.health_card_id and s2.last_status == "stopped":
+                    st = collect_stats(config.agent, sid, cwd)
+                    _edit_card(s2.health_card_id,
+                               _build_health_card(st, _session_health(sid, st), summary))
+        except Exception as e:
+            logger.info("summary callback failed: %s", e)
+        finally:
+            with _summarizing_lock:
+                _summarizing.discard(sid)
+
+    try:
+        summarizer.summarize_async(
+            _cb, src,
+            project=config.summary_vertex_project, region=config.summary_vertex_region,
+            sa_path=config.summary_sa_path, model=config.summary_model,
+            timeout=config.summary_timeout,
+        )
+    except Exception as e:
+        with _summarizing_lock:
+            _summarizing.discard(session_id)
+        logger.info("summarize dispatch failed: %s", e)
+
+
+def _refresh_health_card(session_id: str, session: Session) -> bool:
+    """Collect stats, rebuild and patch the health card. Returns True if the
+    session is now frozen (done/error). Card IO guarded; on patch failure the
+    health_card_id is cleared so the poller stops touching a dead card."""
+    if not session.health_card_id:
+        return False
+    try:
+        stats = collect_stats(config.agent, session_id, session.cwd)
+        health = _session_health(session_id, stats)
+        _maybe_summarize(session_id, session, stats)
+        if session.title_source == "summary" and session.cached_title:
+            title = session.cached_title  # AI-refined title wins
+        else:
+            title = stats.title or session.cached_title or ""
+        card = _build_health_card(stats, health, title)
+        if not _edit_card(session.health_card_id, card):
+            session_store.set_health_card(session_id, "")
+            return False
+        return health in ("done", "error")
+    except Exception as e:
+        logger.info("health card refresh failed for %s: %s", (session_id or "")[:8], e)
+        return False
+
+
+def _refresh_all_health_cards():
+    if not config.health_card_enabled:
+        return
+    for session_id, session in session_store.items():
+        if not session.health_card_id or session.last_status == "stopped":
+            continue
+        if _refresh_health_card(session_id, session):
+            # Re-check liveness before freezing: a new turn may have started during
+            # the refresh; don't let the freeze write clobber a fresh unfreeze. [concurrency#1]
+            if not _is_session_busy(session_id) and not registry.has_open_request(session_id):
+                session_store.set_status(session_id, "stopped")
+
+
+def _start_health_check_poller():
+    if not config.health_card_enabled:
+        logger.info("Health card disabled (WALKCODE_HEALTH_CARD=0)")
+        return
+
+    def _loop():
+        while True:
+            time.sleep(_HEALTH_CHECK_INTERVAL)
+            try:
+                _refresh_all_health_cards()
+            except Exception as e:
+                logger.error("Health poller error: %s", e)
+
+    threading.Thread(target=_loop, daemon=True).start()
+    logger.info("Health card poller started (interval=%ds)", _HEALTH_CHECK_INTERVAL)
+
+
 # --- Init ---
 
 def init(cfg: Config):
@@ -2449,3 +2691,4 @@ def start_ws_client(cfg: Config):
     _start_idle_reaper()
     _start_stuck_watchdog()
     _start_inject_sweeper()
+    _start_health_check_poller()

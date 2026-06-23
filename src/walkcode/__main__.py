@@ -15,6 +15,9 @@ from pathlib import Path
 
 from .i18n import t
 from .tty import detect_tmux_session, owner_check
+# Re-exported from stats so existing callers (and tests/test_stop_hook.py) keep
+# importing them from __main__; the canonical definitions live in stats.py.
+from .stats import _is_user_turn_start, _find_codex_rollout, _CODEX_SESSION_ID_RE  # noqa: F401
 
 _RUNTIME_DIR = Path.home() / ".walkcode"
 
@@ -340,27 +343,6 @@ def _read_last_assistant_text(path: str, max_chars: int = 28000) -> str:
     return ""
 
 
-def _is_user_turn_start(rec: dict) -> bool:
-    """True if a Claude transcript ``user`` record is a real prompt (a turn
-    boundary), not a tool_result echo.
-
-    Tool results are also ``user`` records, but their content is an array carrying
-    a ``tool_result`` block; a genuine prompt is a plain string or a text/image
-    array. Used to scope a turn to "everything since the last real user input".
-    """
-    msg = rec.get("message")
-    if not isinstance(msg, dict):  # message can arrive as JSON null → not a dict
-        return False
-    content = msg.get("content")
-    if isinstance(content, str):
-        return True
-    if isinstance(content, list):
-        return not any(
-            isinstance(b, dict) and b.get("type") == "tool_result" for b in content
-        )
-    return False
-
-
 def _join_turn_segments(segments: list[str], max_chars: int) -> str:
     """Join a turn's text segments, preserving the TAIL when over budget.
 
@@ -436,35 +418,6 @@ def _read_turn_assistant_texts(path: str, max_chars: int = 28000) -> str:
     if not seen_turn_start:
         return ""
     return _join_turn_segments(segments, max_chars)
-
-
-# A codex session id is a plain token (UUID-ish). Reject anything else before it
-# reaches a glob pattern, so a value containing * ? [ can't widen the match to
-# another session's rollout.
-_CODEX_SESSION_ID_RE = re.compile(r"[A-Za-z0-9._-]+")
-
-
-def _find_codex_rollout(session_id: str) -> str:
-    """Locate a Codex rollout JSONL by session id.
-
-    The rollout is named ``rollout-<ts>-<session_id>.jsonl`` under
-    ``~/.codex/sessions/<Y>/<M>/<D>/``. ``session_id`` comes from hook input, so it
-    is validated to a plain token first (no glob metacharacters) and matched on the
-    exact ``-<session_id>.jsonl`` suffix. Returns the newest match (mtime) or "".
-    """
-    if not session_id or not _CODEX_SESSION_ID_RE.fullmatch(session_id):
-        return ""
-    base = Path.home() / ".codex" / "sessions"
-    try:
-        matches = [p for p in base.rglob(f"rollout-*-{session_id}.jsonl")]
-    except OSError:
-        return ""
-    if not matches:
-        return ""
-    try:
-        return str(max(matches, key=lambda p: p.stat().st_mtime))
-    except OSError:
-        return str(matches[0])
 
 
 def _read_codex_turn_messages(session_id: str, path: str = "", max_chars: int = 28000) -> str:
