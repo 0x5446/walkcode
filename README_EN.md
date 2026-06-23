@@ -52,7 +52,7 @@ Your agent hits a permission prompt while you're away. Without WalkCode, it bloc
 - **Session health card** — every session keeps a live status card at the top of its thread, with status, model, duration, message count, and token usage (grouped by model), refreshed every minute and frozen once the session ends
 - **Remote start** — send a message to start a new agent session from your phone
 - **Session resume** — reply in an expired thread to automatically resume the conversation
-- **Mid-turn receipts** — a message you send while the agent is busy gets a queued-receipt first, then is injected once it's free
+- **Send while busy** — a message you send while the agent is busy is injected right away (queuing is left to the terminal/agent), with an emoji reaction to confirm delivery
 - **Auto-cleanup** — idle tmux sessions are killed after 2 hours and you get notified
 - **Multi-agent** — run Claude Code and Codex CLI simultaneously, each with its own Feishu bot
 
@@ -233,7 +233,7 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 uv tool install git+https://github.com/0x5446/walkcode.git
 ```
 
-> To enable auto-summarized titles for the session health card (optional), install with the `summary` extra:
+> To enable auto-summarized titles for the session health card (optional, Codex sessions only — Claude uses its own AI title), install with the `summary` extra:
 > `uv tool install "walkcode[summary] @ git+https://github.com/0x5446/walkcode.git"`
 
 #### 3. Configure
@@ -449,9 +449,11 @@ Each instance can set its own agent launch flags and permission mode via `.env`,
 | Variable | Purpose | Typical use |
 |----------|---------|-------------|
 | `WALKCODE_PERMISSION_FLAG` | Replace the default permission/approval flag | `--yolo` for fully autonomous Codex; unset uses the default (Claude `--permission-mode default`, Codex `--ask-for-approval untrusted`) |
-| `WALKCODE_EXTRA_ARGS` | Insert extra flags after the agent command | Route Claude through Vertex: `--settings ~/.walkcode/vertex.json` |
+| `WALKCODE_EXTRA_ARGS` | Insert extra flags after the agent command | Route Claude through Vertex: `--settings /Users/you/.walkcode/vertex.json` (absolute path) |
 
 > These values are strictly shell-escaped before being spliced into the launch command, so they can only ever be parsed as agent arguments, never as shell syntax. Applied on both start and resume, so routing stays consistent when a session is resumed.
+>
+> **Note:** escaping keeps values literal — a `~` / `$HOME` in a path is NOT expanded, so use an absolute path (e.g. `/Users/you/.walkcode/vertex.json`). Routing Claude through Vertex means your code context is handled by your own cloud project — only enable it for trusted projects; keep the `--settings` file and its credentials (including the service account JSON) outside the repo and out of version control.
 
 ### Multi-Instance Management
 
@@ -500,11 +502,11 @@ Every session keeps an interactive card at the top of its thread, refreshed ever
 | Inputs | Number of messages you've sent |
 | Tokens | Cumulative token usage (grouped by model) |
 
-The thread title is auto-named from a task summary. Once the session ends the card is frozen and stops refreshing. The whole feature is on by default; set `WALKCODE_HEALTH_CARD=0` to turn it off.
+The thread title is auto-named from a task summary (Claude uses its own AI title; Codex can optionally use Haiku to refine it — see Configuration). Once the session ends the card is frozen and stops refreshing. The whole feature is on by default; set `WALKCODE_HEALTH_CARD=0` to turn it off.
 
 ### Security: Remote Start Permissions
 
-When you start an agent from chat, WalkCode launches it with a controlled permission mode (Claude Code: `--permission-mode default`, Codex CLI: `--ask-for-approval untrusted`). Hooks enable approval from Feishu:
+When you start an agent from chat, WalkCode launches it with a controlled permission mode (Claude Code: `--permission-mode default`; Codex CLI: `--ask-for-approval untrusted`, plus a fixed `--dangerously-bypass-hook-trust` so WalkCode's own hooks aren't gated by per-change trust prompts, and `--no-alt-screen`). Hooks enable approval from Feishu:
 
 | Tool status | What happens |
 |---|---|
@@ -526,7 +528,7 @@ If you don't respond within 30 minutes, or the WalkCode server is unreachable, o
 | Send rich text | Reply with rich text in thread | Text and images preserved in order |
 | Waiting for input | Text in thread | Reply with text |
 | Task complete | Full turn forwarded to thread | Reply to continue, or ignore |
-| Mid-turn follow-up | Send while the agent is busy | Get a queued-receipt first, injected once it's free |
+| Mid-turn follow-up | Send while the agent is busy | Injected right away, emoji confirms delivery |
 | Session expired | Reply in old thread | Agent resumes automatically |
 | Remote start | Send a message in chat | Agent starts in new tmux session |
 
@@ -560,17 +562,17 @@ walkcode test-inject <tmux-session> "hi"  # Test injection
 | `WALKCODE_AGENT` | No | Agent type: `claude` (default) or `codex` |
 | `WALKCODE_INSTANCE` | No | Instance name (isolates PID/log/state for multi-agent) |
 | `WALKCODE_ENV_FILE` | No | Override `.env` file path (for multi-instance setups) |
-| `WALKCODE_STATE_PATH` | No | Custom state file path (default: `~/.walkcode/state.json`) |
+| `WALKCODE_STATE_PATH` | No | Custom state file path (default: `~/.walkcode/state.json` for the main Claude instance, `~/.walkcode/<instance>-state.json` for others) |
 | `WALKCODE_PERMISSION_FLAG` | No | Replace the agent's default permission/approval flag, e.g. `--yolo` for Codex |
 | `WALKCODE_EXTRA_ARGS` | No | Extra launch flags inserted after the agent command, e.g. `--settings` to route Claude through Vertex |
 | `WALKCODE_HEALTH_CARD` | No | Session health card toggle; set `0` to disable (on by default) |
-| `WALKCODE_SUMMARY_VERTEX_PROJECT` | No | Vertex project for health-card title summarization (unset → first line as title) |
+| `WALKCODE_SUMMARY_VERTEX_PROJECT` | No | Vertex project for health-card title summarization (Codex sessions only; unset → first line as title) |
 | `WALKCODE_SUMMARY_VERTEX_REGION` | No | Vertex region (default: `global`) |
 | `WALKCODE_SUMMARY_SA_PATH` | No | Path to the Vertex service account JSON |
 | `WALKCODE_SUMMARY_MODEL` | No | Title summarization model (default: `claude-haiku-4-5`) |
 | `WALKCODE_SUMMARY_TIMEOUT` | No | Title summarization timeout in seconds (default: `8`) |
 
-> Title summarization (`WALKCODE_SUMMARY_*`) requires the optional `summary` extra (`anthropic[vertex]`). When it isn't installed or configured, it degrades to using the task's first line as the title — nothing else is affected.
+> Title summarization (`WALKCODE_SUMMARY_*`) applies to **Codex sessions only** (Claude uses its own AI title and skips this path) and requires the optional `summary` extra (`anthropic[vertex]`). When it isn't installed or configured, Codex degrades to using the task's first line as the title — nothing else is affected. Keep credentials like the service account JSON outside the repo, use an absolute path, and don't commit them.
 
 ## Roadmap
 
