@@ -310,7 +310,7 @@ def _handle_permission_request(hook_data, port, tmux_session, cwd, session_id):
         _time.sleep(2)
 
     # Timeout: fail-open so agent falls back to its native prompt.
-    # A 2-min Feishu silence is not the same as an explicit deny.
+    # A 30-min Feishu silence is not the same as an explicit deny.
     print("[walkcode] permission poll timed out after 1800s, fail-open", file=sys.stderr)
     sys.exit(0)
 
