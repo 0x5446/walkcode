@@ -114,10 +114,13 @@ class MaybeSummarizeGateTest(unittest.TestCase):
             summary_vertex_project="p", summary_vertex_region="r", summary_sa_path="/sa",
             summary_model="claude-haiku-4-5", summary_timeout=8.0)
         with mock.patch("walkcode.server.summarizer.summarize_async") as m:
-            server._maybe_summarize("scodex", self._session(), _stats(title="首句"))
+            server._maybe_summarize(
+                "scodex", self._session(), _stats(title="首句"), "本轮完成了修复",
+            )
             # second call deduped while first is in-flight
             server._maybe_summarize("scodex", self._session(), _stats(title="首句"))
         m.assert_called_once()
+        self.assertEqual(m.call_args.kwargs["recent_turn"], "本轮完成了修复")
 
 
 class HealthCardRefreshTest(unittest.TestCase):
@@ -166,9 +169,10 @@ class HealthCardRefreshTest(unittest.TestCase):
                  mock.patch("walkcode.server._maybe_summarize") as summarize:
                 server._refresh_health_card_for_event(
                     "s", summarize=True, freeze_if_terminal=True,
+                    recent_turn="Stop result",
                 )
 
-            summarize.assert_called_once()
+            summarize.assert_called_once_with("s", mock.ANY, mock.ANY, "Stop result")
             self.assertEqual(server.session_store.get("s").last_status, "stopped")
 
 

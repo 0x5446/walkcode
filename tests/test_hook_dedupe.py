@@ -201,7 +201,7 @@ class ReceiveHookDedupeTests(unittest.TestCase):
 
         self.assertEqual(calls, [(
             "s1",
-            {"summarize": True, "freeze_if_terminal": True},
+            {"summarize": True, "freeze_if_terminal": True, "recent_turn": "done"},
         )])
 
     def test_claude_style_no_turn_id_dedupes_on_message(self):

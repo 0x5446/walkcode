@@ -1979,6 +1979,7 @@ async def receive_hook(request: Request):
         display_message = f"{label}\n{message}"
     else:
         display_message = message or label or effective_type
+    summary_context = "\n".join(x for x in (title, message) if x).strip() or display_message
     project = basename(cwd) if cwd else "unknown"
     logger.info(f"Hook: [{project}] {effective_type} | tmux={tty} session={session_id[:8] if session_id else '-'}")
 
@@ -1995,7 +1996,7 @@ async def receive_hook(request: Request):
             # duplicate Stop) — already delivered. Return BEFORE the blocked-backlog
             # check, so a still-blocked tail (other replies) can't cause this
             # already-sent turn to be re-queued (duplicate + reorder).
-            _after_hook_delivered(session_id, hook_type)
+            _after_hook_delivered(session_id, hook_type, summary_context)
             return {"ok": True, "redelivered": True, "thread": session.root_msg_id}
         if not drained:
             # Backlog still blocked (network down): queue the current turn BEHIND it
@@ -2014,7 +2015,7 @@ async def receive_hook(request: Request):
             # Register dedupe ONLY now that the send succeeded (F1: a failed
             # _reply must leave the slot open for codex's duplicate to retry).
             _remember_delivery(dedupe_key, hook_type, session_id)
-            _after_hook_delivered(session_id, hook_type)
+            _after_hook_delivered(session_id, hook_type, summary_context)
             return {"ok": True, "msg_id": msg_id, "thread": session.root_msg_id}
         # transient → stash this turn's output (without the @mention prefix) so the
         # next hook redelivers it; permanent → drop (retrying the same payload is
@@ -2050,7 +2051,7 @@ async def receive_hook(request: Request):
                 if session_id:
                     session_store.mark_subscribed(session_id)
                 _remember_delivery(dedupe_key, hook_type, session_id)
-                _after_hook_delivered(session_id, hook_type)
+                _after_hook_delivered(session_id, hook_type, summary_context)
                 return {"ok": True, "msg_id": root_id}
             # E: reply to the pending root failed — do NOT fall through to creating
             # a new thread (the first reply would land in the wrong place). The
@@ -2084,7 +2085,7 @@ async def receive_hook(request: Request):
                 if session_id:
                     session_store.mark_subscribed(session_id)
                 _remember_delivery(dedupe_key, hook_type, session_id)
-                _after_hook_delivered(session_id, hook_type)
+                _after_hook_delivered(session_id, hook_type, summary_context)
                 return {"ok": True, "msg_id": root_id}
             # Root created but the content reply failed. The session now owns
             # root_msg_id (upserted above), so a transient failure is redelivered
@@ -2650,7 +2651,12 @@ _summarizing: set[str] = set()
 _summarizing_lock = threading.Lock()
 
 
-def _maybe_summarize(session_id: str, session: Session, stats: SessionStats) -> None:
+def _maybe_summarize(
+    session_id: str,
+    session: Session,
+    stats: SessionStats,
+    recent_turn: str = "",
+) -> None:
     """Opt-in: refine the title via Haiku on Stop events.
 
     No-op unless summary is configured (Vertex env set) and this is a codex
@@ -2687,7 +2693,7 @@ def _maybe_summarize(session_id: str, session: Session, stats: SessionStats) -> 
 
     try:
         summarizer.summarize_async(
-            _cb, src,
+            _cb, src, recent_turn=recent_turn,
             project=config.summary_vertex_project, region=config.summary_vertex_region,
             sa_path=config.summary_sa_path, model=config.summary_model,
             timeout=config.summary_timeout,
@@ -2698,7 +2704,13 @@ def _maybe_summarize(session_id: str, session: Session, stats: SessionStats) -> 
         logger.info("summarize dispatch failed: %s", e)
 
 
-def _refresh_health_card(session_id: str, session: Session, *, summarize: bool = False) -> bool:
+def _refresh_health_card(
+    session_id: str,
+    session: Session,
+    *,
+    summarize: bool = False,
+    recent_turn: str = "",
+) -> bool:
     """Collect stats, rebuild and patch the health card. Returns True if the
     session is now frozen (done/error). Card IO guarded; on patch failure the
     health_card_id is cleared so the poller stops touching a dead card."""
@@ -2708,7 +2720,7 @@ def _refresh_health_card(session_id: str, session: Session, *, summarize: bool =
         stats = collect_stats(config.agent, session_id, session.cwd)
         health = _session_health(session_id, stats)
         if summarize:
-            _maybe_summarize(session_id, session, stats)
+            _maybe_summarize(session_id, session, stats, recent_turn)
         if session.title_source == "summary" and session.cached_title:
             title = session.cached_title  # AI-refined title wins
         else:
@@ -2728,6 +2740,7 @@ def _refresh_health_card_for_event(
     *,
     summarize: bool = False,
     freeze_if_terminal: bool = False,
+    recent_turn: str = "",
 ) -> bool:
     """Event-driven health-card refresh.
 
@@ -2740,20 +2753,25 @@ def _refresh_health_card_for_event(
     session = session_store.get(session_id)
     if not session or not session.health_card_id:
         return False
-    frozen = _refresh_health_card(session_id, session, summarize=summarize)
+    frozen = _refresh_health_card(
+        session_id, session,
+        summarize=summarize,
+        recent_turn=recent_turn,
+    )
     if freeze_if_terminal and frozen:
         if not _is_session_busy(session_id) and not registry.has_open_request(session_id):
             session_store.set_status(session_id, "stopped")
     return frozen
 
 
-def _after_hook_delivered(session_id: str, hook_type: str) -> None:
+def _after_hook_delivered(session_id: str, hook_type: str, recent_turn: str = "") -> None:
     """Update the health card after the user-visible hook reply is delivered."""
     if hook_type == "stop":
         _refresh_health_card_for_event(
             session_id,
             summarize=True,
             freeze_if_terminal=True,
+            recent_turn=recent_turn,
         )
 
 
