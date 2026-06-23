@@ -180,7 +180,19 @@ class CardActionTests(unittest.TestCase):
         self.assertEqual(server.registry.get(rid).decision["updatedInput"]["answers"],
                          {"Pick": "A"})  # first answer kept
         self.assertNotIn("B", str(resp2.card.data))  # loser's answer never shown
+        self.assertEqual(resp2.card.data["header"]["template"], "grey")  # neutral, not green
         self.assertEqual(resp2.toast.type, "info")
+
+    def test_other_wait_cleared_on_invalidation(self):
+        # PostToolUse invalidation clears awaiting_other so a later thread reply isn't
+        # consumed as the (now-settled) question's answer (deep-review ISSUE_3).
+        rid = self._askq([{"question": "Pick", "options": [{"label": "A"}]}])
+        _click({"rid": rid, "action": "request_other", "question_index": 0})
+        server.registry.fill_request(rid, session_id="sx")
+        server.registry.invalidate_session("sx")
+        self.assertIsNone(server.registry.find_awaiting_other("root1"))
+        server._consume_other_answer(rid, "late text", "msg1")
+        self.assertIsNone(server.registry.get(rid).decision)  # late Other did not take effect
 
     def test_other_thread_reply_then_stale_click_is_idempotent(self):
         rid = self._askq([{"question": "Pick", "options": [{"label": "A"}]}])

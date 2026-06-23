@@ -233,6 +233,9 @@ class PermissionRegistry:
                 if (req.session_id == session_id and req.decision is None
                         and req.invalidated_at is None):
                     req.invalidated_at = now
+                    # Drop any Other-reply wait so a later thread message isn't consumed
+                    # as this (now-settled) question's answer (deep-review ISSUE_3).
+                    req.awaiting_other = None
                     req.decided.set()  # wake a hook parked in decided.wait()
                     snaps.append(req.snapshot())
         return snaps
@@ -379,6 +382,8 @@ class PermissionRegistry:
             for rid, req in self._by_rid.items():
                 if (req.tool_name == "AskUserQuestion"
                         and req.feishu_root_msg_id == thread_root
-                        and req.awaiting_other):
+                        and req.awaiting_other
+                        and req.decision is None
+                        and req.invalidated_at is None):
                     return rid
         return None

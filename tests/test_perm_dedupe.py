@@ -230,6 +230,7 @@ class ReceivePermDedupeTests(unittest.TestCase):
         self.assertEqual(len(edits), 2)
         for card in edits:
             self.assertNotIn("答A", str(card))  # no misattribution to either card
+            self.assertEqual(card["header"]["template"], "grey")  # neutral, not green "allowed"
 
     def test_post_tool_missing_session_noop(self):
         res = asyncio.run(server.receive_post_tool_hook(_Req({})))

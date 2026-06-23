@@ -928,7 +928,9 @@ def _finalize_askuser_answer(
         # (deep-review B). Show a neutral resolved card + already-answered toast.
         resp.card = CallBackCard()
         resp.card.type = "raw"
-        resp.card.data = _build_permission_result_card("AskUserQuestion", "invalidated")
+        # Neutral grey, NOT green "allowed": a losing click's outcome is unknown to this
+        # path; the first/terminal decision stands (deep-review B follow-up).
+        resp.card.data = _build_permission_result_card("AskUserQuestion", "stale")
         resp.toast = CallBackToast()
         resp.toast.type = "info"
         resp.toast.content = t("feishu.perm.already_decided")
@@ -1413,8 +1415,10 @@ def _consume_other_answer(request_id: str, text: str, message_id: str):
         "answers": answers_list,
         "updatedInput": _build_askuser_updated_input(questions, answers_list),
     }
-    registry.set_decision_once(request_id, final_decision)
-    _add_reaction(message_id, random.choice(_SUCCESS_EMOJIS))
+    won = registry.set_decision_once(request_id, final_decision)
+    # If write-once lost (TUI already settled / PostToolUse invalidated it), don't react
+    # success on a reply that never took effect (deep-review ISSUE_3).
+    _add_reaction(message_id, random.choice(_SUCCESS_EMOJIS if won else _FAILURE_EMOJIS))
 
 
 def _norm(s: str) -> str:
@@ -2292,7 +2296,12 @@ async def receive_post_tool_hook(request: Request):
             card = _build_askuser_answers_card(
                 t("feishu.askuser.terminal_selected"), questions, answers,
             )
+        elif snap.get("tool_name") == "AskUserQuestion":
+            # A non-unique / unmatched question card: this PostToolUse can't tell us this
+            # card's real outcome → neutral grey, never green "allowed" (deep-review C follow-up).
+            card = _build_permission_result_card(snap.get("tool_name", ""), "stale")
         else:
+            # A permission tool whose PostToolUse fired = it actually ran = approved → green.
             card = _build_permission_result_card(snap.get("tool_name", ""), "invalidated")
         _edit_card(card_msg_id, card)
     if snaps:
