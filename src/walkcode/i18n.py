@@ -490,8 +490,8 @@ _T: dict[str, tuple[str, str]] = {
     "feishu.health.field_duration": ("Duration", "时长"),
     "feishu.health.field_inputs": ("Inputs", "输入"),
     "feishu.health.tokens_line": (
-        "in {input} / out {output} / cache {cache}",
-        "输入 {input} / 输出 {output} / 缓存 {cache}",
+        "in {input} / out {output} / cache read {cache_read} / create {cache_creation}",
+        "输入 {input} / 输出 {output} / 缓存读取 {cache_read} / 创建 {cache_creation}",
     ),
     "feishu.health.duration_min": ("{minutes} min", "{minutes} 分钟"),
     "feishu.health.inputs_n": ("{n} msgs", "{n} 条"),

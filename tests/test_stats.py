@@ -53,6 +53,8 @@ class ClaudeStatsTest(unittest.TestCase):
         models = {m.model: m for m in s.per_model}
         self.assertEqual(models["claude-opus-4-8"].input, 100)
         self.assertEqual(models["claude-opus-4-8"].output, 20)
+        self.assertEqual(models["claude-opus-4-8"].cache_creation, 5)
+        self.assertEqual(models["claude-opus-4-8"].cache_read, 3)
         self.assertEqual(models["claude-opus-4-8"].cache, 8)  # 5 + 3
         self.assertEqual(models["claude-haiku-4-5"].output, 10)
 
@@ -116,6 +118,8 @@ class CodexStatsTest(unittest.TestCase):
         mt = s.per_model[0]
         self.assertEqual(mt.model, "gpt-5.5-test")
         self.assertEqual(mt.input, 600)   # 1000 - 400 cached
+        self.assertEqual(mt.cache_creation, 0)
+        self.assertEqual(mt.cache_read, 400)
         self.assertEqual(mt.cache, 400)
         self.assertEqual(mt.output, 60)   # 50 + 10 reasoning
         self.assertEqual(s.input_rounds, 1)

@@ -2628,7 +2628,8 @@ def _build_health_card(stats: SessionStats, health: str, title: str) -> dict:
                                  'feishu.health.tokens_line',
                                  input=_human_tokens(m.input),
                                  output=_human_tokens(m.output),
-                                 cache=_human_tokens(m.cache))})
+                                 cache_read=_human_tokens(m.cache_read),
+                                 cache_creation=_human_tokens(m.cache_creation))})
     elif stats.source == "unavailable":
         elements.append({"tag": "markdown", "content": t('feishu.health.unavailable')})
     frozen = health in ("done", "error")
