@@ -8,9 +8,10 @@ failure degrades to ``source="unavailable"`` rather than raising — health-card
 refresh paths must never crash on a malformed or half-written file.
 
 Token accounting is normalized so Claude and Codex read the same way:
-``input`` = fresh (non-cached) input tokens, ``cache`` = cached/reused input
-tokens, ``output`` = generated tokens (incl. reasoning). Claude is genuinely
-multi-model per session (model can switch mid-session) so tokens are grouped by
+``input`` = fresh (non-cached) input tokens, ``cache_creation`` = input tokens
+used to create prompt cache entries, ``cache_read`` = cached/reused input tokens,
+``output`` = generated tokens (incl. reasoning). Claude is genuinely multi-model
+per session (model can switch mid-session) so tokens are grouped by
 ``message.model``; Codex is single-model per session.
 """
 
@@ -19,7 +20,7 @@ import logging
 import re
 import sqlite3
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 logger = logging.getLogger("walkcode.stats")
@@ -40,7 +41,12 @@ class ModelTokens:
     model: str
     input: int = 0
     output: int = 0
-    cache: int = 0
+    cache_creation: int = 0
+    cache_read: int = 0
+
+    @property
+    def cache(self) -> int:
+        return self.cache_creation + self.cache_read
 
 
 @dataclass(frozen=True)
@@ -235,14 +241,23 @@ def collect_claude_stats(session_id: str, cwd: str = "") -> SessionStats:
         if not isinstance(usage, dict):
             continue
         model = msg.get("model") or "unknown"
-        agg = by_model.setdefault(model, {"input": 0, "output": 0, "cache": 0})
+        agg = by_model.setdefault(
+            model,
+            {"input": 0, "output": 0, "cache_creation": 0, "cache_read": 0},
+        )
         agg["input"] += int(usage.get("input_tokens") or 0)
         agg["output"] += int(usage.get("output_tokens") or 0)
-        agg["cache"] += (int(usage.get("cache_creation_input_tokens") or 0)
-                         + int(usage.get("cache_read_input_tokens") or 0))
+        agg["cache_creation"] += int(usage.get("cache_creation_input_tokens") or 0)
+        agg["cache_read"] += int(usage.get("cache_read_input_tokens") or 0)
 
     per_model = tuple(
-        ModelTokens(model=m, input=v["input"], output=v["output"], cache=v["cache"])
+        ModelTokens(
+            model=m,
+            input=v["input"],
+            output=v["output"],
+            cache_creation=v["cache_creation"],
+            cache_read=v["cache_read"],
+        )
         for m, v in by_model.items()
     )
     # Prefer Claude's auto ai-title; fall back to the first user message (truncated)
@@ -375,7 +390,7 @@ def collect_codex_stats(session_id: str) -> SessionStats:
             model=model or "unknown",
             input=max(total_in - cached, 0),  # fresh input only, mirror Claude
             output=out,
-            cache=cached,
+            cache_read=cached,
         ),)
 
     if not rollout and not row:

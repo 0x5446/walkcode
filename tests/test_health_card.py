@@ -8,7 +8,7 @@ from unittest import mock
 
 from walkcode import server
 from walkcode.state import SessionStore, Session
-from walkcode.stats import SessionStats
+from walkcode.stats import ModelTokens, SessionStats
 
 
 def _stats(last_error=None, title="t"):
@@ -56,6 +56,33 @@ class SessionHealthStateMachineTest(unittest.TestCase):
     def test_error_when_stopped_with_error(self):
         server._session_last_stop["s"] = 100.0
         self.assertEqual(server._session_health("s", _stats(last_error="boom")), "error")
+
+
+class HealthCardRenderTest(unittest.TestCase):
+    def test_token_line_includes_cache_read_and_creation(self):
+        stats = SessionStats(
+            title="t",
+            per_model=(ModelTokens(
+                model="claude-opus-4-8",
+                input=20800,
+                output=373900,
+                cache_read=11_600_000,
+                cache_creation=300_000,
+            ),),
+            duration_minutes=50,
+            input_rounds=1,
+            source="ok",
+        )
+
+        with mock.patch("walkcode.i18n._ZH", False):
+            card = server._build_health_card(stats, "running", "t")
+        content = "\n".join(
+            e.get("content", "")
+            for e in card["elements"]
+            if e.get("tag") == "markdown"
+        )
+        self.assertIn("cache read 11.6M", content)
+        self.assertIn("create 300.0k", content)
 
 
 class HealthCardStoreTest(unittest.TestCase):
