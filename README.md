@@ -505,13 +505,14 @@ WalkCode 的核心设计：**1 个聊天话题 = 1 个 tmux 会话 = 1 个 Codin
 
 | 字段 | 内容 |
 |------|------|
-| 状态 | 🟢 进行中 / 🟠 等待确认 / ✅ 已完成 / 🔴 出错（卡片颜色随状态变化） |
+| 状态 | 🟢 进行中 / 🟠 等待确认 / ✅ 已完成 / 🔴 出错 / ⏱️ 超时已中断（卡片颜色随状态变化） |
+| Session | 当前会话 ID |
 | 模型 | 当前会话使用的模型 |
 | 时长 | 会话已运行时间 |
 | 输入 | 你发出的消息条数 |
 | Token | 累计 Token 用量（按模型分组） |
 
-话题标题会自动用任务摘要命名（Claude 用自带 AI 标题；Codex 可选用 Haiku 在 Stop 后异步精炼，见配置项）。每个 Stop 后卡片会刷新并冻结；如果你继续在话题里回复，卡片会重新进入进行中状态。整个功能默认开启，`WALKCODE_HEALTH_CARD=0` 可关闭。
+话题标题会自动用任务摘要命名（Claude 用自带 AI 标题；Codex 可选用 Haiku 在 Stop 后异步精炼，见配置项）。每个 Stop 后卡片会刷新并冻结；如果你继续在话题里回复，卡片会重新进入进行中状态。进行中状态超过 30 分钟没有可观测进展，或权限确认 / AskUserQuestion 等等待状态超过 30 分钟没有用户处理时，WalkCode 会向 TUI 发送 Esc 中断，把卡片标为「超时已中断」，并在话题里发提醒；判断基于 WalkCode 自己记录的状态、hook 事件和去掉底部动态区后的 pane 内容变化，不解析 TUI 底部文案，也不依赖 tmux `window_activity`。整个功能默认开启，`WALKCODE_HEALTH_CARD=0` 可关闭。
 
 ### 安全设计：远程启动的权限控制
 
@@ -575,6 +576,7 @@ walkcode test-inject <tmux-session> "hi"  # 测试注入
 | `WALKCODE_PERMISSION_FLAG` | 否 | 替换 Agent 默认权限/审批 flag，如 Codex 设 `--yolo` |
 | `WALKCODE_EXTRA_ARGS` | 否 | 在 Agent 命令后插入额外启动参数，如 Claude 走 Vertex 的 `--settings` |
 | `WALKCODE_HEALTH_CARD` | 否 | 会话健康卡片开关，设 `0` 关闭（默认开启） |
+| `WALKCODE_STUCK_THRESHOLD` | 否 | 进行中无进展或等待确认未处理时自动发送 Esc 中断的秒数（默认 `1800`，即 30 分钟） |
 | `WALKCODE_SUMMARY_VERTEX_PROJECT` | 否 | 健康卡片标题精炼用的 Vertex 项目（仅 Codex 会话；不设则用首行作标题） |
 | `WALKCODE_SUMMARY_VERTEX_REGION` | 否 | Vertex 区域（默认 `global`） |
 | `WALKCODE_SUMMARY_SA_PATH` | 否 | Vertex service account JSON 路径 |

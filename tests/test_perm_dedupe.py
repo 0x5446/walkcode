@@ -78,6 +78,10 @@ class ReceivePermDedupeTests(unittest.TestCase):
         self._orig_config = server.config
         self._orig_store = server.session_store
         self._orig_registry = server.registry
+        self._orig_last_stop = dict(server._session_last_stop)
+        self._orig_last_ups = dict(server._session_last_ups)
+        server._session_last_stop.clear()
+        server._session_last_ups.clear()
         server.config = Config(
             feishu_app_id="x", feishu_app_secret="y",
             feishu_receive_id="", feishu_receive_id_type="open_id",
@@ -94,6 +98,10 @@ class ReceivePermDedupeTests(unittest.TestCase):
             server.config = self._orig_config
             server.session_store = self._orig_store
             server.registry = self._orig_registry
+            server._session_last_stop.clear()
+            server._session_last_stop.update(self._orig_last_stop)
+            server._session_last_ups.clear()
+            server._session_last_ups.update(self._orig_last_ups)
         self.addCleanup(_restore)
 
         self.cards = []
@@ -125,6 +133,14 @@ class ReceivePermDedupeTests(unittest.TestCase):
             self._post(_perm_body(tool_use_id="tu-1"))
 
         self.assertEqual(calls, [("s1", {})])
+
+    def test_permission_card_marks_session_waiting(self):
+        res = self._post(_perm_body(tool_use_id="tu-wait"))
+        self.assertTrue(res["ok"])
+        sess = server.session_store.get("s1")
+        self.assertEqual(sess.status, "stopped")
+        self.assertEqual(sess.stop_reason, "permission_request")
+        self.assertGreater(sess.running_since, 0.0)
 
     def test_distinct_tool_use_ids_two_cards(self):
         self._post(_perm_body(tool_use_id="tu-1"))

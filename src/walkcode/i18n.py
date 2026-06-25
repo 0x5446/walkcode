@@ -480,13 +480,23 @@ _T: dict[str, tuple[str, str]] = {
         "（比如卡在一个一直返回不了的浏览器/登录操作）。去看看：\n"
         "tmux attach -t {tmux}",
     ),
+    "feishu.timeout_interrupted": (
+        "⏱️ This session had no progress or user action for {minutes} min, so WalkCode "
+        "sent Esc to interrupt it. Inspect or continue in the TUI:\n"
+        "tmux attach -t {tmux}",
+        "⏱️ 当前会话 {minutes} 分钟没有进展或用户处理，WalkCode 已发送 Esc 中断。"
+        "可以进 TUI 查看或继续：\n"
+        "tmux attach -t {tmux}",
+    ),
     # --- session health card ---
     "feishu.health.status_running": ("🟢 Running", "🟢 进行中"),
     "feishu.health.status_hitl": ("🟠 Waiting for you", "🟠 等待确认"),
     "feishu.health.status_done": ("✅ Done", "✅ 已完成"),
     "feishu.health.status_error": ("🔴 Error", "🔴 出错"),
+    "feishu.health.status_timeout": ("⏱️ Timeout interrupted", "⏱️ 超时已中断"),
     "feishu.health.field_status": ("Status", "状态"),
     "feishu.health.field_model": ("Model", "模型"),
+    "feishu.health.field_session": ("Session", "Session"),
     "feishu.health.field_duration": ("Duration", "时长"),
     "feishu.health.field_inputs": ("Inputs", "输入"),
     "feishu.health.tokens_line": (

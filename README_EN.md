@@ -496,13 +496,14 @@ Every session keeps an interactive card at the top of its thread, refreshed ever
 
 | Field | Content |
 |-------|---------|
-| Status | 🟢 Running / 🟠 Waiting for you / ✅ Done / 🔴 Error (the card color tracks the status) |
+| Status | 🟢 Running / 🟠 Waiting for you / ✅ Done / 🔴 Error / ⏱️ Timeout interrupted (the card color tracks the status) |
+| Session | Current session ID |
 | Model | Model the session is using |
 | Duration | How long the session has been running |
 | Inputs | Number of messages you've sent |
 | Tokens | Cumulative token usage (grouped by model) |
 
-The thread title is auto-named from a task summary (Claude uses its own AI title; Codex can optionally use Haiku to refine it — see Configuration). Once the session ends the card is frozen and stops refreshing. The whole feature is on by default; set `WALKCODE_HEALTH_CARD=0` to turn it off.
+The thread title is auto-named from a task summary (Claude uses its own AI title; Codex can optionally use Haiku to refine it — see Configuration). Once the session ends the card is frozen and stops refreshing. If a running state has no observable progress for more than 30 minutes, or a permission / AskUserQuestion wait state goes unanswered for more than 30 minutes, WalkCode sends Esc to interrupt it, marks the card as "Timeout interrupted", and posts a thread notice. This uses WalkCode's own recorded state, hook events, and pane content changes after stripping the bottom dynamic footer; it does not parse TUI footer wording or depend on tmux `window_activity`. The whole feature is on by default; set `WALKCODE_HEALTH_CARD=0` to turn it off.
 
 ### Security: Remote Start Permissions
 
@@ -566,6 +567,7 @@ walkcode test-inject <tmux-session> "hi"  # Test injection
 | `WALKCODE_PERMISSION_FLAG` | No | Replace the agent's default permission/approval flag, e.g. `--yolo` for Codex |
 | `WALKCODE_EXTRA_ARGS` | No | Extra launch flags inserted after the agent command, e.g. `--settings` to route Claude through Vertex |
 | `WALKCODE_HEALTH_CARD` | No | Session health card toggle; set `0` to disable (on by default) |
+| `WALKCODE_STUCK_THRESHOLD` | No | Seconds before auto-sending Esc for a running state with no progress, or an unanswered wait state (default: `1800`, 30 minutes) |
 | `WALKCODE_SUMMARY_VERTEX_PROJECT` | No | Vertex project for health-card title summarization (Codex sessions only; unset → first line as title) |
 | `WALKCODE_SUMMARY_VERTEX_REGION` | No | Vertex region (default: `global`) |
 | `WALKCODE_SUMMARY_SA_PATH` | No | Path to the Vertex service account JSON |

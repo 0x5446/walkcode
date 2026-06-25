@@ -34,7 +34,10 @@ class Session:
     health_card_id: str = ""        # feishu interactive card message id (the thread root)
     cached_title: str = ""          # AI summary title (when summarizer refines it); else unset
     title_source: str = ""          # "" | "summary" (summary = haiku-refined, rate-limit gate)
-    last_status: str = ""           # "" while live; "stopped" freezes the card (stops refresh)
+    status: str = "running"         # "running" | "stopped"
+    stop_reason: str = ""           # "" | completed | permission_request | ask_user_question | interrupted | agent_error | agent_exited | unknown
+    interrupt_reason: str = ""      # "" | timeout | user
+    running_since: float = 0.0      # epoch seconds for the current timeout timer t0
 
     @classmethod
     def from_dict(cls, data: dict) -> "Session":
@@ -51,6 +54,30 @@ class Session:
                     })
                 elif isinstance(item, str):  # legacy list[str] form
                     pending.append({"key": None, "text": item})
+        status = str(data.get("status", "") or "")
+        stop_reason = str(data.get("stop_reason", "") or "")
+        interrupt_reason = str(data.get("interrupt_reason", "") or "")
+        if not status:
+            legacy = str(data.get("last_status", "") or "")
+            if legacy == "timeout":
+                status = "stopped"
+                stop_reason = "interrupted"
+                interrupt_reason = interrupt_reason or "timeout"
+            elif legacy == "stopped":
+                status = "stopped"
+                stop_reason = stop_reason or "completed"
+            else:
+                status = "running"
+        if status not in ("running", "stopped"):
+            status = "running"
+            stop_reason = ""
+            interrupt_reason = ""
+        if status == "running":
+            stop_reason = ""
+            interrupt_reason = ""
+        elif not stop_reason:
+            stop_reason = "unknown"
+
         return cls(
             tty=str(data.get("tty", "")),
             cwd=str(data.get("cwd", "")),
@@ -61,7 +88,10 @@ class Session:
             health_card_id=str(data.get("health_card_id", "")),
             cached_title=str(data.get("cached_title", "")),
             title_source=str(data.get("title_source", "")),
-            last_status=str(data.get("last_status", "")),
+            status=status,
+            stop_reason=stop_reason,
+            interrupt_reason=interrupt_reason,
+            running_since=float(data.get("running_since", 0.0) or 0.0),
         )
 
     def to_dict(self) -> dict:
@@ -78,8 +108,37 @@ class Session:
             "health_card_id": self.health_card_id,
             "cached_title": self.cached_title,
             "title_source": self.title_source,
-            "last_status": self.last_status,
+            "status": self.status,
+            "stop_reason": self.stop_reason,
+            "interrupt_reason": self.interrupt_reason,
+            "running_since": self.running_since,
         }
+
+    @property
+    def last_status(self) -> str:
+        """Legacy in-memory view. New state is status/stop_reason."""
+        if self.status == "running":
+            return ""
+        if self.stop_reason == "interrupted" and self.interrupt_reason == "timeout":
+            return "timeout"
+        return "stopped"
+
+    @last_status.setter
+    def last_status(self, value: str) -> None:
+        if value == "timeout":
+            self.status = "stopped"
+            self.stop_reason = "interrupted"
+            self.interrupt_reason = "timeout"
+            self.running_since = 0.0
+        elif value == "stopped":
+            self.status = "stopped"
+            self.stop_reason = "completed"
+            self.interrupt_reason = ""
+            self.running_since = 0.0
+        else:
+            self.status = "running"
+            self.stop_reason = ""
+            self.interrupt_reason = ""
 
 
 class SessionStore:
@@ -329,13 +388,93 @@ class SessionStore:
                 session.title_source = source
                 self._save_locked()
 
-    def set_status(self, session_id: str, status: str) -> None:
-        """Set the freeze flag. status="stopped" freezes the card; "" unfreezes
-        (only the resume path should pass "")."""
+    def set_stopped(
+        self,
+        session_id: str,
+        reason: str = "completed",
+        *,
+        interrupt_reason: str = "",
+        running_since: float = 0.0,
+        preserve_terminal: bool = True,
+    ) -> None:
+        """Record a stopped state.
+
+        `preserve_terminal` keeps a later Stop hook from overwriting an earlier
+        timeout/user interrupt or agent-exit style terminal state.
+        """
+        reason = reason or "unknown"
+        terminal_reasons = {"interrupted", "agent_error", "agent_exited"}
         with self._lock:
             session = self._sessions.get(session_id)
-            if session is not None and session.last_status != status:
-                session.last_status = status
+            if session is None:
+                return
+            if (
+                preserve_terminal
+                and session.status == "stopped"
+                and session.stop_reason in terminal_reasons
+                and reason == "completed"
+            ):
+                return
+            changed = (
+                session.status != "stopped"
+                or session.stop_reason != reason
+                or session.interrupt_reason != interrupt_reason
+                or session.running_since != running_since
+            )
+            if changed:
+                session.status = "stopped"
+                session.stop_reason = reason
+                session.interrupt_reason = interrupt_reason
+                session.running_since = running_since
+                self._save_locked()
+
+    def mark_waiting(self, session_id: str, reason: str, started_at: float) -> None:
+        """Record a human-waiting state that is still timeout-watchable."""
+        if reason not in ("permission_request", "ask_user_question"):
+            reason = "unknown"
+        self.set_stopped(
+            session_id,
+            reason,
+            running_since=started_at,
+            preserve_terminal=False,
+        )
+
+    def set_status(self, session_id: str, status: str) -> None:
+        """Compatibility wrapper for the pre-status/stop_reason state model."""
+        if status in ("", "running"):
+            self.start_running(session_id, time.time())
+        elif status == "timeout":
+            self.set_stopped(session_id, "interrupted", interrupt_reason="timeout")
+        elif status == "stopped":
+            self.set_stopped(session_id, "completed")
+        else:
+            self.set_stopped(session_id, "unknown")
+
+    def start_running(self, session_id: str, started_at: float) -> None:
+        """Record running state and reset the running timeout timer."""
+        with self._lock:
+            session = self._sessions.get(session_id)
+            if session is None:
+                return
+            changed = (
+                session.status != "running"
+                or session.stop_reason
+                or session.interrupt_reason
+                or session.running_since != started_at
+            )
+            if changed:
+                session.status = "running"
+                session.stop_reason = ""
+                session.interrupt_reason = ""
+                session.running_since = started_at
+                self._save_locked()
+
+    def clear_running(self, session_id: str) -> None:
+        """Clear the timeout-watchable period without changing the status."""
+        with self._lock:
+            session = self._sessions.get(session_id)
+            if session is not None and session.running_since:
+                session.running_since = 0.0
                 self._save_locked()
 
 
