@@ -259,6 +259,25 @@ class CardActionTests(unittest.TestCase):
         self.assertEqual(server.registry.get(rid).decision["updatedInput"]["answers"],
                          {"Pick": "my custom text"})
 
+    def test_timeout_decision_makes_askq_click_stale_without_refreshing_wait(self):
+        rid = self._askq([{"question": "Pick", "options": [{"label": "A"}]}])
+        server.registry.fill_request(rid, session_id="s1")
+        server.registry.timeout_session("s1")
+        waiting = []
+        refreshes = []
+
+        with patch.object(server, "_mark_session_waiting",
+                          lambda sid, reason: waiting.append((sid, reason))), \
+             patch.object(server, "_refresh_health_card_for_event",
+                          lambda sid, **kw: refreshes.append((sid, kw)) or False):
+            resp = _click({"rid": rid, "action": "toggle",
+                           "option_idx": 1, "question_index": 0})
+
+        self.assertEqual(waiting, [])
+        self.assertEqual(refreshes, [])
+        self.assertEqual(resp.card.data["header"]["template"], "grey")
+        self.assertEqual(resp.toast.type, "info")
+
 
 if __name__ == "__main__":
     unittest.main()

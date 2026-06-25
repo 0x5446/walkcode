@@ -1030,11 +1030,28 @@ def _on_card_action(data: P2CardActionTrigger) -> P2CardActionTriggerResponse:
 
         tool_name = req_data.tool_name or "unknown"
 
-        # Gate BOTH AskUserQuestion and permission clicks up front: a stale click —
-        # the TUI already handled this (PostToolUse invalidated it) or the hook stopped
-        # polling (TUI deny/Esc killed it). Reject before any state mutation (toggle /
-        # answer / decision). set_decision_once also re-checks invalidated_at inside its
-        # lock to close the check-then-act race.
+        # Gate BOTH AskUserQuestion and permission clicks up front: a click after a
+        # final decision, a PostToolUse invalidation, or a stale poll must be rejected
+        # before any state mutation (toggle / answer / decision). set_decision_once
+        # also re-checks invalidated_at inside its lock to close the check-then-act race.
+        if req_data.decision is not None:
+            decision = req_data.decision
+            shown = decision.get("_button") or decision.get("behavior") or "stale"
+            timeout_decision = decision.get("_reason") == "timeout"
+            logger.info(
+                "Already-decided card click ignored: reason=%s tool=%s rid=%s",
+                "timeout" if timeout_decision else "decided", tool_name, request_id[:8],
+            )
+            resp.card = CallBackCard()
+            resp.card.type = "raw"
+            resp.card.data = _build_permission_result_card(tool_name, "stale" if timeout_decision else shown)
+            resp.toast = CallBackToast()
+            resp.toast.type = "info"
+            resp.toast.content = t("feishu.perm.expired" if timeout_decision else "feishu.perm.already_decided")
+            return resp
+
+        # The TUI already handled this (PostToolUse invalidated it) or the hook stopped
+        # polling (TUI deny/Esc killed it).
         if registry.is_invalidated(request_id) or _perm_click_stale(request_id):
             is_inv = registry.is_invalidated(request_id)
             reason = "invalidated" if is_inv else "stale_poll"
