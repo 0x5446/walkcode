@@ -42,7 +42,16 @@ from .agent import AgentAdapter, get_agent
 from .config import Config, DEFAULT_STUCK_THRESHOLD, parse_stuck_threshold
 from .i18n import t
 from .permreg import CardStatus, PermissionRegistry
-from .state import Session, SessionStore
+from .state import (
+    INTERRUPT_REASON_TIMEOUT,
+    STATUS_RUNNING,
+    STATUS_STOPPED,
+    STOP_REASON_COMPLETED,
+    STOP_REASON_INTERRUPTED,
+    WAITING_STOP_REASONS,
+    Session,
+    SessionStore,
+)
 from .stats import collect_stats, SessionStats, ModelTokens
 from . import summarizer
 from .tty import (
@@ -1532,7 +1541,7 @@ def _mark_session_busy(session_id: str):
 
 
 def _mark_session_progress(session_id: str) -> bool:
-    """Refresh running progress unless the session is waiting on a human.
+    """Refresh progress only while the visible session is running.
 
     Subagent/task lifecycle hooks can arrive late or from sibling work while the
     visible session is already stopped. Those events are useful telemetry during
@@ -1575,7 +1584,7 @@ def _mark_session_idle(session_id: str):
         with _pending_lock:
             _session_last_stop[session_id] = time.time()
         if session_store is not None:
-            session_store.set_stopped(session_id, "completed")
+            session_store.set_stopped(session_id, STOP_REASON_COMPLETED)
         # Turn ended → clear any stuck-turn alert state so the next turn that
         # wedges alerts fresh (covers turns that start and stall between scans).
         with _stuck_lock:
@@ -1598,7 +1607,11 @@ def _mark_session_timeout(session_id: str):
         with _pending_lock:
             _session_last_stop[session_id] = time.time()
         if session_store is not None:
-            session_store.set_stopped(session_id, "interrupted", interrupt_reason="timeout")
+            session_store.set_stopped(
+                session_id,
+                STOP_REASON_INTERRUPTED,
+                interrupt_reason=INTERRUPT_REASON_TIMEOUT,
+            )
 
 
 def _timeout_open_requests(session_id: str) -> int:
@@ -2331,8 +2344,8 @@ async def receive_progress_hook(request: Request):
     """Cheap progress-only hook for events that should not post Feishu messages.
 
     Subagent/task events are turn-internal activity, not the main turn's terminal
-    Stop. They refresh the running timeout timer only if the visible session is
-    not currently stopped on a human decision.
+    Stop. They refresh the running timeout timer only while the visible session
+    is still running; they never reopen any stopped state.
     """
     body = await request.json()
     session_id = body.get("session_id", "")
@@ -2662,16 +2675,16 @@ _stuck_lock = threading.Lock()
 # stale timer left in scrollback and read an idle pane as busy.
 _FOOTER_LINES = 6
 
-_WAITING_STOP_REASONS = {"permission_request", "ask_user_question"}
+_WAITING_STOP_REASONS = WAITING_STOP_REASONS
 _TERMINAL_HEALTH = {"done", "error", "timeout"}
+_watchdog_started_at = 0.0
 
 
 def _parse_working_seconds(pane: str) -> int | None:
     """Elapsed seconds of the *current* turn from the live TUI footer, or None.
 
-    Both Claude and Codex render an "(Xh Ym Zs …)" timer on the bottom line while
-    a turn runs. Only the last few non-blank lines are scanned, so a stale timer
-    further up in scrollback isn't mistaken for the current turn.
+    This legacy inject guard only treats timers with the "esc to interrupt"
+    suffix as current-turn evidence. The timeout watchdog does not call it.
     """
     lines = [ln for ln in pane.splitlines() if ln.strip()]
     for ln in reversed(lines[-_FOOTER_LINES:]):
@@ -2685,9 +2698,7 @@ def _running_started_at(session_id: str, session: Session, now: float | None = N
     """Timeout timer t0 for the current watchable state, or None."""
     if not session_id:
         return None
-    if now is None:
-        now = time.time()
-    if session.status == "stopped":
+    if session.status == STATUS_STOPPED:
         if session.stop_reason not in _WAITING_STOP_REASONS:
             return None
         return session.running_since or None
@@ -2698,7 +2709,6 @@ def _running_started_at(session_id: str, session: Session, now: float | None = N
         last_ups = _session_last_ups.get(session_id, 0.0)
         if last_ups > last_stop:
             candidates.append(last_ups)
-        stopped_in_memory = session_id in _session_last_stop
     if session.running_since:
         candidates.append(session.running_since)
     if candidates:
@@ -2707,6 +2717,15 @@ def _running_started_at(session_id: str, session: Session, now: float | None = N
     # Treat that as unknown instead of using created_at; otherwise a long-idle
     # legacy tmux can be interrupted immediately after upgrade/restart.
     return None
+
+
+def _watchdog_in_startup_grace(started_at: float, now: float) -> bool:
+    """Skip old persisted timers for one threshold window after service start."""
+    if _watchdog_started_at <= 0:
+        return False
+    if now < _watchdog_started_at:
+        return False
+    return started_at < _watchdog_started_at and now - _watchdog_started_at < _STUCK_THRESHOLD
 
 
 def _interrupt_agent_turn(tmux_name: str) -> bool:
@@ -2750,7 +2769,12 @@ def _check_stuck_sessions():
             with _stuck_lock:
                 _stuck_alerted.pop(session_id, None)
             continue
+        if _watchdog_in_startup_grace(started_at, now):
+            with _stuck_lock:
+                _stuck_alerted.pop(session_id, None)
+            continue
         secs = max(0, int(now - started_at))
+        kind = STATUS_RUNNING if session.status == STATUS_RUNNING else session.stop_reason
         with _stuck_lock:
             st = _stuck_alerted.get(session_id)
             if st is None:
@@ -2761,13 +2785,26 @@ def _check_stuck_sessions():
         if secs < _STUCK_THRESHOLD:
             continue
         if not interrupted:
-            if not _interrupt_agent_turn(session.tty):
+            result = session_store.interrupt_timeout_if_unchanged(
+                session_id,
+                expected_tty=session.tty,
+                expected_status=session.status,
+                expected_stop_reason=session.stop_reason,
+                expected_running_since=session.running_since,
+                interrupt=_interrupt_agent_turn,
+            )
+            if result == "stale":
+                with _stuck_lock:
+                    _stuck_alerted.pop(session_id, None)
+                continue
+            if result != "interrupted":
                 logger.error(
-                    "Stuck watchdog: interrupt NOT sent for session=%s tmux=%s working=%ds; will retry",
-                    session_id[:8], session.tty, secs,
+                    "Stuck watchdog: interrupt NOT sent for session=%s tmux=%s kind=%s no_progress=%ds; will retry",
+                    session_id[:8], session.tty, kind, secs,
                 )
                 continue
-            _mark_session_timeout(session_id)
+            with _pending_lock:
+                _session_last_stop[session_id] = now
             _timeout_open_requests(session_id)
             _refresh_health_card_for_event(session_id)
             with _stuck_lock:
@@ -2775,8 +2812,8 @@ def _check_stuck_sessions():
                 if cur is not None:
                     cur["interrupted"] = True
             logger.warning(
-                "Stuck watchdog: session=%s tmux=%s working=%ds — interrupted",
-                session_id[:8], session.tty, secs,
+                "Stuck watchdog: session=%s tmux=%s kind=%s no_progress=%ds - interrupted",
+                session_id[:8], session.tty, kind, secs,
             )
         if notified:
             continue
@@ -2792,8 +2829,8 @@ def _check_stuck_sessions():
                 if cur is not None:
                     cur["notified"] = True
             logger.warning(
-                "Stuck watchdog: session=%s tmux=%s working=%ds — notified",
-                session_id[:8], session.tty, secs,
+                "Stuck watchdog: session=%s tmux=%s kind=%s no_progress=%ds - notified",
+                session_id[:8], session.tty, kind, secs,
             )
         elif status == "transient":
             session_store.add_redelivery(session_id, text)
@@ -2802,18 +2839,21 @@ def _check_stuck_sessions():
                 if cur is not None:
                     cur["notified"] = True
             logger.error(
-                "Stuck watchdog: timeout notice stashed for session=%s tmux=%s working=%ds",
-                session_id[:8], session.tty, secs,
+                "Stuck watchdog: timeout notice stashed for session=%s tmux=%s kind=%s no_progress=%ds",
+                session_id[:8], session.tty, kind, secs,
             )
         else:
             logger.error(
-                "Stuck watchdog: timeout notice NOT delivered for session=%s tmux=%s working=%ds; will retry",
-                session_id[:8], session.tty, secs,
+                "Stuck watchdog: timeout notice NOT delivered for session=%s tmux=%s kind=%s no_progress=%ds; dropped",
+                session_id[:8], session.tty, kind, secs,
             )
 
 
 def _start_stuck_watchdog():
     """Background thread that interrupts turns wedged past _STUCK_THRESHOLD."""
+    global _watchdog_started_at
+    _watchdog_started_at = time.time()
+
     def _loop():
         while True:
             time.sleep(_WATCHDOG_INTERVAL)
@@ -2861,11 +2901,11 @@ def _session_health(session_id: str, stats: SessionStats) -> str:
     DONE before its first turn ends."""
     session = session_store.get(session_id) if session_store is not None else None
     if session:
-        if session.stop_reason == "interrupted" and session.interrupt_reason == "timeout":
+        if session.stop_reason == STOP_REASON_INTERRUPTED and session.interrupt_reason == INTERRUPT_REASON_TIMEOUT:
             return "timeout"
-        if session.status == "stopped" and session.stop_reason in _WAITING_STOP_REASONS:
+        if session.status == STATUS_STOPPED and session.stop_reason in _WAITING_STOP_REASONS:
             return "hitl"
-        if session.status == "stopped":
+        if session.status == STATUS_STOPPED:
             return "error" if session.stop_reason == "agent_error" or stats.last_error else "done"
     if registry.has_open_request(session_id):
         return "hitl"
@@ -2873,7 +2913,7 @@ def _session_health(session_id: str, stats: SessionStats) -> str:
         return "running"
     with _pending_lock:
         ever_stopped = session_id in _session_last_stop
-    if session and session.status == "running":
+    if session and session.status == STATUS_RUNNING:
         return "running" if not ever_stopped else ("error" if stats.last_error else "done")
     if not ever_stopped:
         return "running"

@@ -256,14 +256,13 @@ def _handle_permission_request(hook_data, port, tmux_session, cwd, session_id):
 
     # Poll for decision slightly longer than the watchdog threshold. The
     # watchdog owns the user-visible timeout and sends Esc at the threshold; this
-    # hook stays alive long enough to receive the deny decision it writes.
-    poll_timeout = _permission_hook_timeout_seconds()
-    # Long ceiling
-    # accommodates AskUserQuestion's Other / multiSelect flow where the user
-    # may take many minutes typing custom text or selecting multiple options
-    # in Feishu before clicking Submit. Must stay <= the matching agent hook
+    # hook stays alive long enough to receive the deny decision it writes. The
+    # long ceiling accommodates AskUserQuestion's Other / multiSelect flow where
+    # the user may take many minutes typing custom text or selecting multiple
+    # options in Feishu before clicking Submit. Must stay <= the matching agent hook
     # timeout — Claude/Codex kills the hook process at that external limit
     # regardless of internal deadline.
+    poll_timeout = _permission_hook_timeout_seconds()
     decision_url = f"http://127.0.0.1:{port}/hook/permission/{request_id}/decision"
     deadline = _time.monotonic() + poll_timeout
 

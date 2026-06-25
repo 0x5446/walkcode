@@ -167,6 +167,19 @@ class HealthCardStoreTest(unittest.TestCase):
             store.set_stopped("nope", "completed")
             self.assertIsNone(store.get("nope"))
 
+    def test_late_completed_stop_preserves_timeout_terminal_state(self):
+        with tempfile.TemporaryDirectory() as d:
+            store = SessionStore(Path(d) / "state.json")
+            store.upsert("s", tty="t", cwd="/c", root_msg_id="r")
+            store.set_stopped("s", "interrupted", interrupt_reason="timeout")
+            store.set_stopped("s", "completed")
+
+            sess = store.get("s")
+            self.assertEqual(sess.status, "stopped")
+            self.assertEqual(sess.stop_reason, "interrupted")
+            self.assertEqual(sess.interrupt_reason, "timeout")
+            self.assertEqual(sess.running_since, 0.0)
+
 
 class HealthCardBuildTest(unittest.TestCase):
     def test_card_includes_full_session_id(self):
@@ -178,6 +191,18 @@ class HealthCardBuildTest(unittest.TestCase):
             if el.get("tag") == "markdown"
         ]
         self.assertTrue(any(session_id in c for c in contents))
+
+    def test_timeout_card_uses_timeout_status_and_frozen_footer(self):
+        card = server._build_health_card(_stats(), "timeout", "t", session_id="sid-timeout")
+        self.assertEqual(card["header"]["template"], "orange")
+        text = "\n".join(
+            el.get("content", "")
+            for el in card["elements"]
+            if el.get("tag") == "markdown"
+        )
+        self.assertTrue("超时已中断" in text or "Timeout interrupted" in text)
+        footer = card["elements"][-1]["elements"][0]["content"]
+        self.assertTrue("已停止" in footer or "stopped" in footer)
 
 
 class ReceiveSyncPendingHealthCardTest(unittest.TestCase):

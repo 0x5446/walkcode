@@ -179,9 +179,24 @@ class _FakeStore:
         self.start_running(session_id, started_at)
         return True
 
-    def clear_running(self, session_id):
-        if session_id in self._sessions:
-            self._sessions[session_id].running_since = 0.0
+    def interrupt_timeout_if_unchanged(
+        self, session_id, *, expected_tty, expected_status, expected_stop_reason,
+        expected_running_since, interrupt,
+    ):
+        sess = self._sessions.get(session_id)
+        if sess is None:
+            return "stale"
+        if (
+            sess.tty != expected_tty
+            or sess.status != expected_status
+            or sess.stop_reason != expected_stop_reason
+            or sess.running_since != expected_running_since
+        ):
+            return "stale"
+        if not interrupt(sess.tty):
+            return "failed"
+        self.set_stopped(session_id, "interrupted", interrupt_reason="timeout")
+        return "interrupted"
 
     def add_redelivery(self, session_id, text, key=None):
         self.redeliveries.append((session_id, text, key))
@@ -202,6 +217,25 @@ class _FakeRegistry:
 
 
 class StuckWatchdogTests(unittest.TestCase):
+    def setUp(self):
+        self._last_ups = dict(server._session_last_ups)
+        self._last_stop = dict(server._session_last_stop)
+        with server._stuck_lock:
+            self._last_stuck = dict(server._stuck_alerted)
+            server._stuck_alerted.clear()
+        server._session_last_ups.clear()
+        server._session_last_stop.clear()
+        self.addCleanup(self._restore_globals)
+
+    def _restore_globals(self):
+        server._session_last_ups.clear()
+        server._session_last_ups.update(self._last_ups)
+        server._session_last_stop.clear()
+        server._session_last_stop.update(self._last_stop)
+        with server._stuck_lock:
+            server._stuck_alerted.clear()
+            server._stuck_alerted.update(self._last_stuck)
+
     def _run_scans(
         self, ages_min, *, reply_status="sent", interrupt_ok=True,
         alive=True, target=None, hitl=False, initial_status="running",
@@ -305,6 +339,64 @@ class StuckWatchdogTests(unittest.TestCase):
             self._run_scans([40], initial_status="stopped", stop_reason="ask_user_question"),
             [(1, 1, 1, 0)],
         )
+
+    def test_startup_grace_skips_persisted_old_timer_once(self):
+        now = {"t": 10_000.0}
+        sess = Session(tty="walkcode-1", cwd="/x", root_msg_id="root-1")
+        sess.running_since = now["t"] - 40 * 60
+        store = _FakeStore({"sid-1": sess})
+        interrupts = []
+        old_started = server._watchdog_started_at
+        try:
+            server._watchdog_started_at = now["t"] - 60
+            with patch.object(server, "session_store", store), \
+                 patch.object(server, "registry", _FakeRegistry(False)), \
+                 patch.object(server, "validate_target", lambda t: None), \
+                 patch.object(server, "is_agent_alive", lambda t: True), \
+                 patch.object(server, "_interrupt_agent_turn",
+                              lambda tmux: interrupts.append(tmux) or True), \
+                 patch.object(server, "_reply_status", lambda *a, **k: ("sent", "m1")), \
+                 patch.object(server, "_refresh_health_card_for_event", lambda *a, **k: False), \
+                 patch.object(server.time, "time", lambda: now["t"]):
+                with server._stuck_lock:
+                    server._stuck_alerted.clear()
+                server._check_stuck_sessions()
+                self.assertEqual(interrupts, [])
+
+                now["t"] = server._watchdog_started_at + server._STUCK_THRESHOLD + 1
+                server._check_stuck_sessions()
+        finally:
+            server._watchdog_started_at = old_started
+
+        self.assertEqual(interrupts, ["walkcode-1"])
+
+    def test_stale_timeout_snapshot_is_not_interrupted_or_marked(self):
+        now = {"t": 10_000.0}
+        sess = Session(tty="walkcode-1", cwd="/x", root_msg_id="root-1")
+        sess.running_since = now["t"] - 40 * 60
+        store = _FakeStore({"sid-1": sess})
+        interrupts = []
+
+        def stale_timeout(*_args, **_kwargs):
+            return "stale"
+
+        store.interrupt_timeout_if_unchanged = stale_timeout
+        with patch.object(server, "session_store", store), \
+             patch.object(server, "registry", _FakeRegistry(False)), \
+             patch.object(server, "validate_target", lambda t: None), \
+             patch.object(server, "is_agent_alive", lambda t: True), \
+             patch.object(server, "_interrupt_agent_turn",
+                          lambda tmux: interrupts.append(tmux) or True), \
+             patch.object(server, "_reply_status", lambda *a, **k: ("sent", "m1")), \
+             patch.object(server, "_refresh_health_card_for_event", lambda *a, **k: False), \
+             patch.object(server.time, "time", lambda: now["t"]):
+            with server._stuck_lock:
+                server._stuck_alerted.clear()
+            server._check_stuck_sessions()
+
+        self.assertEqual(interrupts, [])
+        self.assertEqual(store.statuses, [])
+        self.assertEqual(sess.status, "running")
 
     def test_permission_waiting_timeout_updates_root_card_state(self):
         now = {"t": 10_000.0}
