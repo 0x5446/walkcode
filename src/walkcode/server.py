@@ -1496,6 +1496,28 @@ def _mark_session_busy(session_id: str):
                 _stuck_alerted.pop(session_id, None)
 
 
+def _mark_session_progress(session_id: str) -> bool:
+    """Refresh running progress unless the session is waiting on a human.
+
+    Subagent/task lifecycle hooks can arrive from sibling work while the visible
+    session is stopped on a PermissionRequest or AskUserQuestion. Those events
+    are useful telemetry, but they must not turn the human-waiting state back
+    into running or reset its timeout timer.
+    """
+    if not session_id:
+        return False
+    if session_store is not None:
+        session = session_store.get(session_id)
+        if (
+            session is not None
+            and session.status == "stopped"
+            and session.stop_reason in _TIMEOUT_STOP_REASONS
+        ):
+            return False
+    _mark_session_busy(session_id)
+    return True
+
+
 def _mark_session_idle(session_id: str):
     if session_id:
         with _pending_lock:
@@ -2011,14 +2033,14 @@ async def receive_hook(request: Request):
     if not tty:
         return {"ok": False, "error": "missing tty (not in tmux?)"}
 
-    # Stop = turn ended → session is idle. Any other generic hook we receive is
-    # observable progress for the running timeout timer. Mark BEFORE the dedupe
-    # gate so observability still sees duplicate hook deliveries; dedupe only
-    # suppresses duplicate user-facing messages.
+    # Stop = turn ended → session is idle. Other generic hooks are observable
+    # progress only while the session is not waiting on a human. Mark BEFORE the
+    # dedupe gate so duplicate hook deliveries still refresh observability when
+    # they truly represent running work; dedupe only suppresses user-facing noise.
     if hook_type == "stop" and session_id:
         _mark_session_idle(session_id)
     elif session_id:
-        _mark_session_busy(session_id)
+        _mark_session_progress(session_id)
 
     # codex (>=0.135) fires each hook twice with an identical payload — a turn
     # ends once, so suppress the duplicate before it becomes a second Feishu reply.
@@ -2186,6 +2208,7 @@ async def receive_sync_hook(request: Request):
     drift = bool(old_tty and old_tty != tty)
 
     refresh_bound_card = False
+    start_bound_session = False
 
     if session and session.root_msg_id:
         session_store.upsert(session_id, tty=tty, cwd=cwd, cwd_is_launch=True)
@@ -2204,6 +2227,7 @@ async def receive_sync_hook(request: Request):
             if pending_health_card:
                 session_store.set_health_card(session_id, pending_health_card)
                 refresh_bound_card = True
+            start_bound_session = True
             if reply_id:
                 _edit_message(reply_id, t(
                     "feishu.started_with_session",
@@ -2224,7 +2248,8 @@ async def receive_sync_hook(request: Request):
             daemon=True,
         ).start()
 
-    _mark_session_busy(session_id)
+    if start_bound_session:
+        _mark_session_busy(session_id)
 
     if refresh_bound_card:
         _refresh_health_card_for_event(session_id)
@@ -2254,18 +2279,19 @@ async def receive_prompt_hook(request: Request):
 async def receive_progress_hook(request: Request):
     """Cheap progress-only hook for events that should not post Feishu messages.
 
-    SubagentStart/SubagentStop are turn-internal activity, not the main turn's
-    terminal Stop. They only refresh the running timeout timer and health card.
+    Subagent/task events are turn-internal activity, not the main turn's terminal
+    Stop. They refresh the running timeout timer only if the visible session is
+    not currently stopped on a human decision.
     """
     body = await request.json()
     session_id = body.get("session_id", "")
     hook_type = body.get("type", "progress")
     if not session_id:
         return {"ok": False, "error": "missing session_id"}
-    _mark_session_busy(session_id)
+    updated = _mark_session_progress(session_id)
     _refresh_health_card_for_event(session_id)
-    logger.info("Progress hook: %s session=%s", hook_type, session_id[:8])
-    return {"ok": True}
+    logger.info("Progress hook: %s session=%s updated=%s", hook_type, session_id[:8], updated)
+    return {"ok": True, "updated": updated}
 
 
 def _perm_dedupe_key(session_id: str, tool_use_id: str) -> tuple | None:

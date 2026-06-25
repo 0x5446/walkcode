@@ -512,7 +512,7 @@ WalkCode 的核心设计：**1 个聊天话题 = 1 个 tmux 会话 = 1 个 Codin
 | 输入 | 你发出的消息条数 |
 | Token | 累计 Token 用量（按模型分组） |
 
-话题标题会自动用任务摘要命名（Claude 用自带 AI 标题；Codex 可选用 Haiku 在 Stop 后异步精炼，见配置项）。每个 Stop 后卡片会刷新并冻结；如果你继续在话题里回复，卡片会重新进入进行中状态。进行中状态超过 30 分钟没有可观测进展，或权限确认 / AskUserQuestion 等等待状态超过 30 分钟没有用户处理时，WalkCode 会向 TUI 发送 Esc 中断，把卡片标为「超时已中断」，并在话题里发提醒；判断基于 WalkCode 自己记录的状态和 hook/progress 事件，不解析 TUI 底部文案，不把 pane 重绘当作进展，也不依赖 tmux `window_activity`。整个功能默认开启，`WALKCODE_HEALTH_CARD=0` 可关闭。
+话题标题会自动用任务摘要命名（Claude 用自带 AI 标题；Codex 可选用 Haiku 在 Stop 后异步精炼，见配置项）。每个 Stop 后卡片会刷新并冻结；如果你继续在话题里回复，卡片会重新进入进行中状态。进行中状态超过 30 分钟没有可观测进展，或权限确认 / AskUserQuestion 等等待状态超过 30 分钟没有用户处理时，WalkCode 会向 TUI 发送 Esc 中断，把卡片标为「超时已中断」，并在话题里发提醒；判断基于 WalkCode 自己记录的状态和 hook/progress 事件，不解析 TUI 底部文案，不把 pane 重绘当作进展，也不依赖 tmux `window_activity`。Subagent / task 生命周期事件只会刷新 running 的计时器；如果当前卡在权限确认或 AskUserQuestion，它们不会把等待态改回 running，也不会重置等待超时。整个功能默认开启，`WALKCODE_HEALTH_CARD=0` 可关闭。
 
 ### 安全设计：远程启动的权限控制
 

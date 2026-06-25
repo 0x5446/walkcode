@@ -589,9 +589,12 @@ def cmd_hook(args):
             print(f"[walkcode] post-tool hook failed (card invalidation skipped): {e}", file=sys.stderr)
         return
 
-    # --- Subagent progress: refresh the parent turn timeout timer without
-    # creating Feishu thread noise. These are not terminal Stop events. ---
-    if args.hook_type in ("subagent-start", "subagent-stop"):
+    # --- Progress-only lifecycle events: refresh the parent turn timeout timer
+    # without creating Feishu thread noise. These are not terminal Stop events. ---
+    if args.hook_type in (
+        "subagent-start", "subagent-stop",
+        "task-created", "task-completed",
+    ):
         payload = json.dumps({
             "type": args.hook_type,
             "tty": tmux_session,
@@ -775,6 +778,12 @@ def _install_claude_hooks(_args):
         "SubagentStop": [{"matcher": "", "hooks": [
             {"type": "command", "command": "walkcode hook subagent-stop"}
         ]}],
+        "TaskCreated": [{"matcher": "", "hooks": [
+            {"type": "command", "command": "walkcode hook task-created"}
+        ]}],
+        "TaskCompleted": [{"matcher": "", "hooks": [
+            {"type": "command", "command": "walkcode hook task-completed"}
+        ]}],
         "Notification": [{"matcher": "elicitation_dialog", "hooks": [
             {"type": "command", "command": hook_cmd("notification", "Ping")}
         ]}],
@@ -825,6 +834,12 @@ def _install_codex_hooks(_args):
             ]}],
             "Stop": [{"matcher": "", "hooks": [
                 {"type": "command", "command": hook_cmd("stop", "Hero")}
+            ]}],
+            "SubagentStart": [{"matcher": "", "hooks": [
+                {"type": "command", "command": f"{env_prefix}walkcode hook subagent-start", "timeout": 5}
+            ]}],
+            "SubagentStop": [{"matcher": "", "hooks": [
+                {"type": "command", "command": f"{env_prefix}walkcode hook subagent-stop", "timeout": 5}
             ]}],
             "PreToolUse": [{"matcher": "", "hooks": [
                 {"type": "command", "command": f"afplay /System/Library/Sounds/Ping.aiff & {env_prefix}walkcode hook permission-request", "timeout": 1800}
@@ -1174,7 +1189,7 @@ def main():
         choices=[
             "stop", "notification", "permission-request", "sync",
             "user-prompt-submit", "post-tool", "subagent-start",
-            "subagent-stop",
+            "subagent-stop", "task-created", "task-completed",
         ],
         help="Hook event type",
     )

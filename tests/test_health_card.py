@@ -245,6 +245,28 @@ class ReceiveSyncPendingHealthCardTest(unittest.TestCase):
 
         self.assertEqual(server.session_store.get("sid-sync-cwd").cwd, "/sync-launch")
 
+    def test_session_start_sync_does_not_reopen_stopped_session(self):
+        session_id = "sid-stopped-sync"
+        server.session_store.upsert(
+            session_id, tty="tmux-old", cwd="/old", root_msg_id="root-card",
+        )
+        server.session_store.set_stopped(session_id, "interrupted", interrupt_reason="timeout")
+
+        res = asyncio.run(server.receive_sync_hook(_Req({
+            "tty": "tmux-old",
+            "session_id": session_id,
+            "cwd": "/new",
+        })))
+
+        sess = server.session_store.get(session_id)
+        self.assertEqual(res, {"ok": True})
+        self.assertEqual(sess.tty, "tmux-old")
+        self.assertEqual(sess.cwd, "/new")
+        self.assertEqual(sess.status, "stopped")
+        self.assertEqual(sess.stop_reason, "interrupted")
+        self.assertEqual(sess.interrupt_reason, "timeout")
+        self.assertEqual(sess.running_since, 0.0)
+
 
 class MaybeSummarizeGateTest(unittest.TestCase):
     """_maybe_summarize is opt-in, codex-only, and event-triggered."""

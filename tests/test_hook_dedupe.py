@@ -522,6 +522,15 @@ class CmdHookTurnIdForwardingTests(unittest.TestCase):
         self.assertEqual(cap["body"]["session_id"], "s1")
         self.assertNotIn("message", cap["body"])
 
+    def test_task_event_posts_progress_only(self):
+        cap = self._run("task-completed", {
+            "session_id": "s1", "cwd": "/tmp",
+        })
+        self.assertEqual(cap["url"], "http://127.0.0.1:3999/hook/progress")
+        self.assertEqual(cap["body"]["type"], "task-completed")
+        self.assertEqual(cap["body"]["session_id"], "s1")
+        self.assertNotIn("message", cap["body"])
+
 
 class CmdHookStopMessageTests(unittest.TestCase):
     """cmd_hook's Stop branch must forward the WHOLE turn (not just the last

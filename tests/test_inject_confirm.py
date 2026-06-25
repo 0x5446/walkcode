@@ -93,9 +93,34 @@ class InjectConfirmTests(unittest.TestCase):
                           lambda sid, **kw: refreshes.append((sid, kw)) or False):
             res = asyncio.run(server.receive_progress_hook(_Req()))
 
-        self.assertEqual(res, {"ok": True})
+        self.assertEqual(res, {"ok": True, "updated": True})
         self.assertEqual(busy, ["s"])
         self.assertEqual([sid for sid, _ in refreshes], ["s"])
+
+    def test_progress_hook_does_not_reset_human_waiting_timeout(self):
+        for reason in ("permission_request", "ask_user_question"):
+            with self.subTest(reason=reason), TemporaryDirectory() as d:
+                store = SessionStore(Path(d) / "state.json")
+                store.upsert("s", tty="tmux1", cwd="/tmp/proj", root_msg_id="root1")
+                store.mark_waiting("s", reason, 111.0)
+
+                class _Req:
+                    async def json(self):
+                        return {"type": "subagent-stop", "session_id": "s", "tty": "tmux1"}
+
+                refreshes = []
+                with patch.object(server, "session_store", store), \
+                     patch.object(server, "_refresh_health_card_for_event",
+                                  lambda sid, **kw: refreshes.append((sid, kw)) or False), \
+                     patch.object(server.time, "time", lambda: 999.0):
+                    res = asyncio.run(server.receive_progress_hook(_Req()))
+
+                sess = store.get("s")
+                self.assertEqual(res, {"ok": True, "updated": False})
+                self.assertEqual(sess.status, "stopped")
+                self.assertEqual(sess.stop_reason, reason)
+                self.assertEqual(sess.running_since, 111.0)
+                self.assertEqual([sid for sid, _ in refreshes], ["s"])
 
 
 class FeishuReplyInjectionTests(unittest.TestCase):

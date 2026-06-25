@@ -148,6 +148,34 @@ class InstallClaudeHooksTests(unittest.TestCase):
                 hooks["SubagentStop"][0]["hooks"][0]["command"],
                 "walkcode hook subagent-stop",
             )
+            self.assertEqual(
+                hooks["TaskCreated"][0]["hooks"][0]["command"],
+                "walkcode hook task-created",
+            )
+            self.assertEqual(
+                hooks["TaskCompleted"][0]["hooks"][0]["command"],
+                "walkcode hook task-completed",
+            )
+
+
+class InstallCodexHooksTests(unittest.TestCase):
+    def test_installs_subagent_progress_hooks(self):
+        with TemporaryDirectory() as d:
+            home = Path(d)
+
+            with patch.object(m.Path, "home", return_value=home), \
+                 patch.dict("os.environ", {}, clear=True):
+                m._install_codex_hooks(None)
+
+            hooks = json.loads((home / ".codex" / "hooks.json").read_text())["hooks"]
+            self.assertEqual(
+                hooks["SubagentStart"][0]["hooks"][0]["command"],
+                "WALKCODE_AGENT=codex WALKCODE_PORT=3001 walkcode hook subagent-start",
+            )
+            self.assertEqual(
+                hooks["SubagentStop"][0]["hooks"][0]["command"],
+                "WALKCODE_AGENT=codex WALKCODE_PORT=3001 walkcode hook subagent-stop",
+            )
 
 
 if __name__ == "__main__":
