@@ -212,7 +212,7 @@ Claude Code hooks call `walkcode hook {stop|notification|permission-request|sync
 | `sync` | SessionStart | POST /hook/sync | None (mapping update only) | No |
 | `user-prompt-submit` | UserPromptSubmit | POST /hook/prompt | None (best-effort observation + busy state) | No |
 | `stop` | Stop | POST /hook | Plain text | No |
-| `post-tool` | PostToolUse | POST /hook/tool | None (progress / stale HITL cleanup) | No |
+| `post-tool` | PostToolUse | POST /hook/post-tool | None (progress / stale HITL cleanup) | No |
 | `subagent-start` / `subagent-stop` | SubagentStart / SubagentStop | POST /hook/progress | None (running progress only) | No |
 | `task-created` / `task-completed` | TaskCreated / TaskCompleted | POST /hook/progress | None (running progress only) | No |
 | `notification` | Notification (elicitation_dialog) | POST /hook | Plain text or interactive card (AskUserQuestion) | No |
@@ -243,6 +243,10 @@ having no observable progress and gets Esc. This is a product tradeoff: long
 single-tool jobs with no intermediate hook event need a larger threshold. Setting
 `WALKCODE_HEALTH_CARD=0` disables both the health card and this automatic
 timeout interrupt path.
+Codex currently exposes fewer progress signals than Claude: it has no
+UserPromptSubmit/PostToolUse hook, and trusted or `--yolo` tool calls may skip
+the permission hook path entirely. Long unattended Codex turns should therefore
+set a larger `WALKCODE_STUCK_THRESHOLD` or disable the health card.
 
 **Note on Notification subtypes:**
 - **elicitation_dialog** — When the notification carries an `AskUserQuestion` payload (with `question` and `options` fields), WalkCode sends an interactive card with option buttons instead of plain text. Supports multi-question flows: each question generates a card, the card auto-updates to the next question when answered, and all answers are returned together after the last question.

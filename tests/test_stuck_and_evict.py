@@ -333,6 +333,38 @@ class BackgroundServicesTests(unittest.TestCase):
         self.assertEqual(calls, ["idle", "stuck", "inject"])
 
 
+class InterruptAgentTurnTests(unittest.TestCase):
+    def test_interrupt_agent_turn_sends_escape_to_tmux(self):
+        calls = []
+
+        def fake_run(argv, **kwargs):
+            calls.append((argv, kwargs))
+            return SimpleNamespace(returncode=0, stderr="")
+
+        with patch.object(server.subprocess, "run", fake_run):
+            self.assertTrue(server._interrupt_agent_turn("walkcode-1"))
+
+        self.assertEqual(calls, [(
+            ["tmux", "send-keys", "-t", "walkcode-1", "Escape"],
+            {"capture_output": True, "text": True, "timeout": 5},
+        )])
+
+    def test_interrupt_agent_turn_returns_false_on_tmux_error(self):
+        with patch.object(
+            server.subprocess,
+            "run",
+            lambda *_args, **_kwargs: SimpleNamespace(returncode=1, stderr="no pane"),
+        ):
+            self.assertFalse(server._interrupt_agent_turn("walkcode-1"))
+
+    def test_interrupt_agent_turn_returns_false_on_exception(self):
+        def fail(*_args, **_kwargs):
+            raise OSError("boom")
+
+        with patch.object(server.subprocess, "run", fail):
+            self.assertFalse(server._interrupt_agent_turn("walkcode-1"))
+
+
 class StuckWatchdogTests(unittest.TestCase):
     def setUp(self):
         self._last_ups = dict(server._session_last_ups)
