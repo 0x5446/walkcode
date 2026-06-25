@@ -1358,11 +1358,25 @@ def _start_agent(prompt: str, message_id: str, image_path: str | None = None):
         if card_id:
             root_id, health_card_id = card_id, card_id
             _reply(card_id, prompt, reply_in_thread=True)
-    session_store.add_pending(tmux_name, root_id, cwd=cwd, health_card_id=health_card_id)
+    bound_session_id = session_store.add_pending(
+        tmux_name, root_id, cwd=cwd, health_card_id=health_card_id,
+    )
+    if bound_session_id:
+        _mark_session_busy(bound_session_id)
+        if health_card_id:
+            _refresh_health_card_for_event(bound_session_id)
     if not health_card_id:
         reply_id = _reply(message_id, t("feishu.started", agent=agent_adapter.name.title(), tmux=tmux_name), reply_in_thread=True)
         if reply_id:
-            session_store.update_pending_reply(tmux_name, reply_id)
+            if bound_session_id:
+                _edit_message(reply_id, t(
+                    "feishu.started_with_session",
+                    agent=agent_adapter.name.title(),
+                    session_id=bound_session_id[:8],
+                    tmux=tmux_name,
+                ))
+            else:
+                session_store.update_pending_reply(tmux_name, reply_id)
     logger.info(f"Started {agent_adapter.name}: tmux={tmux_name} cwd={cwd} prompt={prompt[:50]}")
 
     # Background: detect auth failure and recover via device-auth
@@ -2067,15 +2081,6 @@ async def receive_hook(request: Request):
     if not tty:
         return {"ok": False, "error": "missing tty (not in tmux?)"}
 
-    # Stop = turn ended → session is idle. Other generic hooks are observable
-    # progress only while the session is not waiting on a human. Mark BEFORE the
-    # dedupe gate so duplicate hook deliveries still refresh observability when
-    # they truly represent running work; dedupe only suppresses user-facing noise.
-    if hook_type == "stop" and session_id:
-        _mark_session_idle(session_id)
-    elif session_id:
-        _mark_session_progress(session_id)
-
     # codex (>=0.135) fires each hook twice with an identical payload — a turn
     # ends once, so suppress the duplicate before it becomes a second Feishu reply.
     # Read-only check here; the key is registered only AFTER a successful send
@@ -2090,6 +2095,14 @@ async def receive_hook(request: Request):
             f"key={dedupe_key[2]}:{dedupe_key[3][:12]}"
         )
         return {"ok": True, "deduped": True}
+
+    # Stop = turn ended → session is idle. Do this only after the dedupe gate:
+    # a delayed duplicate Stop from the previous turn must not clear a newer
+    # running_since after the next turn has already started.
+    if hook_type == "stop" and session_id:
+        _mark_session_idle(session_id)
+    elif session_id:
+        _mark_session_progress(session_id)
 
     effective_type = matcher or hook_type
     labels = _labels()

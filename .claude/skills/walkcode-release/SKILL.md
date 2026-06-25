@@ -19,6 +19,7 @@ metadata:
 - **顺序不可换：先 release，再 upgrade**。`walkcode upgrade` 拉的是 GitHub **Release**（Releases API），所以必须先把改动合并进 `main` 并建好 Release，本地 upgrade 才拿得到新代码。
 - **账号必须是 `0x5446`**（脚本会校验 `gh` 当前账号）。
 - **门禁**：单测必须全绿、`/deep-review` 必须过且**无 Critical**，才能合并 PR。
+  Review 门禁由 deep-review skill 执行；不要用普通 `codex review` / `claude review` 替代。
 - **tag 打在合并后的 `main`**，不在分支上发版。
 - **两个 launchd 实例**（claude `com.walkcode` + codex `com.walkcode-codex`）都要升、都要验。
 - 版本单一真源是 `pyproject.toml`（`__init__.py` 从安装元数据派生，不要手改）。
@@ -32,7 +33,7 @@ metadata:
    - 前置（脚本会拒绝不满足的）：在 `main`、`main`==`origin/main`、无未跟踪文件；本次新文件先 `git add`。
    - 不传 VERSION 默认 patch 自增。会 bump `pyproject.toml`、跑测试（挂了就中止）、建 `release/vX.Y.Z` 分支、`git add -A` 提交、push、开 PR。
    - 记下输出的 PR 编号/URL。
-2. **门禁 deep-review**：对本次 diff 跑 `/deep-review`。命中 **Critical** → 修复 → 重跑，直到过。Warning 酌情修。**没过不许进下一步。**
+2. **门禁 deep-review**：调用 deep-review skill 对本次 diff 做 CR。命中 **Critical** → 修复 → 重跑，直到过。Warning 酌情修。**没过不许进下一步。**
 3. **合并**（门禁通过后）：`gh pr merge <PR#> --merge --delete-branch`，然后 `git checkout main && git pull --ff-only`。
 4. **publish**：`./release.sh publish [VERSION]`
    - 打 tag 前校验 `HEAD`==`origin/main`（防发未合并的本地提交）。在 `main` 打 `vX.Y.Z` tag、push、`gh release create --latest`（release notes 自动取上个 tag 到 HEAD 的 commit）。

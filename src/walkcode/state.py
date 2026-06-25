@@ -334,8 +334,17 @@ class SessionStore:
     # --- Pending Feishu-initiated session helpers ---
 
     def add_pending(self, tmux_name: str, root_msg_id: str, reply_id: str | None = None,
-                    cwd: str = "", health_card_id: str = ""):
+                    cwd: str = "", health_card_id: str = "") -> str | None:
         with self._lock:
+            for session_id, session in self._sessions.items():
+                if session.tty == tmux_name and not session.root_msg_id:
+                    session.root_msg_id = root_msg_id
+                    if cwd and not session.cwd:
+                        session.cwd = cwd
+                    if health_card_id:
+                        session.health_card_id = health_card_id
+                    self._sync_locked()
+                    return session_id
             # cwd is the agent's launch dir (config.default_cwd for Feishu-initiated
             # starts). Carried so that if SessionStart sync is dropped, the first
             # runtime hook can still establish the correct launch cwd from here.
@@ -345,6 +354,7 @@ class SessionStore:
                                         "cwd": cwd, "health_card_id": health_card_id}
             self._pending_msg_to_tty[root_msg_id] = tmux_name
             self._save_locked()
+            return None
 
     def update_pending_reply(self, tmux_name: str, reply_id: str):
         with self._lock:
