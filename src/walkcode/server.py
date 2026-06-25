@@ -918,8 +918,13 @@ def _finalize_askuser_answer(
 
     logger.info(f"AskUserQuestion answer[{question_index}]: {final_answer!r} (rid={request_id[:8]})")
 
+    req_data = registry.get(request_id)
+    session_id = req_data.session_id if req_data else ""
     has_next = question_index + 1 < total_questions
     if has_next:
+        if session_id:
+            _mark_session_waiting(session_id, "ask_user_question")
+            _refresh_health_card_for_event(session_id)
         next_card = _build_askuserquestion_card(request_id, questions, question_index + 1)
         resp.card = CallBackCard()
         resp.card.type = "raw"
@@ -960,10 +965,9 @@ def _finalize_askuser_answer(
     resp.toast = CallBackToast()
     resp.toast.type = "success"
     resp.toast.content = "All answers submitted"
-    req_data = registry.get(request_id)
-    if req_data and req_data.session_id:
-        _mark_session_busy(req_data.session_id)
-        _refresh_health_card_for_event(req_data.session_id)
+    if session_id:
+        _mark_session_busy(session_id)
+        _refresh_health_card_for_event(session_id)
     return resp
 
 
@@ -1068,6 +1072,9 @@ def _on_card_action(data: P2CardActionTrigger) -> P2CardActionTriggerResponse:
                     resp.toast.type = "info"
                     resp.toast.content = t("feishu.perm.expired")
                     return resp
+                if req_data.session_id:
+                    _mark_session_waiting(req_data.session_id, "ask_user_question")
+                    _refresh_health_card_for_event(req_data.session_id)
                 logger.info(f"AskUser toggle Q{question_index+1} idx={option_idx} → selected={selected} (rid={request_id[:8]})")
                 resp.card = CallBackCard()
                 resp.card.type = "raw"
@@ -1081,6 +1088,9 @@ def _on_card_action(data: P2CardActionTrigger) -> P2CardActionTriggerResponse:
                 registry.askuser_set_awaiting_other(
                     request_id, question_index, req_data.feishu_root_msg_id,
                 )
+                if req_data.session_id:
+                    _mark_session_waiting(req_data.session_id, "ask_user_question")
+                    _refresh_health_card_for_event(req_data.session_id)
                 logger.info(f"AskUser request_other Q{question_index+1} (rid={request_id[:8]})")
                 resp.card = CallBackCard()
                 resp.card.type = "raw"
@@ -1096,6 +1106,9 @@ def _on_card_action(data: P2CardActionTrigger) -> P2CardActionTriggerResponse:
             if action == "submit_multi":
                 selected = registry.askuser_get_selected(request_id, question_index)
                 if not selected:
+                    if req_data.session_id:
+                        _mark_session_waiting(req_data.session_id, "ask_user_question")
+                        _refresh_health_card_for_event(req_data.session_id)
                     resp.toast = CallBackToast()
                     resp.toast.type = "warning"
                     resp.toast.content = "未选择任何选项"
@@ -1435,6 +1448,9 @@ def _consume_other_answer(request_id: str, text: str, message_id: str):
 
     has_next = qi + 1 < total
     if has_next:
+        if req_data.session_id:
+            _mark_session_waiting(req_data.session_id, "ask_user_question")
+            _refresh_health_card_for_event(req_data.session_id)
         # Send next question card as a fresh thread reply since we don't have a
         # CallBackCard channel for the original card.
         next_card = _build_askuserquestion_card(request_id, questions, qi + 1)
@@ -1451,6 +1467,7 @@ def _consume_other_answer(request_id: str, text: str, message_id: str):
     }
     won = registry.set_decision_once(request_id, final_decision)
     if won and req_data.session_id:
+        _mark_session_busy(req_data.session_id)
         _refresh_health_card_for_event(req_data.session_id)
     # If write-once lost (TUI already settled / PostToolUse invalidated it), don't react
     # success on a reply that never took effect (deep-review ISSUE_3).
@@ -1460,11 +1477,6 @@ def _consume_other_answer(request_id: str, text: str, message_id: str):
 def _norm(s: str) -> str:
     """Collapse whitespace for tolerant prompt matching."""
     return " ".join((s or "").split())
-
-
-def _forget_pane_progress(session_id: str) -> None:
-    with _pane_progress_lock:
-        _pane_progress.pop(session_id, None)
 
 
 def _mark_session_busy(session_id: str):
@@ -1490,7 +1502,6 @@ def _mark_session_idle(session_id: str):
             _session_last_stop[session_id] = time.time()
         if session_store is not None:
             session_store.set_stopped(session_id, "completed")
-        _forget_pane_progress(session_id)
         # Turn ended → clear any stuck-turn alert state so the next turn that
         # wedges alerts fresh (covers turns that start and stall between scans).
         with _stuck_lock:
@@ -1504,7 +1515,6 @@ def _mark_session_waiting(session_id: str, reason: str):
             _session_last_stop[session_id] = now
         if session_store is not None:
             session_store.mark_waiting(session_id, reason, now)
-        _forget_pane_progress(session_id)
         with _stuck_lock:
             _stuck_alerted.pop(session_id, None)
 
@@ -1515,7 +1525,6 @@ def _mark_session_timeout(session_id: str):
             _session_last_stop[session_id] = time.time()
         if session_store is not None:
             session_store.set_stopped(session_id, "interrupted", interrupt_reason="timeout")
-        _forget_pane_progress(session_id)
 
 
 def _is_session_busy(session_id: str) -> bool:
@@ -2222,6 +2231,24 @@ async def receive_prompt_hook(request: Request):
     return {"ok": True}
 
 
+@app.post("/hook/progress")
+async def receive_progress_hook(request: Request):
+    """Cheap progress-only hook for events that should not post Feishu messages.
+
+    SubagentStart/SubagentStop are turn-internal activity, not the main turn's
+    terminal Stop. They only refresh the running timeout timer and health card.
+    """
+    body = await request.json()
+    session_id = body.get("session_id", "")
+    hook_type = body.get("type", "progress")
+    if not session_id:
+        return {"ok": False, "error": "missing session_id"}
+    _mark_session_busy(session_id)
+    _refresh_health_card_for_event(session_id)
+    logger.info("Progress hook: %s session=%s", hook_type, session_id[:8])
+    return {"ok": True}
+
+
 def _perm_dedupe_key(session_id: str, tool_use_id: str) -> tuple | None:
     """Dedupe key for a permission request. tool_use_id identifies ONE tool call
     (turn_id would wrongly merge a whole turn's requests). None → not deduped
@@ -2520,7 +2547,7 @@ def _start_idle_reaper():
 # --- Stuck-turn watchdog ---
 # A running/waiting state with no observable progress is usually wedged on an
 # interactive step the agent can't get past. The watchdog follows WalkCode's own
-# state plus hook/pane progress, not TUI footer text: once the idle span
+# state plus explicit progress hooks, not TUI footer text: once the idle span
 # crosses the threshold, send Esc, refresh the health card, and notify Feishu.
 
 # Legacy helper for inject verification only. The timeout watchdog intentionally
@@ -2533,15 +2560,10 @@ _INTERRUPT_TIME_RE = re.compile(
 # no-progress span; state transitions reset this state.
 _stuck_alerted: dict[str, dict] = {}
 _stuck_lock = threading.Lock()
-_pane_progress: dict[str, str] = {}
-_pane_progress_lock = threading.Lock()
-
-
 # How many trailing non-blank pane lines count as the live footer. The active
 # turn timer sits on the bottom line(s); scanning the whole capture would match a
 # stale timer left in scrollback and read an idle pane as busy.
 _FOOTER_LINES = 6
-_PROGRESS_CAPTURE_LINES = 80
 
 _TIMEOUT_STOP_REASONS = {"permission_request", "ask_user_question"}
 
@@ -2561,50 +2583,6 @@ def _parse_working_seconds(pane: str) -> int | None:
     return None
 
 
-def _pane_progress_fingerprint(pane: str) -> str | None:
-    """Stable pane fingerprint for meaningful progress detection.
-
-    Claude/Codex redraw their bottom status/footer while thinking. tmux sees
-    those redraws as activity, but they are not user-visible progress. Ignore the
-    bottom footer block and hash only the stable content area.
-    """
-    if not pane.strip():
-        return None
-    lines = pane.splitlines()
-    if len(lines) <= _FOOTER_LINES:
-        return None
-    lines = lines[:-_FOOTER_LINES]
-    stable = "\n".join(ln.strip() for ln in lines if ln.strip())
-    if not stable:
-        return None
-    return hashlib.sha256(stable.encode("utf-8", "ignore")).hexdigest()
-
-
-def _observe_pane_progress(session_id: str, session: Session, now: float) -> float | None:
-    """Return `now` when the stable pane content changed since the last scan."""
-    if not session.tty:
-        return None
-    pane = capture_pane(session.tty, lines=_PROGRESS_CAPTURE_LINES)
-    fp = _pane_progress_fingerprint(pane)
-    if not fp:
-        return None
-    with _pane_progress_lock:
-        prev = _pane_progress.get(session_id)
-        _pane_progress[session_id] = fp
-    if prev is None or prev == fp:
-        return None
-
-    session.running_since = now
-    with _pending_lock:
-        if now > _session_last_stop.get(session_id, 0.0):
-            _session_last_ups[session_id] = now
-    if session_store is not None:
-        session_store.start_running(session_id, now)
-    with _stuck_lock:
-        _stuck_alerted.pop(session_id, None)
-    return now
-
-
 def _running_started_at(session_id: str, session: Session, now: float | None = None) -> float | None:
     """Timeout timer t0 for the current watchable state, or None."""
     if not session_id:
@@ -2617,9 +2595,6 @@ def _running_started_at(session_id: str, session: Session, now: float | None = N
         return session.running_since or None
 
     candidates = []
-    pane_progress_at = _observe_pane_progress(session_id, session, now)
-    if pane_progress_at:
-        candidates.append(pane_progress_at)
     with _pending_lock:
         last_stop = _session_last_stop.get(session_id, 0.0)
         last_ups = _session_last_ups.get(session_id, 0.0)

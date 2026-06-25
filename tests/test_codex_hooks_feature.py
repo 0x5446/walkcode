@@ -10,6 +10,7 @@ adding the feature flag. These tests pin that the installer writes the current
 flag and is not fooled by `[hooks.state]`.
 """
 
+import json
 import tomllib
 import unittest
 from pathlib import Path
@@ -125,6 +126,28 @@ class EnsureCodexHooksFeatureTests(unittest.TestCase):
                 m._ensure_codex_hooks_feature(p)
             self.assertEqual(p.read_text(), initial)  # unchanged
             self.assertIn("skipped enabling codex hooks", err.getvalue())
+
+
+class InstallClaudeHooksTests(unittest.TestCase):
+    def test_installs_subagent_progress_hooks(self):
+        with TemporaryDirectory() as d:
+            home = Path(d)
+            settings_path = home / ".claude" / "settings.json"
+            settings_path.parent.mkdir()
+            settings_path.write_text("{}")
+
+            with patch.object(m.Path, "home", return_value=home):
+                m._install_claude_hooks(None)
+
+            hooks = json.loads(settings_path.read_text())["hooks"]
+            self.assertEqual(
+                hooks["SubagentStart"][0]["hooks"][0]["command"],
+                "walkcode hook subagent-start",
+            )
+            self.assertEqual(
+                hooks["SubagentStop"][0]["hooks"][0]["command"],
+                "walkcode hook subagent-stop",
+            )
 
 
 if __name__ == "__main__":

@@ -7,6 +7,7 @@ observation, so missing or late hooks must not create user-visible queued or
 swallowed notices.
 """
 
+import asyncio
 import json
 import time
 import types
@@ -79,6 +80,22 @@ class InjectConfirmTests(unittest.TestCase):
         self.assertTrue(server._is_session_busy("s"))
         server._mark_session_idle("s")
         self.assertFalse(server._is_session_busy("s"))
+
+    def test_progress_hook_marks_session_busy(self):
+        class _Req:
+            async def json(self):
+                return {"type": "subagent-stop", "session_id": "s", "tty": "tmux1"}
+
+        busy = []
+        refreshes = []
+        with patch.object(server, "_mark_session_busy", lambda sid: busy.append(sid)), \
+             patch.object(server, "_refresh_health_card_for_event",
+                          lambda sid, **kw: refreshes.append((sid, kw)) or False):
+            res = asyncio.run(server.receive_progress_hook(_Req()))
+
+        self.assertEqual(res, {"ok": True})
+        self.assertEqual(busy, ["s"])
+        self.assertEqual([sid for sid, _ in refreshes], ["s"])
 
 
 class FeishuReplyInjectionTests(unittest.TestCase):

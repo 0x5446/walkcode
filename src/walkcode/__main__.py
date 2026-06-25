@@ -589,6 +589,26 @@ def cmd_hook(args):
             print(f"[walkcode] post-tool hook failed (card invalidation skipped): {e}", file=sys.stderr)
         return
 
+    # --- Subagent progress: refresh the parent turn timeout timer without
+    # creating Feishu thread noise. These are not terminal Stop events. ---
+    if args.hook_type in ("subagent-start", "subagent-stop"):
+        payload = json.dumps({
+            "type": args.hook_type,
+            "tty": tmux_session,
+            "cwd": cwd,
+            "session_id": session_id,
+        }).encode()
+        try:
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{port}/hook/progress",
+                data=payload,
+                headers={"Content-Type": "application/json"},
+            )
+            urllib.request.urlopen(req, timeout=2)
+        except Exception as e:
+            print(t("hook.failed", error=e), file=sys.stderr)
+        return
+
     # DEBUG: dump full hook_data to file for analysis
     try:
         import datetime as _dt
@@ -746,6 +766,14 @@ def _install_claude_hooks(_args):
         ]}],
         "Stop": [{"matcher": "", "hooks": [
             {"type": "command", "command": hook_cmd("stop", "Hero")}
+        ]}],
+        # Subagent activity is progress inside the parent turn. Do not route it
+        # through the Stop hook path or it would freeze the parent health card.
+        "SubagentStart": [{"matcher": "", "hooks": [
+            {"type": "command", "command": "walkcode hook subagent-start"}
+        ]}],
+        "SubagentStop": [{"matcher": "", "hooks": [
+            {"type": "command", "command": "walkcode hook subagent-stop"}
         ]}],
         "Notification": [{"matcher": "elicitation_dialog", "hooks": [
             {"type": "command", "command": hook_cmd("notification", "Ping")}
@@ -1141,7 +1169,15 @@ def main():
     sub.add_parser("status", help="Check if server is running")
 
     hp = sub.add_parser("hook", help="Handle an agent hook event (reads stdin)")
-    hp.add_argument("hook_type", choices=["stop", "notification", "permission-request", "sync", "user-prompt-submit", "post-tool"], help="Hook event type")
+    hp.add_argument(
+        "hook_type",
+        choices=[
+            "stop", "notification", "permission-request", "sync",
+            "user-prompt-submit", "post-tool", "subagent-start",
+            "subagent-stop",
+        ],
+        help="Hook event type",
+    )
 
     ihp = sub.add_parser("install-hooks", help="Install agent hooks")
     ihp.add_argument("--agent", choices=["claude", "codex"], default=None, help="Agent type (default: from WALKCODE_AGENT or claude)")

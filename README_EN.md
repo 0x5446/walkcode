@@ -503,7 +503,7 @@ Every session keeps an interactive card at the top of its thread, refreshed ever
 | Inputs | Number of messages you've sent |
 | Tokens | Cumulative token usage (grouped by model) |
 
-The thread title is auto-named from a task summary (Claude uses its own AI title; Codex can optionally use Haiku to refine it — see Configuration). Once the session ends the card is frozen and stops refreshing. If a running state has no observable progress for more than 30 minutes, or a permission / AskUserQuestion wait state goes unanswered for more than 30 minutes, WalkCode sends Esc to interrupt it, marks the card as "Timeout interrupted", and posts a thread notice. This uses WalkCode's own recorded state, hook events, and pane content changes after stripping the bottom dynamic footer; it does not parse TUI footer wording or depend on tmux `window_activity`. The whole feature is on by default; set `WALKCODE_HEALTH_CARD=0` to turn it off.
+The thread title is auto-named from a task summary (Claude uses its own AI title; Codex can optionally use Haiku to refine it — see Configuration). Once the session ends the card is frozen and stops refreshing. If a running state has no observable progress for more than 30 minutes, or a permission / AskUserQuestion wait state goes unanswered for more than 30 minutes, WalkCode sends Esc to interrupt it, marks the card as "Timeout interrupted", and posts a thread notice. This uses WalkCode's own recorded state and hook/progress events; it does not parse TUI footer wording, treat pane repaints as progress, or depend on tmux `window_activity`. The whole feature is on by default; set `WALKCODE_HEALTH_CARD=0` to turn it off.
 
 ### Security: Remote Start Permissions
 

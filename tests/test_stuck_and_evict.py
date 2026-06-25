@@ -191,12 +191,9 @@ class StuckWatchdogTests(unittest.TestCase):
     ):
         last_ups = dict(server._session_last_ups)
         last_stop = dict(server._session_last_stop)
-        pane_progress = dict(server._pane_progress)
         try:
             server._session_last_ups.clear()
             server._session_last_stop.clear()
-            with server._pane_progress_lock:
-                server._pane_progress.clear()
             return self._run_scans_inner(
                 ages_min, reply_status=reply_status, interrupt_ok=interrupt_ok,
                 alive=alive, target=target, hitl=hitl,
@@ -209,9 +206,6 @@ class StuckWatchdogTests(unittest.TestCase):
             server._session_last_ups.update(last_ups)
             server._session_last_stop.clear()
             server._session_last_stop.update(last_stop)
-            with server._pane_progress_lock:
-                server._pane_progress.clear()
-                server._pane_progress.update(pane_progress)
 
     def _run_scans_inner(
         self, ages_min, *, reply_status, interrupt_ok, alive, target, hitl,
@@ -240,8 +234,6 @@ class StuckWatchdogTests(unittest.TestCase):
              patch.object(server, "registry", _FakeRegistry(hitl)), \
              patch.object(server, "validate_target", lambda t: target), \
              patch.object(server, "is_agent_alive", lambda t: alive), \
-             patch.object(server, "capture_pane",
-                          lambda *a, **k: "stable output\nf1\nf2\nf3\nf4\nf5\nf6\n"), \
              patch.object(server, "_interrupt_agent_turn", interrupt), \
              patch.object(server, "_reply_status", reply_status_fn), \
              patch.object(server, "_refresh_health_card_for_event",
@@ -350,18 +342,13 @@ class StuckWatchdogTests(unittest.TestCase):
         refreshes = []
         last_ups = dict(server._session_last_ups)
         last_stop = dict(server._session_last_stop)
-        pane_progress = dict(server._pane_progress)
         try:
             server._session_last_ups.clear()
             server._session_last_stop.clear()
-            with server._pane_progress_lock:
-                server._pane_progress.clear()
             with patch.object(server, "session_store", store), \
                  patch.object(server, "registry", _FakeRegistry(False)), \
                  patch.object(server, "validate_target", lambda t: None), \
                  patch.object(server, "is_agent_alive", lambda t: True), \
-                 patch.object(server, "capture_pane",
-                              lambda *a, **k: "stable output\nf1\nf2\nf3\nf4\nf5\nf6\n"), \
                  patch.object(server, "_interrupt_agent_turn",
                               lambda tmux: interrupts.append(tmux) or True), \
                  patch.object(server, "_reply_status",
@@ -383,9 +370,6 @@ class StuckWatchdogTests(unittest.TestCase):
             server._session_last_ups.update(last_ups)
             server._session_last_stop.clear()
             server._session_last_stop.update(last_stop)
-            with server._pane_progress_lock:
-                server._pane_progress.clear()
-                server._pane_progress.update(pane_progress)
 
         self.assertEqual(len(interrupts), 2)
         self.assertEqual(len(sent), 2)
@@ -394,29 +378,23 @@ class StuckWatchdogTests(unittest.TestCase):
     def test_footer_text_is_not_used_for_timeout_detection(self):
         self.assertEqual(self._run_scans([40]), [(1, 1, 1, 0)])
 
-    def test_footer_only_changes_do_not_reset_running_timeout(self):
+    def test_pane_changes_do_not_reset_running_timeout(self):
         now = {"t": 10_000.0}
         sess = Session(tty="walkcode-1", cwd="/x", root_msg_id="root-1")
         sess.running_since = now["t"] - 29 * 60
         store = _FakeStore({"sid-1": sess})
-        panes = iter([
-            "stable body\nstable body 2\nf1\nf2\nf3\nf4\nf5\nfooter tick 1\n",
-            "stable body\nstable body 2\nf1\nf2\nf3\nf4\nf5\nfooter tick 2\n",
-        ])
         interrupts = []
         last_ups = dict(server._session_last_ups)
         last_stop = dict(server._session_last_stop)
-        pane_progress = dict(server._pane_progress)
         try:
             server._session_last_ups.clear()
             server._session_last_stop.clear()
-            with server._pane_progress_lock:
-                server._pane_progress.clear()
             with patch.object(server, "session_store", store), \
                  patch.object(server, "registry", _FakeRegistry(False)), \
                  patch.object(server, "validate_target", lambda t: None), \
                  patch.object(server, "is_agent_alive", lambda t: True), \
-                 patch.object(server, "capture_pane", lambda *a, **k: next(panes)), \
+                 patch.object(server, "capture_pane",
+                              side_effect=AssertionError("running timeout must not inspect pane progress")), \
                  patch.object(server, "_interrupt_agent_turn",
                               lambda tmux: interrupts.append(tmux) or True), \
                  patch.object(server, "_reply_status", lambda *a, **k: ("sent", "m1")), \
@@ -432,36 +410,26 @@ class StuckWatchdogTests(unittest.TestCase):
             server._session_last_ups.update(last_ups)
             server._session_last_stop.clear()
             server._session_last_stop.update(last_stop)
-            with server._pane_progress_lock:
-                server._pane_progress.clear()
-                server._pane_progress.update(pane_progress)
 
         self.assertEqual(interrupts, ["walkcode-1"])
 
-    def test_stable_pane_content_change_resets_running_timeout(self):
+    def test_explicit_progress_event_resets_running_timeout(self):
         now = {"t": 10_000.0}
         sess = Session(tty="walkcode-1", cwd="/x", root_msg_id="root-1")
         sess.running_since = now["t"] - 29 * 60
         store = _FakeStore({"sid-1": sess})
-        panes = iter([
-            "old body\nold body 2\nf1\nf2\nf3\nf4\nf5\nfooter tick 1\n",
-            "new body\nnew body 2\nf1\nf2\nf3\nf4\nf5\nfooter tick 2\n",
-            "new body\nnew body 2\nf1\nf2\nf3\nf4\nf5\nfooter tick 3\n",
-        ])
         interrupts = []
         last_ups = dict(server._session_last_ups)
         last_stop = dict(server._session_last_stop)
-        pane_progress = dict(server._pane_progress)
         try:
             server._session_last_ups.clear()
             server._session_last_stop.clear()
-            with server._pane_progress_lock:
-                server._pane_progress.clear()
             with patch.object(server, "session_store", store), \
                  patch.object(server, "registry", _FakeRegistry(False)), \
                  patch.object(server, "validate_target", lambda t: None), \
                  patch.object(server, "is_agent_alive", lambda t: True), \
-                 patch.object(server, "capture_pane", lambda *a, **k: next(panes)), \
+                 patch.object(server, "capture_pane",
+                              side_effect=AssertionError("running timeout must not inspect pane progress")), \
                  patch.object(server, "_interrupt_agent_turn",
                               lambda tmux: interrupts.append(tmux) or True), \
                  patch.object(server, "_reply_status", lambda *a, **k: ("sent", "m1")), \
@@ -471,6 +439,7 @@ class StuckWatchdogTests(unittest.TestCase):
                     server._stuck_alerted.clear()
                 server._check_stuck_sessions()
                 now["t"] += 2 * 60
+                server._mark_session_busy("sid-1")
                 server._check_stuck_sessions()
                 self.assertEqual(interrupts, [])
                 self.assertEqual(sess.running_since, now["t"])
@@ -481,9 +450,6 @@ class StuckWatchdogTests(unittest.TestCase):
             server._session_last_ups.update(last_ups)
             server._session_last_stop.clear()
             server._session_last_stop.update(last_stop)
-            with server._pane_progress_lock:
-                server._pane_progress.clear()
-                server._pane_progress.update(pane_progress)
 
         self.assertEqual(interrupts, ["walkcode-1"])
 

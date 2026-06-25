@@ -167,6 +167,54 @@ class CardActionTests(unittest.TestCase):
         # multiSelect answer joins labels with comma in updatedInput
         self.assertEqual(dec["updatedInput"]["answers"], {"Pick many": "L1,L2"})
 
+    def test_askq_interactions_refresh_wait_timeout_timer(self):
+        waiting = []
+        refreshes = []
+        qs = [
+            {"question": "Q1", "options": [{"label": "A"}, {"label": "B"}]},
+            {"question": "Q2", "options": [{"label": "C"}, {"label": "D"}]},
+        ]
+
+        with patch.object(server, "_mark_session_waiting",
+                          lambda sid, reason: waiting.append((sid, reason))), \
+             patch.object(server, "_refresh_health_card_for_event",
+                          lambda sid, **kw: refreshes.append((sid, kw)) or False):
+            rid_toggle = self._askq([{"question": "Pick many",
+                                      "options": [{"label": "L1"}, {"label": "L2"}]}])
+            server.registry.fill_request(rid_toggle, session_id="s-wait")
+            _click({"rid": rid_toggle, "action": "toggle", "option_idx": 1, "question_index": 0})
+
+            rid_other = self._askq([{"question": "Pick", "options": [{"label": "A"}]}])
+            server.registry.fill_request(rid_other, session_id="s-wait")
+            _click({"rid": rid_other, "action": "request_other", "question_index": 0})
+
+            rid_next = self._askq(qs)
+            server.registry.fill_request(rid_next, session_id="s-wait")
+            _click({"rid": rid_next, "action": "select", "answer": "A",
+                    "question_index": 0, "total_questions": 2})
+
+        self.assertEqual(waiting, [
+            ("s-wait", "ask_user_question"),
+            ("s-wait", "ask_user_question"),
+            ("s-wait", "ask_user_question"),
+        ])
+        self.assertEqual([sid for sid, _ in refreshes], ["s-wait", "s-wait", "s-wait"])
+
+    def test_other_final_answer_marks_session_running(self):
+        busy = []
+        refreshes = []
+        rid = self._askq([{"question": "Pick", "options": [{"label": "A"}]}])
+        _click({"rid": rid, "action": "request_other", "question_index": 0})
+        server.registry.fill_request(rid, session_id="s1")
+
+        with patch.object(server, "_mark_session_busy", lambda sid: busy.append(sid)), \
+             patch.object(server, "_refresh_health_card_for_event",
+                          lambda sid, **kw: refreshes.append((sid, kw)) or False):
+            server._consume_other_answer(rid, "my custom text", "msg1")
+
+        self.assertEqual(busy, ["s1"])
+        self.assertEqual([sid for sid, _ in refreshes], ["s1"])
+
     def test_finalize_loser_does_not_show_its_answer(self):
         # A later finalize that loses write-once (double-click / race with PostToolUse)
         # must NOT render its own answer as if it took effect; the first decision stands
