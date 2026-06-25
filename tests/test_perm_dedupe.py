@@ -214,6 +214,17 @@ class ReceivePermDedupeTests(unittest.TestCase):
         self.assertTrue(server.registry.is_invalidated(rid))
         dec = asyncio.run(server.get_permission_decision(rid))
         self.assertEqual(dec["status"], "invalidated")
+        self.assertEqual(server.session_store.get("s1").status, "running")
+
+    def test_late_post_tool_does_not_reopen_timeout_session(self):
+        server.session_store.set_stopped("s1", "interrupted", interrupt_reason="timeout")
+        res = asyncio.run(server.receive_post_tool_hook(_Req({"session_id": "s1"})))
+        self.assertEqual(res["invalidated"], 0)
+        sess = server.session_store.get("s1")
+        self.assertEqual(sess.status, "stopped")
+        self.assertEqual(sess.stop_reason, "interrupted")
+        self.assertEqual(sess.interrupt_reason, "timeout")
+        self.assertEqual(sess.running_since, 0.0)
 
     def test_post_tool_askuser_renders_answers(self):
         # TUI answered an AskUserQuestion → PostToolUse carries the chosen answers

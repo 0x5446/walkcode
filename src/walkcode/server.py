@@ -1531,6 +1531,27 @@ def _mark_session_progress(session_id: str) -> bool:
     return True
 
 
+def _mark_session_tool_progress(session_id: str) -> bool:
+    """Refresh progress for a tool that actually ran.
+
+    PostToolUse can legitimately resolve a human-waiting state when the user
+    answered in the native TUI instead of Feishu. But a late PostToolUse must not
+    reopen a terminal stopped state such as completed or timeout-interrupted.
+    """
+    if not session_id:
+        return False
+    if session_store is not None:
+        session = session_store.get(session_id)
+        if (
+            session is not None
+            and session.status == "stopped"
+            and session.stop_reason not in _TIMEOUT_STOP_REASONS
+        ):
+            return False
+    _mark_session_busy(session_id)
+    return True
+
+
 def _mark_session_idle(session_id: str):
     if session_id:
         with _pending_lock:
@@ -2506,7 +2527,7 @@ async def receive_post_tool_hook(request: Request):
     session_id = body.get("session_id", "")
     if not session_id:
         return {"ok": False, "error": "missing session_id"}
-    _mark_session_busy(session_id)
+    _mark_session_tool_progress(session_id)
     # answers is {question_text: chosen_label}, sent by the hook only for AskUserQuestion.
     # TUI-chosen answers live nowhere in walkcode's memory (req.answers is filled only on a
     # Feishu click), so they reach us here via PostToolUse's tool_response.
