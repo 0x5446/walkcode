@@ -176,11 +176,17 @@ class _FakeStore:
 
 
 class _FakeRegistry:
-    def __init__(self, hitl=False):
+    def __init__(self, hitl=False, snaps=None):
         self.hitl = hitl
+        self.snaps = list(snaps or [])
+        self.invalidated = []
 
     def has_open_request(self, session_id):
         return self.hitl
+
+    def invalidate_session(self, session_id):
+        self.invalidated.append(session_id)
+        return list(self.snaps)
 
 
 class StuckWatchdogTests(unittest.TestCase):
@@ -316,6 +322,68 @@ class StuckWatchdogTests(unittest.TestCase):
         self.assertEqual(sess.stop_reason, "interrupted")
         self.assertEqual(sess.interrupt_reason, "timeout")
         self.assertEqual(refreshes, [("sid-1", {})])
+
+    def test_timeout_invalidates_open_hitl_cards(self):
+        now = {"t": 10_000.0}
+        sess = Session(tty="walkcode-1", cwd="/x", root_msg_id="root-1")
+        sess.status = "stopped"
+        sess.stop_reason = "permission_request"
+        sess.running_since = now["t"] - 40 * 60
+        store = _FakeStore({"sid-1": sess})
+        reg = _FakeRegistry(snaps=[
+            {"tool_name": "Bash", "card_msg_id": "card-perm"},
+            {"tool_name": "AskUserQuestion", "card_msg_id": "card-ask"},
+        ])
+        edits = []
+        with patch.object(server, "session_store", store), \
+             patch.object(server, "registry", reg), \
+             patch.object(server, "validate_target", lambda t: None), \
+             patch.object(server, "is_agent_alive", lambda t: True), \
+             patch.object(server, "_interrupt_agent_turn", lambda tmux: True), \
+             patch.object(server, "_reply_status", lambda *a, **k: ("sent", "m1")), \
+             patch.object(server, "_refresh_health_card_for_event", lambda *a, **k: False), \
+             patch.object(server, "_edit_card", lambda mid, card: edits.append((mid, card)) or True), \
+             patch.object(server.time, "time", lambda: now["t"]):
+            with server._stuck_lock:
+                server._stuck_alerted.clear()
+            server._check_stuck_sessions()
+
+        self.assertEqual(reg.invalidated, ["sid-1"])
+        self.assertEqual([mid for mid, _ in edits], ["card-perm", "card-ask"])
+        self.assertTrue(all(card["header"]["template"] == "grey" for _, card in edits))
+
+    def test_legacy_running_without_timer_is_not_watchable(self):
+        now = {"t": 10_000.0}
+        sess = Session(tty="walkcode-1", cwd="/x", root_msg_id="root-1")
+        sess.status = "running"
+        sess.running_since = 0.0
+        sess.created_at = now["t"] - 40 * 60
+        store = _FakeStore({"sid-1": sess})
+        interrupts = []
+        last_ups = dict(server._session_last_ups)
+        last_stop = dict(server._session_last_stop)
+        try:
+            server._session_last_ups.clear()
+            server._session_last_stop.clear()
+            with patch.object(server, "session_store", store), \
+                 patch.object(server, "registry", _FakeRegistry(False)), \
+                 patch.object(server, "validate_target", lambda t: None), \
+                 patch.object(server, "is_agent_alive", lambda t: True), \
+                 patch.object(server, "_interrupt_agent_turn",
+                              lambda tmux: interrupts.append(tmux) or True), \
+                 patch.object(server, "_reply_status", lambda *a, **k: ("sent", "m1")), \
+                 patch.object(server, "_refresh_health_card_for_event", lambda *a, **k: False), \
+                 patch.object(server.time, "time", lambda: now["t"]):
+                with server._stuck_lock:
+                    server._stuck_alerted.clear()
+                server._check_stuck_sessions()
+        finally:
+            server._session_last_ups.clear()
+            server._session_last_ups.update(last_ups)
+            server._session_last_stop.clear()
+            server._session_last_stop.update(last_stop)
+
+        self.assertEqual(interrupts, [])
 
     def test_no_interrupt_when_dead(self):
         self.assertEqual(self._run_scans([40], target="not found"), [(0, 0, 0, 0)])

@@ -1527,6 +1527,25 @@ def _mark_session_timeout(session_id: str):
             session_store.set_stopped(session_id, "interrupted", interrupt_reason="timeout")
 
 
+def _invalidate_timeout_requests(session_id: str) -> int:
+    """Expire still-open HITL cards after WalkCode interrupts a timed-out state."""
+    if not session_id:
+        return 0
+    snaps = registry.invalidate_session(session_id)
+    for snap in snaps:
+        card_msg_id = snap.get("card_msg_id")
+        if not card_msg_id:
+            continue
+        card = _build_permission_result_card(snap.get("tool_name", ""), "stale")
+        _edit_card(card_msg_id, card)
+    if snaps:
+        logger.info(
+            "Timeout invalidated %d open HITL request(s) for session %s",
+            len(snaps), session_id[:8],
+        )
+    return len(snaps)
+
+
 def _is_session_busy(session_id: str) -> bool:
     """A turn is in progress if the last progress event is newer than Stop/wait."""
     if not session_id:
@@ -2605,11 +2624,9 @@ def _running_started_at(session_id: str, session: Session, now: float | None = N
         candidates.append(session.running_since)
     if candidates:
         return max(candidates)
-    # Compatibility for sessions created before running_since existed, and for a
-    # process restart during a first turn: if no Stop is known anywhere, the
-    # session record itself is the best available start point.
-    if not stopped_in_memory:
-        return session.created_at
+    # Older state files may have status=running but no explicit timeout timer.
+    # Treat that as unknown instead of using created_at; otherwise a long-idle
+    # legacy tmux can be interrupted immediately after upgrade/restart.
     return None
 
 
@@ -2672,6 +2689,7 @@ def _check_stuck_sessions():
                 )
                 continue
             _mark_session_timeout(session_id)
+            _invalidate_timeout_requests(session_id)
             _refresh_health_card_for_event(session_id)
             with _stuck_lock:
                 cur = _stuck_alerted.get(session_id)
