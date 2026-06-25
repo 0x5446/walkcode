@@ -149,6 +149,9 @@ class _FakeStore:
     def items(self):
         return [(sid, s) for sid, s in self._sessions.items()]
 
+    def get(self, session_id):
+        return self._sessions.get(session_id)
+
     def set_stopped(self, session_id, reason="completed", *, interrupt_reason="", running_since=0.0, preserve_terminal=True):
         self.statuses.append((session_id, reason, interrupt_reason))
         if session_id in self._sessions:
@@ -179,13 +182,13 @@ class _FakeRegistry:
     def __init__(self, hitl=False, snaps=None):
         self.hitl = hitl
         self.snaps = list(snaps or [])
-        self.invalidated = []
+        self.timed_out = []
 
     def has_open_request(self, session_id):
         return self.hitl
 
-    def invalidate_session(self, session_id):
-        self.invalidated.append(session_id)
+    def timeout_session(self, session_id):
+        self.timed_out.append(session_id)
         return list(self.snaps)
 
 
@@ -323,7 +326,7 @@ class StuckWatchdogTests(unittest.TestCase):
         self.assertEqual(sess.interrupt_reason, "timeout")
         self.assertEqual(refreshes, [("sid-1", {})])
 
-    def test_timeout_invalidates_open_hitl_cards(self):
+    def test_timeout_denies_open_hitl_hooks_and_updates_cards(self):
         now = {"t": 10_000.0}
         sess = Session(tty="walkcode-1", cwd="/x", root_msg_id="root-1")
         sess.status = "stopped"
@@ -348,9 +351,37 @@ class StuckWatchdogTests(unittest.TestCase):
                 server._stuck_alerted.clear()
             server._check_stuck_sessions()
 
-        self.assertEqual(reg.invalidated, ["sid-1"])
+        self.assertEqual(reg.timed_out, ["sid-1"])
         self.assertEqual([mid for mid, _ in edits], ["card-perm", "card-ask"])
         self.assertTrue(all(card["header"]["template"] == "grey" for _, card in edits))
+
+    def test_progress_event_does_not_reopen_stopped_session(self):
+        sess = Session(tty="walkcode-1", cwd="/x", root_msg_id="root-1")
+        sess.status = "stopped"
+        sess.stop_reason = "completed"
+        sess.running_since = 0.0
+        store = _FakeStore({"sid-1": sess})
+        with patch.object(server, "session_store", store):
+            updated = server._mark_session_progress("sid-1")
+        self.assertFalse(updated)
+        self.assertEqual(sess.status, "stopped")
+        self.assertEqual(sess.stop_reason, "completed")
+        self.assertEqual(sess.running_since, 0.0)
+
+    def test_progress_event_does_not_reopen_timeout_session(self):
+        sess = Session(tty="walkcode-1", cwd="/x", root_msg_id="root-1")
+        sess.status = "stopped"
+        sess.stop_reason = "interrupted"
+        sess.interrupt_reason = "timeout"
+        sess.running_since = 0.0
+        store = _FakeStore({"sid-1": sess})
+        with patch.object(server, "session_store", store):
+            updated = server._mark_session_progress("sid-1")
+        self.assertFalse(updated)
+        self.assertEqual(sess.status, "stopped")
+        self.assertEqual(sess.stop_reason, "interrupted")
+        self.assertEqual(sess.interrupt_reason, "timeout")
+        self.assertEqual(sess.running_since, 0.0)
 
     def test_legacy_running_without_timer_is_not_watchable(self):
         now = {"t": 10_000.0}

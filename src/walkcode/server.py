@@ -1499,20 +1499,16 @@ def _mark_session_busy(session_id: str):
 def _mark_session_progress(session_id: str) -> bool:
     """Refresh running progress unless the session is waiting on a human.
 
-    Subagent/task lifecycle hooks can arrive from sibling work while the visible
-    session is stopped on a PermissionRequest or AskUserQuestion. Those events
-    are useful telemetry, but they must not turn the human-waiting state back
-    into running or reset its timeout timer.
+    Subagent/task lifecycle hooks can arrive late or from sibling work while the
+    visible session is already stopped. Those events are useful telemetry during
+    a running turn, but they must not reopen a completed, interrupted, or
+    human-waiting state.
     """
     if not session_id:
         return False
     if session_store is not None:
         session = session_store.get(session_id)
-        if (
-            session is not None
-            and session.status == "stopped"
-            and session.stop_reason in _TIMEOUT_STOP_REASONS
-        ):
+        if session is not None and session.status == "stopped":
             return False
     _mark_session_busy(session_id)
     return True
@@ -1549,11 +1545,11 @@ def _mark_session_timeout(session_id: str):
             session_store.set_stopped(session_id, "interrupted", interrupt_reason="timeout")
 
 
-def _invalidate_timeout_requests(session_id: str) -> int:
-    """Expire still-open HITL cards after WalkCode interrupts a timed-out state."""
+def _timeout_open_requests(session_id: str) -> int:
+    """Deny still-open HITL hooks after WalkCode interrupts a timed-out state."""
     if not session_id:
         return 0
-    snaps = registry.invalidate_session(session_id)
+    snaps = registry.timeout_session(session_id)
     for snap in snaps:
         card_msg_id = snap.get("card_msg_id")
         if not card_msg_id:
@@ -1562,7 +1558,7 @@ def _invalidate_timeout_requests(session_id: str) -> int:
         _edit_card(card_msg_id, card)
     if snaps:
         logger.info(
-            "Timeout invalidated %d open HITL request(s) for session %s",
+            "Timeout denied %d open HITL request(s) for session %s",
             len(snaps), session_id[:8],
         )
     return len(snaps)
@@ -2715,7 +2711,7 @@ def _check_stuck_sessions():
                 )
                 continue
             _mark_session_timeout(session_id)
-            _invalidate_timeout_requests(session_id)
+            _timeout_open_requests(session_id)
             _refresh_health_card_for_event(session_id)
             with _stuck_lock:
                 cur = _stuck_alerted.get(session_id)

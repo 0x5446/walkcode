@@ -425,6 +425,37 @@ class HandlePermissionForwardingTests(unittest.TestCase):
         self.assertEqual(captured["body"]["tool_name"], "AskUserQuestion")
         self.assertEqual(captured["body"]["tool_input"], hook_data["tool_input"])
 
+    def test_askuserquestion_deny_without_updated_input_does_not_fail_open(self):
+        calls = [0]
+        stdout = io.StringIO()
+
+        def fake_urlopen(req, timeout=None):
+            calls[0] += 1
+            if calls[0] == 1:  # POST /hook/permission
+                return self._resp({"request_id": "rid-ask"})
+            return self._resp({
+                "status": "decided",
+                "decision": {"behavior": "deny", "_reason": "timeout"},
+            })
+
+        hook_data = {
+            "tool_name": "AskUserQuestion",
+            "tool_input": {"questions": [{"question": "继续吗？"}]},
+            "permission_mode": "default",
+        }
+        with patch.object(m.urllib.request, "urlopen", fake_urlopen), \
+             patch.dict(os.environ, {"WALKCODE_AGENT": "claude"}, clear=False), \
+             patch("sys.stdout", stdout):
+            with self.assertRaises(SystemExit) as cm:
+                m._handle_permission_request(hook_data, 3999, "tmux1", "/tmp/proj", "s1")
+
+        self.assertEqual(cm.exception.code, 2)
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(
+            payload["hookSpecificOutput"]["decision"],
+            {"behavior": "deny"},
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

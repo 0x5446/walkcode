@@ -240,6 +240,27 @@ class PermissionRegistry:
                     snaps.append(req.snapshot())
         return snaps
 
+    def timeout_session(self, session_id: str) -> list[dict]:
+        """Deny every still-open request of `session_id` because WalkCode timed out.
+
+        This is deliberately separate from invalidation. Invalidation means the TUI
+        already handled the request, so the hook client fail-opens and lets that
+        terminal decision stand. Timeout means WalkCode is actively interrupting the
+        waiting state, so any still-polling hook must receive an explicit deny.
+        """
+        if not session_id:
+            return []
+        snaps = []
+        with self._lock:
+            for req in self._by_rid.values():
+                if (req.session_id == session_id and req.decision is None
+                        and req.invalidated_at is None):
+                    req.decision = {"behavior": "deny", "_reason": "timeout"}
+                    req.awaiting_other = None
+                    req.decided.set()
+                    snaps.append(req.snapshot())
+        return snaps
+
     def is_invalidated(self, rid: str) -> bool:
         with self._lock:
             req = self._by_rid.get(rid)

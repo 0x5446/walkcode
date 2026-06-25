@@ -274,15 +274,13 @@ def _handle_permission_request(hook_data, port, tmux_session, cwd, session_id):
                 decision = result["decision"]
                 behavior = decision.get("behavior", "deny")
 
-                # AskUserQuestion: inject answers via PermissionRequest
-                # `updatedInput.answers` so Claude consumes them directly and
-                # skips its native TUI prompt entirely. The server has already
-                # collected answers from Feishu and packaged them in the
-                # decision payload as {questions, answers} ready to echo back.
+                # AskUserQuestion allow decisions need `updatedInput.answers` so
+                # Claude consumes Feishu answers directly. Deny decisions, including
+                # timeout, intentionally carry no updatedInput and must not fail-open.
                 updated_input = None
                 if tool_name == "AskUserQuestion":
                     updated_input = decision.get("updatedInput")
-                    if updated_input is None:
+                    if behavior != "deny" and updated_input is None:
                         # Server somehow didn't supply updated_input — fail-open
                         # so the agent falls back to its native prompt.
                         print("[walkcode] AskUserQuestion decision missing updatedInput, fail-open", file=sys.stderr)
