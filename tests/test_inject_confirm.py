@@ -88,7 +88,7 @@ class InjectConfirmTests(unittest.TestCase):
 
         busy = []
         refreshes = []
-        with patch.object(server, "_mark_session_busy", lambda sid: busy.append(sid)), \
+        with patch.object(server, "_mark_session_progress", lambda sid: busy.append(sid) or True), \
              patch.object(server, "_refresh_health_card_for_event",
                           lambda sid, **kw: refreshes.append((sid, kw)) or False):
             res = asyncio.run(server.receive_progress_hook(_Req()))

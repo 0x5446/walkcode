@@ -170,6 +170,15 @@ class _FakeStore:
             self._sessions[session_id].interrupt_reason = ""
             self._sessions[session_id].running_since = started_at
 
+    def start_running_if_allowed(self, session_id, started_at, *, allow_stopped_reasons=frozenset()):
+        sess = self._sessions.get(session_id)
+        if sess is None:
+            return True
+        if sess.status == "stopped" and sess.stop_reason not in allow_stopped_reasons:
+            return False
+        self.start_running(session_id, started_at)
+        return True
+
     def clear_running(self, session_id):
         if session_id in self._sessions:
             self._sessions[session_id].running_since = 0.0

@@ -516,7 +516,7 @@ When you start an agent from chat, WalkCode launches it with a controlled permis
 
 > If you set `WALKCODE_PERMISSION_FLAG` to a fully autonomous mode like `--yolo` (Codex) in an instance `.env`, the agent skips approvals and runs directly — no approval cards. Choose this according to your own trust boundary.
 
-If you don't respond within 30 minutes, or the WalkCode server is unreachable, or the hook itself crashes, the **hook fails open** — it does not block the agent. The agent falls back to its own native terminal permission prompt, so "hook broken = same as no WalkCode installed" instead of leaving the Coding Agent stuck.
+If you don't respond within 30 minutes, WalkCode uses the unified watchdog to send Esc to the TUI and marks the wait as "Timeout interrupted". If the WalkCode server is unreachable or the hook itself crashes, the hook still fails open — it does not block the agent. The agent falls back to its own native terminal permission prompt, so "hook broken = same as no WalkCode installed" instead of leaving the Coding Agent stuck.
 
 ## Usage
 

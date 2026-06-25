@@ -480,6 +480,34 @@ class SessionStore:
                 session.running_since = started_at
                 self._save_locked()
 
+    def start_running_if_allowed(
+        self,
+        session_id: str,
+        started_at: float,
+        *,
+        allow_stopped_reasons: set[str] | frozenset[str] = frozenset(),
+    ) -> bool:
+        """Atomically start running unless the current stopped reason blocks it."""
+        with self._lock:
+            session = self._sessions.get(session_id)
+            if session is None:
+                return True
+            if session.status == "stopped" and session.stop_reason not in allow_stopped_reasons:
+                return False
+            changed = (
+                session.status != "running"
+                or session.stop_reason
+                or session.interrupt_reason
+                or session.running_since != started_at
+            )
+            if changed:
+                session.status = "running"
+                session.stop_reason = ""
+                session.interrupt_reason = ""
+                session.running_since = started_at
+                self._save_locked()
+            return True
+
     def clear_running(self, session_id: str) -> None:
         """Clear the timeout-watchable period without changing the status."""
         with self._lock:

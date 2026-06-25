@@ -1510,21 +1510,25 @@ def _norm(s: str) -> str:
     return " ".join((s or "").split())
 
 
+def _record_session_progress_memory(session_id: str, now: float) -> None:
+    with _pending_lock:
+        was_idle = _session_last_ups.get(session_id, 0.0) <= _session_last_stop.get(session_id, 0.0)
+        _session_last_ups[session_id] = now
+        # Kept for compatibility with the old inject-observation model.
+        _ups_capable_sessions.add(session_id)
+    if was_idle:
+        with _stuck_lock:
+            _stuck_alerted.pop(session_id, None)
+
+
 def _mark_session_busy(session_id: str):
     if session_id:
         now = time.time()
-        with _pending_lock:
-            was_idle = _session_last_ups.get(session_id, 0.0) <= _session_last_stop.get(session_id, 0.0)
-            _session_last_ups[session_id] = now
-            # Kept for compatibility with the old inject-observation model.
-            _ups_capable_sessions.add(session_id)
         # Any accepted prompt / tool-progress hook is observable progress. Reset
         # the running timeout timer; a later Stop freezes the card again.
         if session_store is not None:
             session_store.start_running(session_id, now)
-        if was_idle:
-            with _stuck_lock:
-                _stuck_alerted.pop(session_id, None)
+        _record_session_progress_memory(session_id, now)
 
 
 def _mark_session_progress(session_id: str) -> bool:
@@ -1537,11 +1541,11 @@ def _mark_session_progress(session_id: str) -> bool:
     """
     if not session_id:
         return False
+    now = time.time()
     if session_store is not None:
-        session = session_store.get(session_id)
-        if session is not None and session.status == "stopped":
+        if not session_store.start_running_if_allowed(session_id, now):
             return False
-    _mark_session_busy(session_id)
+    _record_session_progress_memory(session_id, now)
     return True
 
 
@@ -1554,15 +1558,15 @@ def _mark_session_tool_progress(session_id: str) -> bool:
     """
     if not session_id:
         return False
+    now = time.time()
     if session_store is not None:
-        session = session_store.get(session_id)
-        if (
-            session is not None
-            and session.status == "stopped"
-            and session.stop_reason not in _WAITING_STOP_REASONS
+        if not session_store.start_running_if_allowed(
+            session_id,
+            now,
+            allow_stopped_reasons=_WAITING_STOP_REASONS,
         ):
             return False
-    _mark_session_busy(session_id)
+    _record_session_progress_memory(session_id, now)
     return True
 
 

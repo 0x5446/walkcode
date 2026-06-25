@@ -313,8 +313,9 @@ def _handle_permission_request(hook_data, port, tmux_session, cwd, session_id):
             print(f"[walkcode] poll error: {e}", file=sys.stderr)
         _time.sleep(2)
 
-    # Timeout: fail-open so agent falls back to its native prompt.
-    # A 30-min Feishu silence is not the same as an explicit deny.
+    # Timeout here means the hook outlived the watchdog grace window without a
+    # server decision, so fail open and let the agent fall back to its native
+    # prompt instead of wedging the hook forever.
     print(f"[walkcode] permission poll timed out after {poll_timeout}s, fail-open", file=sys.stderr)
     sys.exit(0)
 

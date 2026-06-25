@@ -525,7 +525,7 @@ WalkCode 的核心设计：**1 个聊天话题 = 1 个 tmux 会话 = 1 个 Codin
 
 > 如果你在实例 `.env` 里把 `WALKCODE_PERMISSION_FLAG` 设成 `--yolo`（Codex）这类完全自动的模式，Agent 会跳过审批直接执行，不再发审批卡片——请按自己的信任边界选择。
 
-如果 30 分钟内未响应，或 WalkCode 服务端不可达、Hook 本身异常，**Hook 会 fail-open**（不阻塞 Agent），退回到 Agent 自身的原生终端权限提示。这样「Hook 挂了 = 你回到没装 WalkCode 的状态」，不会把 Coding Agent 整个卡死。
+如果 30 分钟内未响应，WalkCode 会按统一 watchdog 逻辑向 TUI 发送 Esc，并把这次等待标记为「超时已中断」。如果 WalkCode 服务端不可达、Hook 本身异常，Hook 仍会 fail-open（不阻塞 Agent），退回到 Agent 自身的原生终端权限提示。这样「Hook 挂了 = 你回到没装 WalkCode 的状态」，不会把 Coding Agent 整个卡死。
 
 ## 使用方式
 
