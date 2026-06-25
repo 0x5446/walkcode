@@ -3129,8 +3129,13 @@ def start_ws_client(cfg: Config):
     threading.Thread(target=cli.start, daemon=True).start()
     logger.info("Feishu WebSocket client started")
 
+    _start_background_services(cfg)
+
+
+def _start_background_services(cfg: Config):
     _start_idle_reaper()
-    _start_stuck_watchdog()
+    if cfg.health_card_enabled:
+        _start_stuck_watchdog()
+    else:
+        logger.info("Health card disabled (WALKCODE_HEALTH_CARD=0); stuck watchdog disabled")
     _start_inject_sweeper()
-    if not config.health_card_enabled:
-        logger.info("Health card disabled (WALKCODE_HEALTH_CARD=0)")

@@ -11,11 +11,22 @@ at all. _resume_agent additionally injects instead of resuming when the old tmux
 is still alive, and the watchdog interrupts once per timeout-watchable period.
 """
 
+import tempfile
 import unittest
+from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from walkcode import server, tty
-from walkcode.state import Session
+from walkcode.config import parse_stuck_threshold
+from walkcode.state import (
+    INTERRUPT_REASON_TIMEOUT,
+    STATUS_RUNNING,
+    STATUS_STOPPED,
+    STOP_REASON_INTERRUPTED,
+    Session,
+    SessionStore,
+)
 
 
 def _footer(minutes=None, *, seconds=0, text=None):
@@ -214,6 +225,112 @@ class _FakeRegistry:
     def timeout_session(self, session_id):
         self.timed_out.append(session_id)
         return list(self.snaps)
+
+
+class ParseStuckThresholdTests(unittest.TestCase):
+    def test_invalid_values_fall_back_to_default(self):
+        for raw in ("", "abc", "-5", "0"):
+            with self.subTest(raw=raw):
+                self.assertEqual(parse_stuck_threshold(raw, default=123), 123)
+
+    def test_missing_env_falls_back_to_default(self):
+        with patch.dict("os.environ", {}, clear=True):
+            self.assertEqual(parse_stuck_threshold(None, default=123), 123)
+
+    def test_positive_value_is_used(self):
+        self.assertEqual(parse_stuck_threshold("45", default=123), 45)
+
+
+class SessionStoreTimeoutInterruptTests(unittest.TestCase):
+    def _store(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        store = SessionStore(Path(tmp.name) / "state.json")
+        store.upsert("sid-1", "walkcode-1", "/x", root_msg_id="root-1", cwd_is_launch=True)
+        return store
+
+    def test_interrupt_timeout_success_persists_terminal_timeout(self):
+        store = self._store()
+        store.start_running("sid-1", 123.0)
+        calls = []
+
+        result = store.interrupt_timeout_if_unchanged(
+            "sid-1",
+            expected_tty="walkcode-1",
+            expected_status=STATUS_RUNNING,
+            expected_stop_reason="",
+            expected_running_since=123.0,
+            interrupt=lambda tty_name: calls.append(tty_name) or True,
+        )
+
+        self.assertEqual(result, "interrupted")
+        self.assertEqual(calls, ["walkcode-1"])
+        session = store.get("sid-1")
+        self.assertEqual(session.status, STATUS_STOPPED)
+        self.assertEqual(session.stop_reason, STOP_REASON_INTERRUPTED)
+        self.assertEqual(session.interrupt_reason, INTERRUPT_REASON_TIMEOUT)
+        self.assertEqual(session.running_since, 0.0)
+
+        reloaded = SessionStore(store.path)
+        reloaded.load()
+        session = reloaded.get("sid-1")
+        self.assertEqual(session.status, STATUS_STOPPED)
+        self.assertEqual(session.stop_reason, STOP_REASON_INTERRUPTED)
+        self.assertEqual(session.interrupt_reason, INTERRUPT_REASON_TIMEOUT)
+
+    def test_interrupt_timeout_stale_does_not_send_or_mark(self):
+        store = self._store()
+        store.start_running("sid-1", 123.0)
+
+        result = store.interrupt_timeout_if_unchanged(
+            "sid-1",
+            expected_tty="walkcode-1",
+            expected_status=STATUS_RUNNING,
+            expected_stop_reason="",
+            expected_running_since=122.0,
+            interrupt=lambda _tty: self.fail("stale timeout must not send Esc"),
+        )
+
+        self.assertEqual(result, "stale")
+        session = store.get("sid-1")
+        self.assertEqual(session.status, STATUS_RUNNING)
+        self.assertEqual(session.running_since, 123.0)
+
+    def test_interrupt_timeout_failed_send_keeps_state(self):
+        store = self._store()
+        store.start_running("sid-1", 123.0)
+
+        result = store.interrupt_timeout_if_unchanged(
+            "sid-1",
+            expected_tty="walkcode-1",
+            expected_status=STATUS_RUNNING,
+            expected_stop_reason="",
+            expected_running_since=123.0,
+            interrupt=lambda _tty: False,
+        )
+
+        self.assertEqual(result, "failed")
+        session = store.get("sid-1")
+        self.assertEqual(session.status, STATUS_RUNNING)
+        self.assertEqual(session.running_since, 123.0)
+
+
+class BackgroundServicesTests(unittest.TestCase):
+    def test_health_card_disabled_skips_stuck_watchdog(self):
+        calls = []
+        with patch.object(server, "_start_idle_reaper", lambda: calls.append("idle")), \
+             patch.object(server, "_start_stuck_watchdog", lambda: calls.append("stuck")), \
+             patch.object(server, "_start_inject_sweeper", lambda: calls.append("inject")):
+            server._start_background_services(SimpleNamespace(health_card_enabled=False))
+        self.assertEqual(calls, ["idle", "inject"])
+
+    def test_health_card_enabled_starts_stuck_watchdog(self):
+        calls = []
+        with patch.object(server, "_start_idle_reaper", lambda: calls.append("idle")), \
+             patch.object(server, "_start_stuck_watchdog", lambda: calls.append("stuck")), \
+             patch.object(server, "_start_inject_sweeper", lambda: calls.append("inject")):
+            server._start_background_services(SimpleNamespace(health_card_enabled=True))
+        self.assertEqual(calls, ["idle", "stuck", "inject"])
 
 
 class StuckWatchdogTests(unittest.TestCase):

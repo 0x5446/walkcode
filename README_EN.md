@@ -503,7 +503,7 @@ Every session keeps an interactive card at the top of its thread. Remote replies
 | Inputs | Number of messages you've sent |
 | Tokens | Cumulative token usage (grouped by model) |
 
-The thread title is auto-named from a task summary (Claude uses its own AI title; Codex can optionally use Haiku to refine it — see Configuration). Once the session ends the card is frozen and stops refreshing. If a running state has no observable progress for more than 30 minutes, or a permission / AskUserQuestion wait state goes unanswered for more than 30 minutes, WalkCode sends Esc to interrupt it, marks the card as "Timeout interrupted", and posts a thread notice. This uses WalkCode's own recorded state and hook/progress events; it does not parse TUI footer wording, treat pane repaints as progress, or depend on tmux `window_activity`. Subagent/task lifecycle events refresh the timer only while the session is running; if the session is stopped on permission or AskUserQuestion, they do not move it back to running or reset the wait timeout. The whole feature is on by default; set `WALKCODE_HEALTH_CARD=0` to turn it off.
+The thread title is auto-named from a task summary (Claude uses its own AI title; Codex can optionally use Haiku to refine it — see Configuration). Once the session ends the card is frozen and stops refreshing. If a running state has no observable progress for more than 30 minutes, or a permission / AskUserQuestion wait state goes unanswered for more than 30 minutes, WalkCode sends Esc to interrupt it, marks the card as "Timeout interrupted", and posts a thread notice. This uses WalkCode's own recorded state and hook/progress events; it does not parse TUI footer wording, treat pane repaints as progress, or depend on tmux `window_activity`. Subagent/task lifecycle events refresh the timer only while the session is running; if the session is stopped on permission or AskUserQuestion, they do not move it back to running or reset the wait timeout. A single long-running tool call that exceeds the threshold without any WalkCode hook/progress event is intentionally treated as "no observable progress" and interrupted; raise `WALKCODE_STUCK_THRESHOLD` for long unattended tasks. The whole feature is on by default; set `WALKCODE_HEALTH_CARD=0` to disable the health card and automatic timeout interrupts.
 
 ### Security: Remote Start Permissions
 
@@ -516,7 +516,7 @@ When you start an agent from chat, WalkCode launches it with a controlled permis
 
 > If you set `WALKCODE_PERMISSION_FLAG` to a fully autonomous mode like `--yolo` (Codex) in an instance `.env`, the agent skips approvals and runs directly — no approval cards. Choose this according to your own trust boundary.
 
-If you don't respond within 30 minutes, WalkCode uses the unified watchdog to send Esc to the TUI and marks the wait as "Timeout interrupted". If the WalkCode server is unreachable or the hook itself crashes, the hook still fails open — it does not block the agent. The agent falls back to its own native terminal permission prompt, so "hook broken = same as no WalkCode installed" instead of leaving the Coding Agent stuck.
+If you don't respond within 30 minutes, WalkCode uses the unified watchdog to send Esc to the TUI and marks the wait as "Timeout interrupted". That visible interrupt applies to WalkCode remote-started sessions bound to a health-card thread; locally started sessions without a remote thread still rely on the hook's own fail-open behavior. If the WalkCode server is unreachable or the hook itself crashes, the hook still fails open — it does not block the agent. The agent falls back to its own native terminal permission prompt, so "hook broken = same as no WalkCode installed" instead of leaving the Coding Agent stuck.
 
 ## Usage
 
@@ -566,8 +566,8 @@ walkcode test-inject <tmux-session> "hi"  # Test injection
 | `WALKCODE_STATE_PATH` | No | Custom state file path (default: `~/.walkcode/state.json` for the main Claude instance, `~/.walkcode/<instance>-state.json` for others) |
 | `WALKCODE_PERMISSION_FLAG` | No | Replace the agent's default permission/approval flag, e.g. `--yolo` for Codex |
 | `WALKCODE_EXTRA_ARGS` | No | Extra launch flags inserted after the agent command, e.g. `--settings` to route Claude through Vertex |
-| `WALKCODE_HEALTH_CARD` | No | Session health card toggle; set `0` to disable (on by default) |
-| `WALKCODE_STUCK_THRESHOLD` | No | Seconds before auto-sending Esc for a running state with no progress, or an unanswered wait state (default: `1800`, 30 minutes) |
+| `WALKCODE_HEALTH_CARD` | No | Session health card and automatic timeout interrupt toggle; set `0` to disable (on by default) |
+| `WALKCODE_STUCK_THRESHOLD` | No | Seconds before auto-sending Esc for a running state with no progress, or an unanswered wait state (default: `1800`, 30 minutes). After changing it, rerun `walkcode install-hooks` for each instance and restart the service so agent hook timeouts stay aligned with the watchdog |
 | `WALKCODE_SUMMARY_VERTEX_PROJECT` | No | Vertex project for health-card title summarization (Codex sessions only; unset → first line as title) |
 | `WALKCODE_SUMMARY_VERTEX_REGION` | No | Vertex region (default: `global`) |
 | `WALKCODE_SUMMARY_SA_PATH` | No | Path to the Vertex service account JSON |

@@ -203,7 +203,7 @@ permanently suppress the warning.
 
 ## Hook Communication Protocol
 
-Claude Code hooks call `walkcode hook {stop|notification|permission-request|sync|user-prompt-submit}` which reads JSON from stdin and communicates with the WalkCode server.
+Claude Code hooks call `walkcode hook {stop|notification|permission-request|sync|user-prompt-submit|post-tool|subagent-start|subagent-stop|task-created|task-completed}` which reads JSON from stdin and communicates with the WalkCode server.
 
 ### Hook types
 
@@ -212,8 +212,37 @@ Claude Code hooks call `walkcode hook {stop|notification|permission-request|sync
 | `sync` | SessionStart | POST /hook/sync | None (mapping update only) | No |
 | `user-prompt-submit` | UserPromptSubmit | POST /hook/prompt | None (best-effort observation + busy state) | No |
 | `stop` | Stop | POST /hook | Plain text | No |
+| `post-tool` | PostToolUse | POST /hook/tool | None (progress / stale HITL cleanup) | No |
+| `subagent-start` / `subagent-stop` | SubagentStart / SubagentStop | POST /hook/progress | None (running progress only) | No |
+| `task-created` / `task-completed` | TaskCreated / TaskCompleted | POST /hook/progress | None (running progress only) | No |
 | `notification` | Notification (elicitation_dialog) | POST /hook | Plain text or interactive card (AskUserQuestion) | No |
 | `permission-request` | PermissionRequest | POST /hook/permission → poll GET /hook/permission/{rid}/decision | Interactive card with buttons | Yes (up to 30m) |
+
+### Session state model
+
+Persistent state has only two top-level values:
+
+- `status="running"`: the current turn is active. `running_since` is the
+  watchdog timer start and is refreshed only by explicit WalkCode hook/progress
+  events such as user prompt submit, post-tool, subagent, task, or a user action
+  that resumes a waiting turn.
+- `status="stopped"`: the current turn is not actively running. The reason lives
+  in `stop_reason`: `completed`, `permission_request`, `ask_user_question`,
+  `interrupted`, `agent_error`, `agent_exited`, or `unknown`.
+
+`timeout` is not a status. A timeout interruption is represented as
+`status="stopped"`, `stop_reason="interrupted"`, and
+`interrupt_reason="timeout"`. PermissionRequest and AskUserQuestion are stopped
+states from the user's point of view, but they keep `running_since` so the same
+watchdog can time them out if nobody responds.
+
+The watchdog deliberately does not parse the Claude/Codex footer, pane repaint
+noise, or tmux `window_activity`. A running session that exceeds
+`WALKCODE_STUCK_THRESHOLD` without any WalkCode hook/progress event is treated as
+having no observable progress and gets Esc. This is a product tradeoff: long
+single-tool jobs with no intermediate hook event need a larger threshold. Setting
+`WALKCODE_HEALTH_CARD=0` disables both the health card and this automatic
+timeout interrupt path.
 
 **Note on Notification subtypes:**
 - **elicitation_dialog** — When the notification carries an `AskUserQuestion` payload (with `question` and `options` fields), WalkCode sends an interactive card with option buttons instead of plain text. Supports multi-question flows: each question generates a card, the card auto-updates to the next question when answered, and all answers are returned together after the last question.
@@ -305,12 +334,20 @@ Note: Claude Code reads `settings.json` only at startup, so writing to it alone 
 {
   "hooks": {
     "SessionStart": [{"hooks": [{"type": "command", "command": "walkcode hook sync"}]}],
+    "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "walkcode hook user-prompt-submit"}]}],
     "Stop": [{"hooks": [{"type": "command", "command": "walkcode hook stop"}]}],
+    "SubagentStart": [{"hooks": [{"type": "command", "command": "walkcode hook subagent-start"}]}],
+    "SubagentStop": [{"hooks": [{"type": "command", "command": "walkcode hook subagent-stop"}]}],
+    "TaskCreated": [{"hooks": [{"type": "command", "command": "walkcode hook task-created"}]}],
+    "TaskCompleted": [{"hooks": [{"type": "command", "command": "walkcode hook task-completed"}]}],
     "Notification": [{"matcher": "elicitation_dialog", "hooks": [
       {"type": "command", "command": "walkcode hook notification"}
     ]}],
     "PermissionRequest": [{"matcher": "", "hooks": [
       {"type": "command", "command": "walkcode hook permission-request", "timeout": 2100000}
+    ]}],
+    "PostToolUse": [{"hooks": [
+      {"type": "command", "command": "walkcode hook post-tool"}
     ]}]
   }
 }
@@ -319,6 +356,9 @@ Note: Claude Code reads `settings.json` only at startup, so writing to it alone 
 The generated permission hook timeout follows `WALKCODE_STUCK_THRESHOLD` plus a
 short grace window, so the watchdog owns the visible timeout and the hook remains
 alive long enough to consume the watchdog's deny decision.
+Because hook timeout values are written into the agent's hook config at install
+time, changing `WALKCODE_STUCK_THRESHOLD` requires rerunning
+`walkcode install-hooks` for each instance and restarting the service.
 
 ---
 
