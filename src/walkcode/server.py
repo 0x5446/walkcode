@@ -39,7 +39,7 @@ from importlib.metadata import version as pkg_version
 from fastapi import FastAPI, Request
 
 from .agent import AgentAdapter, get_agent
-from .config import Config
+from .config import Config, DEFAULT_STUCK_THRESHOLD, parse_stuck_threshold
 from .i18n import t
 from .permreg import CardStatus, PermissionRegistry
 from .state import Session, SessionStore
@@ -66,7 +66,7 @@ _REAPER_INTERVAL = 600  # 10min — how often the idle reaper runs
 _WATCHDOG_INTERVAL = 120  # 2min — how often the stuck-turn watchdog scans
 # Interrupt a running/waiting state after this long with no observable progress.
 # Env-overridable for tuning without a code change.
-_STUCK_THRESHOLD = int(os.environ.get("WALKCODE_STUCK_THRESHOLD", "1800"))  # 30min
+_STUCK_THRESHOLD = parse_stuck_threshold(default=DEFAULT_STUCK_THRESHOLD)  # 30min
 
 
 # --- Permission request state ---
@@ -1559,7 +1559,7 @@ def _mark_session_tool_progress(session_id: str) -> bool:
         if (
             session is not None
             and session.status == "stopped"
-            and session.stop_reason not in _TIMEOUT_STOP_REASONS
+            and session.stop_reason not in _WAITING_STOP_REASONS
         ):
             return False
     _mark_session_busy(session_id)
@@ -2520,7 +2520,8 @@ async def get_permission_decision(request_id: str):
         if decision is not None:
             return {"status": "decided", "decision": decision}
         # decided set without a decision → the TUI handled it (PostToolUse invalidated
-        # the card). Tell the hook to fail-open instead of polling to the 1800s ceiling.
+        # the card). Tell the hook to fail-open instead of polling until its
+        # permission timeout ceiling.
         if registry.is_invalidated(request_id):
             return {"status": "invalidated"}
 
@@ -2657,7 +2658,8 @@ _stuck_lock = threading.Lock()
 # stale timer left in scrollback and read an idle pane as busy.
 _FOOTER_LINES = 6
 
-_TIMEOUT_STOP_REASONS = {"permission_request", "ask_user_question"}
+_WAITING_STOP_REASONS = {"permission_request", "ask_user_question"}
+_TERMINAL_HEALTH = {"done", "error", "timeout"}
 
 
 def _parse_working_seconds(pane: str) -> int | None:
@@ -2682,7 +2684,7 @@ def _running_started_at(session_id: str, session: Session, now: float | None = N
     if now is None:
         now = time.time()
     if session.status == "stopped":
-        if session.stop_reason not in _TIMEOUT_STOP_REASONS:
+        if session.stop_reason not in _WAITING_STOP_REASONS:
             return None
         return session.running_since or None
 
@@ -2857,7 +2859,7 @@ def _session_health(session_id: str, stats: SessionStats) -> str:
     if session:
         if session.stop_reason == "interrupted" and session.interrupt_reason == "timeout":
             return "timeout"
-        if session.status == "stopped" and session.stop_reason in _TIMEOUT_STOP_REASONS:
+        if session.status == "stopped" and session.stop_reason in _WAITING_STOP_REASONS:
             return "hitl"
         if session.status == "stopped":
             return "error" if session.stop_reason == "agent_error" or stats.last_error else "done"
@@ -2902,7 +2904,7 @@ def _build_health_card(stats: SessionStats, health: str, title: str, session_id:
                                  cache=_human_tokens(m.cache))})
     elif stats.source == "unavailable":
         elements.append({"tag": "markdown", "content": t('feishu.health.unavailable')})
-    frozen = health in ("done", "error", "timeout")
+    frozen = health in _TERMINAL_HEALTH
     foot = "feishu.health.footer_frozen" if frozen else "feishu.health.footer"
     elements.append({"tag": "note",
                      "elements": [{"tag": "plain_text",
@@ -3002,7 +3004,7 @@ def _refresh_health_card(
         if not _edit_card(session.health_card_id, card):
             session_store.set_health_card(session_id, "")
             return False
-        return health in ("done", "error", "timeout")
+        return health in _TERMINAL_HEALTH
     except Exception as e:
         logger.info("health card refresh failed for %s: %s", (session_id or "")[:8], e)
         return False
@@ -3050,8 +3052,9 @@ def _after_hook_delivered(session_id: str, hook_type: str, recent_turn: str = ""
 # --- Init ---
 
 def init(cfg: Config):
-    global config, lark_client, session_store, agent_adapter
+    global config, lark_client, session_store, agent_adapter, _STUCK_THRESHOLD
     config = cfg
+    _STUCK_THRESHOLD = cfg.stuck_threshold
     agent_adapter = get_agent(cfg.agent)
     lark_client = lark.Client.builder() \
         .app_id(cfg.feishu_app_id) \

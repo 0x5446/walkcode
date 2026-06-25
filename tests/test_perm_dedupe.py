@@ -203,7 +203,7 @@ class ReceivePermDedupeTests(unittest.TestCase):
     def test_post_tool_invalidates_session_cards(self):
         # End-to-end: an open permission card, then PostToolUse fires for the session
         # → the card is invalidated (edited grey) and the decision long-poll returns
-        # "invalidated" so the hook fails open instead of waiting to 1800s.
+        # "invalidated" so the hook fails open instead of waiting to its ceiling.
         edits = []
         with patch.object(server, "_edit_card", lambda mid, card: edits.append((mid, card))):
             rid = self._post(_perm_body(tool_use_id="tu-1"))["request_id"]

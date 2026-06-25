@@ -37,7 +37,8 @@ class Session:
     status: str = "running"         # "running" | "stopped"
     stop_reason: str = ""           # "" | completed | permission_request | ask_user_question | interrupted | agent_error | agent_exited | unknown
     interrupt_reason: str = ""      # "" | timeout | user
-    running_since: float = 0.0      # epoch seconds for the current timeout timer t0
+    # Timeout timer t0 for a running turn or a human-waiting stopped state.
+    running_since: float = 0.0
 
     @classmethod
     def from_dict(cls, data: dict) -> "Session":

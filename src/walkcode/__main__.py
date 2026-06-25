@@ -13,6 +13,7 @@ import tomllib
 import urllib.request
 from pathlib import Path
 
+from .config import DEFAULT_STUCK_THRESHOLD, parse_stuck_threshold
 from .i18n import t
 from .tty import detect_tmux_session, owner_check
 # Re-exported from stats so existing callers (and tests/test_stop_hook.py) keep
@@ -20,6 +21,7 @@ from .tty import detect_tmux_session, owner_check
 from .stats import _is_user_turn_start, _find_codex_rollout, _CODEX_SESSION_ID_RE  # noqa: F401
 
 _RUNTIME_DIR = Path.home() / ".walkcode"
+_PERMISSION_HOOK_GRACE_SECONDS = 300
 
 
 def _quick_load_env(keys: set[str]):
@@ -252,14 +254,18 @@ def _handle_permission_request(hook_data, port, tmux_session, cwd, session_id):
         print("[walkcode] no request_id from server, fail-open", file=sys.stderr)
         sys.exit(0)
 
-    # Poll for decision (long-poll, up to 30 minutes total). Long ceiling
+    # Poll for decision slightly longer than the watchdog threshold. The
+    # watchdog owns the user-visible timeout and sends Esc at the threshold; this
+    # hook stays alive long enough to receive the deny decision it writes.
+    poll_timeout = _permission_hook_timeout_seconds()
+    # Long ceiling
     # accommodates AskUserQuestion's Other / multiSelect flow where the user
     # may take many minutes typing custom text or selecting multiple options
-    # in Feishu before clicking Submit. Must stay <= the matching settings.json
-    # hook timeout (1_800_000 ms) — Claude Code kills the hook process at that
-    # external limit regardless of internal deadline.
+    # in Feishu before clicking Submit. Must stay <= the matching agent hook
+    # timeout — Claude/Codex kills the hook process at that external limit
+    # regardless of internal deadline.
     decision_url = f"http://127.0.0.1:{port}/hook/permission/{request_id}/decision"
-    deadline = _time.monotonic() + 1800
+    deadline = _time.monotonic() + poll_timeout
 
     agent_name = os.environ.get("WALKCODE_AGENT", "claude")
     agent = get_agent(agent_name)
@@ -309,7 +315,7 @@ def _handle_permission_request(hook_data, port, tmux_session, cwd, session_id):
 
     # Timeout: fail-open so agent falls back to its native prompt.
     # A 30-min Feishu silence is not the same as an explicit deny.
-    print("[walkcode] permission poll timed out after 1800s, fail-open", file=sys.stderr)
+    print(f"[walkcode] permission poll timed out after {poll_timeout}s, fail-open", file=sys.stderr)
     sys.exit(0)
 
 
@@ -746,6 +752,19 @@ def _read_env_file_values(path: str | None = None) -> dict[str, str]:
     return values
 
 
+def _stuck_threshold_seconds(file_values: dict[str, str] | None = None) -> int:
+    raw = os.environ.get("WALKCODE_STUCK_THRESHOLD")
+    if raw is None:
+        if file_values is None:
+            file_values = _read_env_file_values(os.environ.get("WALKCODE_ENV_FILE"))
+        raw = file_values.get("WALKCODE_STUCK_THRESHOLD")
+    return parse_stuck_threshold(raw, default=DEFAULT_STUCK_THRESHOLD)
+
+
+def _permission_hook_timeout_seconds(file_values: dict[str, str] | None = None) -> int:
+    return _stuck_threshold_seconds(file_values) + _PERMISSION_HOOK_GRACE_SECONDS
+
+
 def _install_claude_hooks(_args):
     """Install hooks into Claude Code settings.json."""
     settings_path = Path.home() / ".claude" / "settings.json"
@@ -754,6 +773,7 @@ def _install_claude_hooks(_args):
         sys.exit(1)
 
     settings = json.loads(settings_path.read_text())
+    permission_timeout = _permission_hook_timeout_seconds()
 
     def hook_cmd(hook_type: str, sound: str) -> str:
         return f"afplay /System/Library/Sounds/{sound}.aiff & walkcode hook {hook_type}"
@@ -786,7 +806,7 @@ def _install_claude_hooks(_args):
             {"type": "command", "command": hook_cmd("notification", "Ping")}
         ]}],
         "PermissionRequest": [{"matcher": "", "hooks": [
-            {"type": "command", "command": "afplay /System/Library/Sounds/Ping.aiff & walkcode hook permission-request", "timeout": 1800000}
+            {"type": "command", "command": "afplay /System/Library/Sounds/Ping.aiff & walkcode hook permission-request", "timeout": permission_timeout * 1000}
         ]}],
         # PostToolUse: a tool actually ran → invalidate this session's stale Feishu
         # permission cards (the TUI already settled them). No sound/timeout needed.
@@ -804,6 +824,7 @@ def _install_codex_hooks(_args):
     """Install hooks into Codex CLI hooks.json and enable feature flag."""
     env_file = os.environ.get("WALKCODE_ENV_FILE")
     file_values = _read_env_file_values(env_file)
+    permission_timeout = _permission_hook_timeout_seconds(file_values)
     port = (
         os.environ.get("WALKCODE_PORT")
         or file_values.get("WALKCODE_PORT")
@@ -840,7 +861,7 @@ def _install_codex_hooks(_args):
                 {"type": "command", "command": f"{env_prefix}walkcode hook subagent-stop", "timeout": 5}
             ]}],
             "PreToolUse": [{"matcher": "", "hooks": [
-                {"type": "command", "command": f"afplay /System/Library/Sounds/Ping.aiff & {env_prefix}walkcode hook permission-request", "timeout": 1800}
+                {"type": "command", "command": f"afplay /System/Library/Sounds/Ping.aiff & {env_prefix}walkcode hook permission-request", "timeout": permission_timeout}
             ]}],
         }
     }

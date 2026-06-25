@@ -17,7 +17,7 @@ Coding Agent (tmux) ──Hook──> WalkCode ──API──> Chat (thread)
 
 - 🔔 **Approve from your phone** — when the agent hits a permission prompt, your phone buzzes; tap "Allow" and it keeps going
 - 💬 **Drive it from your phone** — reply with text, images, or rich text and it goes straight into the agent's terminal
-- 🩺 **Session health card** — every session keeps a live status card at the top of its thread: Running / Waiting for you / Done, plus model, duration, message count, and token usage, refreshed every minute
+- 🩺 **Session health card** — every session keeps a live status card at the top of its thread: Running / Waiting for you / Done, plus model, duration, message count, and token usage, updated on key events
 - 🧵 **One thread = one session = one agent** — zero cross-talk; reply in a thread and it always reaches the right agent
 - 🚀 **Remote start + auto-resume** — send a message to spin up an agent in a fresh tmux; reply in an expired thread to resume it
 - 🤖 **Multiple agents in parallel** — run Claude Code and Codex CLI at the same time, each with its own Feishu bot
@@ -49,7 +49,7 @@ Your agent hits a permission prompt while you're away. Without WalkCode, it bloc
 - **Question answering** — AskUserQuestion interactive cards, each option shown with its description, with multi-question sequential flow, multiSelect, and custom text (Other) via thread reply
 - **Text replies** — reply in a thread to type directly into the agent's terminal; when the agent finishes a turn, the full turn (including multi-part output) is forwarded to you, not just the last chunk
 - **Image & rich text** — send images or rich text (text + images); images are auto-downloaded and passed to the agent
-- **Session health card** — every session keeps a live status card at the top of its thread, with status, model, duration, message count, and token usage (grouped by model), refreshed every minute and frozen once the session ends
+- **Session health card** — every session keeps a live status card at the top of its thread, with status, model, duration, message count, and token usage (grouped by model), updated on key events and frozen once the session ends
 - **Remote start** — send a message to start a new agent session from your phone
 - **Session resume** — reply in an expired thread to automatically resume the conversation
 - **Send while busy** — a message you send while the agent is busy is injected right away (queuing is left to the terminal/agent), with an emoji reaction to confirm delivery
@@ -492,7 +492,7 @@ Chat Thread C  <──1:1──>  tmux: walkcode-99999      <──1:1──>  C
 
 ### Session Health Card
 
-Every session keeps an interactive card at the top of its thread, refreshed every minute by a background poller, so you can see its status at a glance:
+Every session keeps an interactive card at the top of its thread. Remote replies, local input, permission approvals, and Stop results refresh it immediately, so you can see the session status at a glance:
 
 | Field | Content |
 |-------|---------|

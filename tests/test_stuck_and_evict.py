@@ -253,7 +253,7 @@ class StuckWatchdogTests(unittest.TestCase):
             for age in ages_min:
                 if age is None:
                     sess.running_since = 0.0
-                elif sess.status == "running" or sess.stop_reason in server._TIMEOUT_STOP_REASONS:
+                elif sess.status == "running" or sess.stop_reason in server._WAITING_STOP_REASONS:
                     sess.running_since = now["t"] - age * 60
                 server._check_stuck_sessions()
                 counts.append((len(interrupts), len(sent), len(refreshes), len(store.redeliveries)))

@@ -310,11 +310,15 @@ Note: Claude Code reads `settings.json` only at startup, so writing to it alone 
       {"type": "command", "command": "walkcode hook notification"}
     ]}],
     "PermissionRequest": [{"matcher": "", "hooks": [
-      {"type": "command", "command": "walkcode hook permission-request", "timeout": 1800000}
+      {"type": "command", "command": "walkcode hook permission-request", "timeout": 2100000}
     ]}]
   }
 }
 ```
+
+The generated permission hook timeout follows `WALKCODE_STUCK_THRESHOLD` plus a
+short grace window, so the watchdog owns the visible timeout and the hook remains
+alive long enough to consume the watchdog's deny decision.
 
 ---
 
@@ -479,4 +483,3 @@ def t(key: str, **kwargs) -> str:
 - **Logger messages stay English** — logs are for developers; mixing locales in log output hurts searchability.
 - **Shell scripts have their own i18n** — `install.sh` and `uninstall.sh` use `is_zh()` / `msg()` functions, not the Python module.
 - **No framework dependency** — the entire i18n system is a single file with zero external imports.
-

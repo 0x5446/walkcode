@@ -3,7 +3,7 @@ name: walkcode-release
 version: 1.0.0
 description: >
   WalkCode 发布与本地升级编排（带门禁，全自动）。先 release 再 upgrade：release =
-  bump 版本 + 跑测试 + /deep-review 过关(无 Critical) + 合并 main + 打 tag + 建 GitHub
+  bump 版本 + 跑测试 + deep-review skill 过关(无 Critical) + 合并 main + 打 tag + 建 GitHub
   Release；upgrade = walkcode upgrade + 重启并验证两个 launchd 实例。触发：发版、
   release、上线、ship、cut a release、升级 walkcode、部署 walkcode、bump 版本。
 metadata:
@@ -18,7 +18,7 @@ metadata:
 
 - **顺序不可换：先 release，再 upgrade**。`walkcode upgrade` 拉的是 GitHub **Release**（Releases API），所以必须先把改动合并进 `main` 并建好 Release，本地 upgrade 才拿得到新代码。
 - **账号必须是 `0x5446`**（脚本会校验 `gh` 当前账号）。
-- **门禁**：单测必须全绿、`/deep-review` 必须过且**无 Critical**，才能合并 PR。
+- **门禁**：单测必须全绿、deep-review skill 必须过且**无 Critical**，才能合并 PR。
   Review 门禁由 deep-review skill 执行；不要用普通 `codex review` / `claude review` 替代。
 - **tag 打在合并后的 `main`**，不在分支上发版。
 - **两个 launchd 实例**（claude `com.walkcode` + codex `com.walkcode-codex`）都要升、都要验。
