@@ -13,6 +13,7 @@ import tomllib
 import urllib.request
 from pathlib import Path
 
+from .config import DEFAULT_STUCK_THRESHOLD, parse_stuck_threshold
 from .i18n import t
 from .tty import detect_tmux_session, owner_check
 # Re-exported from stats so existing callers (and tests/test_stop_hook.py) keep
@@ -20,6 +21,7 @@ from .tty import detect_tmux_session, owner_check
 from .stats import _is_user_turn_start, _find_codex_rollout, _CODEX_SESSION_ID_RE  # noqa: F401
 
 _RUNTIME_DIR = Path.home() / ".walkcode"
+_PERMISSION_HOOK_GRACE_SECONDS = 300
 
 
 def _quick_load_env(keys: set[str]):
@@ -252,14 +254,17 @@ def _handle_permission_request(hook_data, port, tmux_session, cwd, session_id):
         print("[walkcode] no request_id from server, fail-open", file=sys.stderr)
         sys.exit(0)
 
-    # Poll for decision (long-poll, up to 30 minutes total). Long ceiling
-    # accommodates AskUserQuestion's Other / multiSelect flow where the user
-    # may take many minutes typing custom text or selecting multiple options
-    # in Feishu before clicking Submit. Must stay <= the matching settings.json
-    # hook timeout (1_800_000 ms) — Claude Code kills the hook process at that
-    # external limit regardless of internal deadline.
+    # Poll for decision slightly longer than the watchdog threshold. The
+    # watchdog owns the user-visible timeout and sends Esc at the threshold; this
+    # hook stays alive long enough to receive the deny decision it writes. The
+    # long ceiling accommodates AskUserQuestion's Other / multiSelect flow where
+    # the user may take many minutes typing custom text or selecting multiple
+    # options in Feishu before clicking Submit. Must stay <= the matching agent hook
+    # timeout — Claude/Codex kills the hook process at that external limit
+    # regardless of internal deadline.
+    poll_timeout = _permission_hook_timeout_seconds()
     decision_url = f"http://127.0.0.1:{port}/hook/permission/{request_id}/decision"
-    deadline = _time.monotonic() + 1800
+    deadline = _time.monotonic() + poll_timeout
 
     agent_name = os.environ.get("WALKCODE_AGENT", "claude")
     agent = get_agent(agent_name)
@@ -274,15 +279,13 @@ def _handle_permission_request(hook_data, port, tmux_session, cwd, session_id):
                 decision = result["decision"]
                 behavior = decision.get("behavior", "deny")
 
-                # AskUserQuestion: inject answers via PermissionRequest
-                # `updatedInput.answers` so Claude consumes them directly and
-                # skips its native TUI prompt entirely. The server has already
-                # collected answers from Feishu and packaged them in the
-                # decision payload as {questions, answers} ready to echo back.
+                # AskUserQuestion allow decisions need `updatedInput.answers` so
+                # Claude consumes Feishu answers directly. Deny decisions, including
+                # timeout, intentionally carry no updatedInput and must not fail-open.
                 updated_input = None
                 if tool_name == "AskUserQuestion":
                     updated_input = decision.get("updatedInput")
-                    if updated_input is None:
+                    if behavior != "deny" and updated_input is None:
                         # Server somehow didn't supply updated_input — fail-open
                         # so the agent falls back to its native prompt.
                         print("[walkcode] AskUserQuestion decision missing updatedInput, fail-open", file=sys.stderr)
@@ -309,9 +312,10 @@ def _handle_permission_request(hook_data, port, tmux_session, cwd, session_id):
             print(f"[walkcode] poll error: {e}", file=sys.stderr)
         _time.sleep(2)
 
-    # Timeout: fail-open so agent falls back to its native prompt.
-    # A 30-min Feishu silence is not the same as an explicit deny.
-    print("[walkcode] permission poll timed out after 1800s, fail-open", file=sys.stderr)
+    # Timeout here means the hook outlived the watchdog grace window without a
+    # server decision, so fail open and let the agent fall back to its native
+    # prompt instead of wedging the hook forever.
+    print(f"[walkcode] permission poll timed out after {poll_timeout}s, fail-open", file=sys.stderr)
     sys.exit(0)
 
 
@@ -589,6 +593,29 @@ def cmd_hook(args):
             print(f"[walkcode] post-tool hook failed (card invalidation skipped): {e}", file=sys.stderr)
         return
 
+    # --- Progress-only lifecycle events: refresh the parent turn timeout timer
+    # without creating Feishu thread noise. These are not terminal Stop events. ---
+    if args.hook_type in (
+        "subagent-start", "subagent-stop",
+        "task-created", "task-completed",
+    ):
+        payload = json.dumps({
+            "type": args.hook_type,
+            "tty": tmux_session,
+            "cwd": cwd,
+            "session_id": session_id,
+        }).encode()
+        try:
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{port}/hook/progress",
+                data=payload,
+                headers={"Content-Type": "application/json"},
+            )
+            urllib.request.urlopen(req, timeout=2)
+        except Exception as e:
+            print(t("hook.failed", error=e), file=sys.stderr)
+        return
+
     # DEBUG: dump full hook_data to file for analysis
     try:
         import datetime as _dt
@@ -725,6 +752,19 @@ def _read_env_file_values(path: str | None = None) -> dict[str, str]:
     return values
 
 
+def _stuck_threshold_seconds(file_values: dict[str, str] | None = None) -> int:
+    raw = os.environ.get("WALKCODE_STUCK_THRESHOLD")
+    if raw is None:
+        if file_values is None:
+            file_values = _read_env_file_values(os.environ.get("WALKCODE_ENV_FILE"))
+        raw = file_values.get("WALKCODE_STUCK_THRESHOLD")
+    return parse_stuck_threshold(raw, default=DEFAULT_STUCK_THRESHOLD)
+
+
+def _permission_hook_timeout_seconds(file_values: dict[str, str] | None = None) -> int:
+    return _stuck_threshold_seconds(file_values) + _PERMISSION_HOOK_GRACE_SECONDS
+
+
 def _install_claude_hooks(_args):
     """Install hooks into Claude Code settings.json."""
     settings_path = Path.home() / ".claude" / "settings.json"
@@ -733,6 +773,7 @@ def _install_claude_hooks(_args):
         sys.exit(1)
 
     settings = json.loads(settings_path.read_text())
+    permission_timeout = _permission_hook_timeout_seconds()
 
     def hook_cmd(hook_type: str, sound: str) -> str:
         return f"afplay /System/Library/Sounds/{sound}.aiff & walkcode hook {hook_type}"
@@ -747,11 +788,25 @@ def _install_claude_hooks(_args):
         "Stop": [{"matcher": "", "hooks": [
             {"type": "command", "command": hook_cmd("stop", "Hero")}
         ]}],
+        # Subagent activity is progress inside the parent turn. Do not route it
+        # through the Stop hook path or it would freeze the parent health card.
+        "SubagentStart": [{"matcher": "", "hooks": [
+            {"type": "command", "command": "walkcode hook subagent-start"}
+        ]}],
+        "SubagentStop": [{"matcher": "", "hooks": [
+            {"type": "command", "command": "walkcode hook subagent-stop"}
+        ]}],
+        "TaskCreated": [{"matcher": "", "hooks": [
+            {"type": "command", "command": "walkcode hook task-created"}
+        ]}],
+        "TaskCompleted": [{"matcher": "", "hooks": [
+            {"type": "command", "command": "walkcode hook task-completed"}
+        ]}],
         "Notification": [{"matcher": "elicitation_dialog", "hooks": [
             {"type": "command", "command": hook_cmd("notification", "Ping")}
         ]}],
         "PermissionRequest": [{"matcher": "", "hooks": [
-            {"type": "command", "command": "afplay /System/Library/Sounds/Ping.aiff & walkcode hook permission-request", "timeout": 1800000}
+            {"type": "command", "command": "afplay /System/Library/Sounds/Ping.aiff & walkcode hook permission-request", "timeout": permission_timeout * 1000}
         ]}],
         # PostToolUse: a tool actually ran → invalidate this session's stale Feishu
         # permission cards (the TUI already settled them). No sound/timeout needed.
@@ -769,6 +824,7 @@ def _install_codex_hooks(_args):
     """Install hooks into Codex CLI hooks.json and enable feature flag."""
     env_file = os.environ.get("WALKCODE_ENV_FILE")
     file_values = _read_env_file_values(env_file)
+    permission_timeout = _permission_hook_timeout_seconds(file_values)
     port = (
         os.environ.get("WALKCODE_PORT")
         or file_values.get("WALKCODE_PORT")
@@ -798,8 +854,14 @@ def _install_codex_hooks(_args):
             "Stop": [{"matcher": "", "hooks": [
                 {"type": "command", "command": hook_cmd("stop", "Hero")}
             ]}],
+            "SubagentStart": [{"matcher": "", "hooks": [
+                {"type": "command", "command": f"{env_prefix}walkcode hook subagent-start", "timeout": 5}
+            ]}],
+            "SubagentStop": [{"matcher": "", "hooks": [
+                {"type": "command", "command": f"{env_prefix}walkcode hook subagent-stop", "timeout": 5}
+            ]}],
             "PreToolUse": [{"matcher": "", "hooks": [
-                {"type": "command", "command": f"afplay /System/Library/Sounds/Ping.aiff & {env_prefix}walkcode hook permission-request", "timeout": 1800}
+                {"type": "command", "command": f"afplay /System/Library/Sounds/Ping.aiff & {env_prefix}walkcode hook permission-request", "timeout": permission_timeout}
             ]}],
         }
     }
@@ -1141,7 +1203,15 @@ def main():
     sub.add_parser("status", help="Check if server is running")
 
     hp = sub.add_parser("hook", help="Handle an agent hook event (reads stdin)")
-    hp.add_argument("hook_type", choices=["stop", "notification", "permission-request", "sync", "user-prompt-submit", "post-tool"], help="Hook event type")
+    hp.add_argument(
+        "hook_type",
+        choices=[
+            "stop", "notification", "permission-request", "sync",
+            "user-prompt-submit", "post-tool", "subagent-start",
+            "subagent-stop", "task-created", "task-completed",
+        ],
+        help="Hook event type",
+    )
 
     ihp = sub.add_parser("install-hooks", help="Install agent hooks")
     ihp.add_argument("--agent", choices=["claude", "codex"], default=None, help="Agent type (default: from WALKCODE_AGENT or claude)")

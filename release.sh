@@ -6,7 +6,7 @@ set -euo pipefail
 #
 #   release.sh prepare [VERSION] [-m MSG] [--dry-run]
 #       bump pyproject version, run tests, branch release/vX.Y.Z, commit, push, open PR
-#   ... run /deep-review, merge the PR, then on main ...
+#   ... run the deep-review skill, merge the PR, then on main ...
 #   release.sh publish [VERSION] [--dry-run]
 #       tag the merged main and create the GitHub Release (--latest)
 #
@@ -143,8 +143,8 @@ $untracked")"
   run gh pr create --base main --head "$branch" --title "$pr_msg" \
         --body "$(printf 'Release v%s\n\n🤖 prepared by release.sh' "$version")"
 
-  info "$(msg "PR opened. Next: run /deep-review, merge the PR, then:" \
-              "PR 已创建。下一步：跑 /deep-review，合并 PR，然后：")"
+  info "$(msg "PR opened. Next: run the deep-review skill, merge the PR, then:" \
+              "PR 已创建。下一步：跑 deep-review skill，合并 PR，然后：")"
   echo "    git checkout main && git pull --ff-only"
   echo "    ./release.sh publish $version"
 }
@@ -248,7 +248,7 @@ Usage:
   ./release.sh publish [VERSION] [--dry-run]            tag merged main + create GitHub Release
 
 VERSION defaults to a patch bump of pyproject.toml ($(pyproject_version)).
-Merge the PR (after /deep-review) between prepare and publish — that is the gate.
+Merge the PR (after the deep-review skill) between prepare and publish — that is the gate.
 EOF
 }
 

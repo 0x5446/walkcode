@@ -6,6 +6,7 @@ from .i18n import t
 
 
 DEFAULT_OPENAPI_DOMAIN = "https://open.feishu.cn"
+DEFAULT_STUCK_THRESHOLD = 1800
 
 
 def _load_env_file(env_file: Path):
@@ -21,6 +22,15 @@ def _load_env_file(env_file: Path):
             k = key.strip()
             if k not in os.environ:
                 os.environ[k] = value.strip()
+
+
+def parse_stuck_threshold(raw: str | None = None, default: int = DEFAULT_STUCK_THRESHOLD) -> int:
+    """Return a positive watchdog threshold in seconds."""
+    try:
+        value = int(raw if raw is not None else os.environ.get("WALKCODE_STUCK_THRESHOLD", str(default)))
+    except (TypeError, ValueError):
+        return default
+    return value if value > 0 else default
 
 
 @dataclass
@@ -42,6 +52,7 @@ class Config:
     summary_sa_path: str = ""
     summary_model: str = "claude-haiku-4-5"
     summary_timeout: float = 8.0
+    stuck_threshold: int = DEFAULT_STUCK_THRESHOLD
 
     @property
     def summary_enabled(self) -> bool:
@@ -111,4 +122,5 @@ class Config:
             summary_sa_path=os.environ.get("WALKCODE_SUMMARY_SA_PATH", ""),
             summary_model=os.environ.get("WALKCODE_SUMMARY_MODEL", "claude-haiku-4-5"),
             summary_timeout=summary_timeout,
+            stuck_threshold=parse_stuck_threshold(),
         )

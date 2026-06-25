@@ -158,6 +158,7 @@ class ReceiveHookDedupeTests(unittest.TestCase):
             server._recent_hook_keys.clear()
         with server._pending_lock:
             server._session_last_stop.clear()
+            server._session_last_ups.clear()
 
         self.replies = []          # (message_id, text)
         self._reply_results = []   # successive results: str → sent w/ that id;
@@ -184,6 +185,17 @@ class ReceiveHookDedupeTests(unittest.TestCase):
         self.assertEqual(len(self.replies), 1)
         self.assertFalse(r1.get("deduped", False))
         self.assertTrue(r2.get("deduped"))
+
+    def test_delayed_duplicate_stop_does_not_clear_new_running_turn(self):
+        self._post(_stop_body(turn_id="turn-A"))
+        server._mark_session_busy("s1")
+
+        r2 = self._post(_stop_body(turn_id="turn-A"))
+
+        self.assertTrue(r2.get("deduped"))
+        sess = server.session_store.get("s1")
+        self.assertEqual(sess.status, "running")
+        self.assertGreater(sess.running_since, 0.0)
 
     def test_distinct_turns_send_two_replies(self):
         self._post(_stop_body(turn_id="turn-A"))
@@ -512,6 +524,24 @@ class CmdHookTurnIdForwardingTests(unittest.TestCase):
             "session_id": "s1", "last_assistant_message": "done", "cwd": "/tmp",
         })
         self.assertEqual(cap["body"]["turn_id"], "")
+
+    def test_subagent_event_posts_progress_only(self):
+        cap = self._run("subagent-stop", {
+            "session_id": "s1", "cwd": "/tmp",
+        })
+        self.assertEqual(cap["url"], "http://127.0.0.1:3999/hook/progress")
+        self.assertEqual(cap["body"]["type"], "subagent-stop")
+        self.assertEqual(cap["body"]["session_id"], "s1")
+        self.assertNotIn("message", cap["body"])
+
+    def test_task_event_posts_progress_only(self):
+        cap = self._run("task-completed", {
+            "session_id": "s1", "cwd": "/tmp",
+        })
+        self.assertEqual(cap["url"], "http://127.0.0.1:3999/hook/progress")
+        self.assertEqual(cap["body"]["type"], "task-completed")
+        self.assertEqual(cap["body"]["session_id"], "s1")
+        self.assertNotIn("message", cap["body"])
 
 
 class CmdHookStopMessageTests(unittest.TestCase):

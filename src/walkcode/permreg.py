@@ -70,6 +70,7 @@ class PermissionRequest:
     card_msg_id: str = ""  # feishu card message id, for _edit_card on invalidation
     # decision side — `decision` is the final, write-once verdict
     decision: dict | None = None
+    decided_at: float | None = None
     # invalidation — TUI handled this request (PostToolUse) → card no longer actionable
     invalidated_at: float | None = None
     # AskUserQuestion accumulation (mutable mid-flight, distinct from `decision`)
@@ -130,6 +131,9 @@ class PermissionRegistry:
         for rid, req in self._by_rid.items():
             if req.consumed_at is not None and now - req.consumed_at > self._grace:
                 dead.append(rid)  # decision read; keep GRACE for a 2nd poller, then drop
+            elif (req.decision is not None and req.consumed_at is None
+                  and now - (req.decided_at or req.created_at) > self._ttl):
+                dead.append(rid)  # decision written but hook died before consuming it
             elif req.invalidated_at is not None and now - req.invalidated_at > self._grace:
                 dead.append(rid)  # TUI handled it; keep GRACE so a late click reads "expired"
             elif (req.decision is None and req.invalidated_at is None
@@ -208,6 +212,7 @@ class PermissionRegistry:
             if req is None or req.decision is not None or req.invalidated_at is not None:
                 return False
             req.decision = decision
+            req.decided_at = self._now()
             req.decided.set()
             return True
 
@@ -237,6 +242,28 @@ class PermissionRegistry:
                     # as this (now-settled) question's answer (deep-review ISSUE_3).
                     req.awaiting_other = None
                     req.decided.set()  # wake a hook parked in decided.wait()
+                    snaps.append(req.snapshot())
+        return snaps
+
+    def timeout_session(self, session_id: str) -> list[dict]:
+        """Deny every still-open request of `session_id` because WalkCode timed out.
+
+        This is deliberately separate from invalidation. Invalidation means the TUI
+        already handled the request, so the hook client fail-opens and lets that
+        terminal decision stand. Timeout means WalkCode is actively interrupting the
+        waiting state, so any still-polling hook must receive an explicit deny.
+        """
+        if not session_id:
+            return []
+        snaps = []
+        with self._lock:
+            for req in self._by_rid.values():
+                if (req.session_id == session_id and req.decision is None
+                        and req.invalidated_at is None):
+                    req.decision = {"behavior": "deny", "_reason": "timeout"}
+                    req.decided_at = self._now()
+                    req.awaiting_other = None
+                    req.decided.set()
                     snaps.append(req.snapshot())
         return snaps
 

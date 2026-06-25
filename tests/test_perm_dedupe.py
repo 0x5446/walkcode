@@ -78,6 +78,10 @@ class ReceivePermDedupeTests(unittest.TestCase):
         self._orig_config = server.config
         self._orig_store = server.session_store
         self._orig_registry = server.registry
+        self._orig_last_stop = dict(server._session_last_stop)
+        self._orig_last_ups = dict(server._session_last_ups)
+        server._session_last_stop.clear()
+        server._session_last_ups.clear()
         server.config = Config(
             feishu_app_id="x", feishu_app_secret="y",
             feishu_receive_id="", feishu_receive_id_type="open_id",
@@ -94,6 +98,10 @@ class ReceivePermDedupeTests(unittest.TestCase):
             server.config = self._orig_config
             server.session_store = self._orig_store
             server.registry = self._orig_registry
+            server._session_last_stop.clear()
+            server._session_last_stop.update(self._orig_last_stop)
+            server._session_last_ups.clear()
+            server._session_last_ups.update(self._orig_last_ups)
         self.addCleanup(_restore)
 
         self.cards = []
@@ -125,6 +133,14 @@ class ReceivePermDedupeTests(unittest.TestCase):
             self._post(_perm_body(tool_use_id="tu-1"))
 
         self.assertEqual(calls, [("s1", {})])
+
+    def test_permission_card_marks_session_waiting(self):
+        res = self._post(_perm_body(tool_use_id="tu-wait"))
+        self.assertTrue(res["ok"])
+        sess = server.session_store.get("s1")
+        self.assertEqual(sess.status, "stopped")
+        self.assertEqual(sess.stop_reason, "permission_request")
+        self.assertGreater(sess.running_since, 0.0)
 
     def test_distinct_tool_use_ids_two_cards(self):
         self._post(_perm_body(tool_use_id="tu-1"))
@@ -187,7 +203,7 @@ class ReceivePermDedupeTests(unittest.TestCase):
     def test_post_tool_invalidates_session_cards(self):
         # End-to-end: an open permission card, then PostToolUse fires for the session
         # → the card is invalidated (edited grey) and the decision long-poll returns
-        # "invalidated" so the hook fails open instead of waiting to 1800s.
+        # "invalidated" so the hook fails open instead of waiting to its ceiling.
         edits = []
         with patch.object(server, "_edit_card", lambda mid, card: edits.append((mid, card))):
             rid = self._post(_perm_body(tool_use_id="tu-1"))["request_id"]
@@ -198,6 +214,17 @@ class ReceivePermDedupeTests(unittest.TestCase):
         self.assertTrue(server.registry.is_invalidated(rid))
         dec = asyncio.run(server.get_permission_decision(rid))
         self.assertEqual(dec["status"], "invalidated")
+        self.assertEqual(server.session_store.get("s1").status, "running")
+
+    def test_late_post_tool_does_not_reopen_timeout_session(self):
+        server.session_store.set_stopped("s1", "interrupted", interrupt_reason="timeout")
+        res = asyncio.run(server.receive_post_tool_hook(_Req({"session_id": "s1"})))
+        self.assertEqual(res["invalidated"], 0)
+        sess = server.session_store.get("s1")
+        self.assertEqual(sess.status, "stopped")
+        self.assertEqual(sess.stop_reason, "interrupted")
+        self.assertEqual(sess.interrupt_reason, "timeout")
+        self.assertEqual(sess.running_since, 0.0)
 
     def test_post_tool_askuser_renders_answers(self):
         # TUI answered an AskUserQuestion → PostToolUse carries the chosen answers
@@ -408,6 +435,37 @@ class HandlePermissionForwardingTests(unittest.TestCase):
         self.assertEqual(cm.exception.code, 0)
         self.assertEqual(captured["body"]["tool_name"], "AskUserQuestion")
         self.assertEqual(captured["body"]["tool_input"], hook_data["tool_input"])
+
+    def test_askuserquestion_deny_without_updated_input_does_not_fail_open(self):
+        calls = [0]
+        stdout = io.StringIO()
+
+        def fake_urlopen(req, timeout=None):
+            calls[0] += 1
+            if calls[0] == 1:  # POST /hook/permission
+                return self._resp({"request_id": "rid-ask"})
+            return self._resp({
+                "status": "decided",
+                "decision": {"behavior": "deny", "_reason": "timeout"},
+            })
+
+        hook_data = {
+            "tool_name": "AskUserQuestion",
+            "tool_input": {"questions": [{"question": "继续吗？"}]},
+            "permission_mode": "default",
+        }
+        with patch.object(m.urllib.request, "urlopen", fake_urlopen), \
+             patch.dict(os.environ, {"WALKCODE_AGENT": "claude"}, clear=False), \
+             patch("sys.stdout", stdout):
+            with self.assertRaises(SystemExit) as cm:
+                m._handle_permission_request(hook_data, 3999, "tmux1", "/tmp/proj", "s1")
+
+        self.assertEqual(cm.exception.code, 2)
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(
+            payload["hookSpecificOutput"]["decision"],
+            {"behavior": "deny"},
+        )
 
 
 if __name__ == "__main__":

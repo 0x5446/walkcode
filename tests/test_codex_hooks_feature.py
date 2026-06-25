@@ -10,6 +10,7 @@ adding the feature flag. These tests pin that the installer writes the current
 flag and is not fooled by `[hooks.state]`.
 """
 
+import json
 import tomllib
 import unittest
 from pathlib import Path
@@ -125,6 +126,92 @@ class EnsureCodexHooksFeatureTests(unittest.TestCase):
                 m._ensure_codex_hooks_feature(p)
             self.assertEqual(p.read_text(), initial)  # unchanged
             self.assertIn("skipped enabling codex hooks", err.getvalue())
+
+
+class InstallClaudeHooksTests(unittest.TestCase):
+    def test_installs_subagent_progress_hooks(self):
+        with TemporaryDirectory() as d:
+            home = Path(d)
+            settings_path = home / ".claude" / "settings.json"
+            settings_path.parent.mkdir()
+            settings_path.write_text("{}")
+
+            with patch.object(m.Path, "home", return_value=home), \
+                 patch.dict("os.environ", {}, clear=True):
+                m._install_claude_hooks(None)
+
+            hooks = json.loads(settings_path.read_text())["hooks"]
+            self.assertEqual(
+                hooks["SubagentStart"][0]["hooks"][0]["command"],
+                "walkcode hook subagent-start",
+            )
+            self.assertEqual(
+                hooks["SubagentStop"][0]["hooks"][0]["command"],
+                "walkcode hook subagent-stop",
+            )
+            self.assertEqual(
+                hooks["TaskCreated"][0]["hooks"][0]["command"],
+                "walkcode hook task-created",
+            )
+            self.assertEqual(
+                hooks["TaskCompleted"][0]["hooks"][0]["command"],
+                "walkcode hook task-completed",
+            )
+            self.assertEqual(
+                hooks["PermissionRequest"][0]["hooks"][0]["timeout"],
+                2_100_000,
+            )
+
+    def test_permission_hook_timeout_follows_stuck_threshold(self):
+        with TemporaryDirectory() as d:
+            home = Path(d)
+            settings_path = home / ".claude" / "settings.json"
+            settings_path.parent.mkdir()
+            settings_path.write_text("{}")
+
+            with patch.object(m.Path, "home", return_value=home), \
+                 patch.dict("os.environ", {"WALKCODE_STUCK_THRESHOLD": "60"}, clear=True):
+                m._install_claude_hooks(None)
+
+            hooks = json.loads(settings_path.read_text())["hooks"]
+            self.assertEqual(
+                hooks["PermissionRequest"][0]["hooks"][0]["timeout"],
+                360_000,
+            )
+
+
+class InstallCodexHooksTests(unittest.TestCase):
+    def test_installs_subagent_progress_hooks(self):
+        with TemporaryDirectory() as d:
+            home = Path(d)
+
+            with patch.object(m.Path, "home", return_value=home), \
+                 patch.dict("os.environ", {}, clear=True):
+                m._install_codex_hooks(None)
+
+            hooks = json.loads((home / ".codex" / "hooks.json").read_text())["hooks"]
+            self.assertEqual(
+                hooks["SubagentStart"][0]["hooks"][0]["command"],
+                "WALKCODE_AGENT=codex WALKCODE_PORT=3001 walkcode hook subagent-start",
+            )
+            self.assertEqual(
+                hooks["SubagentStop"][0]["hooks"][0]["command"],
+                "WALKCODE_AGENT=codex WALKCODE_PORT=3001 walkcode hook subagent-stop",
+            )
+            self.assertEqual(hooks["PreToolUse"][0]["hooks"][0]["timeout"], 2100)
+
+    def test_permission_hook_timeout_follows_env_file(self):
+        with TemporaryDirectory() as d:
+            home = Path(d)
+            env_file = home / "codex.env"
+            env_file.write_text("WALKCODE_STUCK_THRESHOLD=90\n")
+
+            with patch.object(m.Path, "home", return_value=home), \
+                 patch.dict("os.environ", {"WALKCODE_ENV_FILE": str(env_file)}, clear=True):
+                m._install_codex_hooks(None)
+
+            hooks = json.loads((home / ".codex" / "hooks.json").read_text())["hooks"]
+            self.assertEqual(hooks["PreToolUse"][0]["hooks"][0]["timeout"], 390)
 
 
 if __name__ == "__main__":

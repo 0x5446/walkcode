@@ -173,6 +173,15 @@ class GcTests(unittest.TestCase):
         reg.gc()
         self.assertIsNone(reg.get(a.rid))
 
+    def test_unconsumed_decision_reaps_after_ttl(self):
+        clock = _Clock(1000.0)
+        reg = PermissionRegistry(now=clock, ttl=90.0)
+        a, _ = reg.register_or_get(("s", "t1"))
+        reg.set_decision_once(a.rid, {"behavior": "allow"})
+        clock.t = 1000.0 + 91
+        reg.gc()
+        self.assertIsNone(reg.get(a.rid))
+
     def test_ttl_reaps_undrained_codex_request(self):
         clock = _Clock(1000.0)
         reg = PermissionRegistry(now=clock, ttl=90.0)
@@ -285,6 +294,36 @@ class InvalidationTests(unittest.TestCase):
         reg.fill_request(a.rid, session_id="s1")
         reg.invalidate_session("s1")
         clock.t = 1000.0 + 6
+        reg.gc()
+        self.assertIsNone(reg.get(a.rid))
+
+    def test_timeout_session_sets_deny_decision_and_wakes(self):
+        reg = PermissionRegistry(now=_Clock(1000.0))
+        a, _ = reg.register_or_get(None)
+        reg.fill_request(a.rid, session_id="s1", card_msg_id="c1")
+        snaps = reg.timeout_session("s1")
+        self.assertEqual(len(snaps), 1)
+        self.assertEqual(snaps[0]["card_msg_id"], "c1")
+        self.assertFalse(reg.is_invalidated(a.rid))
+        self.assertTrue(a.decided.is_set())
+        self.assertEqual(reg.try_consume(a.rid), {"behavior": "deny", "_reason": "timeout"})
+
+    def test_timeout_session_is_write_once(self):
+        reg = PermissionRegistry(now=_Clock(1000.0))
+        a, _ = reg.register_or_get(None)
+        reg.fill_request(a.rid, session_id="s1")
+        self.assertEqual(len(reg.timeout_session("s1")), 1)
+        self.assertEqual(len(reg.timeout_session("s1")), 0)
+        self.assertFalse(reg.set_decision_once(a.rid, {"behavior": "allow"}))
+        self.assertEqual(reg.get(a.rid).decision, {"behavior": "deny", "_reason": "timeout"})
+
+    def test_timeout_decision_reaps_after_ttl_if_hook_never_consumes(self):
+        clock = _Clock(1000.0)
+        reg = PermissionRegistry(now=clock, ttl=90.0)
+        a, _ = reg.register_or_get(None)
+        reg.fill_request(a.rid, session_id="s1")
+        reg.timeout_session("s1")
+        clock.t = 1000.0 + 91
         reg.gc()
         self.assertIsNone(reg.get(a.rid))
 

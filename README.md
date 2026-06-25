@@ -505,13 +505,14 @@ WalkCode 的核心设计：**1 个聊天话题 = 1 个 tmux 会话 = 1 个 Codin
 
 | 字段 | 内容 |
 |------|------|
-| 状态 | 🟢 进行中 / 🟠 等待确认 / ✅ 已完成 / 🔴 出错（卡片颜色随状态变化） |
+| 状态 | 🟢 进行中 / 🟠 等待确认 / ✅ 已完成 / 🔴 出错 / ⏱️ 超时已中断（卡片颜色随状态变化） |
+| Session | 当前会话 ID |
 | 模型 | 当前会话使用的模型 |
 | 时长 | 会话已运行时间 |
 | 输入 | 你发出的消息条数 |
 | Token | 累计 Token 用量（按模型分组） |
 
-话题标题会自动用任务摘要命名（Claude 用自带 AI 标题；Codex 可选用 Haiku 在 Stop 后异步精炼，见配置项）。每个 Stop 后卡片会刷新并冻结；如果你继续在话题里回复，卡片会重新进入进行中状态。整个功能默认开启，`WALKCODE_HEALTH_CARD=0` 可关闭。
+话题标题会自动用任务摘要命名（Claude 用自带 AI 标题；Codex 可选用 Haiku 在 Stop 后异步精炼，见配置项）。每个 Stop 后卡片会刷新并冻结；如果你继续在话题里回复，卡片会重新进入进行中状态。进行中状态超过 30 分钟没有可观测进展，或权限确认 / AskUserQuestion 等等待状态超过 30 分钟没有用户处理时，WalkCode 会向 TUI 发送 Esc 中断，把卡片标为「超时已中断」，并在话题里发提醒；判断基于 WalkCode 自己记录的状态和 hook/progress 事件，不解析 TUI 底部文案，不把 pane 重绘当作进展，也不依赖 tmux `window_activity`。Subagent / task 生命周期事件只会刷新 running 的计时器；如果当前卡在权限确认或 AskUserQuestion，它们不会把等待态改回 running，也不会重置等待超时。一个单独运行超过阈值、期间没有任何 WalkCode hook/progress 事件的长工具调用，会被按“无可观测进展”处理并中断；Codex 当前比 Claude 少 UserPromptSubmit / PostToolUse 这类进度信号，`--yolo` 或受信任工具还会跳过审批 hook，因此长时间无人值守的 Codex 轮次建议显式调大 `WALKCODE_STUCK_THRESHOLD`。整个功能默认开启，`WALKCODE_HEALTH_CARD=0` 可关闭健康卡片和自动超时中断。
 
 ### 安全设计：远程启动的权限控制
 
@@ -524,7 +525,7 @@ WalkCode 的核心设计：**1 个聊天话题 = 1 个 tmux 会话 = 1 个 Codin
 
 > 如果你在实例 `.env` 里把 `WALKCODE_PERMISSION_FLAG` 设成 `--yolo`（Codex）这类完全自动的模式，Agent 会跳过审批直接执行，不再发审批卡片——请按自己的信任边界选择。
 
-如果 30 分钟内未响应，或 WalkCode 服务端不可达、Hook 本身异常，**Hook 会 fail-open**（不阻塞 Agent），退回到 Agent 自身的原生终端权限提示。这样「Hook 挂了 = 你回到没装 WalkCode 的状态」，不会把 Coding Agent 整个卡死。
+如果 30 分钟内未响应，WalkCode 会按统一 watchdog 逻辑向 TUI 发送 Esc，并把这次等待标记为「超时已中断」。这个可见中断只适用于 WalkCode 远程启动并绑定健康卡片的会话；本地手动启动的会话没有可中断的远程话题根，会继续依赖 Hook 自身的 fail-open 行为。如果 WalkCode 服务端不可达、Hook 本身异常，Hook 仍会 fail-open（不阻塞 Agent），退回到 Agent 自身的原生终端权限提示。这样「Hook 挂了 = 你回到没装 WalkCode 的状态」，不会把 Coding Agent 整个卡死。
 
 ## 使用方式
 
@@ -574,7 +575,8 @@ walkcode test-inject <tmux-session> "hi"  # 测试注入
 | `WALKCODE_STATE_PATH` | 否 | 自定义状态文件路径（默认：Claude 主实例 `~/.walkcode/state.json`，其他实例 `~/.walkcode/<实例名>-state.json`） |
 | `WALKCODE_PERMISSION_FLAG` | 否 | 替换 Agent 默认权限/审批 flag，如 Codex 设 `--yolo` |
 | `WALKCODE_EXTRA_ARGS` | 否 | 在 Agent 命令后插入额外启动参数，如 Claude 走 Vertex 的 `--settings` |
-| `WALKCODE_HEALTH_CARD` | 否 | 会话健康卡片开关，设 `0` 关闭（默认开启） |
+| `WALKCODE_HEALTH_CARD` | 否 | 会话健康卡片和自动超时中断开关，设 `0` 关闭（默认开启） |
+| `WALKCODE_STUCK_THRESHOLD` | 否 | 进行中无进展或等待确认未处理时自动发送 Esc 中断的秒数（默认 `1800`，即 30 分钟）。修改后需重新运行 `walkcode install-hooks`（多实例分别安装）并重启服务，让 Agent hook 的外部超时与 watchdog 对齐 |
 | `WALKCODE_SUMMARY_VERTEX_PROJECT` | 否 | 健康卡片标题精炼用的 Vertex 项目（仅 Codex 会话；不设则用首行作标题） |
 | `WALKCODE_SUMMARY_VERTEX_REGION` | 否 | Vertex 区域（默认 `global`） |
 | `WALKCODE_SUMMARY_SA_PATH` | 否 | Vertex service account JSON 路径 |

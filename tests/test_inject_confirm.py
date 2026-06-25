@@ -7,6 +7,7 @@ observation, so missing or late hooks must not create user-visible queued or
 swallowed notices.
 """
 
+import asyncio
 import json
 import time
 import types
@@ -80,6 +81,47 @@ class InjectConfirmTests(unittest.TestCase):
         server._mark_session_idle("s")
         self.assertFalse(server._is_session_busy("s"))
 
+    def test_progress_hook_marks_session_busy(self):
+        class _Req:
+            async def json(self):
+                return {"type": "subagent-stop", "session_id": "s", "tty": "tmux1"}
+
+        busy = []
+        refreshes = []
+        with patch.object(server, "_mark_session_progress", lambda sid: busy.append(sid) or True), \
+             patch.object(server, "_refresh_health_card_for_event",
+                          lambda sid, **kw: refreshes.append((sid, kw)) or False):
+            res = asyncio.run(server.receive_progress_hook(_Req()))
+
+        self.assertEqual(res, {"ok": True, "updated": True})
+        self.assertEqual(busy, ["s"])
+        self.assertEqual([sid for sid, _ in refreshes], ["s"])
+
+    def test_progress_hook_does_not_reset_human_waiting_timeout(self):
+        for reason in ("permission_request", "ask_user_question"):
+            with self.subTest(reason=reason), TemporaryDirectory() as d:
+                store = SessionStore(Path(d) / "state.json")
+                store.upsert("s", tty="tmux1", cwd="/tmp/proj", root_msg_id="root1")
+                store.mark_waiting("s", reason, 111.0)
+
+                class _Req:
+                    async def json(self):
+                        return {"type": "subagent-stop", "session_id": "s", "tty": "tmux1"}
+
+                refreshes = []
+                with patch.object(server, "session_store", store), \
+                     patch.object(server, "_refresh_health_card_for_event",
+                                  lambda sid, **kw: refreshes.append((sid, kw)) or False), \
+                     patch.object(server.time, "time", lambda: 999.0):
+                    res = asyncio.run(server.receive_progress_hook(_Req()))
+
+                sess = store.get("s")
+                self.assertEqual(res, {"ok": True, "updated": False})
+                self.assertEqual(sess.status, "stopped")
+                self.assertEqual(sess.stop_reason, reason)
+                self.assertEqual(sess.running_since, 111.0)
+                self.assertEqual([sid for sid, _ in refreshes], ["s"])
+
 
 class FeishuReplyInjectionTests(unittest.TestCase):
     def setUp(self):
@@ -150,13 +192,13 @@ class FeishuReplyInjectionTests(unittest.TestCase):
         self.assertEqual(len(server._pending_injects), 1)
 
     def test_inject_success_marks_busy_and_unfreezes_health_card(self):
-        server.session_store.set_status("sess1", "stopped")
+        server.session_store.set_stopped("sess1", "completed")
         server._mark_session_idle("sess1")
 
         server._handle_message(self._data("继续"))
 
         self.assertTrue(server._is_session_busy("sess1"))
-        self.assertEqual(server.session_store.get("sess1").last_status, "")
+        self.assertEqual(server.session_store.get("sess1").status, "running")
 
     def test_busy_session_does_not_send_queued_receipt(self):
         server._mark_session_busy("sess1")

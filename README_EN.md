@@ -17,7 +17,7 @@ Coding Agent (tmux) ──Hook──> WalkCode ──API──> Chat (thread)
 
 - 🔔 **Approve from your phone** — when the agent hits a permission prompt, your phone buzzes; tap "Allow" and it keeps going
 - 💬 **Drive it from your phone** — reply with text, images, or rich text and it goes straight into the agent's terminal
-- 🩺 **Session health card** — every session keeps a live status card at the top of its thread: Running / Waiting for you / Done, plus model, duration, message count, and token usage, refreshed every minute
+- 🩺 **Session health card** — every session keeps a live status card at the top of its thread: Running / Waiting for you / Done, plus model, duration, message count, and token usage, updated on key events
 - 🧵 **One thread = one session = one agent** — zero cross-talk; reply in a thread and it always reaches the right agent
 - 🚀 **Remote start + auto-resume** — send a message to spin up an agent in a fresh tmux; reply in an expired thread to resume it
 - 🤖 **Multiple agents in parallel** — run Claude Code and Codex CLI at the same time, each with its own Feishu bot
@@ -49,7 +49,7 @@ Your agent hits a permission prompt while you're away. Without WalkCode, it bloc
 - **Question answering** — AskUserQuestion interactive cards, each option shown with its description, with multi-question sequential flow, multiSelect, and custom text (Other) via thread reply
 - **Text replies** — reply in a thread to type directly into the agent's terminal; when the agent finishes a turn, the full turn (including multi-part output) is forwarded to you, not just the last chunk
 - **Image & rich text** — send images or rich text (text + images); images are auto-downloaded and passed to the agent
-- **Session health card** — every session keeps a live status card at the top of its thread, with status, model, duration, message count, and token usage (grouped by model), refreshed every minute and frozen once the session ends
+- **Session health card** — every session keeps a live status card at the top of its thread, with status, model, duration, message count, and token usage (grouped by model), updated on key events and frozen once the session ends
 - **Remote start** — send a message to start a new agent session from your phone
 - **Session resume** — reply in an expired thread to automatically resume the conversation
 - **Send while busy** — a message you send while the agent is busy is injected right away (queuing is left to the terminal/agent), with an emoji reaction to confirm delivery
@@ -492,17 +492,18 @@ Chat Thread C  <──1:1──>  tmux: walkcode-99999      <──1:1──>  C
 
 ### Session Health Card
 
-Every session keeps an interactive card at the top of its thread, refreshed every minute by a background poller, so you can see its status at a glance:
+Every session keeps an interactive card at the top of its thread. Remote replies, local input, permission approvals, and Stop results refresh it immediately, so you can see the session status at a glance:
 
 | Field | Content |
 |-------|---------|
-| Status | 🟢 Running / 🟠 Waiting for you / ✅ Done / 🔴 Error (the card color tracks the status) |
+| Status | 🟢 Running / 🟠 Waiting for you / ✅ Done / 🔴 Error / ⏱️ Timeout interrupted (the card color tracks the status) |
+| Session | Current session ID |
 | Model | Model the session is using |
 | Duration | How long the session has been running |
 | Inputs | Number of messages you've sent |
 | Tokens | Cumulative token usage (grouped by model) |
 
-The thread title is auto-named from a task summary (Claude uses its own AI title; Codex can optionally use Haiku to refine it — see Configuration). Once the session ends the card is frozen and stops refreshing. The whole feature is on by default; set `WALKCODE_HEALTH_CARD=0` to turn it off.
+The thread title is auto-named from a task summary (Claude uses its own AI title; Codex can optionally use Haiku to refine it — see Configuration). Once the session ends the card is frozen and stops refreshing. If a running state has no observable progress for more than 30 minutes, or a permission / AskUserQuestion wait state goes unanswered for more than 30 minutes, WalkCode sends Esc to interrupt it, marks the card as "Timeout interrupted", and posts a thread notice. This uses WalkCode's own recorded state and hook/progress events; it does not parse TUI footer wording, treat pane repaints as progress, or depend on tmux `window_activity`. Subagent/task lifecycle events refresh the timer only while the session is running; if the session is stopped on permission or AskUserQuestion, they do not move it back to running or reset the wait timeout. A single long-running tool call that exceeds the threshold without any WalkCode hook/progress event is intentionally treated as "no observable progress" and interrupted; Codex currently has fewer progress signals than Claude, with no UserPromptSubmit/PostToolUse hook and `--yolo` or trusted tools skipping approval hooks, so long unattended Codex turns should explicitly raise `WALKCODE_STUCK_THRESHOLD`. The whole feature is on by default; set `WALKCODE_HEALTH_CARD=0` to disable the health card and automatic timeout interrupts.
 
 ### Security: Remote Start Permissions
 
@@ -515,7 +516,7 @@ When you start an agent from chat, WalkCode launches it with a controlled permis
 
 > If you set `WALKCODE_PERMISSION_FLAG` to a fully autonomous mode like `--yolo` (Codex) in an instance `.env`, the agent skips approvals and runs directly — no approval cards. Choose this according to your own trust boundary.
 
-If you don't respond within 30 minutes, or the WalkCode server is unreachable, or the hook itself crashes, the **hook fails open** — it does not block the agent. The agent falls back to its own native terminal permission prompt, so "hook broken = same as no WalkCode installed" instead of leaving the Coding Agent stuck.
+If you don't respond within 30 minutes, WalkCode uses the unified watchdog to send Esc to the TUI and marks the wait as "Timeout interrupted". That visible interrupt applies to WalkCode remote-started sessions bound to a health-card thread; locally started sessions without a remote thread still rely on the hook's own fail-open behavior. If the WalkCode server is unreachable or the hook itself crashes, the hook still fails open — it does not block the agent. The agent falls back to its own native terminal permission prompt, so "hook broken = same as no WalkCode installed" instead of leaving the Coding Agent stuck.
 
 ## Usage
 
@@ -565,7 +566,8 @@ walkcode test-inject <tmux-session> "hi"  # Test injection
 | `WALKCODE_STATE_PATH` | No | Custom state file path (default: `~/.walkcode/state.json` for the main Claude instance, `~/.walkcode/<instance>-state.json` for others) |
 | `WALKCODE_PERMISSION_FLAG` | No | Replace the agent's default permission/approval flag, e.g. `--yolo` for Codex |
 | `WALKCODE_EXTRA_ARGS` | No | Extra launch flags inserted after the agent command, e.g. `--settings` to route Claude through Vertex |
-| `WALKCODE_HEALTH_CARD` | No | Session health card toggle; set `0` to disable (on by default) |
+| `WALKCODE_HEALTH_CARD` | No | Session health card and automatic timeout interrupt toggle; set `0` to disable (on by default) |
+| `WALKCODE_STUCK_THRESHOLD` | No | Seconds before auto-sending Esc for a running state with no progress, or an unanswered wait state (default: `1800`, 30 minutes). After changing it, rerun `walkcode install-hooks` for each instance and restart the service so agent hook timeouts stay aligned with the watchdog |
 | `WALKCODE_SUMMARY_VERTEX_PROJECT` | No | Vertex project for health-card title summarization (Codex sessions only; unset → first line as title) |
 | `WALKCODE_SUMMARY_VERTEX_REGION` | No | Vertex region (default: `global`) |
 | `WALKCODE_SUMMARY_SA_PATH` | No | Path to the Vertex service account JSON |

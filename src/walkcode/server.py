@@ -39,10 +39,19 @@ from importlib.metadata import version as pkg_version
 from fastapi import FastAPI, Request
 
 from .agent import AgentAdapter, get_agent
-from .config import Config
+from .config import Config, DEFAULT_STUCK_THRESHOLD, parse_stuck_threshold
 from .i18n import t
 from .permreg import CardStatus, PermissionRegistry
-from .state import Session, SessionStore
+from .state import (
+    INTERRUPT_REASON_TIMEOUT,
+    STATUS_RUNNING,
+    STATUS_STOPPED,
+    STOP_REASON_COMPLETED,
+    STOP_REASON_INTERRUPTED,
+    WAITING_STOP_REASONS,
+    Session,
+    SessionStore,
+)
 from .stats import collect_stats, SessionStats, ModelTokens
 from . import summarizer
 from .tty import (
@@ -64,10 +73,9 @@ agent_adapter: AgentAdapter = None  # type: ignore
 _IDLE_TIMEOUT = 7200  # 2h — kill tmux sessions idle longer than this
 _REAPER_INTERVAL = 600  # 10min — how often the idle reaper runs
 _WATCHDOG_INTERVAL = 120  # 2min — how often the stuck-turn watchdog scans
-# Warn on the Feishu thread when a turn has been "Working" this long with no
-# result (the agent may be wedged on an interactive step, e.g. a browser/login
-# that never returns). Env-overridable for tuning without a code change.
-_STUCK_THRESHOLD = int(os.environ.get("WALKCODE_STUCK_THRESHOLD", "1800"))  # 30min
+# Interrupt a running/waiting state after this long with no observable progress.
+# Env-overridable for tuning without a code change.
+_STUCK_THRESHOLD = parse_stuck_threshold(default=DEFAULT_STUCK_THRESHOLD)  # 30min
 
 
 # --- Permission request state ---
@@ -85,11 +93,11 @@ registry = PermissionRegistry()
 # Code may process it immediately or queue it behind the current turn; WalkCode
 # should not second-guess that with its own busy/idle model.
 #
-# UserPromptSubmit/Stop still provide useful observability, so we keep a small
-# in-memory pending list for debug logs. It never drives a user-visible
-# "swallowed" or "queued" verdict.
-_session_last_ups: dict[str, float] = {}   # session_id → ts of last UserPromptSubmit
-_session_last_stop: dict[str, float] = {}  # session_id → ts of last Stop
+# Hook events still provide useful observability, so we keep a small in-memory
+# pending list for debug logs. It never drives a user-visible "swallowed" or
+# "queued" verdict.
+_session_last_ups: dict[str, float] = {}   # session_id → ts of last observable progress
+_session_last_stop: dict[str, float] = {}  # session_id → ts of last Stop / waiting transition
 _ups_capable_sessions: set[str] = set()    # sessions seen to emit UserPromptSubmit
 _pending_injects: list[dict] = []          # optional observations only
 _pending_lock = threading.Lock()
@@ -919,8 +927,13 @@ def _finalize_askuser_answer(
 
     logger.info(f"AskUserQuestion answer[{question_index}]: {final_answer!r} (rid={request_id[:8]})")
 
+    req_data = registry.get(request_id)
+    session_id = req_data.session_id if req_data else ""
     has_next = question_index + 1 < total_questions
     if has_next:
+        if session_id:
+            _mark_session_waiting(session_id, "ask_user_question")
+            _refresh_health_card_for_event(session_id)
         next_card = _build_askuserquestion_card(request_id, questions, question_index + 1)
         resp.card = CallBackCard()
         resp.card.type = "raw"
@@ -961,9 +974,9 @@ def _finalize_askuser_answer(
     resp.toast = CallBackToast()
     resp.toast.type = "success"
     resp.toast.content = "All answers submitted"
-    req_data = registry.get(request_id)
-    if req_data and req_data.session_id:
-        _refresh_health_card_for_event(req_data.session_id)
+    if session_id:
+        _mark_session_busy(session_id)
+        _refresh_health_card_for_event(session_id)
     return resp
 
 
@@ -1026,11 +1039,28 @@ def _on_card_action(data: P2CardActionTrigger) -> P2CardActionTriggerResponse:
 
         tool_name = req_data.tool_name or "unknown"
 
-        # Gate BOTH AskUserQuestion and permission clicks up front: a stale click —
-        # the TUI already handled this (PostToolUse invalidated it) or the hook stopped
-        # polling (TUI deny/Esc killed it). Reject before any state mutation (toggle /
-        # answer / decision). set_decision_once also re-checks invalidated_at inside its
-        # lock to close the check-then-act race.
+        # Gate BOTH AskUserQuestion and permission clicks up front: a click after a
+        # final decision, a PostToolUse invalidation, or a stale poll must be rejected
+        # before any state mutation (toggle / answer / decision). set_decision_once
+        # also re-checks invalidated_at inside its lock to close the check-then-act race.
+        if req_data.decision is not None:
+            decision = req_data.decision
+            shown = decision.get("_button") or decision.get("behavior") or "stale"
+            timeout_decision = decision.get("_reason") == "timeout"
+            logger.info(
+                "Already-decided card click ignored: reason=%s tool=%s rid=%s",
+                "timeout" if timeout_decision else "decided", tool_name, request_id[:8],
+            )
+            resp.card = CallBackCard()
+            resp.card.type = "raw"
+            resp.card.data = _build_permission_result_card(tool_name, "stale" if timeout_decision else shown)
+            resp.toast = CallBackToast()
+            resp.toast.type = "info"
+            resp.toast.content = t("feishu.perm.expired" if timeout_decision else "feishu.perm.already_decided")
+            return resp
+
+        # The TUI already handled this (PostToolUse invalidated it) or the hook stopped
+        # polling (TUI deny/Esc killed it).
         if registry.is_invalidated(request_id) or _perm_click_stale(request_id):
             is_inv = registry.is_invalidated(request_id)
             reason = "invalidated" if is_inv else "stale_poll"
@@ -1068,6 +1098,9 @@ def _on_card_action(data: P2CardActionTrigger) -> P2CardActionTriggerResponse:
                     resp.toast.type = "info"
                     resp.toast.content = t("feishu.perm.expired")
                     return resp
+                if req_data.session_id:
+                    _mark_session_waiting(req_data.session_id, "ask_user_question")
+                    _refresh_health_card_for_event(req_data.session_id)
                 logger.info(f"AskUser toggle Q{question_index+1} idx={option_idx} → selected={selected} (rid={request_id[:8]})")
                 resp.card = CallBackCard()
                 resp.card.type = "raw"
@@ -1081,6 +1114,9 @@ def _on_card_action(data: P2CardActionTrigger) -> P2CardActionTriggerResponse:
                 registry.askuser_set_awaiting_other(
                     request_id, question_index, req_data.feishu_root_msg_id,
                 )
+                if req_data.session_id:
+                    _mark_session_waiting(req_data.session_id, "ask_user_question")
+                    _refresh_health_card_for_event(req_data.session_id)
                 logger.info(f"AskUser request_other Q{question_index+1} (rid={request_id[:8]})")
                 resp.card = CallBackCard()
                 resp.card.type = "raw"
@@ -1096,6 +1132,9 @@ def _on_card_action(data: P2CardActionTrigger) -> P2CardActionTriggerResponse:
             if action == "submit_multi":
                 selected = registry.askuser_get_selected(request_id, question_index)
                 if not selected:
+                    if req_data.session_id:
+                        _mark_session_waiting(req_data.session_id, "ask_user_question")
+                        _refresh_health_card_for_event(req_data.session_id)
                     resp.toast = CallBackToast()
                     resp.toast.type = "warning"
                     resp.toast.content = "未选择任何选项"
@@ -1162,6 +1201,7 @@ def _on_card_action(data: P2CardActionTrigger) -> P2CardActionTriggerResponse:
 
         logger.info(f"Permission decision: {behavior} for {tool_name} (rid={request_id[:8]})")
         if req_data.session_id:
+            _mark_session_busy(req_data.session_id)
             _refresh_health_card_for_event(req_data.session_id)
 
         result_card = _build_permission_result_card(tool_name, behavior)
@@ -1327,11 +1367,25 @@ def _start_agent(prompt: str, message_id: str, image_path: str | None = None):
         if card_id:
             root_id, health_card_id = card_id, card_id
             _reply(card_id, prompt, reply_in_thread=True)
-    session_store.add_pending(tmux_name, root_id, cwd=cwd, health_card_id=health_card_id)
+    bound_session_id = session_store.add_pending(
+        tmux_name, root_id, cwd=cwd, health_card_id=health_card_id,
+    )
+    if bound_session_id:
+        _mark_session_busy(bound_session_id)
+        if health_card_id:
+            _refresh_health_card_for_event(bound_session_id)
     if not health_card_id:
         reply_id = _reply(message_id, t("feishu.started", agent=agent_adapter.name.title(), tmux=tmux_name), reply_in_thread=True)
         if reply_id:
-            session_store.update_pending_reply(tmux_name, reply_id)
+            if bound_session_id:
+                _edit_message(reply_id, t(
+                    "feishu.started_with_session",
+                    agent=agent_adapter.name.title(),
+                    session_id=bound_session_id[:8],
+                    tmux=tmux_name,
+                ))
+            else:
+                session_store.update_pending_reply(tmux_name, reply_id)
     logger.info(f"Started {agent_adapter.name}: tmux={tmux_name} cwd={cwd} prompt={prompt[:50]}")
 
     # Background: detect auth failure and recover via device-auth
@@ -1378,6 +1432,7 @@ def _resume_agent(session_id: str, old_session: Session, reply_text: str, messag
         return
 
     session_store.upsert(session_id, tty=tmux_name, cwd=cwd, root_msg_id=old_session.root_msg_id, cwd_is_launch=True)
+    _mark_session_busy(session_id)
     _reply(message_id, t("feishu.resumed", agent=agent_adapter.name.title(), tmux=tmux_name))
     logger.info(f"Resumed {agent_adapter.name}: session={session_id[:8]} tmux={tmux_name} cwd={cwd}")
 
@@ -1433,6 +1488,9 @@ def _consume_other_answer(request_id: str, text: str, message_id: str):
 
     has_next = qi + 1 < total
     if has_next:
+        if req_data.session_id:
+            _mark_session_waiting(req_data.session_id, "ask_user_question")
+            _refresh_health_card_for_event(req_data.session_id)
         # Send next question card as a fresh thread reply since we don't have a
         # CallBackCard channel for the original card.
         next_card = _build_askuserquestion_card(request_id, questions, qi + 1)
@@ -1449,6 +1507,7 @@ def _consume_other_answer(request_id: str, text: str, message_id: str):
     }
     won = registry.set_decision_once(request_id, final_decision)
     if won and req_data.session_id:
+        _mark_session_busy(req_data.session_id)
         _refresh_health_card_for_event(req_data.session_id)
     # If write-once lost (TUI already settled / PostToolUse invalidated it), don't react
     # success on a reply that never took effect (deep-review ISSUE_3).
@@ -1460,32 +1519,122 @@ def _norm(s: str) -> str:
     return " ".join((s or "").split())
 
 
+def _record_session_progress_memory(session_id: str, now: float) -> None:
+    with _pending_lock:
+        was_idle = _session_last_ups.get(session_id, 0.0) <= _session_last_stop.get(session_id, 0.0)
+        _session_last_ups[session_id] = now
+        # Kept for compatibility with the old inject-observation model.
+        _ups_capable_sessions.add(session_id)
+    if was_idle:
+        with _stuck_lock:
+            _stuck_alerted.pop(session_id, None)
+
+
 def _mark_session_busy(session_id: str):
     if session_id:
-        with _pending_lock:
-            _session_last_ups[session_id] = time.time()
-            # Receiving any UserPromptSubmit proves this session has the hook
-            # installed — so a *missing* one later is a real swallow, not just a
-            # legacy session that predates the hook.
-            _ups_capable_sessions.add(session_id)
-        # A new turn started → unfreeze the health card so event refreshes can
-        # move a previously terminal card back to running. [R9]
-        if config and config.health_card_enabled and session_store is not None:
-            session_store.set_status(session_id, "")
+        now = time.time()
+        # Any accepted prompt / tool-progress hook is observable progress. Reset
+        # the running timeout timer; a later Stop freezes the card again.
+        if session_store is not None:
+            session_store.start_running(session_id, now)
+        _record_session_progress_memory(session_id, now)
+
+
+def _mark_session_progress(session_id: str) -> bool:
+    """Refresh progress only while the visible session is running.
+
+    Subagent/task lifecycle hooks can arrive late or from sibling work while the
+    visible session is already stopped. Those events are useful telemetry during
+    a running turn, but they must not reopen a completed, interrupted, or
+    human-waiting state.
+    """
+    if not session_id:
+        return False
+    now = time.time()
+    if session_store is not None:
+        if not session_store.start_running_if_allowed(session_id, now):
+            return False
+    _record_session_progress_memory(session_id, now)
+    return True
+
+
+def _mark_session_tool_progress(session_id: str) -> bool:
+    """Refresh progress for a tool that actually ran.
+
+    PostToolUse can legitimately resolve a human-waiting state when the user
+    answered in the native TUI instead of Feishu. But a late PostToolUse must not
+    reopen a terminal stopped state such as completed or timeout-interrupted.
+    """
+    if not session_id:
+        return False
+    now = time.time()
+    if session_store is not None:
+        if not session_store.start_running_if_allowed(
+            session_id,
+            now,
+            allow_stopped_reasons=_WAITING_STOP_REASONS,
+        ):
+            return False
+    _record_session_progress_memory(session_id, now)
+    return True
 
 
 def _mark_session_idle(session_id: str):
     if session_id:
         with _pending_lock:
             _session_last_stop[session_id] = time.time()
+        if session_store is not None:
+            session_store.set_stopped(session_id, STOP_REASON_COMPLETED)
         # Turn ended → clear any stuck-turn alert state so the next turn that
         # wedges alerts fresh (covers turns that start and stall between scans).
         with _stuck_lock:
             _stuck_alerted.pop(session_id, None)
 
 
+def _mark_session_waiting(session_id: str, reason: str):
+    if session_id:
+        now = time.time()
+        with _pending_lock:
+            _session_last_stop[session_id] = now
+        if session_store is not None:
+            session_store.mark_waiting(session_id, reason, now)
+        with _stuck_lock:
+            _stuck_alerted.pop(session_id, None)
+
+
+def _mark_session_timeout(session_id: str):
+    if session_id:
+        with _pending_lock:
+            _session_last_stop[session_id] = time.time()
+        if session_store is not None:
+            session_store.set_stopped(
+                session_id,
+                STOP_REASON_INTERRUPTED,
+                interrupt_reason=INTERRUPT_REASON_TIMEOUT,
+            )
+
+
+def _timeout_open_requests(session_id: str) -> int:
+    """Deny still-open HITL hooks after WalkCode interrupts a timed-out state."""
+    if not session_id:
+        return 0
+    snaps = registry.timeout_session(session_id)
+    for snap in snaps:
+        card_msg_id = snap.get("card_msg_id")
+        if not card_msg_id:
+            continue
+        card = _build_permission_result_card(snap.get("tool_name", ""), "stale")
+        _edit_card(card_msg_id, card)
+    if snaps:
+        logger.info(
+            "Timeout denied %d open HITL request(s) for session %s",
+            len(snaps), session_id[:8],
+        )
+    return len(snaps)
+
+
 def _is_session_busy(session_id: str) -> bool:
-    """A turn is in progress if the last UserPromptSubmit is newer than the last Stop."""
+    """A turn is in progress if the last progress event is newer than Stop/wait."""
     if not session_id:
         return False
     with _pending_lock:
@@ -1949,12 +2098,6 @@ async def receive_hook(request: Request):
     if not tty:
         return {"ok": False, "error": "missing tty (not in tmux?)"}
 
-    # Stop = turn ended → session is idle. Mark idle BEFORE the dedupe gate so
-    # busy/idle observability still sees every Stop; dedupe only suppresses the
-    # duplicate user-facing message.
-    if hook_type == "stop" and session_id:
-        _mark_session_idle(session_id)
-
     # codex (>=0.135) fires each hook twice with an identical payload — a turn
     # ends once, so suppress the duplicate before it becomes a second Feishu reply.
     # Read-only check here; the key is registered only AFTER a successful send
@@ -1969,6 +2112,14 @@ async def receive_hook(request: Request):
             f"key={dedupe_key[2]}:{dedupe_key[3][:12]}"
         )
         return {"ok": True, "deduped": True}
+
+    # Stop = turn ended → session is idle. Do this only after the dedupe gate:
+    # a delayed duplicate Stop from the previous turn must not clear a newer
+    # running_since after the next turn has already started.
+    if hook_type == "stop" and session_id:
+        _mark_session_idle(session_id)
+    elif session_id:
+        _mark_session_progress(session_id)
 
     effective_type = matcher or hook_type
     labels = _labels()
@@ -2067,7 +2218,10 @@ async def receive_hook(request: Request):
         health_card_id = ""
         root_id = None
         if config.health_card_enabled:
-            root_id = _send_card(_build_health_card(SessionStats(source="unavailable"), "running", (message or "").strip()[:40]))
+            root_id = _send_card(_build_health_card(
+                SessionStats(source="unavailable"), "running",
+                (message or "").strip()[:40], session_id=session_id,
+            ))
             health_card_id = root_id or ""
         if not root_id:  # feature off or card send failed → post-title fallback
             root_id = _send(text=_make_title(cwd, session_id, message))
@@ -2117,13 +2271,39 @@ async def receive_sync_hook(request: Request):
     old_root = session.root_msg_id if session else None
     drift = bool(old_tty and old_tty != tty)
 
+    refresh_bound_card = False
+    start_bound_session = False
+
     if session and session.root_msg_id:
         session_store.upsert(session_id, tty=tty, cwd=cwd, cwd_is_launch=True)
         logger.info(f"Sync: session={session_id[:8]} tty={tty} (updated)")
     else:
-        # New session or no Feishu thread yet — store tty+cwd so first hook finds it
-        session_store.upsert(session_id, tty=tty, cwd=cwd, cwd_is_launch=True)
-        logger.info(f"Sync: session={session_id[:8]} tty={tty} (new, no thread yet)")
+        # A Feishu-started session already has a thread root/card stashed under
+        # its tmux name. Bind it as soon as SessionStart reveals session_id, so a
+        # long first turn does not leave the root card detached until Stop.
+        pending_root, reply_id, pending_cwd, pending_health_card = session_store.pop_pending(tty)
+        if pending_root:
+            launch_cwd = pending_cwd or cwd or config.default_cwd
+            session_store.upsert(
+                session_id, tty=tty, cwd=launch_cwd, root_msg_id=pending_root,
+                cwd_is_launch=True,
+            )
+            if pending_health_card:
+                session_store.set_health_card(session_id, pending_health_card)
+                refresh_bound_card = True
+            start_bound_session = True
+            if reply_id:
+                _edit_message(reply_id, t(
+                    "feishu.started_with_session",
+                    agent=agent_adapter.name.title(),
+                    session_id=session_id[:8],
+                    tmux=tty,
+                ))
+            logger.info(f"Sync: session={session_id[:8]} tty={tty} (bound pending root)")
+        else:
+            # New session or no Feishu thread yet — store tty+cwd so first hook finds it
+            session_store.upsert(session_id, tty=tty, cwd=cwd, cwd_is_launch=True)
+            logger.info(f"Sync: session={session_id[:8]} tty={tty} (new, no thread yet)")
 
     if drift:
         threading.Thread(
@@ -2131,6 +2311,12 @@ async def receive_sync_hook(request: Request):
             args=(session_id, old_tty, old_root, tty),
             daemon=True,
         ).start()
+
+    if start_bound_session:
+        _mark_session_busy(session_id)
+
+    if refresh_bound_card:
+        _refresh_health_card_for_event(session_id)
 
     return {"ok": True}
 
@@ -2151,6 +2337,25 @@ async def receive_prompt_hook(request: Request):
         _refresh_health_card_for_event(session_id)
     _confirm_pending_inject(session_id, tty, prompt)
     return {"ok": True}
+
+
+@app.post("/hook/progress")
+async def receive_progress_hook(request: Request):
+    """Cheap progress-only hook for events that should not post Feishu messages.
+
+    Subagent/task events are turn-internal activity, not the main turn's terminal
+    Stop. They refresh the running timeout timer only while the visible session
+    is still running; they never reopen any stopped state.
+    """
+    body = await request.json()
+    session_id = body.get("session_id", "")
+    hook_type = body.get("type", "progress")
+    if not session_id:
+        return {"ok": False, "error": "missing session_id"}
+    updated = _mark_session_progress(session_id)
+    _refresh_health_card_for_event(session_id)
+    logger.info("Progress hook: %s session=%s updated=%s", hook_type, session_id[:8], updated)
+    return {"ok": True, "updated": updated}
 
 
 def _perm_dedupe_key(session_id: str, tool_use_id: str) -> tuple | None:
@@ -2249,7 +2454,10 @@ async def receive_permission_hook(request: Request):
                 hc = ""
                 new_root = None
                 if config.health_card_enabled:
-                    new_root = _send_card(_build_health_card(SessionStats(source="unavailable"), "running", (tool_name or "").strip()[:40]))
+                    new_root = _send_card(_build_health_card(
+                        SessionStats(source="unavailable"), "running",
+                        (tool_name or "").strip()[:40], session_id=session_id,
+                    ))
                     hc = new_root or ""
                 if not new_root:
                     new_root = _send(_make_title(cwd, session_id, tool_name))
@@ -2297,6 +2505,8 @@ async def receive_permission_hook(request: Request):
             registry.fill_request(request_id, card_msg_id=card_msg_id)
         registry.card_sent(request_id)
         if session_id:
+            reason = "ask_user_question" if tool_name == "AskUserQuestion" else "permission_request"
+            _mark_session_waiting(session_id, reason)
             _refresh_health_card_for_event(session_id)
 
         project = basename(cwd) if cwd else "unknown"
@@ -2327,7 +2537,8 @@ async def get_permission_decision(request_id: str):
         if decision is not None:
             return {"status": "decided", "decision": decision}
         # decided set without a decision → the TUI handled it (PostToolUse invalidated
-        # the card). Tell the hook to fail-open instead of polling to the 1800s ceiling.
+        # the card). Tell the hook to fail-open instead of polling until its
+        # permission timeout ceiling.
         if registry.is_invalidated(request_id):
             return {"status": "invalidated"}
 
@@ -2347,6 +2558,7 @@ async def receive_post_tool_hook(request: Request):
     session_id = body.get("session_id", "")
     if not session_id:
         return {"ok": False, "error": "missing session_id"}
+    _mark_session_tool_progress(session_id)
     # answers is {question_text: chosen_label}, sent by the hook only for AskUserQuestion.
     # TUI-chosen answers live nowhere in walkcode's memory (req.answers is filled only on a
     # Feishu click), so they reach us here via PostToolUse's tool_response.
@@ -2382,7 +2594,7 @@ async def receive_post_tool_hook(request: Request):
         _edit_card(card_msg_id, card)
     if snaps:
         logger.info(f"PostToolUse invalidated {len(snaps)} card(s) for session {session_id[:8]}")
-        _refresh_health_card_for_event(session_id)
+    _refresh_health_card_for_event(session_id)
     return {"ok": True, "invalidated": len(snaps)}
 
 
@@ -2443,36 +2655,36 @@ def _start_idle_reaper():
 
 
 # --- Stuck-turn watchdog ---
-# A turn that runs very long with no Stop is usually wedged on an interactive step
-# the agent can't get past (the incident: codex sat 6.5h on a Playwright Google
-# login that never returned). There is no "still working" hook (codex has no
-# UserPromptSubmit hook at all), so detect it from the TUI: both Claude and Codex
-# render an "(… esc to interrupt)" footer with an elapsed timer while a turn runs.
-# Parse that elapsed time; once it crosses the threshold, warn on the Feishu
-# thread so a human can attach and unstick it.
+# A running/waiting state with no observable progress is usually wedged on an
+# interactive step the agent can't get past. The watchdog follows WalkCode's own
+# state plus explicit progress hooks, not TUI footer text: once the idle span
+# crosses the threshold, send Esc, refresh the health card, and notify Feishu.
+
+# Legacy helper for inject verification only. The timeout watchdog intentionally
+# does not use footer wording/timers as a progress signal.
 _INTERRUPT_TIME_RE = re.compile(
     r"\((?:(\d+)h\s+)?(?:(\d+)m\s+)?(\d+)s\b[^)]*esc to interrupt",
     re.IGNORECASE,
 )
-# session_id → {"alerted": bool, "last_secs": int}. One warning per stuck turn:
-# a turn is "new" when the elapsed timer drops below last_secs (it restarts each
-# turn); idle/dead clears the entry; the flag flips only after a confirmed send.
+# session_id → {"interrupted": bool, "notified": bool}. One interrupt per
+# no-progress span; state transitions reset this state.
 _stuck_alerted: dict[str, dict] = {}
 _stuck_lock = threading.Lock()
-
-
 # How many trailing non-blank pane lines count as the live footer. The active
-# "esc to interrupt" timer sits on the bottom line(s); scanning the whole capture
-# would match a stale timer left in scrollback and read an idle pane as busy.
+# turn timer sits on the bottom line(s); scanning the whole capture would match a
+# stale timer left in scrollback and read an idle pane as busy.
 _FOOTER_LINES = 6
+
+_WAITING_STOP_REASONS = WAITING_STOP_REASONS
+_TERMINAL_HEALTH = {"done", "error", "timeout"}
+_watchdog_started_at = 0.0
 
 
 def _parse_working_seconds(pane: str) -> int | None:
     """Elapsed seconds of the *current* turn from the live TUI footer, or None.
 
-    Both Claude and Codex render an "(Xh Ym Zs … esc to interrupt)" timer on the
-    bottom line while a turn runs. Only the last few non-blank lines are scanned,
-    so a stale timer further up in scrollback isn't mistaken for the current turn.
+    This legacy inject guard only treats timers with the "esc to interrupt"
+    suffix as current-turn evidence. The timeout watchdog does not call it.
     """
     lines = [ln for ln in pane.splitlines() if ln.strip()]
     for ln in reversed(lines[-_FOOTER_LINES:]):
@@ -2482,15 +2694,66 @@ def _parse_working_seconds(pane: str) -> int | None:
     return None
 
 
-def _check_stuck_sessions():
-    """Warn on the Feishu thread for any turn stuck past _STUCK_THRESHOLD.
+def _running_started_at(session_id: str, session: Session, now: float | None = None) -> float | None:
+    """Timeout timer t0 for the current watchable state, or None."""
+    if not session_id:
+        return None
+    if session.status == STATUS_STOPPED:
+        if session.stop_reason not in _WAITING_STOP_REASONS:
+            return None
+        return session.running_since or None
 
-    One warning per stuck turn. Per-session state is {"alerted", "last_secs"}: a
-    new turn is detected when the elapsed timer drops below last_secs (it restarts
-    each turn), and idle/dead clears the entry. The alert flag flips only after a
-    confirmed Feishu send, so a failed send is retried on the next scan instead of
-    being silently swallowed.
+    candidates = []
+    with _pending_lock:
+        last_stop = _session_last_stop.get(session_id, 0.0)
+        last_ups = _session_last_ups.get(session_id, 0.0)
+        if last_ups > last_stop:
+            candidates.append(last_ups)
+    if session.running_since:
+        candidates.append(session.running_since)
+    if candidates:
+        return max(candidates)
+    # Older state files may have status=running but no explicit timeout timer.
+    # Treat that as unknown instead of using created_at; otherwise a long-idle
+    # legacy tmux can be interrupted immediately after upgrade/restart.
+    return None
+
+
+def _watchdog_in_startup_grace(started_at: float, now: float) -> bool:
+    """Skip old persisted timers for one threshold window after service start."""
+    if _watchdog_started_at <= 0:
+        return False
+    if now < _watchdog_started_at:
+        return False
+    return started_at < _watchdog_started_at and now - _watchdog_started_at < _STUCK_THRESHOLD
+
+
+def _interrupt_agent_turn(tmux_name: str) -> bool:
+    """Send Esc to the active agent TUI turn."""
+    try:
+        result = subprocess.run(
+            ["tmux", "send-keys", "-t", tmux_name, "Escape"],
+            capture_output=True, text=True, timeout=5,
+        )
+    except Exception as e:
+        logger.error("Stuck watchdog interrupt failed for %s: %s", tmux_name, e)
+        return False
+    if result.returncode != 0:
+        logger.error(
+            "Stuck watchdog interrupt failed for %s: %s",
+            tmux_name, result.stderr.strip(),
+        )
+        return False
+    return True
+
+
+def _check_stuck_sessions():
+    """Interrupt and notify for any watchable state idle past threshold.
+
+    One interrupt per no-progress span. Per-session state is
+    {"interrupted", "notified"} and is reset by Running/Stop transitions.
     """
+    now = time.time()
     for session_id, session in session_store.items():
         # Only Feishu-bound, walkcode-managed, live sessions are watched.
         if not session.root_msg_id or not session.tty:
@@ -2501,57 +2764,96 @@ def _check_stuck_sessions():
             with _stuck_lock:
                 _stuck_alerted.pop(session_id, None)
             continue
-        pane = capture_pane(session.tty, lines=40)
-        if not pane.strip():
-            # Capture failed / empty (a tmux hiccup) — NOT proof of idle. Keep the
-            # alert state so one transient failure doesn't reset dedup and fire a
-            # duplicate alert next scan. Skip this round.
-            continue
-        secs = _parse_working_seconds(pane)
-        if secs is None:
-            # Readable pane with no live timer → genuinely idle / between turns;
-            # reset so the next stuck turn alerts fresh.
+        started_at = _running_started_at(session_id, session, now)
+        if started_at is None:
             with _stuck_lock:
                 _stuck_alerted.pop(session_id, None)
             continue
+        if _watchdog_in_startup_grace(started_at, now):
+            with _stuck_lock:
+                _stuck_alerted.pop(session_id, None)
+            continue
+        secs = max(0, int(now - started_at))
+        kind = STATUS_RUNNING if session.status == STATUS_RUNNING else session.stop_reason
         with _stuck_lock:
             st = _stuck_alerted.get(session_id)
-            if st is not None and secs < st["last_secs"]:
-                st = None  # timer went backwards → a new turn started; reset
             if st is None:
-                st = {"alerted": False, "last_secs": secs}
+                st = {"interrupted": False, "notified": False}
                 _stuck_alerted[session_id] = st
-            st["last_secs"] = secs
-            already = st["alerted"]
-        if secs < _STUCK_THRESHOLD or already:
+            interrupted = st["interrupted"]
+            notified = st["notified"]
+        if secs < _STUCK_THRESHOLD:
             continue
-        msg_id = None
-        try:
-            msg_id = _reply(
-                session.root_msg_id,
-                t("feishu.stuck_warning", minutes=secs // 60, tmux=session.tty),
-                reply_in_thread=True,
+        if not interrupted:
+            result = session_store.interrupt_timeout_if_unchanged(
+                session_id,
+                expected_tty=session.tty,
+                expected_status=session.status,
+                expected_stop_reason=session.stop_reason,
+                expected_running_since=session.running_since,
+                interrupt=_interrupt_agent_turn,
             )
-        except Exception as e:
-            logger.error(f"Stuck watchdog alert failed: {e}")
-        if msg_id:
+            if result == "stale":
+                with _stuck_lock:
+                    _stuck_alerted.pop(session_id, None)
+                continue
+            if result != "interrupted":
+                logger.error(
+                    "Stuck watchdog: interrupt NOT sent for session=%s tmux=%s kind=%s no_progress=%ds; will retry",
+                    session_id[:8], session.tty, kind, secs,
+                )
+                continue
+            with _pending_lock:
+                _session_last_stop[session_id] = now
+            _timeout_open_requests(session_id)
+            _refresh_health_card_for_event(session_id)
             with _stuck_lock:
                 cur = _stuck_alerted.get(session_id)
                 if cur is not None:
-                    cur["alerted"] = True
+                    cur["interrupted"] = True
             logger.warning(
-                "Stuck watchdog: session=%s tmux=%s working=%ds — warned",
-                session_id[:8], session.tty, secs,
+                "Stuck watchdog: session=%s tmux=%s kind=%s no_progress=%ds - interrupted",
+                session_id[:8], session.tty, kind, secs,
+            )
+        if notified:
+            continue
+        text = t("feishu.timeout_interrupted", minutes=secs // 60, tmux=session.tty)
+        try:
+            status, msg_id = _reply_status(session.root_msg_id, text, reply_in_thread=True)
+        except Exception as e:
+            logger.error(f"Stuck watchdog timeout notice failed: {e}")
+            status, msg_id = "transient", None
+        if status == "sent" and msg_id:
+            with _stuck_lock:
+                cur = _stuck_alerted.get(session_id)
+                if cur is not None:
+                    cur["notified"] = True
+            logger.warning(
+                "Stuck watchdog: session=%s tmux=%s kind=%s no_progress=%ds - notified",
+                session_id[:8], session.tty, kind, secs,
+            )
+        elif status == "transient":
+            session_store.add_redelivery(session_id, text)
+            with _stuck_lock:
+                cur = _stuck_alerted.get(session_id)
+                if cur is not None:
+                    cur["notified"] = True
+            logger.error(
+                "Stuck watchdog: timeout notice stashed for session=%s tmux=%s kind=%s no_progress=%ds",
+                session_id[:8], session.tty, kind, secs,
             )
         else:
             logger.error(
-                "Stuck watchdog: alert NOT delivered for session=%s tmux=%s working=%ds; will retry",
-                session_id[:8], session.tty, secs,
+                "Stuck watchdog: timeout notice NOT delivered for session=%s tmux=%s kind=%s no_progress=%ds; dropped",
+                session_id[:8], session.tty, kind, secs,
             )
 
 
 def _start_stuck_watchdog():
-    """Background thread that warns about turns wedged past _STUCK_THRESHOLD."""
+    """Background thread that interrupts turns wedged past _STUCK_THRESHOLD."""
+    global _watchdog_started_at
+    _watchdog_started_at = time.time()
+
     def _loop():
         while True:
             time.sleep(_WATCHDOG_INTERVAL)
@@ -2569,12 +2871,13 @@ def _start_stuck_watchdog():
 
 # --- Session health card ---
 
-_HEALTH_COLOR = {"running": "blue", "hitl": "orange", "done": "grey", "error": "red"}
+_HEALTH_COLOR = {"running": "blue", "hitl": "orange", "done": "grey", "error": "red", "timeout": "orange"}
 _HEALTH_STATUS_KEY = {
     "running": "feishu.health.status_running",
     "hitl": "feishu.health.status_hitl",
     "done": "feishu.health.status_done",
     "error": "feishu.health.status_error",
+    "timeout": "feishu.health.status_timeout",
 }
 
 
@@ -2588,32 +2891,46 @@ def _human_tokens(n) -> str:
 
 
 def _session_health(session_id: str, stats: SessionStats) -> str:
-    """Return one of: running | hitl | done | error.
+    """Return one of: running | hitl | timeout | done | error.
 
-    HITL overrides running (the agent process stays alive while a permission card
-    waits, so is_agent_alive can't be the signal — [R1]). A session that has never
-    recorded a Stop is treated as running (starting up), so a freshly created card
-    isn't mislabeled DONE before its first turn ends. Only a session that has
-    stopped AND has a trailing error is ERROR; otherwise DONE."""
+    Timeout is a stopped state with stop_reason=interrupted and
+    interrupt_reason=timeout, and it overrides any still-open permission card.
+    PermissionRequest/AskUserQuestion are stopped from the user's view, but still
+    shown as HITL while they wait. A session that has never recorded a Stop is
+    treated as running (starting up), so a freshly created card isn't mislabeled
+    DONE before its first turn ends."""
+    session = session_store.get(session_id) if session_store is not None else None
+    if session:
+        if session.stop_reason == STOP_REASON_INTERRUPTED and session.interrupt_reason == INTERRUPT_REASON_TIMEOUT:
+            return "timeout"
+        if session.status == STATUS_STOPPED and session.stop_reason in _WAITING_STOP_REASONS:
+            return "hitl"
+        if session.status == STATUS_STOPPED:
+            return "error" if session.stop_reason == "agent_error" or stats.last_error else "done"
     if registry.has_open_request(session_id):
         return "hitl"
     if _is_session_busy(session_id):
         return "running"
     with _pending_lock:
         ever_stopped = session_id in _session_last_stop
+    if session and session.status == STATUS_RUNNING:
+        return "running" if not ever_stopped else ("error" if stats.last_error else "done")
     if not ever_stopped:
         return "running"
     return "error" if stats.last_error else "done"
 
 
-def _build_health_card(stats: SessionStats, health: str, title: str) -> dict:
+def _build_health_card(stats: SessionStats, health: str, title: str, session_id: str = "") -> dict:
     color = _HEALTH_COLOR.get(health, "blue")
     status_txt = t(_HEALTH_STATUS_KEY.get(health, "feishu.health.status_running"))
     models = "、".join(m.model for m in stats.per_model) or "—"
+    sid = f"`{session_id}`" if session_id else "—"
     elements = [
         {"tag": "markdown",
          "content": f"**{t('feishu.health.field_status')}**: {status_txt}　"
                     f"**{t('feishu.health.field_model')}**: {models}"},
+        {"tag": "markdown",
+         "content": f"**{t('feishu.health.field_session')}**: {sid}"},
         {"tag": "markdown",
          "content": f"**{t('feishu.health.field_duration')}**: "
                     f"{t('feishu.health.duration_min', minutes=stats.duration_minutes)}　"
@@ -2631,7 +2948,7 @@ def _build_health_card(stats: SessionStats, health: str, title: str) -> dict:
                                  cache=_human_tokens(m.cache))})
     elif stats.source == "unavailable":
         elements.append({"tag": "markdown", "content": t('feishu.health.unavailable')})
-    frozen = health in ("done", "error")
+    frozen = health in _TERMINAL_HEALTH
     foot = "feishu.health.footer_frozen" if frozen else "feishu.health.footer"
     elements.append({"tag": "note",
                      "elements": [{"tag": "plain_text",
@@ -2683,8 +3000,10 @@ def _maybe_summarize(
                 s2 = session_store.get(sid)
                 if s2 and s2.health_card_id:
                     st = collect_stats(config.agent, sid, cwd)
-                    _edit_card(s2.health_card_id,
-                               _build_health_card(st, _session_health(sid, st), summary))
+                    _edit_card(
+                        s2.health_card_id,
+                        _build_health_card(st, _session_health(sid, st), summary, session_id=sid),
+                    )
         except Exception as e:
             logger.info("summary callback failed: %s", e)
         finally:
@@ -2725,11 +3044,11 @@ def _refresh_health_card(
             title = session.cached_title  # AI-refined title wins
         else:
             title = stats.title or session.cached_title or ""
-        card = _build_health_card(stats, health, title)
+        card = _build_health_card(stats, health, title, session_id=session_id)
         if not _edit_card(session.health_card_id, card):
             session_store.set_health_card(session_id, "")
             return False
-        return health in ("done", "error")
+        return health in _TERMINAL_HEALTH
     except Exception as e:
         logger.info("health card refresh failed for %s: %s", (session_id or "")[:8], e)
         return False
@@ -2744,9 +3063,8 @@ def _refresh_health_card_for_event(
 ) -> bool:
     """Event-driven health-card refresh.
 
-    This intentionally ignores last_status="stopped": a new Feishu reply, HITL
-    card, UserPromptSubmit, or Stop hook is new evidence and must be able to
-    update a previously frozen card.
+    A new Feishu reply, HITL card, UserPromptSubmit, or Stop hook is fresh
+    evidence and must be able to update a previously frozen card.
     """
     if not config or not session_store or not config.health_card_enabled or not session_id:
         return False
@@ -2760,7 +3078,7 @@ def _refresh_health_card_for_event(
     )
     if freeze_if_terminal and frozen:
         if not _is_session_busy(session_id) and not registry.has_open_request(session_id):
-            session_store.set_status(session_id, "stopped")
+            session_store.set_stopped(session_id, "completed")
     return frozen
 
 
@@ -2778,8 +3096,9 @@ def _after_hook_delivered(session_id: str, hook_type: str, recent_turn: str = ""
 # --- Init ---
 
 def init(cfg: Config):
-    global config, lark_client, session_store, agent_adapter
+    global config, lark_client, session_store, agent_adapter, _STUCK_THRESHOLD
     config = cfg
+    _STUCK_THRESHOLD = cfg.stuck_threshold
     agent_adapter = get_agent(cfg.agent)
     lark_client = lark.Client.builder() \
         .app_id(cfg.feishu_app_id) \
@@ -2810,8 +3129,13 @@ def start_ws_client(cfg: Config):
     threading.Thread(target=cli.start, daemon=True).start()
     logger.info("Feishu WebSocket client started")
 
+    _start_background_services(cfg)
+
+
+def _start_background_services(cfg: Config):
     _start_idle_reaper()
-    _start_stuck_watchdog()
+    if cfg.health_card_enabled:
+        _start_stuck_watchdog()
+    else:
+        logger.info("Health card disabled (WALKCODE_HEALTH_CARD=0); stuck watchdog disabled")
     _start_inject_sweeper()
-    if not config.health_card_enabled:
-        logger.info("Health card disabled (WALKCODE_HEALTH_CARD=0)")

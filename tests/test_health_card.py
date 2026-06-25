@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest import mock
 
 from walkcode import server
+from walkcode.config import Config
 from walkcode.state import SessionStore, Session
 from walkcode.stats import SessionStats
 
@@ -25,20 +26,52 @@ class _Req:
 
 
 class SessionHealthStateMachineTest(unittest.TestCase):
-    """_session_health priority: HITL > running > (never stopped→running) > error/done."""
+    """_session_health priority: timeout > waiting > running > error/done."""
 
     def setUp(self):
         server._session_last_ups.clear()
         server._session_last_stop.clear()
         self._reg = server.registry
+        self._store = server.session_store
         server.registry = mock.MagicMock()
         server.registry.has_open_request.return_value = False
+        server.session_store = mock.MagicMock()
+        server.session_store.get.return_value = None
         self.addCleanup(lambda: setattr(server, "registry", self._reg))
+        self.addCleanup(lambda: setattr(server, "session_store", self._store))
 
     def test_hitl_overrides_running(self):
         server.registry.has_open_request.return_value = True
         server._session_last_ups["s"] = 100.0  # also busy, but HITL wins
         self.assertEqual(server._session_health("s", _stats()), "hitl")
+
+    def test_timeout_overrides_hitl(self):
+        sess = Session(tty="t", cwd="/c", root_msg_id="r")
+        sess.status = "stopped"
+        sess.stop_reason = "interrupted"
+        sess.interrupt_reason = "timeout"
+        server.registry.has_open_request.return_value = True
+        with mock.patch.object(server, "session_store") as store:
+            store.get.return_value = sess
+            self.assertEqual(server._session_health("s", _stats()), "timeout")
+
+    def test_permission_waiting_is_hitl_without_registry_memory(self):
+        sess = Session(tty="t", cwd="/c", root_msg_id="r")
+        sess.status = "stopped"
+        sess.stop_reason = "permission_request"
+        sess.running_since = 123.0
+        with mock.patch.object(server, "session_store") as store:
+            store.get.return_value = sess
+            self.assertEqual(server._session_health("s", _stats()), "hitl")
+
+    def test_ask_user_question_waiting_is_hitl_without_registry_memory(self):
+        sess = Session(tty="t", cwd="/c", root_msg_id="r")
+        sess.status = "stopped"
+        sess.stop_reason = "ask_user_question"
+        sess.running_since = 123.0
+        with mock.patch.object(server, "session_store") as store:
+            store.get.return_value = sess
+            self.assertEqual(server._session_health("s", _stats()), "hitl")
 
     def test_running_when_busy(self):
         server._session_last_ups["s"] = 200.0
@@ -57,6 +90,16 @@ class SessionHealthStateMachineTest(unittest.TestCase):
         server._session_last_stop["s"] = 100.0
         self.assertEqual(server._session_health("s", _stats(last_error="boom")), "error")
 
+    def test_timeout_status_overrides_terminal_done(self):
+        sess = Session(tty="t", cwd="/c", root_msg_id="r")
+        sess.status = "stopped"
+        sess.stop_reason = "interrupted"
+        sess.interrupt_reason = "timeout"
+        with mock.patch.object(server, "session_store") as store:
+            store.get.return_value = sess
+            server._session_last_stop["s"] = 100.0
+            self.assertEqual(server._session_health("s", _stats()), "timeout")
+
 
 class HealthCardStoreTest(unittest.TestCase):
     """set_* mutators must persist (locked + saved), survive reload [R3]."""
@@ -68,21 +111,186 @@ class HealthCardStoreTest(unittest.TestCase):
             store.upsert("s", tty="t", cwd="/c", root_msg_id="r")
             store.set_health_card("s", "card1")
             store.set_title("s", "精炼标题", "summary")
-            store.set_status("s", "stopped")
+            store.start_running("s", 123.0)
+            store.set_stopped("s", "completed")
             store2 = SessionStore(p)
             store2.load()
             sess = store2.get("s")
             self.assertEqual(sess.health_card_id, "card1")
             self.assertEqual(sess.cached_title, "精炼标题")
             self.assertEqual(sess.title_source, "summary")
-            self.assertEqual(sess.last_status, "stopped")
+            self.assertEqual(sess.status, "stopped")
+            self.assertEqual(sess.stop_reason, "completed")
+            self.assertEqual(sess.interrupt_reason, "")
+            self.assertEqual(sess.running_since, 0.0)
+
+    def test_running_since_persists_across_reload(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "state.json"
+            store = SessionStore(p)
+            store.upsert("s", tty="t", cwd="/c", root_msg_id="r")
+            store.start_running("s", 123.0)
+
+            store2 = SessionStore(p)
+            store2.load()
+            sess = store2.get("s")
+            self.assertEqual(sess.status, "running")
+            self.assertEqual(sess.stop_reason, "")
+            self.assertEqual(sess.interrupt_reason, "")
+            self.assertEqual(sess.running_since, 123.0)
+
+    def test_legacy_last_status_migrates_to_status_model(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "state.json"
+            p.write_text("""{
+              "sessions": {
+                "run": {"tty": "t1", "cwd": "/c", "last_status": "", "running_since": 11},
+                "done": {"tty": "t2", "cwd": "/c", "last_status": "stopped"},
+                "tout": {"tty": "t3", "cwd": "/c", "last_status": "timeout"}
+              }
+            }""")
+            store = SessionStore(p)
+            store.load()
+
+            self.assertEqual(store.get("run").status, "running")
+            self.assertEqual(store.get("run").running_since, 11.0)
+            self.assertEqual(store.get("done").status, "stopped")
+            self.assertEqual(store.get("done").stop_reason, "completed")
+            self.assertEqual(store.get("tout").status, "stopped")
+            self.assertEqual(store.get("tout").stop_reason, "interrupted")
+            self.assertEqual(store.get("tout").interrupt_reason, "timeout")
 
     def test_set_methods_noop_on_unknown_session(self):
         with tempfile.TemporaryDirectory() as d:
             store = SessionStore(Path(d) / "state.json")
             store.set_health_card("nope", "x")  # no crash, no-op
-            store.set_status("nope", "stopped")
+            store.set_stopped("nope", "completed")
             self.assertIsNone(store.get("nope"))
+
+    def test_late_completed_stop_preserves_timeout_terminal_state(self):
+        with tempfile.TemporaryDirectory() as d:
+            store = SessionStore(Path(d) / "state.json")
+            store.upsert("s", tty="t", cwd="/c", root_msg_id="r")
+            store.set_stopped("s", "interrupted", interrupt_reason="timeout")
+            store.set_stopped("s", "completed")
+
+            sess = store.get("s")
+            self.assertEqual(sess.status, "stopped")
+            self.assertEqual(sess.stop_reason, "interrupted")
+            self.assertEqual(sess.interrupt_reason, "timeout")
+            self.assertEqual(sess.running_since, 0.0)
+
+
+class HealthCardBuildTest(unittest.TestCase):
+    def test_card_includes_full_session_id(self):
+        session_id = "229719b9-0a2c-4f55-aa31-ed8fc60a5dfe"
+        card = server._build_health_card(_stats(), "running", "t", session_id=session_id)
+        contents = [
+            el.get("content", "")
+            for el in card["elements"]
+            if el.get("tag") == "markdown"
+        ]
+        self.assertTrue(any(session_id in c for c in contents))
+
+    def test_timeout_card_uses_timeout_status_and_frozen_footer(self):
+        card = server._build_health_card(_stats(), "timeout", "t", session_id="sid-timeout")
+        self.assertEqual(card["header"]["template"], "orange")
+        text = "\n".join(
+            el.get("content", "")
+            for el in card["elements"]
+            if el.get("tag") == "markdown"
+        )
+        self.assertTrue("超时已中断" in text or "Timeout interrupted" in text)
+        footer = card["elements"][-1]["elements"][0]["content"]
+        self.assertTrue("已停止" in footer or "stopped" in footer)
+
+
+class ReceiveSyncPendingHealthCardTest(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self._cfg = server.config
+        self._store = server.session_store
+        self._adapter = server.agent_adapter
+        server.config = Config(
+            feishu_app_id="x", feishu_app_secret="y",
+            feishu_receive_id="", feishu_receive_id_type="open_id",
+            default_cwd="/default",
+        )
+        server.agent_adapter = mock.MagicMock(name="claude")
+        server.agent_adapter.name = "claude"
+        server.session_store = SessionStore(Path(self._tmp.name) / "state.json")
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        self._tmp.cleanup()
+        server.config = self._cfg
+        server.session_store = self._store
+        server.agent_adapter = self._adapter
+
+    def test_session_start_binds_pending_root_and_refreshes_card(self):
+        session_id = "229719b9-0a2c-4f55-aa31-ed8fc60a5dfe"
+        server.session_store.add_pending(
+            "tmux-pending", "root-card", reply_id="reply-start",
+            cwd="/launch", health_card_id="root-card",
+        )
+        edits = []
+        refreshes = []
+
+        with mock.patch("walkcode.server._edit_message",
+                        lambda mid, text: edits.append((mid, text)) or True), \
+             mock.patch("walkcode.server._refresh_health_card_for_event",
+                        lambda sid, **kw: refreshes.append((sid, kw)) or False):
+            res = asyncio.run(server.receive_sync_hook(_Req({
+                "tty": "tmux-pending",
+                "session_id": session_id,
+                "cwd": "/sync-cwd",
+            })))
+
+        self.assertEqual(res, {"ok": True})
+        sess = server.session_store.get(session_id)
+        self.assertEqual(sess.root_msg_id, "root-card")
+        self.assertEqual(sess.health_card_id, "root-card")
+        self.assertEqual(sess.cwd, "/launch")
+        self.assertGreater(sess.running_since, 0.0)
+        self.assertEqual(server.session_store.resolve(root_id="root-card"), session_id)
+        self.assertIsNone(server.session_store.resolve_pending_tty("root-card"))
+        self.assertEqual(refreshes, [(session_id, {})])
+        self.assertEqual(edits[0][0], "reply-start")
+        self.assertIn(session_id[:8], edits[0][1])
+
+    def test_pending_without_cwd_uses_session_start_cwd(self):
+        server.session_store.add_pending("tmux-pending", "root-card", health_card_id="root-card")
+
+        with mock.patch("walkcode.server._refresh_health_card_for_event", return_value=False):
+            asyncio.run(server.receive_sync_hook(_Req({
+                "tty": "tmux-pending",
+                "session_id": "sid-sync-cwd",
+                "cwd": "/sync-launch",
+            })))
+
+        self.assertEqual(server.session_store.get("sid-sync-cwd").cwd, "/sync-launch")
+
+    def test_session_start_sync_does_not_reopen_stopped_session(self):
+        session_id = "sid-stopped-sync"
+        server.session_store.upsert(
+            session_id, tty="tmux-old", cwd="/old", root_msg_id="root-card",
+        )
+        server.session_store.set_stopped(session_id, "interrupted", interrupt_reason="timeout")
+
+        res = asyncio.run(server.receive_sync_hook(_Req({
+            "tty": "tmux-old",
+            "session_id": session_id,
+            "cwd": "/new",
+        })))
+
+        sess = server.session_store.get(session_id)
+        self.assertEqual(res, {"ok": True})
+        self.assertEqual(sess.tty, "tmux-old")
+        self.assertEqual(sess.cwd, "/new")
+        self.assertEqual(sess.status, "stopped")
+        self.assertEqual(sess.stop_reason, "interrupted")
+        self.assertEqual(sess.interrupt_reason, "timeout")
+        self.assertEqual(sess.running_since, 0.0)
 
 
 class MaybeSummarizeGateTest(unittest.TestCase):
@@ -153,7 +361,7 @@ class HealthCardRefreshTest(unittest.TestCase):
             server.session_store = SessionStore(Path(d) / "state.json")
             server.session_store.upsert("s", tty="t", cwd="/c", root_msg_id="r")
             server.session_store.set_health_card("s", "card1")
-            server.session_store.set_status("s", "stopped")
+            server.session_store.set_stopped("s", "completed")
             server.registry = mock.MagicMock()
             server.registry.has_open_request.return_value = False
             server._session_last_stop["s"] = 100.0
@@ -167,7 +375,7 @@ class HealthCardRefreshTest(unittest.TestCase):
 
         self.assertEqual(res, {"ok": True})
         self.assertTrue(server._is_session_busy("s"))
-        self.assertEqual(server.session_store.get("s").last_status, "")
+        self.assertEqual(server.session_store.get("s").status, "running")
         collect.assert_called_once()
         edit_card.assert_called_once()
         summarize.assert_not_called()
@@ -191,7 +399,9 @@ class HealthCardRefreshTest(unittest.TestCase):
                 )
 
             summarize.assert_called_once_with("s", mock.ANY, mock.ANY, "Stop result")
-            self.assertEqual(server.session_store.get("s").last_status, "stopped")
+            sess = server.session_store.get("s")
+            self.assertEqual(sess.status, "stopped")
+            self.assertEqual(sess.stop_reason, "completed")
 
 
 if __name__ == "__main__":

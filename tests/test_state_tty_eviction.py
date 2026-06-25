@@ -197,6 +197,24 @@ class CwdDriftTests(unittest.TestCase):
         self.assertEqual(root, "root-1")
         self.assertEqual(cwd, "/launch")
 
+    def test_add_pending_binds_rootless_session_start_race(self):
+        # SessionStart can arrive before _start_agent has finished sending the
+        # Feishu root card. add_pending must bind that already-known session
+        # instead of leaving the root stranded in pending forever.
+        self.store.upsert("sid", tty="tmux-a", cwd="/launch", cwd_is_launch=True)
+
+        bound = self.store.add_pending(
+            "tmux-a", "root-1", cwd="/launch", health_card_id="root-1",
+        )
+
+        self.assertEqual(bound, "sid")
+        sess = self.store.get("sid")
+        self.assertEqual(sess.root_msg_id, "root-1")
+        self.assertEqual(sess.health_card_id, "root-1")
+        self.assertIsNone(self.store.resolve_pending_tty("root-1"))
+        root, _reply, _cwd, _hc = self.store.pop_pending("tmux-a")
+        self.assertIsNone(root)
+
 
 if __name__ == "__main__":
     unittest.main()
