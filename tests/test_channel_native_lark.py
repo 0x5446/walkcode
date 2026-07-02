@@ -466,3 +466,85 @@ class RepoCommandTests(_LarkRuntimeHarness):
 
         self.assertEqual(result.reason, "repo_command_rejected")
         self.assertEqual(len(transport.submitted_turns), 1)
+
+
+class LarkTuiObservationTests(_LarkRuntimeHarness):
+    @staticmethod
+    def _tui_payload(tmp, **extra):
+        payload = {
+            "session_id": "claude-session-1",
+            "cwd": tmp,
+            "terminate_ref": {
+                "controller_kind": "process",
+                "process_ref": {"pid": 123, "allow_terminate": True},
+            },
+        }
+        payload.update(extra)
+        return payload
+
+    def test_tui_hook_creates_observed_lark_session_rooted_at_notice(self):
+        runtime, api, transport = self._runtime(
+            env_extra={"LARK_ALLOWED_CHAT_IDS": "oc_chat"}
+        )
+
+        created = asyncio.run(
+            runtime.process_tui_hook(
+                hook_type="sync", agent="claude", payload=self._tui_payload(self._tmp.name)
+            )
+        )
+        stopped = asyncio.run(
+            runtime.process_tui_hook(
+                hook_type="stop",
+                agent="claude",
+                payload=self._tui_payload(self._tmp.name, message="finished from TUI"),
+            )
+        )
+
+        self.assertTrue(created.accepted)
+        self.assertTrue(stopped.accepted)
+        root_call = api.calls[0]
+        self.assertEqual(root_call[0], "sendMessage")
+        self.assertEqual(root_call[1]["chat_id"], "oc_chat")
+        self.assertIn("TUI 观察会话", root_call[1]["text"])
+        summaries = runtime.state.sessions.list_sessions(channel_kind="lark")
+        self.assertEqual(len(summaries), 1)
+        session = runtime.state.sessions.get(summaries[0].session_id)
+        self.assertEqual(session.channel_binding.chat_id, "oc_chat")
+        self.assertEqual(session.channel_binding.root_message_id, "lark-msg-1")
+        self.assertEqual(session.lifecycle_state, "EXTERNAL_OBSERVED_READONLY")
+        self.assertEqual(session.writer_owner.kind, "external_tui")
+        forwarded = [p for m, p in api.calls if m == "sendMessage" and p.get("text") == "finished from TUI"]
+        self.assertEqual(len(forwarded), 1)
+        self.assertEqual(forwarded[0]["root_id"], "lark-msg-1")
+
+    def test_tui_hook_without_lark_chat_raises_config_error(self):
+        runtime, api, transport = self._runtime()
+
+        with self.assertRaisesRegex(
+            runtime_module.ChannelConfigError, "WALKCODE_LARK_TUI_CHAT_ID"
+        ):
+            asyncio.run(
+                runtime.process_tui_hook(
+                    hook_type="sync", agent="claude", payload=self._tui_payload(self._tmp.name)
+                )
+            )
+
+    def test_explicit_tui_chat_id_beats_allowlist(self):
+        runtime, api, transport = self._runtime(
+            env_extra={
+                "LARK_ALLOWED_CHAT_IDS": "oc_a,oc_b",
+                "WALKCODE_LARK_TUI_CHAT_ID": "oc_tui",
+            }
+        )
+
+        created = asyncio.run(
+            runtime.process_tui_hook(
+                hook_type="sync", agent="claude", payload=self._tui_payload(self._tmp.name)
+            )
+        )
+
+        self.assertTrue(created.accepted)
+        session = runtime.state.sessions.get(
+            runtime.state.sessions.list_sessions(channel_kind="lark")[0].session_id
+        )
+        self.assertEqual(session.channel_binding.chat_id, "oc_tui")

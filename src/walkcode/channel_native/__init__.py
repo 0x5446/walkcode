@@ -501,6 +501,7 @@ def _lark_config_from_env(source: Any, *, priority: int) -> ChannelEndpointConfi
             "openapi_domain": source.get("LARK_OPENAPI_DOMAIN", "https://open.feishu.cn").rstrip("/"),
             "allowed_chat_ids": allowed_chat_ids,
             "allowed_open_ids": tuple(_split_csv(source.get("LARK_ALLOWED_OPEN_IDS", ""))),
+            "tui_chat_id": str(source.get("WALKCODE_LARK_TUI_CHAT_ID", "") or "").strip(),
         },
         priority=priority,
     )

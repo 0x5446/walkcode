@@ -1782,6 +1782,13 @@ class ChannelNativeRuntime:
                         agent=str(item.get("agent", "") or ""),
                         payload=payload,
                     )
+            except ChannelConfigError as exc:
+                # Configuration-level failures do not heal by retrying the same
+                # hook against the same config; archiving avoids an endless
+                # per-second retry loop on the spool.
+                print(f"deferred TUI hook dropped (config): {exc}", file=sys.stderr)
+                self._archive_bad_tui_hook(path)
+                continue
             except Exception as exc:
                 print(f"deferred TUI hook retry pending: {type(exc).__name__}: {exc}", file=sys.stderr)
                 break
@@ -2006,12 +2013,16 @@ class ChannelNativeRuntime:
     @staticmethod
     def _ensure_tui_observed_binding_capabilities(session) -> bool:
         binding = session.channel_binding
-        if binding is None or binding.channel_kind != "telegram":
+        if binding is None or binding.channel_kind not in {"telegram", "lark"}:
             return False
         if not binding.thread_id:
             return False
         changed = False
-        for key in ("status_card", "native_topic", "readonly_topic", "pin_status_card", "static_status_card"):
+        if binding.channel_kind == "telegram":
+            keys = ("status_card", "native_topic", "readonly_topic", "pin_status_card", "static_status_card")
+        else:
+            keys = ("status_card", "readonly_topic", "static_status_card")
+        for key in keys:
             if key not in binding.capabilities:
                 binding.capabilities[key] = True
                 changed = True
@@ -2035,8 +2046,14 @@ class ChannelNativeRuntime:
         payload: dict[str, Any],
     ) -> ChannelBinding:
         channel_kind = self.config.channel.kind
+        if channel_kind == "lark":
+            return await self._create_lark_tui_observed_binding(
+                agent_name, transport_kind, resume_ref
+            )
         if channel_kind != "telegram":
-            raise ChannelConfigError("TUI observed session ingress currently requires Telegram channel binding")
+            raise ChannelConfigError(
+                f"TUI observed session ingress is not supported for channel: {channel_kind}"
+            )
         chat_id = _tui_telegram_chat_id(self.config.channel)
         if not chat_id:
             raise ChannelConfigError(
@@ -2067,6 +2084,60 @@ class ChannelNativeRuntime:
                 "native_topic": True,
                 "readonly_topic": True,
                 "pin_status_card": True,
+                "static_status_card": True,
+                "origin": "external_tui",
+            },
+        )
+
+    async def _create_lark_tui_observed_binding(
+        self,
+        agent_name: str,
+        transport_kind: str,
+        resume_ref: dict[str, Any],
+    ) -> ChannelBinding:
+        chat_id = _tui_lark_chat_id(self.config.channel)
+        if not chat_id:
+            raise ChannelConfigError(
+                "missing Lark chat for TUI observation; set WALKCODE_LARK_TUI_CHAT_ID "
+                "or exactly one LARK_ALLOWED_CHAT_IDS"
+            )
+        channel = self.channels["lark"]
+        # Lark has no topic-creation API; the observation thread is rooted at a
+        # bot-sent notice message so the session's transcript lands in one
+        # reply chain instead of the chat root.
+        root_id = ""
+        try:
+            root_id = await channel.send_view(
+                ChannelBinding(
+                    channel_kind="lark",
+                    account_id="bot",
+                    chat_id=chat_id,
+                    thread_id="",
+                    root_message_id="",
+                ),
+                {
+                    "type": "text",
+                    "text": (
+                        f"👀 TUI 观察会话：{agent_name} "
+                        f"{_resume_ref_identity(transport_kind, resume_ref)}"
+                    ),
+                },
+            )
+        except Exception as exc:
+            print(
+                f"lark TUI observation root message failed; falling back to chat root: "
+                f"{type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+        return ChannelBinding(
+            channel_kind="lark",
+            account_id="bot",
+            chat_id=chat_id,
+            thread_id=root_id,
+            root_message_id=root_id,
+            capabilities={
+                "status_card": True,
+                "readonly_topic": True,
                 "static_status_card": True,
                 "origin": "external_tui",
             },
@@ -3653,6 +3724,12 @@ def _tui_telegram_chat_id(endpoint: ChannelEndpointConfig) -> str:
     if len(allowed) == 1:
         return allowed[0]
     return ""
+
+
+def _tui_lark_chat_id(endpoint: ChannelEndpointConfig) -> str:
+    # Same resolution rule as Telegram: explicit TUI chat wins, otherwise a
+    # single-entry allowlist unambiguously names the observation chat.
+    return _tui_telegram_chat_id(endpoint)
 
 
 def _tui_hook_text(hook_type: str, payload: dict[str, Any]) -> str:
