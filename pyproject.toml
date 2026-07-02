@@ -1,27 +1,18 @@
 [project]
 name = "walkcode"
 version = "0.10.54"
-description = "Let your AI agent call you when it needs help — human-in-the-loop via Feishu"
+description = "Channel-native Telegram/Lark runtime for Claude Code and Codex"
 readme = "README.md"
 requires-python = ">=3.13"
 license = {text = "MIT"}
 authors = [{name = "0x5446"}]
-keywords = ["claude-code", "agent", "human-in-the-loop", "feishu", "lark", "terminal", "remote"]
+keywords = ["claude-code", "codex", "agent", "human-in-the-loop", "telegram", "lark", "remote"]
 classifiers = [
     "Operating System :: MacOS",
     "Programming Language :: Python :: 3",
     "Topic :: Software Development :: Libraries",
 ]
-dependencies = [
-    "fastapi>=0.115.0",
-    "uvicorn>=0.34.0",
-    "lark-oapi>=1.4.0",
-]
-
-[project.optional-dependencies]
-# Title summarization for the session health card (Haiku via Vertex). Optional:
-# summarizer.py imports it lazily and degrades to a first-line title if absent.
-summary = ["anthropic[vertex]>=0.39"]
+dependencies = []
 
 [project.urls]
 Homepage = "https://github.com/0x5446/walkcode"

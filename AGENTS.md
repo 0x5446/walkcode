@@ -37,8 +37,14 @@ scripts; orchestration and gates live in the skill.
 - `./release.sh prepare [VERSION] -m MSG` — bump `pyproject.toml`, run tests, branch
   `release/vX.Y.Z`, commit, push, open PR. `./release.sh publish [VERSION]` — tag the
   merged `main` and `gh release create --latest`. Both support `--dry-run`.
-- `./upgrade.sh` — `walkcode upgrade` + restart & verify **both** launchd instances
-  (claude + codex).
+- `./upgrade.sh` — install the latest V3 CLI, restart only labels listed in
+  `WALKCODE_V3_LAUNCHD_LABELS`, and verify with `walkcode native doctor`.
+- V3 hard rules: do not reinstall legacy hooks, do not restart old
+  `walkcode serve/start` daemons, and do not share a bot token or state file
+  between Claude and Codex runtimes.
+- Legacy remnants are blockers for upgrade and real E2E: old LaunchAgents,
+  `walkcode hook` configs, shell wrapper source lines, and `FEISHU_*` env must be
+  cleaned first.
 - Hard rules: use the **0x5446** GitHub account; tests + `/deep-review` (no Critical)
   must pass before merging the PR; version's single source of truth is `pyproject.toml`
   (`__init__.py` derives from installed metadata — don't hand-edit it).
