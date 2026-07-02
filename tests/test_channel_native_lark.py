@@ -216,16 +216,59 @@ class _LarkRuntimeHarness(unittest.TestCase):
 
 
 class LarkRuntimeTests(_LarkRuntimeHarness):
-    def test_plain_message_creates_session_and_submits(self):
+    def test_plain_message_creates_session_rooted_at_status_card(self):
         runtime, api, transport = self._runtime()
 
         result = asyncio.run(runtime.process_lark_event(self._message_payload()))
 
         self.assertTrue(result.accepted)
         self.assertEqual([turn.text for turn in transport.submitted_turns], ["run tests"])
+        # thread root = bot-sent status card, user's text forwarded as first reply
+        self.assertEqual(api.calls[0][0], "sendCard")
+        self.assertEqual(api.calls[0][1]["view"]["type"], "health")
+        self.assertEqual(api.calls[0][1]["root_id"], "")
+        forward = api.calls[1]
+        self.assertEqual(forward[0], "sendMessage")
+        self.assertEqual(forward[1]["root_id"], "lark-msg-1")
+        self.assertIn("run tests", forward[1]["text"])
         sessions = runtime.state.sessions.list_sessions(channel_kind="lark")
         self.assertEqual(len(sessions), 1)
-        self.assertEqual(sessions[0].root_message_id, "om_msg")
+        self.assertEqual(sessions[0].root_message_id, "lark-msg-1")
+        session = runtime.state.sessions.get(sessions[0].session_id)
+        self.assertEqual(session.channel_binding.health_message_id, "lark-msg-1")
+        # lifecycle refreshes patch the root card instead of sending a second one
+        edits = [p for m, p in api.calls if m == "editCard"]
+        self.assertTrue(edits)
+        self.assertTrue(all(p["message_id"] == "lark-msg-1" for p in edits))
+        self.assertEqual(len([m for m, _ in api.calls if m == "sendCard"]), 1)
+
+    def test_thread_reply_to_status_card_continues_session(self):
+        runtime, api, transport = self._runtime(
+            scripted_events=[
+                AgentEvent(
+                    AgentEventType.TURN_COMPLETED,
+                    {"message": "done", "agent_session_id": "agent-abc"},
+                )
+            ]
+        )
+        asyncio.run(runtime.process_lark_event(self._message_payload()))
+
+        result = asyncio.run(
+            runtime.process_lark_event(
+                self._message_payload(
+                    event_id="evt-2",
+                    message_id="om_reply",
+                    root_id="lark-msg-1",
+                    text="follow up",
+                )
+            )
+        )
+
+        self.assertTrue(result.accepted)
+        self.assertEqual(
+            [turn.text for turn in transport.submitted_turns], ["run tests", "follow up"]
+        )
+        self.assertEqual(len(runtime.state.sessions.list_sessions(channel_kind="lark")), 1)
 
     def test_chat_allowlist_blocks_unknown_chat(self):
         runtime, api, transport = self._runtime(
@@ -458,7 +501,7 @@ class RepoCommandTests(_LarkRuntimeHarness):
                 self._message_payload(
                     event_id="evt-2",
                     message_id="om_reply",
-                    root_id="om_msg",
+                    root_id="lark-msg-1",
                     text="/repo proj-a 换个目录",
                 )
             )

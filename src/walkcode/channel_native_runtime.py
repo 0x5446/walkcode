@@ -1055,8 +1055,11 @@ class ChannelNativeRuntime:
                 },
             )
             return SubmitResult(True, "repo_command_usage")
+        task_inbound = replace(inbound, text=task_text)
+        if inbound.channel_kind == "lark":
+            task_inbound = await self._place_lark_new_session(channel, task_inbound)
         result = await self.orchestrator.handle_inbound_event(
-            replace(inbound, text=task_text),
+            task_inbound,
             agent_transport_kind=self.config.agent_transport_kind,
             cwd=resolved,
         )
@@ -1262,6 +1265,7 @@ class ChannelNativeRuntime:
                 )
             if _telegram_message_is_empty(inbound):
                 return SubmitResult(True, "empty_message_ignored")
+            inbound = await self._place_lark_new_session(channel, inbound)
         result = await self.orchestrator.handle_inbound_event(
             inbound,
             agent_transport_kind=self.config.agent_transport_kind,
@@ -1269,6 +1273,72 @@ class ChannelNativeRuntime:
         )
         self.save_state()
         return result
+
+    async def _place_lark_new_session(self, channel, inbound):
+        """Root new Lark sessions at a bot-sent status card (V2 UX parity).
+
+        The card becomes the thread root and is registered as the session's
+        status card, so lifecycle refreshes patch the root card in place. The
+        user's original message stays in the chat; its text is forwarded into
+        the thread as the first reply.
+        """
+        if inbound.callback is not None:
+            return inbound
+        if inbound.root_message_id and inbound.root_message_id != inbound.message_id:
+            return inbound
+        resolution = self.state.sessions.resolve_active_binding(inbound.binding_key())
+        if resolution.session_id or resolution.reason:
+            return inbound
+        text = str(inbound.text or "").strip()
+        title = text.splitlines()[0][:40] if text else "新任务"
+        try:
+            card_id = await channel.send_view(
+                ChannelBinding(
+                    channel_kind=inbound.channel_kind,
+                    account_id=inbound.account_id,
+                    chat_id=inbound.chat_id,
+                    thread_id="",
+                    root_message_id="",
+                ),
+                {
+                    "type": "health",
+                    "status": "running",
+                    "title": title,
+                    "session_id": "",
+                    "transport": self.config.agent_transport_kind,
+                    "elapsed": 0.0,
+                    "cwd": self.config.cwd,
+                    "last_progress_event": "starting",
+                },
+            )
+        except Exception as exc:
+            print(
+                f"lark session root card failed; falling back to message-rooted thread: "
+                f"{type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+            return inbound
+        if not card_id:
+            return inbound
+        thread_binding = ChannelBinding(
+            channel_kind=inbound.channel_kind,
+            account_id=inbound.account_id,
+            chat_id=inbound.chat_id,
+            thread_id=str(card_id),
+            root_message_id=str(card_id),
+        )
+        try:
+            await channel.send_view(thread_binding, {"type": "text", "text": f"👤 {text}"})
+        except Exception:
+            pass
+        raw = inbound.raw if isinstance(inbound.raw, dict) else {}
+        raw["_walkcode_status_card_id"] = str(card_id)
+        return replace(
+            inbound,
+            thread_id=str(card_id),
+            root_message_id=str(card_id),
+            raw=raw,
+        )
 
     async def serve_lark_ws(
         self,

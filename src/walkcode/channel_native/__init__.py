@@ -6168,6 +6168,14 @@ class Orchestrator:
                                 root_message_id=self._root_message_id_for_new_binding(inbound),
                                 capabilities=self._new_binding_capabilities(inbound),
                             )
+                            preset_card = str(
+                                (inbound.raw or {}).get("_walkcode_status_card_id", "") or ""
+                            ) if isinstance(inbound.raw, dict) else ""
+                            if preset_card:
+                                # The channel ingress already sent the status card
+                                # as the thread root; register it so refreshes
+                                # patch that card instead of sending a second one.
+                                binding.health_message_id = preset_card
                             session = await self.start_session(
                                 binding,
                                 agent_transport_kind,
@@ -6233,7 +6241,7 @@ class Orchestrator:
             capabilities["native_topic"] = True
             capabilities["pin_status_card"] = inbound.channel_kind == "telegram"
             capabilities["static_status_card"] = inbound.channel_kind == "telegram"
-            capabilities["origin"] = "telegram"
+            capabilities["origin"] = inbound.channel_kind
         title = _title_from_text(inbound.text)
         if title:
             capabilities["initial_title"] = title
