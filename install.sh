@@ -8,7 +8,7 @@ set -euo pipefail
 REPO="0x5446/walkcode"
 GITHUB_URL="https://github.com/${REPO}.git"
 CONFIG_DIR="${WALKCODE_DIR:-$HOME/.walkcode}"
-ENV_FILE="${WALKCODE_ENV_FILE:-$CONFIG_DIR/telegram-claude.env}"
+ENV_FILE="${WALKCODE_ENV_FILE:-$CONFIG_DIR/work-claude.env}"
 PYTHON_SPEC="${WALKCODE_PYTHON:-3.13}"
 
 RED='\033[0;31m'
@@ -65,7 +65,7 @@ install_package() {
     source="walkcode @ git+${GITHUB_URL}"
     warn "$(msg "No release tag found; installing from main." "未找到 release tag；从 main 安装。")"
   fi
-  uv tool install --python "$PYTHON_SPEC" --with claude-agent-sdk "$source" \
+  uv tool install --python "$PYTHON_SPEC" --with claude-agent-sdk --with lark-oapi "$source" \
     --force --reinstall --refresh-package walkcode
 }
 
@@ -79,38 +79,43 @@ write_env_template() {
   cat > "$ENV_FILE" <<'ENVFILE'
 # WalkCode V3 channel-native runtime
 #
-# One env file configures one runtime:
-#   1 runtime = 1 channel = 1 bot/app identity = 1 coding agent
+# One env file configures one runtime instance:
+#   1 runtime = 1 profile = 1 channel = 1 bot/app identity = 1 coding agent
+#
+# Standard deployment is four Lark/Feishu instances:
+#   {work, personal} x {claude, codex}  (see docs/lark-profile-deploy.md)
 
-WALKCODE_CHANNEL=telegram
-TELEGRAM_BOT_TOKEN=
-
-# Recommended before real use.
-# TELEGRAM_ALLOWED_CHAT_IDS=
-# TELEGRAM_ALLOWED_USER_IDS=
-
-# Bind this bot to exactly one coding agent.
+WALKCODE_PROFILE=work
+WALKCODE_CHANNEL=lark
 WALKCODE_AGENT=claude
 # WALKCODE_AGENT=codex
 
-# Do not share state between Claude and Codex runtimes.
-WALKCODE_STATE_PATH=~/.walkcode/telegram-claude-state.json
+LARK_APP_ID=
+LARK_APP_SECRET=
+# Company Feishu tenant vs personal Lark tenant.
+LARK_OPENAPI_DOMAIN=https://open.feishu.cn
+# LARK_OPENAPI_DOMAIN=https://open.larksuite.com
+
+# Recommended before real use.
+# LARK_ALLOWED_CHAT_IDS=
+# LARK_ALLOWED_OPEN_IDS=
+
 WALKCODE_CWD=~/.walkcode/workspace
+# Enable /repo <dir> <task> inside this allowlist (colon-separated).
+# WALKCODE_WORKSPACE_ROOTS=
 
-# Optional when Claude Code uses a non-default provider/profile.
-# WALKCODE_CLAUDE_SETTINGS=/Users/you/.claude/profiles/vertex.json
+# Per-profile agent isolation.
+# WALKCODE_CLAUDE_CONFIG_DIR=~/.claude-profiles/work
+# WALKCODE_CODEX_HOME=~/.codex-profiles/work
 
-# Optional Lark/Feishu peer channel config for a separate runtime env.
-# WALKCODE_CHANNEL=lark
-# LARK_APP_ID=
-# LARK_APP_SECRET=
-# LARK_RECEIVE_ID=
-# LARK_RECEIVE_ID_TYPE=open_id
+# Telegram peer channel (architecture-validation only) uses a separate env:
+# WALKCODE_CHANNEL=telegram
+# TELEGRAM_BOT_TOKEN=
 ENVFILE
 
   warn "$(msg \
-    "$ENV_FILE created. Fill TELEGRAM_BOT_TOKEN and WALKCODE_AGENT before starting." \
-    "$ENV_FILE 已创建。启动前请填写 TELEGRAM_BOT_TOKEN 和 WALKCODE_AGENT。")"
+    "$ENV_FILE created. Fill LARK_APP_ID/LARK_APP_SECRET and WALKCODE_AGENT before starting." \
+    "$ENV_FILE 已创建。启动前请填写 LARK_APP_ID/LARK_APP_SECRET 和 WALKCODE_AGENT。")"
 }
 
 detect_legacy_remnants() {

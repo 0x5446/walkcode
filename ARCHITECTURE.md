@@ -9,20 +9,29 @@ A running instance has one identity line:
 
 ```text
 WALKCODE_ENV_FILE
+  -> WALKCODE_PROFILE (work | personal)
   -> WALKCODE_CHANNEL
   -> bot/app credentials
   -> WALKCODE_AGENT
-  -> WALKCODE_STATE_PATH
+  -> WALKCODE_STATE_PATH (derived from profile+agent unless explicit)
 ```
 
 That means:
 
 ```text
-1 runtime = 1 Channel = 1 bot/app identity = 1 Coding Agent
+1 runtime = 1 Profile = 1 Channel = 1 bot/app identity = 1 Coding Agent
 ```
 
 Claude Code and Codex are separate runtimes. They must not share a bot token,
 Lark app identity, state file, or long-running process.
+
+The standard local deployment is four Lark/Feishu instances
+({work, personal} x {claude, codex}, ADR 0043). Each profile pins its own agent
+configuration at the process-environment level: `WALKCODE_CLAUDE_CONFIG_DIR`
+flows into the Claude SDK subprocess as `CLAUDE_CONFIG_DIR`, and
+`WALKCODE_CODEX_HOME` flows into codex subprocess/daemon spawns as
+`CODEX_HOME` — giving each profile its own credentials, settings, and (for
+codex) its own managed app-server daemon and control socket.
 
 ## Core Boundaries
 
@@ -49,9 +58,21 @@ identities.
 
 ## Channels
 
-Telegram is the first default local deployment channel.
+Lark/Feishu is the first deployable channel (ADR 0044). One
+`LarkChannelAdapter` serves both tenants; `LARK_OPENAPI_DOMAIN` selects
+open.feishu.cn (work) or open.larksuite.com (personal). Ingress is the
+lark-oapi WebSocket client bridged from its callback thread into the asyncio
+serve loop; card callbacks are acknowledged inline within Feishu's ~3s window
+and button-state changes go through the durable outbox's `im.v1.message.patch`
+edits. View models are rendered to Feishu interactive cards / post markdown by
+`channel_native/lark_cards.py`, which ports the V2-proven card layouts
+(permission three-button card, AskUserQuestion three modes, health card).
+Session placement is one session per reply chain: a non-reply message roots a
+new session at its own message id.
 
-Telegram session placement is capability-driven:
+Telegram is a peer `ChannelAdapter` kept as the architecture-validation
+channel (code and tests stay; no further UX investment). Telegram session
+placement is capability-driven:
 
 - forum supergroup with topic-management rights: one topic per agent session;
 - private chat with bot private-topic mode: one topic per agent session;
@@ -62,10 +83,6 @@ The durable channel binding key is:
 ```text
 channel_kind + account_id + chat_id + thread_id + root_message_id
 ```
-
-Lark/Feishu is a peer `ChannelAdapter`, not a lower-priority agent mode. It uses
-`LARK_*` configuration and should map sessions to native Lark topics/threads
-when V3 live ingress is enabled and E2E-gated.
 
 ## Agents
 
@@ -96,6 +113,11 @@ tmux are not part of this path.
 
 Plain text in the bot starts or continues the bound agent session. `/claude` and
 `/codex` are rejected because one bot cannot multiplex several coding agents.
+
+New sessions run in `WALKCODE_CWD` by default. With
+`WALKCODE_WORKSPACE_ROOTS` configured, `/repo <dir> <task>` starts the session
+in an allowlisted repository instead; resolution is realpath-contained so
+`..` and symlinks cannot escape a root (ADR 0045).
 
 ## TUI-Started Sessions
 

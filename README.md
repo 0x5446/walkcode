@@ -7,16 +7,20 @@ WalkCode V3 是 channel-native 的 Coding Agent runtime。它把 IM 当成一等
 一个本地运行实例只绑定一条清晰身份线：
 
 ```text
-1 runtime = 1 Channel = 1 bot/app identity = 1 Coding Agent
+1 runtime = 1 Profile = 1 Channel = 1 bot/app identity = 1 Coding Agent
 ```
 
-- Channel 使用 `WALKCODE_CHANNEL=telegram|lark` 选择。
+- Profile 使用 `WALKCODE_PROFILE=work|personal` 命名实例，派生默认 state 路径和 launchd label；每个 profile 通过 `WALKCODE_CLAUDE_CONFIG_DIR` / `WALKCODE_CODEX_HOME` 完全隔离 agent 的凭证与配置（codex 每个 profile 一个独立 app-server daemon）。
+- Channel 使用 `WALKCODE_CHANNEL=lark|telegram` 选择。
 - Coding Agent 使用 `WALKCODE_AGENT=claude|codex` 显式绑定。
-- 显式设置 `WALKCODE_ENV_FILE` 时，该 env 文件里的 Channel/Agent 身份优先，避免当前 shell 的旧变量串台。
+- 显式设置 `WALKCODE_ENV_FILE` 时，该 env 文件里的身份优先；hook 命令必须显式携带 `WALKCODE_ENV_FILE`（无隐式默认）。
 - Claude Code 和 Codex 必须使用两个 bot、两个 env、两个 state、两个 runtime。
 - 同一个 bot 里不支持 `/claude`、`/codex` 切 agent；这些命令会被拒绝。
-- Telegram 优先使用 forum topic / private topic 做 `1 agent session = 1 topic`，不具备 topic 能力时退回 root reply-chain。
-- Lark/飞书是同级 `ChannelAdapter`。当前 V3 默认落地优先 Telegram；Lark live ingress 需要独立 E2E gate 后再标记 deployable。
+- **Lark/飞书是首发部署渠道**：同一个 adapter 通过 `LARK_OPENAPI_DOMAIN` 同时支持公司飞书（open.feishu.cn）和 Lark（open.larksuite.com）；会话按话题 reply-chain 放置，卡片体系移植自 V2 已验证的飞书 UI（权限三按钮卡、AskUserQuestion 三模式、健康卡）。
+- Telegram 是架构验证通道（代码与测试保留，不再打磨 UX）；forum topic 会话放置逻辑仍然可用。
+
+标准本地部署是 4 个 Lark/飞书实例：{work, personal} × {claude, codex}，见
+[docs/lark-profile-deploy.md](docs/lark-profile-deploy.md)。
 
 ## 安装
 
@@ -27,8 +31,7 @@ curl -fsSL https://raw.githubusercontent.com/0x5446/walkcode/main/install.sh | b
 安装脚本只做 V3 路径：
 
 - 安装 `uv` 和 `walkcode` CLI；
-- 把 `claude-agent-sdk` 安装进 `walkcode` 的 uv tool 环境；
-- 创建 `~/.walkcode/telegram-claude.env` V3 模板；
+- 把 `claude-agent-sdk`、`lark-oapi` 安装进 `walkcode` 的 uv tool 环境；
 - 阻断旧版 LaunchAgent、hook、legacy shell wrapper、`FEISHU_*` env 残留；
 - 不安装 tmux wrapper；
 - 不写旧版 `walkcode hook`；
@@ -36,65 +39,67 @@ curl -fsSL https://raw.githubusercontent.com/0x5446/walkcode/main/install.sh | b
 
 ## 最小配置
 
-`~/.walkcode/telegram-claude.env`：
+`~/.walkcode/work-claude.env`（公司飞书租户）：
 
 ```bash
-WALKCODE_CHANNEL=telegram
-TELEGRAM_BOT_TOKEN=123456:telegram-bot-token
+WALKCODE_PROFILE=work
+WALKCODE_CHANNEL=lark
 WALKCODE_AGENT=claude
-WALKCODE_STATE_PATH=/Users/you/.walkcode/telegram-claude-state.json
+LARK_APP_ID=cli_xxx
+LARK_APP_SECRET=xxx
+LARK_OPENAPI_DOMAIN=https://open.feishu.cn
+LARK_ALLOWED_CHAT_IDS=oc_xxx
+WALKCODE_CLAUDE_CONFIG_DIR=/Users/you/.claude-profiles/work
 WALKCODE_CWD=/Users/you/.walkcode/workspace
+WALKCODE_WORKSPACE_ROOTS=/Users/you/Documents/workspace
 ```
 
-Codex 使用另一个 bot 和 env：
-
-```bash
-WALKCODE_CHANNEL=telegram
-TELEGRAM_BOT_TOKEN=987654:telegram-codex-bot-token
-WALKCODE_AGENT=codex
-WALKCODE_STATE_PATH=/Users/you/.walkcode/telegram-codex-state.json
-WALKCODE_CWD=/Users/you/.walkcode/workspace
-```
+personal 实例用 Lark 租户的 bot 与 `LARK_OPENAPI_DOMAIN=https://open.larksuite.com`；
+codex 实例把 `WALKCODE_AGENT=codex` 并配 `WALKCODE_CODEX_HOME`。完整 4 实例矩阵和
+launchd 模板见 [docs/lark-profile-deploy.md](docs/lark-profile-deploy.md)，全部
+变量见 [.env.example](.env.example)。
 
 ## 本地运行
 
-先检查配置和 agent 能力：
+先检查配置、凭证和 agent 能力：
 
 ```bash
-WALKCODE_ENV_FILE=~/.walkcode/telegram-claude.env walkcode native doctor
+WALKCODE_ENV_FILE=~/.walkcode/work-claude.env walkcode native doctor
+WALKCODE_ENV_FILE=~/.walkcode/work-claude.env walkcode native debug lark
 ```
 
 在仓库 checkout 里跑模块级 gate：
 
 ```bash
-uv run --with claude-agent-sdk python scripts/channel_native_debug.py --env-file ~/.walkcode/telegram-claude.env config
-uv run --with claude-agent-sdk python scripts/channel_native_debug.py --env-file ~/.walkcode/telegram-claude.env runtime
-uv run --with claude-agent-sdk python scripts/channel_native_debug.py --env-file ~/.walkcode/telegram-claude.env state
-uv run --with claude-agent-sdk python scripts/channel_native_debug.py --env-file ~/.walkcode/telegram-claude.env outbox
-uv run --with claude-agent-sdk python scripts/channel_native_debug.py --env-file ~/.walkcode/telegram-claude.env agent
-uv run --with claude-agent-sdk python scripts/channel_native_debug.py --env-file ~/.walkcode/telegram-claude.env telegram
+uv run --with claude-agent-sdk python scripts/channel_native_debug.py --env-file ~/.walkcode/work-claude.env config
+uv run --with claude-agent-sdk python scripts/channel_native_debug.py --env-file ~/.walkcode/work-claude.env runtime
+uv run --with claude-agent-sdk python scripts/channel_native_debug.py --env-file ~/.walkcode/work-claude.env state
+uv run --with claude-agent-sdk python scripts/channel_native_debug.py --env-file ~/.walkcode/work-claude.env outbox
+uv run --with claude-agent-sdk python scripts/channel_native_debug.py --env-file ~/.walkcode/work-claude.env agent
+uv run --with claude-agent-sdk --with lark-oapi python scripts/channel_native_debug.py --env-file ~/.walkcode/work-claude.env lark
 ```
 
-确认 `telegram` gate 报 `safe_to_run_serve_once: true` 后再消费 update：
+启动常驻服务（长期运行建议 launchd）：
 
 ```bash
-WALKCODE_ENV_FILE=~/.walkcode/telegram-claude.env walkcode native serve --once --poll-timeout 0
-WALKCODE_ENV_FILE=~/.walkcode/telegram-claude.env walkcode native serve
+WALKCODE_ENV_FILE=~/.walkcode/work-claude.env walkcode native serve
 ```
 
-长期运行建议用 launchd 或其他进程管理器直接执行 `walkcode native serve`。不要用旧版 `walkcode start`。
+会话内可用命令：`/status`、`/sessions`、`/model`、`/takeover`、
+`/repo <目录> <任务>`（在 `WALKCODE_WORKSPACE_ROOTS` 白名单内选择仓库启动新会话）。
 
 ## 从旧版迁移
 
 V3 不继承旧版 Feishu/tmux/hook runtime。切换前清理：
 
 - 卸载或停掉运行 `walkcode serve` / `walkcode start` 的 `~/Library/LaunchAgents/com.walkcode*.plist`。
-- 把 `~/.claude/settings.json`、`~/.codex/hooks.json` 里的 `walkcode hook ...` 改成 `walkcode native hook ...`，仅在需要 TUI 只读观测和 takeover 时配置。
+- 把各 profile 的 `{CLAUDE_CONFIG_DIR}/settings.json`、`{CODEX_HOME}/hooks.json` 里的 hook 改成 `WALKCODE_ENV_FILE=... walkcode native hook ...`，仅在需要 TUI 只读观测和 takeover 时配置。
 - `~/.agent-control-plane/agent-wrappers.sh` 只能保留 V3 纯转发 helper；包含 tmux、旧 `walkcode hook/serve/start/status/test-inject`、旧 WalkCode env 或 `FEISHU_*` 的 wrapper 必须清掉。
-- 把旧 `~/.walkcode/*.env` 里的 `FEISHU_*` 迁走或转成 Lark 专用 `LARK_*`，不要让它们参与 V3 Telegram runtime。
-- 给 Claude/Codex 分配独立 bot、env、state 和 runtime。
+- 把旧 `~/.walkcode/*.env` 里的 `FEISHU_*` 转成 `LARK_*`（有 `LegacyFeishuEnvConverter` 提示）。
+- 给每个 profile × agent 分配独立 bot、env、state 和 runtime。
 
-更多部署与验收细节见 [docs/channel-native-local-deploy.md](docs/channel-native-local-deploy.md)。
+更多部署与验收细节见 [docs/lark-profile-deploy.md](docs/lark-profile-deploy.md)
+与 [docs/channel-native-local-deploy.md](docs/channel-native-local-deploy.md)（Telegram，已降级）。
 当前关键进展和 TODO 导出见
 [docs/reports/2026-07-02-channel-native-v3-progress-todo.md](docs/reports/2026-07-02-channel-native-v3-progress-todo.md)。
 

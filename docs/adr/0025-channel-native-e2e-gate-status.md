@@ -52,3 +52,11 @@ uv run --with pytest python -m pytest tests/test_channel_native_*.py
 uv run --with pytest python -m pytest
 603 passed, 4 warnings
 ```
+
+## Amendment (2026-07-02, ADR 0044)
+
+The lark gate now has a live consumer: `scripts/channel_native_debug.py lark
+--live` sends and patches a card against `WALKCODE_E2E_LARK_CHAT_ID` when
+`WALKCODE_E2E_LARK=1`, and `walkcode native debug lark` provides an SDK-free
+tenant token self-check. Lark instances must pass this gate (per tenant
+domain) before being treated as deployable.

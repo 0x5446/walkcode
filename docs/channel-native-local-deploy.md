@@ -1,6 +1,12 @@
-# Channel-native V3 Local Deploy
+# Channel-native V3 Local Deploy (Telegram, demoted)
 
-Date: 2026-06-27
+Date: 2026-06-27 (demoted 2026-07-02)
+
+> **The primary deployment is now the Feishu/Lark 4-instance profile setup —
+> see `docs/lark-profile-deploy.md` (ADR 0043/0044).** Telegram remains a peer
+> `ChannelAdapter` used for architecture validation; its code and tests stay,
+> but it receives no further UX investment. This document is kept for the
+> Telegram-specific runtime details that are still accurate.
 
 This is the local deployment path for the clean-slate channel-native runtime.
 For V3 validation, legacy `walkcode serve/start/hook`, tmux wrappers, and
@@ -15,22 +21,30 @@ Current implementation progress and remaining TODO are exported in
 Currently live:
 
 - `walkcode native doctor`
-- `walkcode native serve`
+- `walkcode native serve` (Telegram polling and Lark WebSocket, dispatched by
+  `WALKCODE_CHANNEL`)
 - `walkcode native hook`
 - Telegram long polling ingress
+- Lark/Feishu WebSocket ingress with V2-ported card rendering
+  (`docs/lark-profile-deploy.md`)
+- `WALKCODE_PROFILE` work/personal instance split with per-profile
+  `CLAUDE_CONFIG_DIR` / `CODEX_HOME` isolation
 - channel-native state persistence
 - Claude agent capability probing
 - Codex app-server capability probing when the `codex` CLI is installed
 - Codex managed daemon control-socket mode when the standalone Codex daemon
-  install exists
-- TUI hook observation and Telegram takeover for authorized local processes
+  install exists (one daemon per CODEX_HOME/profile)
+- TUI hook observation and takeover for authorized local processes
 - E2E gate status reporting
 
 Not yet claimed:
 
-- V3 live Lark ingress
 - full Telegram/Lark/Claude/Codex product acceptance without explicit
   `WALKCODE_E2E_*` gates and fresh user-visible IM validation
+
+Note: hook commands and CLI runs must set `WALKCODE_ENV_FILE` explicitly; the
+old implicit `~/.walkcode/telegram-claude.env` fallback was removed with the
+profile split (ADR 0043).
 
 ## Minimal Telegram + Claude Setup
 

@@ -61,3 +61,12 @@ Contract tests must prove:
 - `WALKCODE_AGENT=codex` maps to the Codex app-server transport internally;
 - `native doctor` reports `channel`, `agent`, and `agent_status` instead of
   removed runtime config fields.
+
+## Amendment (2026-07-02, ADR 0043)
+
+The instance identity gains an optional third dimension: `WALKCODE_PROFILE`
+(work/personal split). One runtime instance still binds exactly one channel,
+one bot/app identity, and one agent; the profile additionally pins the
+instance's `CLAUDE_CONFIG_DIR` / `CODEX_HOME`, derived state path, and launchd
+label. Empty profile keeps the behavior described above unchanged. See
+ADR 0043.

@@ -196,3 +196,14 @@ Required before implementation is considered complete:
   relying on `UserPromptSubmit`;
 - takeover E2E where a pending Codex HITL request remains recoverable after
   `thread/resume`.
+
+## Amendment (2026-07-02, ADR 0043)
+
+The single shared daemon assumption is scoped per profile. With the
+work/personal split, each `WALKCODE_CODEX_HOME` gets its own managed daemon
+and control socket (`{CODEX_HOME}/app-server-control/app-server-control.sock`);
+daemon spawn, standalone probe, model inventory, and hooks.json probe are
+CODEX_HOME-aware. Unknown `WALKCODE_CODEX_APP_SERVER_MODE` values now raise a
+config error instead of silently dropping the configured socket path.
+"Shared" continues to mean shared between the WalkCode runtime and TUI
+`codex --remote` attaches within one profile, not shared across profiles.
