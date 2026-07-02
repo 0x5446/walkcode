@@ -401,11 +401,20 @@ class LarkIngressBridge:
             return {"toast": {"type": "info", "content": "正在处理…"}}
 
     def start(self) -> None:
-        client = self._build_ws_client()
         self._thread = threading.Thread(
-            target=client.start, name="walkcode-lark-ws", daemon=True
+            target=self._run_ws, name="walkcode-lark-ws", daemon=True
         )
         self._thread.start()
+
+    def _run_ws(self) -> None:
+        # The lark-oapi sync WS client captures the current event loop when it
+        # is constructed. Building it on the serve loop's thread would make the
+        # SDK call run_until_complete on the already-running loop ("This event
+        # loop is already running"), so both construction and start() happen on
+        # this thread with a fresh private loop.
+        asyncio.set_event_loop(asyncio.new_event_loop())
+        client = self._build_ws_client()
+        client.start()
 
     def _build_ws_client(self) -> Any:
         if self._ws_client_factory is not None:
