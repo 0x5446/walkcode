@@ -179,6 +179,7 @@ class ChannelNativeConfig:
     state_path: str
     cwd: str
     profile: str = ""
+    workspace_roots: tuple[str, ...] = ()
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> "ChannelNativeConfig":
@@ -213,6 +214,11 @@ class ChannelNativeConfig:
             ),
             cwd=str(Path(source.get("WALKCODE_CWD", "~/.walkcode/workspace")).expanduser()),
             profile=profile,
+            workspace_roots=tuple(
+                str(Path(item).expanduser())
+                for item in str(source.get("WALKCODE_WORKSPACE_ROOTS", "") or "").split(":")
+                if item.strip()
+            ),
         )
 
     @property

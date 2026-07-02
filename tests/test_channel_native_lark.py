@@ -19,6 +19,7 @@ from walkcode.channel_native import (
     TransportCapabilities,
 )
 from walkcode.channel_native_runtime import ChannelNativeRuntime
+from walkcode import channel_native_runtime as runtime_module
 
 
 class _Clock:
@@ -168,7 +169,7 @@ class LarkOrchestratorTests(unittest.TestCase):
         self.assertIn("done", channel.rendered_text())
 
 
-class LarkRuntimeTests(unittest.TestCase):
+class _LarkRuntimeHarness(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
@@ -213,6 +214,8 @@ class LarkRuntimeTests(unittest.TestCase):
             },
         }
 
+
+class LarkRuntimeTests(_LarkRuntimeHarness):
     def test_plain_message_creates_session_and_submits(self):
         runtime, api, transport = self._runtime()
 
@@ -334,3 +337,132 @@ class LarkRuntimeTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class WorkspaceResolutionTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name) / "workspace"
+        (self.root / "proj-a").mkdir(parents=True)
+        (self.root / "proj-b").mkdir()
+        self.outside = Path(self._tmp.name) / "outside"
+        self.outside.mkdir()
+
+    def test_bare_name_resolves_under_root(self):
+        resolved, reason = runtime_module._resolve_workspace_target("proj-a", (str(self.root),))
+
+        self.assertEqual(reason, "")
+        self.assertEqual(resolved, str((self.root / "proj-a").resolve()))
+
+    def test_dotdot_escape_is_rejected(self):
+        resolved, reason = runtime_module._resolve_workspace_target(
+            "proj-a/../../outside", (str(self.root),)
+        )
+
+        self.assertIsNone(resolved)
+        self.assertIn("outside", reason)
+
+    def test_symlink_escape_is_rejected(self):
+        link = self.root / "sneaky"
+        link.symlink_to(self.outside)
+
+        resolved, reason = runtime_module._resolve_workspace_target("sneaky", (str(self.root),))
+
+        self.assertIsNone(resolved)
+
+    def test_absolute_path_inside_root_is_accepted(self):
+        resolved, reason = runtime_module._resolve_workspace_target(
+            str(self.root / "proj-b"), (str(self.root),)
+        )
+
+        self.assertEqual(resolved, str((self.root / "proj-b").resolve()))
+
+    def test_missing_directory_is_rejected_with_reason(self):
+        resolved, reason = runtime_module._resolve_workspace_target("nope", (str(self.root),))
+
+        self.assertIsNone(resolved)
+        self.assertIn("nope", reason)
+
+
+class RepoCommandTests(_LarkRuntimeHarness):
+    def _workspace(self):
+        root = Path(self._tmp.name) / "workspace"
+        (root / "proj-a").mkdir(parents=True, exist_ok=True)
+        return root
+
+    def test_repo_command_starts_session_in_resolved_directory(self):
+        root = self._workspace()
+        runtime, api, transport = self._runtime(
+            env_extra={"WALKCODE_WORKSPACE_ROOTS": str(root)}
+        )
+
+        result = asyncio.run(
+            runtime.process_lark_event(self._message_payload(text="/repo proj-a 修复登录bug"))
+        )
+
+        self.assertTrue(result.accepted)
+        self.assertEqual([turn.text for turn in transport.submitted_turns], ["修复登录bug"])
+        sessions = runtime.state.sessions.list_sessions(channel_kind="lark")
+        self.assertEqual(len(sessions), 1)
+        self.assertEqual(sessions[0].cwd, str((root / "proj-a").resolve()))
+
+    def test_repo_command_without_roots_is_rejected(self):
+        runtime, api, transport = self._runtime()
+
+        result = asyncio.run(
+            runtime.process_lark_event(self._message_payload(text="/repo proj-a 做点事"))
+        )
+
+        self.assertTrue(result.accepted)
+        self.assertEqual(result.reason, "repo_command_rejected")
+        self.assertEqual(transport.submitted_turns, [])
+        self.assertIn("WALKCODE_WORKSPACE_ROOTS", api.calls[-1][1]["view"]["text"])
+
+    def test_repo_command_without_task_text_shows_usage(self):
+        root = self._workspace()
+        runtime, api, transport = self._runtime(
+            env_extra={"WALKCODE_WORKSPACE_ROOTS": str(root)}
+        )
+
+        result = asyncio.run(
+            runtime.process_lark_event(self._message_payload(text="/repo proj-a"))
+        )
+
+        self.assertEqual(result.reason, "repo_command_usage")
+        self.assertEqual(transport.submitted_turns, [])
+
+    def test_repo_command_with_bad_target_lists_allowlist(self):
+        root = self._workspace()
+        runtime, api, transport = self._runtime(
+            env_extra={"WALKCODE_WORKSPACE_ROOTS": str(root)}
+        )
+
+        result = asyncio.run(
+            runtime.process_lark_event(self._message_payload(text="/repo ../etc 干活"))
+        )
+
+        self.assertEqual(result.reason, "repo_command_rejected")
+        self.assertEqual(transport.submitted_turns, [])
+        self.assertIn("proj-a", api.calls[-1][1]["view"]["text"])
+
+    def test_repo_command_inside_existing_session_is_rejected(self):
+        root = self._workspace()
+        runtime, api, transport = self._runtime(
+            env_extra={"WALKCODE_WORKSPACE_ROOTS": str(root)}
+        )
+        asyncio.run(runtime.process_lark_event(self._message_payload(text="第一条任务")))
+
+        result = asyncio.run(
+            runtime.process_lark_event(
+                self._message_payload(
+                    event_id="evt-2",
+                    message_id="om_reply",
+                    root_id="om_msg",
+                    text="/repo proj-a 换个目录",
+                )
+            )
+        )
+
+        self.assertEqual(result.reason, "repo_command_rejected")
+        self.assertEqual(len(transport.submitted_turns), 1)

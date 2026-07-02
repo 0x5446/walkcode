@@ -1000,7 +1000,68 @@ class ChannelNativeRuntime:
         if name == "model":
             await self._handle_telegram_model_command(channel, inbound, session, actor, argument)
             return SubmitResult(True, "telegram_bot_command")
+        if name == "repo":
+            return await self._handle_repo_command(channel, inbound, session, argument)
         return SubmitResult(False, BlockedReason.NOT_FOUND)
+
+    async def _handle_repo_command(self, channel, inbound, session, argument: str) -> SubmitResult:
+        binding = self._telegram_command_reply_binding(inbound, session)
+        roots = self.config.workspace_roots
+        if session is not None:
+            await channel.send_view(
+                binding,
+                {
+                    "type": "text",
+                    "text": "这个话题已经绑定了会话，工作目录不能再改。/repo 只能用于发起新任务。",
+                },
+            )
+            return SubmitResult(True, "repo_command_rejected")
+        if not roots:
+            await channel.send_view(
+                binding,
+                {
+                    "type": "text",
+                    "text": (
+                        "未配置 WALKCODE_WORKSPACE_ROOTS，/repo 不可用。"
+                        f"\n默认工作目录：{self.config.cwd}"
+                    ),
+                },
+            )
+            return SubmitResult(True, "repo_command_rejected")
+        target, _sep, task_text = argument.partition(" ")
+        task_text = task_text.strip()
+        if not target:
+            await channel.send_view(
+                binding,
+                {
+                    "type": "text",
+                    "text": _repo_usage_text(roots),
+                },
+            )
+            return SubmitResult(True, "repo_command_usage")
+        resolved, reason = _resolve_workspace_target(target, roots)
+        if resolved is None:
+            await channel.send_view(
+                binding,
+                {"type": "text", "text": f"目录不可用：{reason}\n\n{_repo_usage_text(roots)}"},
+            )
+            return SubmitResult(True, "repo_command_rejected")
+        if not task_text:
+            await channel.send_view(
+                binding,
+                {
+                    "type": "text",
+                    "text": f"目录 OK：{resolved}\n用法：/repo {target} <任务描述>（目录和任务要在同一条消息里）",
+                },
+            )
+            return SubmitResult(True, "repo_command_usage")
+        result = await self.orchestrator.handle_inbound_event(
+            replace(inbound, text=task_text),
+            agent_transport_kind=self.config.agent_transport_kind,
+            cwd=resolved,
+        )
+        self.save_state()
+        return result
 
     def _resolve_telegram_command_session(self, inbound):
         resolution = self.state.sessions.resolve_active_binding(inbound.binding_key())
@@ -2675,6 +2736,65 @@ def _build_external_tui_controllers() -> dict[str, Any]:
     return {"process": LocalProcessController()}
 
 
+def _resolve_workspace_target(target: str, roots: tuple[str, ...]) -> tuple[str | None, str]:
+    """Resolve a /repo target (bare name or path) to a directory inside one of
+    the allowlisted workspace roots. Returns (resolved_path, "") on success or
+    (None, reason). Realpath containment is checked on both sides so neither
+    `..` segments nor symlinks can escape a root."""
+    cleaned = str(target or "").strip()
+    if not cleaned:
+        return None, "empty target"
+    resolved_roots = []
+    for root in roots:
+        try:
+            resolved_roots.append(Path(root).expanduser().resolve())
+        except OSError:
+            continue
+    if not resolved_roots:
+        return None, "no usable workspace roots"
+    candidates: list[Path] = []
+    if "/" in cleaned or cleaned.startswith("~"):
+        path = Path(cleaned).expanduser()
+        if path.is_absolute():
+            candidates.append(path)
+        else:
+            candidates.extend(root / cleaned for root in resolved_roots)
+    else:
+        candidates.extend(root / cleaned for root in resolved_roots)
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve(strict=True)
+        except OSError:
+            continue
+        if not resolved.is_dir():
+            continue
+        for root in resolved_roots:
+            if resolved == root or root in resolved.parents:
+                return str(resolved), ""
+        return None, f"{resolved} is outside the configured workspace roots"
+    return None, f"no directory named {cleaned!r} under the configured workspace roots"
+
+
+def _repo_usage_text(roots: tuple[str, ...]) -> str:
+    lines = [
+        "用法：/repo <目录名或路径> <任务描述>",
+        "目录白名单：",
+    ]
+    for root in roots:
+        lines.append(f"- {root}")
+        try:
+            children = sorted(
+                item.name
+                for item in Path(root).expanduser().iterdir()
+                if item.is_dir() and not item.name.startswith(".")
+            )[:12]
+        except OSError:
+            children = []
+        if children:
+            lines.append("  " + "、".join(children))
+    return "\n".join(lines)
+
+
 def _telegram_update_id(update: dict[str, Any]) -> int | None:
     try:
         return int(update.get("update_id"))
@@ -2731,6 +2851,7 @@ def _telegram_bot_command(inbound: Any) -> tuple[str, str] | None:
         "commands": "commands",
         "takeover": "takeover",
         "take-over": "takeover",
+        "repo": "repo",
     }
     resolved = aliases.get(name)
     if resolved is None:
@@ -2858,6 +2979,7 @@ def _telegram_commands_help_text(agent: str) -> str:
         alias = aliases.get(item["command"])
         suffix = f" -> /{alias}" if alias else ""
         lines.append(f"/{item['command']}{suffix} - {item['description']}")
+    lines.append("/repo <dir> <task> - Start a new task in an allowlisted workspace directory")
     return "\n".join(lines)
 
 
