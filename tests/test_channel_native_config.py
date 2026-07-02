@@ -150,6 +150,88 @@ class ChannelNativeConfigTests(unittest.TestCase):
         self.assertEqual(cfg.agent_options["claude"]["cli_path"].split("/")[-2:], ["bin", "claude"])
         self.assertEqual(cfg.agent_options["codex"], {})
 
+    def test_profile_defaults_empty_and_keeps_legacy_state_path(self):
+        cfg = ChannelNativeConfig.from_env(
+            {
+                "WALKCODE_CHANNEL": "telegram",
+                "TELEGRAM_BOT_TOKEN": "tg-token",
+                "WALKCODE_AGENT": "claude",
+            }
+        )
+
+        self.assertEqual(cfg.profile, "")
+        self.assertTrue(cfg.state_path.endswith("/.walkcode/telegram-claude-state.json"))
+
+    def test_profile_names_state_path_by_profile_and_agent(self):
+        cfg = ChannelNativeConfig.from_env(
+            {
+                "WALKCODE_CHANNEL": "lark",
+                "LARK_APP_ID": "app-id",
+                "LARK_APP_SECRET": "secret",
+                "WALKCODE_AGENT": "claude",
+                "WALKCODE_PROFILE": "work",
+            }
+        )
+
+        self.assertEqual(cfg.profile, "work")
+        self.assertTrue(cfg.state_path.endswith("/.walkcode/work-claude-state.json"))
+
+    def test_explicit_state_path_beats_profile_derivation(self):
+        cfg = ChannelNativeConfig.from_env(
+            {
+                "WALKCODE_CHANNEL": "lark",
+                "LARK_APP_ID": "app-id",
+                "LARK_APP_SECRET": "secret",
+                "WALKCODE_AGENT": "codex",
+                "WALKCODE_PROFILE": "personal",
+                "WALKCODE_STATE_PATH": "/tmp/custom-state.json",
+            }
+        )
+
+        self.assertEqual(cfg.state_path, "/tmp/custom-state.json")
+
+    def test_invalid_profile_is_rejected(self):
+        for bad in ("Work", "work profile", "work/one", "-work"):
+            with self.assertRaisesRegex(ChannelConfigError, "invalid WALKCODE_PROFILE"):
+                ChannelNativeConfig.from_env(
+                    {
+                        "WALKCODE_CHANNEL": "telegram",
+                        "TELEGRAM_BOT_TOKEN": "tg-token",
+                        "WALKCODE_AGENT": "claude",
+                        "WALKCODE_PROFILE": bad,
+                    }
+                )
+
+    def test_claude_config_dir_is_agent_option(self):
+        cfg = ChannelNativeConfig.from_env(
+            {
+                "WALKCODE_CHANNEL": "telegram",
+                "TELEGRAM_BOT_TOKEN": "tg-token",
+                "WALKCODE_AGENT": "claude",
+                "WALKCODE_CLAUDE_CONFIG_DIR": "~/.claude-profiles/work",
+            }
+        )
+
+        self.assertEqual(
+            cfg.agent_options["claude"]["config_dir"].split("/")[-2:],
+            [".claude-profiles", "work"],
+        )
+
+    def test_codex_home_is_agent_option(self):
+        cfg = ChannelNativeConfig.from_env(
+            {
+                "WALKCODE_CHANNEL": "telegram",
+                "TELEGRAM_BOT_TOKEN": "tg-token",
+                "WALKCODE_AGENT": "codex",
+                "WALKCODE_CODEX_HOME": "~/.codex-profiles/personal",
+            }
+        )
+
+        self.assertEqual(
+            cfg.agent_options["codex"]["codex_home"].split("/")[-2:],
+            [".codex-profiles", "personal"],
+        )
+
     def test_removed_transport_env_is_rejected(self):
         with self.assertRaisesRegex(ChannelConfigError, "WALKCODE_DEFAULT_TRANSPORT is not supported"):
             ChannelNativeConfig.from_env(

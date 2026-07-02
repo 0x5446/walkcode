@@ -14,6 +14,7 @@ from walkcode.channel_native import (
     DurableOutbox,
     FakeAgentTransport,
     InteractionStore,
+    LaunchSpec,
     Orchestrator,
     ResumeSpec,
     SessionRegistry,
@@ -509,6 +510,31 @@ class ClaudeHeadlessTransportTests(unittest.TestCase):
         self.assertEqual(client.submitted[0].text, "hello")
         self.assertEqual(events[0].payload["message"], "done")
         self.assertTrue(transport.capabilities().permission_callback)
+
+    def test_option_kwargs_pin_profile_config_dir_via_sdk_env(self):
+        transport = ClaudeHeadlessTransport(
+            settings="/tmp/vertex.json",
+            cli_path="/tmp/claude",
+            config_dir="/tmp/claude-profiles/work",
+        )
+
+        kwargs = transport._option_kwargs(LaunchSpec(cwd="/tmp/project", session_id="s1"))
+
+        self.assertEqual(kwargs["cwd"], "/tmp/project")
+        self.assertEqual(kwargs["settings"], "/tmp/vertex.json")
+        self.assertEqual(kwargs["cli_path"], "/tmp/claude")
+        self.assertEqual(kwargs["env"], {"CLAUDE_CONFIG_DIR": "/tmp/claude-profiles/work"})
+        self.assertNotIn("resume", kwargs)
+
+    def test_option_kwargs_without_config_dir_do_not_touch_env(self):
+        transport = ClaudeHeadlessTransport()
+
+        kwargs = transport._option_kwargs(
+            LaunchSpec(cwd="/tmp/project", session_id="s1"), resume_id="r1"
+        )
+
+        self.assertNotIn("env", kwargs)
+        self.assertEqual(kwargs["resume"], "r1")
 
     def test_real_sdk_shape_connects_queries_and_converts_messages(self):
         created_options = []

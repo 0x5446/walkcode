@@ -1865,7 +1865,7 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
         original = runtime_module.shutil.which
         original_daemon_available = runtime_module._codex_standalone_daemon_available
         runtime_module.shutil.which = lambda name: "/usr/bin/codex" if name == "codex" else original(name)
-        runtime_module._codex_standalone_daemon_available = lambda: True
+        runtime_module._codex_standalone_daemon_available = lambda codex_home="": True
         try:
             transports = runtime_module._build_transports(cfg)
         finally:
@@ -1890,7 +1890,7 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
         original = runtime_module.shutil.which
         original_daemon_available = runtime_module._codex_standalone_daemon_available
         runtime_module.shutil.which = lambda name: "/usr/bin/codex" if name == "codex" else original(name)
-        runtime_module._codex_standalone_daemon_available = lambda: False
+        runtime_module._codex_standalone_daemon_available = lambda codex_home="": False
         try:
             transports = runtime_module._build_transports(cfg)
         finally:
@@ -1939,6 +1939,7 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
                 "WALKCODE_AGENT": "claude",
                 "WALKCODE_CLAUDE_SETTINGS": "/tmp/vertex.json",
                 "WALKCODE_CLAUDE_CLI_PATH": "/tmp/claude",
+                "WALKCODE_CLAUDE_CONFIG_DIR": "/tmp/claude-profiles/work",
             }
         )
 
@@ -1946,6 +1947,98 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
 
         self.assertEqual(transports["claude_headless"].settings, "/tmp/vertex.json")
         self.assertEqual(transports["claude_headless"].cli_path, "/tmp/claude")
+        self.assertEqual(transports["claude_headless"].config_dir, "/tmp/claude-profiles/work")
+
+    def test_unknown_codex_app_server_mode_fails_instead_of_dropping_socket(self):
+        cfg = ChannelNativeConfig.from_env(
+            {
+                "WALKCODE_CHANNEL": "telegram",
+                "TELEGRAM_BOT_TOKEN": "fake",
+                "WALKCODE_AGENT": "codex",
+                "WALKCODE_CODEX_APP_SERVER_MODE": "bogus",
+                "WALKCODE_CODEX_APP_SERVER_SOCKET": "/tmp/custom.sock",
+            }
+        )
+
+        with self.assertRaisesRegex(ChannelConfigError, "unknown WALKCODE_CODEX_APP_SERVER_MODE"):
+            runtime_module._build_codex_app_server_client(cfg)
+
+    def test_codex_home_flows_into_managed_client_socket_and_env(self):
+        cfg = ChannelNativeConfig.from_env(
+            {
+                "WALKCODE_CHANNEL": "telegram",
+                "TELEGRAM_BOT_TOKEN": "fake",
+                "WALKCODE_AGENT": "codex",
+                "WALKCODE_CODEX_APP_SERVER_MODE": "daemon",
+                "WALKCODE_CODEX_HOME": "/tmp/codex-profiles/personal",
+            }
+        )
+
+        client = runtime_module._build_codex_app_server_client(cfg)
+
+        self.assertIsInstance(client, runtime_module.CodexManagedAppServerClient)
+        self.assertEqual(
+            client.socket_path,
+            "/tmp/codex-profiles/personal/app-server-control/app-server-control.sock",
+        )
+        env = client._subprocess_env()
+        self.assertIsNotNone(env)
+        self.assertEqual(env["CODEX_HOME"], "/tmp/codex-profiles/personal")
+
+    def test_explicit_socket_beats_codex_home_derivation(self):
+        client = runtime_module.CodexManagedAppServerClient(
+            socket_path="/tmp/explicit.sock",
+            codex_home="/tmp/codex-profiles/work",
+        )
+
+        self.assertEqual(client.socket_path, "/tmp/explicit.sock")
+
+    def test_codex_client_without_codex_home_inherits_environment(self):
+        client = runtime_module.CodexStdioAppServerClient()
+
+        self.assertIsNone(client._subprocess_env())
+
+    def test_launchd_service_label_profile_and_legacy_forms(self):
+        self.assertEqual(
+            runtime_module._launchd_service_label("telegram", "claude"),
+            "com.walkcode.telegram-claude",
+        )
+        self.assertEqual(
+            runtime_module._launchd_service_label("lark", "claude", "work"),
+            "com.walkcode.work-claude",
+        )
+        self.assertEqual(
+            runtime_module._launchd_service_label("telegram", "codex", "personal"),
+            "com.walkcode.personal-codex",
+        )
+        self.assertEqual(runtime_module._launchd_service_label("lark", "claude"), "")
+        self.assertEqual(runtime_module._launchd_service_label("lark", "unknown", "work"), "")
+
+    def test_describe_reports_profile(self):
+        cfg = ChannelNativeConfig.from_env(
+            {
+                "WALKCODE_CHANNEL": "lark",
+                "LARK_APP_ID": "app-id",
+                "LARK_APP_SECRET": "secret",
+                "WALKCODE_AGENT": "claude",
+                "WALKCODE_PROFILE": "work",
+                "WALKCODE_STATE_PATH": "/tmp/work-claude-state.json",
+            }
+        )
+        runtime = ChannelNativeRuntime.from_config(
+            cfg,
+            transports={"claude_headless": FakeAgentTransport("claude_headless", _transport_caps())},
+        )
+
+        status = runtime.describe()
+
+        self.assertEqual(status["profile"], "work")
+        self.assertIn("profile: work", runtime_module._format_status(status))
+
+    def test_load_native_env_has_no_implicit_default_env_file(self):
+        merged = runtime_module._load_native_env({"WALKCODE_AGENT": "claude"})
+
+        self.assertEqual(merged, {"WALKCODE_AGENT": "claude"})
 
     def test_polling_without_telegram_channel_fails_explicitly(self):
         cfg = ChannelNativeConfig.from_env(

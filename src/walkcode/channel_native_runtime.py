@@ -93,15 +93,24 @@ class CodexStdioAppServerClient:
         request_timeout: float = 30.0,
         event_timeout: float = 180.0,
         event_idle_timeout: float = 2.0,
+        codex_home: str = "",
     ):
         self.command = command
         self.request_timeout = request_timeout
         self.event_timeout = event_timeout
         self.event_idle_timeout = event_idle_timeout
+        self.codex_home = codex_home
         self._process: asyncio.subprocess.Process | None = None
         self._next_id = 1
         self._lock = asyncio.Lock()
         self._buffered_notifications: list[dict[str, Any]] = []
+
+    def _subprocess_env(self) -> dict[str, str] | None:
+        # CODEX_HOME pins the profile's auth/config/daemon state; None keeps
+        # plain environment inheritance for the no-profile setup.
+        if not self.codex_home:
+            return None
+        return {**os.environ, "CODEX_HOME": self.codex_home}
 
     async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
         async with self._lock:
@@ -161,6 +170,7 @@ class CodexStdioAppServerClient:
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            env=self._subprocess_env(),
         )
         await self._send(
             {
@@ -248,15 +258,17 @@ class CodexManagedAppServerClient(CodexStdioAppServerClient):
         request_timeout: float = 30.0,
         event_timeout: float = 180.0,
         event_idle_timeout: float = 2.0,
+        codex_home: str = "",
     ):
         super().__init__(
             command=("codex", "app-server", "daemon"),
             request_timeout=request_timeout,
             event_timeout=event_timeout,
             event_idle_timeout=event_idle_timeout,
+            codex_home=codex_home,
         )
         self.socket_path = socket_path or str(
-            Path.home() / ".codex" / "app-server-control" / "app-server-control.sock"
+            _codex_home_path(codex_home) / "app-server-control" / "app-server-control.sock"
         )
         self.daemon_command = daemon_command
         self._daemon_checked = False
@@ -288,6 +300,7 @@ class CodexManagedAppServerClient(CodexStdioAppServerClient):
             *self.daemon_command,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            env=self._subprocess_env(),
         )
         stdout, stderr = await process.communicate()
         if process.returncode != 0:
@@ -688,19 +701,23 @@ class ChannelNativeRuntime:
 
     def describe(self) -> dict[str, Any]:
         agent_status = self._describe_agent(self.config.agent)
+        codex_home = str(self.config.agent_options.get("codex", {}).get("codex_home", "") or "")
         return {
+            "profile": self.config.profile,
             "channel": self._describe_channel(self.config.channel.kind, self.config.channel),
             "agent": self.config.agent,
             "agent_status": agent_status,
             "runtime_status": self._describe_runtime_status(),
-            "tui_hook_status": _describe_tui_hook_status(self.config.agent),
+            "tui_hook_status": _describe_tui_hook_status(self.config.agent, codex_home),
             "state_path": self.config.state_path,
             "cwd": self.config.cwd,
             "e2e_gates": self.e2e_gates,
         }
 
     def _describe_runtime_status(self) -> dict[str, Any]:
-        label = _launchd_service_label(self.config.channel.kind, self.config.agent)
+        label = _launchd_service_label(
+            self.config.channel.kind, self.config.agent, self.config.profile
+        )
         if not label:
             return {
                 "service_label": "",
@@ -2410,6 +2427,7 @@ def _build_transports(config: ChannelNativeConfig) -> dict[str, AgentTransport]:
         transports[kind] = ClaudeHeadlessTransport(
             settings=claude_options.get("settings"),
             cli_path=claude_options.get("cli_path"),
+            config_dir=claude_options.get("config_dir"),
         )
     elif kind == "codex_app_server":
         if shutil.which("codex"):
@@ -2421,23 +2439,32 @@ def _build_transports(config: ChannelNativeConfig) -> dict[str, AgentTransport]:
     return transports
 
 
+def _codex_home_path(codex_home: str = "") -> Path:
+    if codex_home:
+        return Path(codex_home).expanduser()
+    return Path.home() / ".codex"
+
+
 def _build_codex_app_server_client(config: ChannelNativeConfig) -> Any:
     options = config.agent_options.get("codex", {})
     mode = str(options.get("app_server_mode", "") or "auto").strip().lower()
     socket_path = str(options.get("app_server_socket", "") or "")
+    codex_home = str(options.get("codex_home", "") or "")
     if mode == "auto":
-        if _codex_standalone_daemon_available():
-            return CodexManagedAppServerClient(socket_path=socket_path)
-        return CodexStdioAppServerClient()
+        if _codex_standalone_daemon_available(codex_home):
+            return CodexManagedAppServerClient(socket_path=socket_path, codex_home=codex_home)
+        return CodexStdioAppServerClient(codex_home=codex_home)
     if mode in {"daemon", "managed", "shared"}:
-        return CodexManagedAppServerClient(socket_path=socket_path)
+        return CodexManagedAppServerClient(socket_path=socket_path, codex_home=codex_home)
     if mode == "stdio":
-        return CodexStdioAppServerClient()
-    return CodexManagedAppServerClient()
+        return CodexStdioAppServerClient(codex_home=codex_home)
+    raise ChannelConfigError(
+        f"unknown WALKCODE_CODEX_APP_SERVER_MODE: {mode}; use auto, daemon, or stdio"
+    )
 
 
-def _codex_standalone_daemon_available() -> bool:
-    return (Path.home() / ".codex" / "packages" / "standalone" / "current" / "codex").exists()
+def _codex_standalone_daemon_available(codex_home: str = "") -> bool:
+    return (_codex_home_path(codex_home) / "packages" / "standalone" / "current" / "codex").exists()
 
 
 def _build_external_tui_controllers() -> dict[str, Any]:
@@ -2737,8 +2764,9 @@ def _claude_local_model_inventory(config: ChannelNativeConfig) -> dict[str, Any]
 
 def _codex_local_model_inventory(config: ChannelNativeConfig) -> dict[str, Any]:
     options = config.agent_options.get("codex", {})
-    config_path = Path(str(options.get("config", "") or "~/.codex/config.toml")).expanduser()
-    cache_path = Path(str(options.get("models_cache", "") or "~/.codex/models_cache.json")).expanduser()
+    codex_home = _codex_home_path(str(options.get("codex_home", "") or ""))
+    config_path = Path(str(options.get("config", "") or codex_home / "config.toml")).expanduser()
+    cache_path = Path(str(options.get("models_cache", "") or codex_home / "models_cache.json")).expanduser()
     current = ""
     provider = ""
     reasoning = ""
@@ -3565,26 +3593,17 @@ def _deferred_tui_hook_created_at(path: Path) -> float:
 
 
 def _load_native_env(env: dict[str, str] | None) -> dict[str, str]:
-    if env is None:
-        base = dict(os.environ)
-        env_file = base.get("WALKCODE_ENV_FILE", "")
-        explicit_env_file = bool(env_file)
-        path = Path(env_file).expanduser() if env_file else Path.home() / ".walkcode" / "telegram-claude.env"
-    else:
-        base = dict(env)
-        env_file = base.get("WALKCODE_ENV_FILE", "")
-        if not env_file:
-            return base
-        explicit_env_file = True
-        path = Path(env_file).expanduser()
-    file_values = _read_env_file(path)
-    if explicit_env_file:
-        merged = dict(base)
-        merged.update(file_values)
-        merged["WALKCODE_ENV_FILE"] = str(path)
-    else:
-        merged = dict(file_values)
-        merged.update(base)
+    # No implicit fallback env file: with multiple profile instances on one
+    # machine, a silent default would misroute hooks/CLI runs to the wrong
+    # instance. Every hook command and launchd plist must set WALKCODE_ENV_FILE.
+    base = dict(os.environ) if env is None else dict(env)
+    env_file = base.get("WALKCODE_ENV_FILE", "")
+    if not env_file:
+        return base
+    path = Path(env_file).expanduser()
+    merged = dict(base)
+    merged.update(_read_env_file(path))
+    merged["WALKCODE_ENV_FILE"] = str(path)
     return merged
 
 
@@ -3613,7 +3632,7 @@ def _describe_e2e_gates(gates: ChannelNativeE2EGates) -> dict[str, dict[str, Any
     }
 
 
-def _describe_tui_hook_status(agent: str) -> dict[str, Any]:
+def _describe_tui_hook_status(agent: str, codex_home: str = "") -> dict[str, Any]:
     normalized = _normalize_tui_agent(agent)
     if normalized != "codex":
         return {
@@ -3621,7 +3640,7 @@ def _describe_tui_hook_status(agent: str) -> dict[str, Any]:
             "checked": False,
             "reason": "codex_hooks_only",
         }
-    path = Path.home() / ".codex" / "hooks.json"
+    path = _codex_home_path(codex_home) / "hooks.json"
     if not path.exists():
         return {
             "agent": "codex",
@@ -3688,6 +3707,7 @@ def _format_status(status: dict[str, Any]) -> str:
     runtime_status = status.get("runtime_status", {})
     lines = [
         "channel-native V3 runtime",
+        f"profile: {status.get('profile', '') or '-'}",
         f"channel: {channel.get('kind', '')}",
         f"agent: {status.get('agent', '')}",
         f"state_path: {status.get('state_path', '')}",
@@ -3722,11 +3742,13 @@ def _format_status(status: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def _launchd_service_label(channel_kind: str, agent: str) -> str:
-    if channel_kind != "telegram":
-        return ""
+def _launchd_service_label(channel_kind: str, agent: str, profile: str = "") -> str:
     value = str(agent or "").strip().lower()
     if value not in {"claude", "codex"}:
+        return ""
+    if profile:
+        return f"com.walkcode.{profile}-{value}"
+    if channel_kind != "telegram":
         return ""
     return f"com.walkcode.telegram-{value}"
 

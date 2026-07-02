@@ -178,6 +178,7 @@ class ChannelNativeConfig:
     agent_options: dict[str, dict[str, Any]]
     state_path: str
     cwd: str
+    profile: str = ""
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> "ChannelNativeConfig":
@@ -185,7 +186,10 @@ class ChannelNativeConfig:
         _reject_removed_runtime_env(source)
         channel_kind = _configured_channel_kind(source)
         if not channel_kind:
-            raise ChannelConfigError("no channel configured for channel-native runtime")
+            raise ChannelConfigError(
+                "no channel configured for channel-native runtime; "
+                "set WALKCODE_ENV_FILE to bind this command to a runtime instance"
+            )
 
         if channel_kind == "telegram":
             channel = _telegram_config_from_env(source, priority=0)
@@ -199,12 +203,16 @@ class ChannelNativeConfig:
         if agent not in supported_agent_names:
             raise ChannelConfigError(f"unknown agent configured: {agent}")
 
+        profile = _configured_profile(source)
         return cls(
             channel=channel,
             agent=agent,
             agent_options=_configured_agent_options(source),
-            state_path=str(Path(_configured_state_path(source, channel_kind, agent)).expanduser()),
+            state_path=str(
+                Path(_configured_state_path(source, channel_kind, agent, profile)).expanduser()
+            ),
             cwd=str(Path(source.get("WALKCODE_CWD", "~/.walkcode/workspace")).expanduser()),
+            profile=profile,
         )
 
     @property
@@ -353,7 +361,13 @@ def _configured_agent_options(source: Any) -> dict[str, dict[str, Any]]:
     cli_path = str(source.get("WALKCODE_CLAUDE_CLI_PATH") or "").strip()
     if cli_path:
         claude["cli_path"] = str(Path(cli_path).expanduser())
+    claude_config_dir = str(source.get("WALKCODE_CLAUDE_CONFIG_DIR") or "").strip()
+    if claude_config_dir:
+        claude["config_dir"] = str(Path(claude_config_dir).expanduser())
     codex: dict[str, Any] = {}
+    codex_home = str(source.get("WALKCODE_CODEX_HOME") or "").strip()
+    if codex_home:
+        codex["codex_home"] = str(Path(codex_home).expanduser())
     codex_config = str(source.get("WALKCODE_CODEX_CONFIG") or "").strip()
     if codex_config:
         codex["config"] = str(Path(codex_config).expanduser())
@@ -372,10 +386,26 @@ def _configured_agent_options(source: Any) -> dict[str, dict[str, Any]]:
     }
 
 
-def _configured_state_path(source: Any, channel_kind: str, agent: str) -> str:
+_PROFILE_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
+
+
+def _configured_profile(source: Any) -> str:
+    raw = str(source.get("WALKCODE_PROFILE") or "").strip()
+    if not raw:
+        return ""
+    if not _PROFILE_RE.match(raw):
+        raise ChannelConfigError(
+            f"invalid WALKCODE_PROFILE: {raw!r}; use lowercase letters, digits, and dashes"
+        )
+    return raw
+
+
+def _configured_state_path(source: Any, channel_kind: str, agent: str, profile: str = "") -> str:
     explicit = str(source.get("WALKCODE_STATE_PATH") or "").strip()
     if explicit:
         return explicit
+    if profile:
+        return f"~/.walkcode/{profile}-{agent}-state.json"
     return f"~/.walkcode/{channel_kind}-{agent}-state.json"
 
 
@@ -4120,11 +4150,13 @@ class ClaudeHeadlessTransport:
         sdk_loader: Callable[[], Any] | None = None,
         settings: str | None = None,
         cli_path: str | None = None,
+        config_dir: str | None = None,
     ):
         self._client_factory = client_factory
         self._sdk_loader = sdk_loader or self._default_sdk_loader
         self.settings = settings
         self.cli_path = cli_path
+        self.config_dir = config_dir
         self._clients: dict[str, Any] = {}
 
     def capabilities(self) -> TransportCapabilities:
@@ -4308,6 +4340,21 @@ class ClaudeHeadlessTransport:
             return False
         return getattr(sdk, "ClaudeSDKClient", None) is not None
 
+    def _option_kwargs(self, spec: LaunchSpec, *, resume_id: str = "") -> dict[str, Any]:
+        option_kwargs: dict[str, Any] = {"cwd": spec.cwd}
+        if self.settings:
+            option_kwargs["settings"] = self.settings
+        if self.cli_path:
+            option_kwargs["cli_path"] = self.cli_path
+        if self.config_dir:
+            # SDK merges options.env over inherited os.environ, so this pins the
+            # profile's Claude config dir (credentials, settings, history) without
+            # touching the runtime's own environment.
+            option_kwargs["env"] = {"CLAUDE_CONFIG_DIR": self.config_dir}
+        if resume_id:
+            option_kwargs["resume"] = resume_id
+        return option_kwargs
+
     def _create_client(self, spec: LaunchSpec, *, resume_id: str = ""):
         if self._client_factory is not None:
             return self._client_factory(spec)
@@ -4318,14 +4365,7 @@ class ClaudeHeadlessTransport:
         options_cls = getattr(sdk, "ClaudeAgentOptions", None)
         try:
             if options_cls is not None:
-                option_kwargs: dict[str, Any] = {"cwd": spec.cwd}
-                if self.settings:
-                    option_kwargs["settings"] = self.settings
-                if self.cli_path:
-                    option_kwargs["cli_path"] = self.cli_path
-                if resume_id:
-                    option_kwargs["resume"] = resume_id
-                return client_cls(options=options_cls(**option_kwargs))
+                return client_cls(options=options_cls(**self._option_kwargs(spec, resume_id=resume_id)))
             return client_cls()
         except TypeError as exc:
             raise TransportUnavailable("claude_agent_sdk.ClaudeSDKClient cannot be constructed") from exc
