@@ -61,6 +61,11 @@ TEST_GROUPS = {
     "outbox": ["tests/test_channel_native_views_auth_outbox.py", "tests/test_channel_native_persistence_reliability.py"],
     "agent-smoke": ["tests/test_channel_native_runtime.py", "tests/test_channel_native_telegram_claude.py", "tests/test_channel_native_codex.py"],
     "runtime": ["tests/test_channel_native_runtime.py", "tests/test_channel_native_core.py", "tests/test_channel_native_debug_script.py"],
+    "lark": [
+        "tests/test_channel_native_lark.py",
+        "tests/test_channel_native_lark_cards.py",
+        "tests/test_channel_native_lark_live.py",
+    ],
     "all": ["tests/test_channel_native_*.py"],
 }
 
@@ -119,6 +124,14 @@ def main() -> None:
     telegram.add_argument("--json", action="store_true")
     telegram.add_argument("--limit", type=int, default=5)
 
+    lark = sub.add_parser("lark", help="Check Lark credentials/domain; --live sends and patches a card")
+    lark.add_argument("--json", action="store_true")
+    lark.add_argument(
+        "--live",
+        action="store_true",
+        help="Send a card to WALKCODE_E2E_LARK_CHAT_ID and patch it (requires WALKCODE_E2E_LARK=1)",
+    )
+
     tests = sub.add_parser("tests", help="Run a module-level pytest group")
     tests.add_argument("module", choices=sorted(TEST_GROUPS))
 
@@ -162,6 +175,10 @@ def main() -> None:
             raise SystemExit(0 if payload["ok"] else 1)
         if args.command == "telegram":
             payload = asyncio.run(debug_telegram(limit=args.limit))
+            print_payload(payload, as_json=args.json)
+            raise SystemExit(0 if payload["ok"] else 1)
+        if args.command == "lark":
+            payload = asyncio.run(debug_lark(live=args.live))
             print_payload(payload, as_json=args.json)
             raise SystemExit(0 if payload["ok"] else 1)
         if args.command == "tests":
@@ -519,6 +536,47 @@ async def debug_agent_smoke(
         "event_types": [str(getattr(event, "type", "")) for event in list(events or [])],
         **_agent_smoke_error_payload(events),
     }
+
+
+async def debug_lark(*, live: bool) -> dict[str, Any]:
+    from walkcode.channel_native import ChannelNativeE2EGates
+
+    runtime = ChannelNativeRuntime.from_env()
+    report = await runtime.diagnose_lark_ingress()
+    payload: dict[str, Any] = {
+        "module": "lark",
+        "ok": bool(report.get("tenant_token", {}).get("ok")),
+        **report,
+    }
+    if not live:
+        return payload
+    env = _load_native_env(None)
+    gate = ChannelNativeE2EGates.from_env(env).evaluate("lark")
+    if not gate.enabled:
+        payload["live"] = {"ok": False, "reason": gate.reason or "lark E2E gate disabled"}
+        payload["ok"] = False
+        return payload
+    chat_id = str(env.get("WALKCODE_E2E_LARK_CHAT_ID", "") or "")
+    channel = runtime.channels["lark"]
+    binding = channel.binding_for(chat_id)
+    view = {
+        "type": "health",
+        "status": "running",
+        "title": "walkcode lark live gate",
+        "session_id": f"e2e-{uuid.uuid4().hex[:8]}",
+        "transport": "e2e",
+        "elapsed": 0.0,
+        "cwd": "-",
+    }
+    message_id = await channel.send_view(binding, view)
+    edited = await channel.edit_view(binding, message_id, {**view, "status": "stopped"})
+    payload["live"] = {
+        "ok": bool(message_id and edited),
+        "sent_message": bool(message_id),
+        "patched": bool(edited),
+    }
+    payload["ok"] = payload["ok"] and payload["live"]["ok"]
+    return payload
 
 
 async def debug_telegram(*, limit: int) -> dict[str, Any]:

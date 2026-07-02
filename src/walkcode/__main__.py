@@ -164,6 +164,7 @@ def cmd_upgrade(_args) -> None:
         "uv tool install "
         f"--python {shlex.quote(python_spec)} "
         "--with claude-agent-sdk "
+        "--with lark-oapi "
         f"{shlex.quote(source)} "
         "--force"
     )
@@ -243,6 +244,8 @@ def main() -> None:
     dtg = dbgsub.add_parser("telegram", help="Inspect Telegram ingress without consuming updates")
     dtg.add_argument("--json", action="store_true", help="Print machine-readable JSON")
     dtg.add_argument("--limit", type=int, default=5, help="Maximum pending updates to inspect")
+    dlk = dbgsub.add_parser("lark", help="Check Lark credentials, domain, and SDK availability")
+    dlk.add_argument("--json", action="store_true", help="Print machine-readable JSON")
 
     ns = nsub.add_parser("serve", help="Run channel-native V3 runtime")
     ns.add_argument("--once", action="store_true", help="Process one polling cycle and exit")

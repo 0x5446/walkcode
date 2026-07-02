@@ -64,6 +64,7 @@ from .channel_native import (
     _agent_to_transport_kind,
     _session_is_external_tui_takeover_candidate,
 )
+from .channel_native.lark_live import AckRegistry, LarkIngressBridge, build_lark_live_api
 
 
 TELEGRAM_FORUM_TOPIC_ICON_COLORS = (0x6FB9F0, 0xFFD67E, 0xCB86DB, 0x8EEE98, 0xFF93B2, 0xFB6F5F)
@@ -624,6 +625,7 @@ class ChannelNativeRuntime:
         self._telegram_offset: int | None = None
         self.last_telegram_offset_confirm_error = ""
         self.last_telegram_poll_error = ""
+        self.last_lark_event_error = ""
         self._telegram_commands_installed = False
         self._tui_hook_queue_dir = _tui_hook_queue_dir(self.state_store.path)
         self._ingress_lock = asyncio.Lock()
@@ -752,6 +754,37 @@ class ChannelNativeRuntime:
             "stdout": result.stdout.strip()[:400],
             "stderr": result.stderr.strip()[:400],
         }
+
+    async def diagnose_lark_ingress(self) -> dict[str, Any]:
+        channel = self.channels.get("lark")
+        if not isinstance(channel, LarkChannelAdapter):
+            raise ChannelConfigError("Lark channel is not configured for channel-native runtime")
+        endpoint = self.config.channel
+        report: dict[str, Any] = {
+            "channel": self._describe_channel("lark", endpoint),
+            "allowed_chat_ids": [
+                str(item) for item in endpoint.options.get("allowed_chat_ids", ()) if item
+            ],
+            "allowed_open_ids": [
+                str(item) for item in endpoint.options.get("allowed_open_ids", ()) if item
+            ],
+        }
+        report["tenant_token"] = await asyncio.to_thread(
+            _lark_tenant_token_self_check,
+            str(endpoint.credentials.get("app_id", "") or ""),
+            str(endpoint.credentials.get("app_secret", "") or ""),
+            str(endpoint.options.get("openapi_domain", "") or "https://open.feishu.cn"),
+        )
+        try:
+            import lark_oapi  # noqa: F401
+
+            report["sdk"] = {"installed": True}
+        except ImportError:
+            report["sdk"] = {
+                "installed": False,
+                "hint": "reinstall walkcode with the lark extra (uv tool install walkcode --with lark-oapi)",
+            }
+        return report
 
     async def diagnose_telegram_ingress(self, *, limit: int = 5) -> dict[str, Any]:
         channel = self.channels.get("telegram")
@@ -932,7 +965,7 @@ class ChannelNativeRuntime:
             return SubmitResult(True, "telegram_bot_command")
         if name == "sessions":
             sessions = self.state.sessions.list_sessions(
-                channel_kind="telegram",
+                channel_kind=inbound.channel_kind,
                 account_id=inbound.account_id,
                 chat_id=inbound.chat_id,
             )
@@ -988,7 +1021,8 @@ class ChannelNativeRuntime:
 
     def _telegram_runtime_status_view(self) -> dict[str, Any]:
         active = [
-            item for item in self.state.sessions.list_sessions(channel_kind="telegram")
+            item
+            for item in self.state.sessions.list_sessions(channel_kind=self.config.channel_kind)
             if item.status != "stopped"
         ]
         return {
@@ -1088,6 +1122,143 @@ class ChannelNativeRuntime:
             )
         except Exception:
             return
+
+    def _lark_chat_allowed(self, chat_id: str, *, is_callback: bool = False) -> bool:
+        endpoint = self.config.channel
+        if endpoint.kind != "lark":
+            return False
+        if is_callback and not chat_id:
+            # Card callbacks may omit the chat context; the callback token
+            # (single-use, TTL, generation-checked) is the real gate there.
+            return True
+        allowed = tuple(str(item) for item in endpoint.options.get("allowed_chat_ids", ()) if item)
+        if not allowed:
+            return True
+        return str(chat_id) in allowed
+
+    def _lark_sender_allowed(self, sender_id: str) -> bool:
+        allowed = tuple(
+            str(item)
+            for item in self.config.channel.options.get("allowed_open_ids", ())
+            if item
+        )
+        if not allowed:
+            return True
+        return str(sender_id) in allowed
+
+    async def process_lark_event(self, payload: dict[str, Any]) -> SubmitResult:
+        channel = self.channels.get("lark")
+        if not isinstance(channel, LarkChannelAdapter):
+            raise ChannelConfigError("Lark channel is not configured for channel-native runtime")
+        inbound = channel.parse_event(payload)
+        if not self._lark_chat_allowed(inbound.chat_id, is_callback=inbound.callback is not None):
+            return SubmitResult(False, BlockedReason.UNAUTHORIZED)
+        if inbound.callback is None:
+            if not self._lark_sender_allowed(inbound.sender_id):
+                return SubmitResult(False, BlockedReason.UNAUTHORIZED)
+            reply_binding = ChannelBinding(
+                channel_kind=inbound.channel_kind,
+                account_id=inbound.account_id,
+                chat_id=inbound.chat_id,
+                thread_id=inbound.thread_id,
+                root_message_id=inbound.root_message_id or inbound.message_id,
+            )
+            command = _telegram_bot_command(inbound)
+            if command:
+                result = await self._handle_telegram_bot_command(channel, inbound, command)
+                self.save_state()
+                return result
+            selector = _agent_selector_command(inbound)
+            if selector:
+                await channel.send_view(
+                    reply_binding,
+                    {
+                        "type": "agent_selector_rejected",
+                        "message": _agent_selector_rejected_message(
+                            configured_agent=self.config.agent,
+                            requested_agent=selector[0],
+                        ),
+                    },
+                )
+                self.save_state()
+                return SubmitResult(True, "agent_selector_rejected")
+            unknown_slash = _telegram_unknown_slash_command(inbound)
+            if unknown_slash and self._resolve_telegram_command_session(inbound) is None:
+                await channel.send_view(
+                    reply_binding,
+                    {
+                        "type": "text",
+                        "text": (
+                            "未知的斜杠命令。agent 原生斜杠命令请在已有会话话题里发送。"
+                        ),
+                    },
+                )
+                self.save_state()
+                return SubmitResult(True, "lark_unknown_slash_command")
+            if unknown_slash:
+                inbound = replace(
+                    inbound, text=_telegram_agent_command_text(self.config.agent, inbound.text)
+                )
+            if _telegram_message_is_empty(inbound):
+                return SubmitResult(True, "empty_message_ignored")
+        result = await self.orchestrator.handle_inbound_event(
+            inbound,
+            agent_transport_kind=self.config.agent_transport_kind,
+            cwd=self.config.cwd,
+        )
+        self.save_state()
+        return result
+
+    async def serve_lark_ws(
+        self,
+        *,
+        retry_delay: float = 2.0,
+        max_events: int | None = None,
+        bridge_factory=None,
+    ) -> None:
+        channel = self.channels.get("lark")
+        if not isinstance(channel, LarkChannelAdapter):
+            raise ChannelConfigError("Lark channel is not configured for channel-native runtime")
+        queue: asyncio.Queue = asyncio.Queue()
+        ack_registry = getattr(channel.api, "ack_registry", None) or AckRegistry()
+        loop = asyncio.get_running_loop()
+        if bridge_factory is None:
+            bridge = LarkIngressBridge(
+                self.config.channel.credentials,
+                self.config.channel.options,
+                loop=loop,
+                queue=queue,
+                ack_registry=ack_registry,
+            )
+        else:
+            bridge = bridge_factory(loop=loop, queue=queue, ack_registry=ack_registry)
+        bridge.start()
+        previous_defer_event_drain = self.orchestrator.defer_event_drain
+        self.orchestrator.defer_event_drain = True
+        maintenance_tasks = self._start_telegram_maintenance_tasks()
+        processed = 0
+        try:
+            while max_events is None or processed < max_events:
+                payload = await queue.get()
+                processed += 1
+                try:
+                    async with self._ingress_lock:
+                        await self.process_lark_event(payload)
+                except ChannelConfigError:
+                    raise
+                except Exception as exc:
+                    self.last_lark_event_error = f"{type(exc).__name__}: {exc}"
+                    print(
+                        f"lark event transient error: {self.last_lark_event_error}",
+                        file=sys.stderr,
+                    )
+                    if retry_delay > 0:
+                        await asyncio.sleep(retry_delay)
+                else:
+                    self.last_lark_event_error = ""
+        finally:
+            await self._stop_telegram_maintenance_tasks(maintenance_tasks)
+            self.orchestrator.defer_event_drain = previous_defer_event_drain
 
     async def _place_telegram_new_session(
         self,
@@ -1902,12 +2073,16 @@ class ChannelNativeRuntime:
 
     def _describe_channel(self, kind: str, endpoint: ChannelEndpointConfig) -> dict[str, Any]:
         channel = self.channels.get(kind)
-        return {
+        item = {
             "kind": endpoint.kind,
             "configured": channel is not None,
             "live_ingress": self._channel_live_ingress(kind, endpoint),
             "credential_keys": sorted(endpoint.credentials),
         }
+        if endpoint.kind == "lark":
+            item["openapi_domain"] = str(endpoint.options.get("openapi_domain", "") or "")
+            item["app_id_prefix"] = str(endpoint.credentials.get("app_id", "") or "")[:8]
+        return item
 
     def _describe_agent(self, agent: str) -> dict[str, Any]:
         transport_kind = _agent_to_transport_kind(agent)
@@ -1927,6 +2102,8 @@ class ChannelNativeRuntime:
     def _channel_live_ingress(kind: str, endpoint: ChannelEndpointConfig) -> str:
         if kind == "telegram":
             return "polling" if endpoint.options.get("polling", True) else "webhook_not_wired"
+        if kind == "lark":
+            return "websocket"
         return "not_wired"
 
     def _telegram_chat_allowed(self, chat_id: str) -> bool:
@@ -2317,14 +2494,22 @@ def run_native_cli(args) -> None:
             print(_format_status(status))
         return
     if args.native_command == "debug":
-        if getattr(args, "debug_module", "") != "telegram":
-            raise ChannelConfigError(f"unknown native debug module: {getattr(args, 'debug_module', '')}")
-        report = asyncio.run(runtime.diagnose_telegram_ingress(limit=args.limit))
-        if getattr(args, "json", False):
-            print(json.dumps(report, indent=2, sort_keys=True))
-        else:
-            print(_format_telegram_diagnosis(report))
-        return
+        module = getattr(args, "debug_module", "")
+        if module == "telegram":
+            report = asyncio.run(runtime.diagnose_telegram_ingress(limit=args.limit))
+            if getattr(args, "json", False):
+                print(json.dumps(report, indent=2, sort_keys=True))
+            else:
+                print(_format_telegram_diagnosis(report))
+            return
+        if module == "lark":
+            report = asyncio.run(runtime.diagnose_lark_ingress())
+            if getattr(args, "json", False):
+                print(json.dumps(report, indent=2, sort_keys=True))
+            else:
+                print(_format_lark_diagnosis(report))
+            return
+        raise ChannelConfigError(f"unknown native debug module: {module}")
     if args.native_command == "hook":
         try:
             payload = json.load(sys.stdin)
@@ -2368,6 +2553,16 @@ def run_native_cli(args) -> None:
             print(f"native hook rejected: {result.reason}", file=sys.stderr)
         raise SystemExit(0 if result.accepted else 1)
     if args.native_command == "serve":
+        if runtime.config.channel_kind == "lark":
+            if getattr(args, "once", False):
+                raise ChannelConfigError(
+                    "serve --once is not supported for the lark channel (WebSocket push has "
+                    "no pull semantics); use doctor and debug lark instead"
+                )
+            print(_format_status(runtime.describe()))
+            print("channel-native V3 runtime listening via Lark WebSocket")
+            asyncio.run(runtime.serve_lark_ws())
+            return
         if getattr(args, "once", False):
             processed = asyncio.run(
                 runtime.poll_telegram_once(timeout=args.poll_timeout, limit=args.limit)
@@ -2414,8 +2609,17 @@ def _build_channels(
             use_rich_messages=bool(endpoint.options.get("rich_messages")),
         )
     elif endpoint.kind == "lark":
-        api = lark_api or LarkBotApi(caller=_unwired_lark_call)
-        channels[endpoint.kind] = LarkChannelAdapter(api)
+        if lark_api is None:
+            ack_registry = AckRegistry()
+            lark_api = build_lark_live_api(
+                endpoint.credentials,
+                endpoint.options,
+                ack_registry=ack_registry,
+            )
+            # serve_lark_ws picks the registry up from the api so the WS
+            # bridge and ack_callback share the same future map.
+            lark_api.ack_registry = ack_registry
+        channels[endpoint.kind] = LarkChannelAdapter(lark_api)
     return channels
 
 
@@ -2469,10 +2673,6 @@ def _codex_standalone_daemon_available(codex_home: str = "") -> bool:
 
 def _build_external_tui_controllers() -> dict[str, Any]:
     return {"process": LocalProcessController()}
-
-
-async def _unwired_lark_call(method: str, payload: dict[str, Any]) -> Any:
-    raise RuntimeError("Lark channel-native live ingress is not wired in the V3 runtime yet")
 
 
 def _telegram_update_id(update: dict[str, Any]) -> int | None:
@@ -3751,6 +3951,56 @@ def _launchd_service_label(channel_kind: str, agent: str, profile: str = "") -> 
     if channel_kind != "telegram":
         return ""
     return f"com.walkcode.telegram-{value}"
+
+
+def _lark_tenant_token_self_check(app_id: str, app_secret: str, domain: str) -> dict[str, Any]:
+    """SDK-free tenant_access_token probe used by `walkcode native debug lark`.
+
+    Only reports reachability and credential validity; the token value itself
+    is never included in the report.
+    """
+    import urllib.error
+    import urllib.request
+
+    url = f"{domain.rstrip('/')}/open-apis/auth/v3/tenant_access_token/internal"
+    body = json.dumps({"app_id": app_id, "app_secret": app_secret}).encode("utf-8")
+    request = urllib.request.Request(
+        url,
+        data=body,
+        headers={"Content-Type": "application/json; charset=utf-8"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        return {"ok": False, "reason": f"http_{exc.code}"}
+    except Exception as exc:
+        return {"ok": False, "reason": f"{type(exc).__name__}: {exc}"}
+    code = int(payload.get("code", -1))
+    if code != 0:
+        return {"ok": False, "reason": f"lark_code_{code}: {payload.get('msg', '')}"}
+    return {"ok": True, "expire_in": payload.get("expire", 0)}
+
+
+def _format_lark_diagnosis(report: dict[str, Any]) -> str:
+    channel = report.get("channel", {})
+    token = report.get("tenant_token", {})
+    sdk = report.get("sdk", {})
+    lines = [
+        "lark ingress diagnosis",
+        f"app_id_prefix: {channel.get('app_id_prefix', '-')}",
+        f"openapi_domain: {channel.get('openapi_domain', '-')}",
+        f"tenant_token: ok={token.get('ok')}"
+        + (f" reason={token.get('reason')}" if not token.get("ok") else ""),
+        f"sdk_installed: {sdk.get('installed')}",
+        f"allowed_chat_ids: {','.join(report.get('allowed_chat_ids', [])) or '-'}",
+        f"allowed_open_ids: {','.join(report.get('allowed_open_ids', [])) or '-'}",
+    ]
+    hint = sdk.get("hint", "")
+    if hint:
+        lines.append(f"hint: {hint}")
+    return "\n".join(lines)
 
 
 def _format_telegram_diagnosis(report: dict[str, Any]) -> str:

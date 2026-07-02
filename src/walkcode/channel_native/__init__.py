@@ -481,6 +481,11 @@ def _lark_config_from_env(source: Any, *, priority: int) -> ChannelEndpointConfi
     missing = [key for key, value in (("LARK_APP_ID", app_id), ("LARK_APP_SECRET", app_secret)) if not value]
     if missing:
         raise ChannelConfigError(f"missing {', '.join(missing)} for lark channel")
+    allowed_chat_ids = tuple(_split_csv(source.get("LARK_ALLOWED_CHAT_IDS", "")))
+    if not allowed_chat_ids:
+        e2e_chat_id = str(source.get("WALKCODE_E2E_LARK_CHAT_ID", "") or "").strip()
+        if e2e_chat_id:
+            allowed_chat_ids = (e2e_chat_id,)
     return ChannelEndpointConfig(
         kind="lark",
         credentials={"app_id": app_id, "app_secret": app_secret},
@@ -488,6 +493,8 @@ def _lark_config_from_env(source: Any, *, priority: int) -> ChannelEndpointConfi
             "receive_id": source.get("LARK_RECEIVE_ID", ""),
             "receive_id_type": source.get("LARK_RECEIVE_ID_TYPE", "open_id"),
             "openapi_domain": source.get("LARK_OPENAPI_DOMAIN", "https://open.feishu.cn").rstrip("/"),
+            "allowed_chat_ids": allowed_chat_ids,
+            "allowed_open_ids": tuple(_split_csv(source.get("LARK_ALLOWED_OPEN_IDS", ""))),
         },
         priority=priority,
     )

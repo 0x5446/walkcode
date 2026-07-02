@@ -2,6 +2,7 @@ import io
 import json
 import sys
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from walkcode import __main__ as main
@@ -15,6 +16,7 @@ class _FakeRuntime:
         self.hooks = []
         self.deferred_hooks = []
         self.hook_result = hook_result or SubmitResult(True)
+        self.config = SimpleNamespace(channel_kind="telegram")
 
     def describe(self):
         return {
