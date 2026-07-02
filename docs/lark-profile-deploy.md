@@ -23,19 +23,27 @@ work 可复用 V2 时代已配好的两个公司飞书 bot；personal 在 Lark �
 
 ## 2. Agent Profile 配置目录（每 profile 一次）
 
-Claude（每 profile 一个配置目录，含凭证/设置/历史）：
+`~/.local/bin` 下有四个 profile wrapper（独立可执行脚本，任何 shell 上下文都生效）：
+
+| wrapper | 等价于 |
+|---|---|
+| `claude-work` | `CLAUDE_CONFIG_DIR=~/.claude-profiles/work claude` |
+| `claude-personal` | `CLAUDE_CONFIG_DIR=~/.claude-profiles/personal claude` |
+| `codex-work` | `CODEX_HOME=~/.codex-profiles/work codex` |
+| `codex-personal` | `CODEX_HOME=~/.codex-profiles/personal codex` |
+
+首次登录（每 profile 一次）：
 
 ```bash
-CLAUDE_CONFIG_DIR=~/.claude-profiles/work claude   # 登录 + 配置
-CLAUDE_CONFIG_DIR=~/.claude-profiles/personal claude
+claude-work      # 登录后 /exit；claude-personal 同理
+codex-work login # codex-personal login 同理
 ```
 
-Codex（每 CODEX_HOME 一个独立 managed daemon + socket）：
-
-```bash
-CODEX_HOME=~/.codex-profiles/work codex login
-CODEX_HOME=~/.codex-profiles/personal codex login
-```
+**日常规则：终端起 TUI 一律用 wrapper，不用裸 `claude`/`codex`。** hook 配置
+住在各 profile 的配置目录里，用哪个 wrapper 启动，TUI 观察就锚定到哪个
+runtime 实例；裸命令读 `~/.claude`/`~/.codex`，不属于任何 profile。
+Codex 的 managed app-server daemon 也按 CODEX_HOME 分家（每 profile 一个
+daemon + socket）。
 
 TUI hook 归属锚定：把 walkcode hook 命令写进各 profile 的
 `{CLAUDE_CONFIG_DIR}/settings.json` / `{CODEX_HOME}/hooks.json`，**命令必须显式
