@@ -310,3 +310,38 @@ class LarkIngressBridgeTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LarkIngressReconnectTests(unittest.TestCase):
+    def test_ws_thread_rebuilds_client_after_connection_dies(self):
+        runs = []
+        bridge_ref = {}
+
+        class _DyingClient:
+            def start(self):
+                runs.append(1)
+                if len(runs) >= 3:
+                    bridge_ref["bridge"].stop()
+
+        async def scenario():
+            bridge = LarkIngressBridge(
+                {"app_id": "a", "app_secret": "s"},
+                {},
+                loop=asyncio.get_running_loop(),
+                queue=asyncio.Queue(),
+                ack_registry=AckRegistry(),
+                ws_client_factory=lambda b: _DyingClient(),
+                reconnect_delay=0.01,
+            )
+            bridge_ref["bridge"] = bridge
+            bridge.start()
+            for _ in range(200):
+                if len(runs) >= 3:
+                    break
+                await asyncio.sleep(0.02)
+            bridge.stop()
+            bridge._thread.join(timeout=2)
+            return len(runs)
+
+        count = asyncio.run(scenario())
+        self.assertGreaterEqual(count, 3)

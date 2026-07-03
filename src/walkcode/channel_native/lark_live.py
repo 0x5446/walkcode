@@ -28,7 +28,9 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import json
+import sys
 import threading
+import time
 from typing import Any, Callable
 
 from . import PermanentDeliveryError, TransientDeliveryError
@@ -371,6 +373,7 @@ class LarkIngressBridge:
         ack_registry: AckRegistry,
         ack_timeout: float = DEFAULT_ACK_TIMEOUT,
         ws_client_factory: Callable[..., Any] | None = None,
+        reconnect_delay: float = 5.0,
     ):
         self.credentials = credentials
         self.options = options
@@ -378,8 +381,10 @@ class LarkIngressBridge:
         self.queue = queue
         self.ack_registry = ack_registry
         self.ack_timeout = ack_timeout
+        self.reconnect_delay = reconnect_delay
         self._ws_client_factory = ws_client_factory
         self._thread: threading.Thread | None = None
+        self._stopped = threading.Event()
 
     def _enqueue(self, payload: dict[str, Any]) -> None:
         self.loop.call_soon_threadsafe(self.queue.put_nowait, payload)
@@ -406,15 +411,36 @@ class LarkIngressBridge:
         )
         self._thread.start()
 
+    def stop(self) -> None:
+        self._stopped.set()
+
     def _run_ws(self) -> None:
         # The lark-oapi sync WS client captures the current event loop when it
         # is constructed. Building it on the serve loop's thread would make the
         # SDK call run_until_complete on the already-running loop ("This event
         # loop is already running"), so both construction and start() happen on
         # this thread with a fresh private loop.
-        asyncio.set_event_loop(asyncio.new_event_loop())
-        client = self._build_ws_client()
-        client.start()
+        #
+        # start() returns (or raises) when the connection dies — e.g. after the
+        # machine sleeps, the SDK logs "receive message loop exit" and gives up.
+        # Without this loop the ingress silently stays dead until a restart.
+        while not self._stopped.is_set():
+            asyncio.set_event_loop(asyncio.new_event_loop())
+            try:
+                client = self._build_ws_client()
+                client.start()
+            except Exception as exc:
+                print(
+                    f"lark WS connection error: {type(exc).__name__}: {exc}",
+                    file=sys.stderr,
+                )
+            if self._stopped.is_set():
+                break
+            print(
+                f"lark WS disconnected; reconnecting in {self.reconnect_delay:.0f}s",
+                file=sys.stderr,
+            )
+            self._stopped.wait(self.reconnect_delay)
 
     def _build_ws_client(self) -> Any:
         if self._ws_client_factory is not None:
