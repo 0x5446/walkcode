@@ -486,6 +486,51 @@ class TelegramOrchestratorTests(unittest.TestCase):
         self.assertNotIn("tool_progress_message_id", session.channel_binding.capabilities)
         self.assertNotIn("tool_progress_lines", session.channel_binding.capabilities)
 
+    def test_empty_turn_completion_still_seals_tool_progress(self):
+        clock = _Clock()
+        api = _FakeTelegramApi()
+        channel = TelegramChannelAdapter(api)
+        transport = FakeAgentTransport(
+            "fake-transport",
+            _transport_caps(),
+            scripted_events=[
+                AgentEvent(AgentEventType.TOOL_STARTED, {"tool_id": "t1", "tool_name": "Bash", "summary": "ls"}),
+                AgentEvent(AgentEventType.TOOL_COMPLETED, {"tool_id": "t1", "tool_name": "Bash", "summary": "done"}),
+                # empty completion message renders no visible text — the burst
+                # must still be sealed or the next turn edits this turn's card
+                AgentEvent(AgentEventType.TURN_COMPLETED, {"message": ""}),
+            ],
+        )
+        orchestrator = Orchestrator(
+            sessions=SessionRegistry(now=clock),
+            interactions=InteractionStore(now=clock),
+            outbox=DurableOutbox(now=clock),
+            channels={"telegram": channel},
+            transports={"fake-transport": transport},
+            now=clock,
+        )
+        session = asyncio.run(
+            orchestrator.start_session(
+                ChannelBinding("telegram", "bot", "100", "77"),
+                "fake-transport",
+                "/tmp/project",
+                ActorRef("telegram", "200", "Ada"),
+            )
+        )
+
+        result = asyncio.run(
+            orchestrator.submit_user_input(
+                session.session_id,
+                TurnInput(text="go"),
+                actor=ActorRef("telegram", "200", "Ada"),
+                generation=session.generation,
+            )
+        )
+
+        self.assertTrue(result.accepted)
+        self.assertNotIn("tool_progress_message_id", session.channel_binding.capabilities)
+        self.assertNotIn("tool_progress_lines", session.channel_binding.capabilities)
+
 
 class ClaudeHeadlessTransportTests(unittest.TestCase):
     def test_missing_sdk_disables_capabilities_and_launch_fails_explicitly(self):

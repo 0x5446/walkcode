@@ -150,6 +150,16 @@ def _token_for(view: dict, label: str) -> str:
     return next(item["token"] for item in view["actions"] if item["label"] == label)
 
 
+def _form_callback(token: str, form: dict, *, actor_id: str = "owner") -> InboundEvent:
+    event = _callback(token, actor_id=actor_id)
+    return InboundEvent(
+        **{
+            **event.__dict__,
+            "callback": {"token": token, "form": form},
+        }
+    )
+
+
 class AskUserQuestionRoundTripTests(unittest.TestCase):
     def test_single_simple_question_finalizes_on_one_click(self):
         orchestrator, transport, channel, _interactions, session = _orchestrator(
@@ -318,6 +328,231 @@ class AskUserQuestionRoundTripTests(unittest.TestCase):
         self.assertTrue(accepted.accepted)
         self.assertTrue(submitted.accepted)
         self.assertEqual(len(transport.question_answer_calls), 1)
+
+    def test_form_submit_delivers_all_answers_in_one_callback(self):
+        orchestrator, transport, channel, _interactions, session = _orchestrator(
+            scripted_events=[
+                _ask_event(
+                    [
+                        {"prompt": "First", "options": ["A", "B"], "allow_other": True},
+                        {"prompt": "Second", "options": ["X", "Y"], "allow_multiple": True},
+                    ]
+                )
+            ]
+        )
+        asyncio.run(
+            orchestrator.submit_user_input(
+                session.session_id,
+                TurnInput(text="run"),
+                actor=_actor("owner"),
+                generation=session.generation,
+            )
+        )
+        card = channel.sent_views[0]["view"]
+        submit_token = card["submit"]["token"]
+
+        final = asyncio.run(
+            orchestrator.handle_inbound_event(
+                _form_callback(
+                    submit_token,
+                    {"q0": "1", "q0_other": "", "q1": ["0", "1"]},
+                    actor_id="owner",
+                ),
+                agent_transport_kind="fake-transport",
+                cwd="/tmp/project",
+            )
+        )
+
+        self.assertTrue(final.accepted)
+        self.assertEqual(
+            transport.question_answer_calls, [("ask-1", {0: "B", 1: ["X", "Y"]})]
+        )
+
+    def test_form_other_text_overrides_selected_option(self):
+        orchestrator, transport, channel, _interactions, session = _orchestrator(
+            scripted_events=[_ask_event()]
+        )
+        asyncio.run(
+            orchestrator.submit_user_input(
+                session.session_id,
+                TurnInput(text="run"),
+                actor=_actor("owner"),
+                generation=session.generation,
+            )
+        )
+        card = channel.sent_views[0]["view"]
+
+        final = asyncio.run(
+            orchestrator.handle_inbound_event(
+                _form_callback(
+                    card["submit"]["token"],
+                    {"q0": "0", "q0_other": "  custom text  "},
+                    actor_id="owner",
+                ),
+                agent_transport_kind="fake-transport",
+                cwd="/tmp/project",
+            )
+        )
+
+        self.assertTrue(final.accepted)
+        self.assertEqual(transport.question_answer_calls, [("ask-1", {0: "custom text"})])
+
+    def test_submit_without_answers_reports_incomplete_and_keeps_card_open(self):
+        orchestrator, transport, channel, interactions, session = _orchestrator(
+            scripted_events=[_ask_event()]
+        )
+        asyncio.run(
+            orchestrator.submit_user_input(
+                session.session_id,
+                TurnInput(text="run"),
+                actor=_actor("owner"),
+                generation=session.generation,
+            )
+        )
+        card = channel.sent_views[0]["view"]
+        submit_token = card["submit"]["token"]
+
+        incomplete = asyncio.run(
+            orchestrator.handle_inbound_event(
+                _callback(submit_token, actor_id="owner"),
+                agent_transport_kind="fake-transport",
+                cwd="/tmp/project",
+            )
+        )
+        self.assertTrue(incomplete.accepted)
+        self.assertEqual(transport.question_answer_calls, [])
+        self.assertIsNone(interactions.get(card["interaction_id"]).decision)
+        notes = [
+            item["view"].get("text", "")
+            for item in channel.sent_views
+            if item["view"].get("type") == "text"
+        ]
+        self.assertTrue(any("未回答" in note for note in notes))
+
+        # answering then reusing the same submit token settles the batch
+        asyncio.run(
+            orchestrator.handle_inbound_event(
+                _callback(_token_for(card, "A"), actor_id="owner"),
+                agent_transport_kind="fake-transport",
+                cwd="/tmp/project",
+            )
+        )
+        final = asyncio.run(
+            orchestrator.handle_inbound_event(
+                _callback(submit_token, actor_id="owner"),
+                agent_transport_kind="fake-transport",
+                cwd="/tmp/project",
+            )
+        )
+        self.assertTrue(final.accepted)
+        self.assertEqual(transport.question_answer_calls, [("ask-1", {0: "A"})])
+
+    def test_plain_message_after_submit_goes_to_agent_not_swallowed(self):
+        orchestrator, transport, channel, interactions, session = _orchestrator(
+            scripted_events=[_ask_event()]
+        )
+        asyncio.run(
+            orchestrator.submit_user_input(
+                session.session_id,
+                TurnInput(text="run"),
+                actor=_actor("owner"),
+                generation=session.generation,
+            )
+        )
+        card = channel.sent_views[0]["view"]
+        # user clicks "其他", changes their mind, picks an option, submits
+        asyncio.run(
+            orchestrator.handle_inbound_event(
+                _callback(_token_for(card, "Other"), actor_id="owner"),
+                agent_transport_kind="fake-transport",
+                cwd="/tmp/project",
+            )
+        )
+        asyncio.run(
+            orchestrator.handle_inbound_event(
+                _callback(_token_for(card, "A"), actor_id="owner"),
+                agent_transport_kind="fake-transport",
+                cwd="/tmp/project",
+            )
+        )
+        final = asyncio.run(
+            orchestrator.handle_inbound_event(
+                _callback(card["submit"]["token"], actor_id="owner"),
+                agent_transport_kind="fake-transport",
+                cwd="/tmp/project",
+            )
+        )
+        self.assertTrue(final.accepted)
+        self.assertEqual(interactions.awaiting_other_count(), 0)
+
+        # the next plain message must reach the agent, not be swallowed as a
+        # stale "other" answer for the settled question
+        followup = asyncio.run(
+            orchestrator.handle_inbound_event(
+                _text("next task", actor_id="owner"),
+                agent_transport_kind="fake-transport",
+                cwd="/tmp/project",
+            )
+        )
+        self.assertTrue(followup.accepted)
+        self.assertEqual(
+            [turn.text for turn in transport.submitted_turns], ["run", "next task"]
+        )
+        self.assertEqual(transport.question_answer_calls, [("ask-1", {0: "A"})])
+
+    def test_update_edit_returning_false_falls_back_to_new_card(self):
+        class _EditFailChannel(FakeChannelAdapter):
+            async def edit_view(self, binding, message_id, view_model):
+                await super().edit_view(binding, message_id, view_model)
+                return False
+
+        clock = _Clock()
+        transport = FakeAgentTransport(
+            "fake-transport",
+            _transport_caps(),
+            scripted_events=[
+                _ask_event([{"prompt": "Pick", "options": ["A", "B"], "allow_multiple": True}])
+            ],
+        )
+        channel = _EditFailChannel("telegram", _channel_caps())
+        orchestrator = Orchestrator(
+            sessions=SessionRegistry(now=clock),
+            interactions=InteractionStore(now=clock),
+            outbox=DurableOutbox(now=clock),
+            channels={"telegram": channel},
+            transports={"fake-transport": transport},
+            now=clock,
+        )
+        session = asyncio.run(
+            orchestrator.start_session(_binding(), "fake-transport", "/tmp/project", _actor("owner"))
+        )
+        asyncio.run(
+            orchestrator.submit_user_input(
+                session.session_id,
+                TurnInput(text="run"),
+                actor=_actor("owner"),
+                generation=session.generation,
+            )
+        )
+        card = channel.sent_views[0]["view"]
+
+        toggled = asyncio.run(
+            orchestrator.handle_inbound_event(
+                _callback(_token_for(card, "A"), actor_id="owner"),
+                agent_transport_kind="fake-transport",
+                cwd="/tmp/project",
+            )
+        )
+
+        self.assertTrue(toggled.accepted)
+        # edit reported failure (False) → a fresh ask card must be sent
+        # (FakeChannelAdapter records edits into sent_views too — exclude them)
+        ask_cards = [
+            item
+            for item in channel.sent_views
+            if item["view"].get("type") == "ask_user_question" and not item.get("edited")
+        ]
+        self.assertEqual(len(ask_cards), 2)
 
     def test_disabled_question_capability_does_not_consume_token(self):
         orchestrator, transport, _channel, interactions, session = _orchestrator(

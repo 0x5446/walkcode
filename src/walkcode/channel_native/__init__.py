@@ -18,6 +18,7 @@ import html
 import json
 import os
 import re
+import sys
 import tempfile
 import urllib.error
 import urllib.request
@@ -46,6 +47,21 @@ def attachment_download_dir() -> Path:
     with contextlib.suppress(OSError):
         base.mkdir(parents=True, exist_ok=True)
     return base
+
+
+def _log_degrade(event: str, **fields: Any) -> None:
+    """One-line stderr trace for silent-degradation paths.
+
+    These paths deliberately keep the user flow alive (fall back to a new
+    card, drop an ephemeral progress update), but without a trace the visible
+    symptom ("card didn't update" / "progress vanished") is undebuggable.
+    """
+    parts = [f"walkcode degrade={event}"]
+    for key, value in fields.items():
+        if isinstance(value, BaseException):
+            value = f"{type(value).__name__}: {value}"
+        parts.append(f"{key}={value}")
+    print(" ".join(str(p) for p in parts), file=sys.stderr, flush=True)
 
 
 def _options_supports_field(cls: Any, name: str) -> bool:
@@ -896,9 +912,19 @@ class AuthorizationStore:
         return store
 
 
+# Rolling tool-progress card state is turn-scoped; persisting it would make a
+# restarted process edit (and pollute) a previous run's card.
+_TRANSIENT_BINDING_KEYS = ("tool_progress_message_id", "tool_progress_lines")
+
+
 def _binding_to_dict(binding: ChannelBinding | None) -> dict[str, Any] | None:
     if binding is None:
         return None
+    capabilities = {
+        key: value
+        for key, value in binding.capabilities.items()
+        if key not in _TRANSIENT_BINDING_KEYS
+    }
     return {
         "channel_kind": binding.channel_kind,
         "account_id": binding.account_id,
@@ -908,13 +934,18 @@ def _binding_to_dict(binding: ChannelBinding | None) -> dict[str, Any] | None:
         "last_message_id": binding.last_message_id,
         "health_message_id": binding.health_message_id,
         "subscribed": binding.subscribed,
-        "capabilities": dict(binding.capabilities),
+        "capabilities": capabilities,
     }
 
 
 def _binding_from_dict(data: dict[str, Any] | None) -> ChannelBinding | None:
     if not data:
         return None
+    capabilities = {
+        key: value
+        for key, value in dict(data.get("capabilities", {})).items()
+        if key not in _TRANSIENT_BINDING_KEYS
+    }
     return ChannelBinding(
         channel_kind=str(data.get("channel_kind", "")),
         account_id=str(data.get("account_id", "")),
@@ -924,7 +955,7 @@ def _binding_from_dict(data: dict[str, Any] | None) -> ChannelBinding | None:
         last_message_id=str(data.get("last_message_id", "")),
         health_message_id=str(data.get("health_message_id", "")),
         subscribed=bool(data.get("subscribed", False)),
-        capabilities=dict(data.get("capabilities", {})),
+        capabilities=capabilities,
     )
 
 
@@ -2060,9 +2091,15 @@ class InteractionStore:
         if interaction_id is None:
             return DecisionResult(False, BlockedReason.NOT_FOUND)
         ctx = self._interactions[interaction_id]
+        if ctx.decision is not None:
+            # The interaction settled while the awaiting-other mapping was
+            # still around; drop the stale mapping so later plain messages go
+            # to the agent instead of being swallowed as answers.
+            self._awaiting_other_by_binding.pop(binding_key, None)
+            return DecisionResult(False, BlockedReason.ALREADY_DECIDED, ctx.decision)
         if ctx.generation != current_generation:
             return DecisionResult(False, BlockedReason.STALE_GENERATION)
-        if ctx.decision is None and ctx.expires_at <= self._now():
+        if ctx.expires_at <= self._now():
             return DecisionResult(False, BlockedReason.INVALID_TOKEN)
         if not ctx.awaiting_other:
             return DecisionResult(False, BlockedReason.NOT_FOUND)
@@ -2186,16 +2223,92 @@ class InteractionStore:
 
         return DecisionResult(False, BlockedReason.INVALID_TOKEN)
 
+    @staticmethod
+    def _has_answer(value: Any) -> bool:
+        if isinstance(value, str):
+            return bool(value.strip())
+        if isinstance(value, list):
+            return len(value) > 0
+        return value is not None
+
     def _finalize_ask_user(
         self,
         ctx: InteractionContext,
         actor: ActorRef,
     ) -> DecisionResult:
+        # Refuse to settle a batch with unanswered questions — an empty or
+        # partial answers dict would silently reach the agent as final input.
+        missing = [
+            index
+            for index in range(len(ctx.questions))
+            if not self._has_answer(ctx.answers.get(index))
+        ]
+        if missing:
+            return DecisionResult(
+                True, decision={"action": "incomplete", "missing": missing}
+            )
+        if ctx.awaiting_other:
+            raw_key = ctx.awaiting_other.get("binding_key")
+            if isinstance(raw_key, (list, tuple)) and len(raw_key) == 5:
+                self._awaiting_other_by_binding.pop(tuple(raw_key), None)  # type: ignore[arg-type]
+            ctx.awaiting_other = None
         decision = {"action": "answers", "answers": dict(ctx.answers)}
         ctx.decision = decision
         ctx.decided_by = actor
         ctx.decided_at = self._now()
         return DecisionResult(True, decision=decision)
+
+    def apply_ask_user_form(
+        self,
+        token: str,
+        form: dict[str, Any],
+        *,
+        current_generation: int,
+    ) -> bool:
+        """Write a Lark form_submit payload into the pending answers.
+
+        Form fields: ``q{i}`` holds the picked option index (str) or index list
+        for multi-select; ``q{i}_other`` holds free text that, when non-empty,
+        overrides the picked options for that question. Returns False when the
+        token doesn't resolve to an open ask_user interaction.
+        """
+        token_state = self._tokens.get(token)
+        if token_state is None or token_state.expires_at <= self._now():
+            return False
+        ctx = self._interactions.get(token_state.interaction_id)
+        if ctx is None or ctx.kind != "ask_user_question" or ctx.decision is not None:
+            return False
+        if ctx.generation != current_generation:
+            return False
+        for q_index, question in enumerate(ctx.questions):
+            options = [str(option) for option in question.get("options", [])]
+            other_text = str(form.get(f"q{q_index}_other", "") or "").strip()
+            if other_text:
+                ctx.answers[q_index] = other_text
+                continue
+            raw = form.get(f"q{q_index}")
+            if raw is None or raw == "":
+                continue
+            if question.get("allow_multiple"):
+                values = raw if isinstance(raw, list) else [raw]
+                picked: list[str] = []
+                for item in values:
+                    try:
+                        index = int(str(item))
+                    except ValueError:
+                        continue
+                    if 0 <= index < len(options):
+                        picked.append(options[index])
+                if picked:
+                    ctx.answers[q_index] = picked
+            else:
+                try:
+                    index = int(str(raw))
+                except (TypeError, ValueError):
+                    continue
+                if 0 <= index < len(options):
+                    ctx.answers[q_index] = options[index]
+        return True
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -4166,6 +4279,7 @@ class LarkChannelAdapter:
         value = action.get("value", {}) if isinstance(action, dict) else {}
         token = str(value.get("token", "") or value.get("callback_token", ""))
         action_name = str(value.get("action", ""))
+        form_value = action.get("form_value") if isinstance(action, dict) else None
         root_id = str(event.get("root_id", "") or "")
         message_id = str(event.get("message_id", "") or "")
         root = root_id or message_id
@@ -4182,11 +4296,14 @@ class LarkChannelAdapter:
             text=token,
             # "data" mirrors Telegram's callback_data: tokenless buttons (e.g.
             # the status card's request_takeover) are routed by action name.
+            # "form" carries a form-container submit's field values (locally
+            # staged selections arrive in one callback).
             callback={
                 "token": token,
                 "action": action_name,
                 "data": token or action_name,
                 "value": value,
+                "form": form_value if isinstance(form_value, dict) else {},
             },
             raw=payload,
         )
@@ -6980,6 +7097,13 @@ class Orchestrator:
                     return SubmitResult(False, authz_result.reason)
             if not transport.capabilities().set_model:
                 return SubmitResult(False, BlockedReason.CAPABILITY_DISABLED)
+        # Lark form cards submit every field in one callback: fold the form
+        # values into the pending answers before the submit token is decided.
+        form_values = (inbound.callback or {}).get("form")
+        if ctx.kind == "ask_user_question" and isinstance(form_values, dict) and form_values:
+            self.interactions.apply_ask_user_form(
+                token, form_values, current_generation=session.generation
+            )
         decision = self.interactions.decide_from_token(
             token,
             actor=actor,
@@ -7585,6 +7709,26 @@ class Orchestrator:
                     delivery_status=DeliveryStatus.SENT,
                 )
             return
+        if action == "incomplete":
+            # Submit arrived with unanswered questions: keep the card open and
+            # tell the user which ones are missing.
+            missing = payload.get("missing", [])
+            titles = []
+            for index in missing if isinstance(missing, list) else []:
+                try:
+                    question = ctx.questions[int(index)]
+                except (ValueError, IndexError, TypeError):
+                    continue
+                titles.append(str(question.get("header") or question.get("prompt") or f"第{index}题"))
+            note = "、".join(t for t in titles if t) or "部分问题"
+            binding = session.channel_binding
+            channel = self.channels.get(binding.channel_kind) if binding is not None else None
+            if channel is not None and binding is not None:
+                await channel.send_view(
+                    binding,
+                    {"type": "text", "text": f"⚠️ 还有未回答的问题：{note}。请补选后再点「提交全部」。"},
+                )
+            return
         if action == "awaiting_other":
             # Keep the all-questions card intact; just prompt for the free-text
             # reply that will fill this one question.
@@ -7609,11 +7753,23 @@ class Orchestrator:
                 and channel.capabilities().editable_message
                 and binding is not None
             ):
+                # edit_view reports failure both ways: False return (e.g.
+                # Telegram API "not modified") and raised errors. Either one
+                # must fall through to sending a fresh card, with a trace.
                 try:
-                    await channel.edit_view(binding, edit_card.message_id, view)
+                    edited = await channel.edit_view(binding, edit_card.message_id, view)
+                except Exception as exc:
+                    edited = False
+                    _log_degrade(
+                        "ask_card_edit_failed",
+                        session_id=session.session_id,
+                        interaction_id=ctx.interaction_id,
+                        message_id=edit_card.message_id,
+                        error=exc,
+                        fallback="send_new_card",
+                    )
+                if edited:
                     return
-                except Exception:
-                    pass
             await self._send_session_view(session, view, idempotency_key=idempotency_key)
 
     async def _send_session_view(
@@ -7655,15 +7811,16 @@ class Orchestrator:
             if view.get("type") == "tool_progress":
                 await self._upsert_tool_progress_view(session, channel, view)
                 continue
+            # Any non-tool event ends the burst — including an empty
+            # turn-completed. Sealing must not depend on the event producing
+            # visible text, or the next turn's tools edit last turn's card.
+            self._seal_tool_progress_burst(session)
             visible_text = render_view_text(view)
             if not visible_text:
                 continue
             if event.type == AgentEventType.TURN_COMPLETED and visible_text == last_visible_text:
                 continue
             last_visible_text = visible_text
-            # This message breaks any in-flight tool burst; seal it so the next
-            # tools open a new progress card instead of editing a stale one.
-            self._seal_tool_progress_burst(session)
             self.outbox.enqueue(
                 channel_binding_key=session.channel_binding.key(),
                 view_model=view,
@@ -7722,14 +7879,32 @@ class Orchestrator:
         if message_id and channel.capabilities().editable_message:
             try:
                 edited = await channel.edit_view(binding, message_id, aggregate)
-            except Exception:
+            except Exception as exc:
                 edited = False
+                _log_degrade(
+                    "tool_progress_edit_failed",
+                    session_id=session.session_id,
+                    message_id=message_id,
+                    tool=entry["tool_name"],
+                    error=exc,
+                    fallback="send_new_card",
+                )
             if edited:
                 return
             binding.capabilities.pop("tool_progress_message_id", None)
         try:
             new_message_id = await channel.send_view(binding, aggregate)
-        except Exception:
+        except Exception as exc:
+            # Progress cards are ephemeral by design (no outbox retry), but the
+            # drop must leave a trace or the missing card is undebuggable.
+            _log_degrade(
+                "tool_progress_send_failed",
+                session_id=session.session_id,
+                tool=entry["tool_name"],
+                status=entry["status"],
+                error=exc,
+                drop=True,
+            )
             return
         if new_message_id:
             binding.capabilities["tool_progress_message_id"] = str(new_message_id)

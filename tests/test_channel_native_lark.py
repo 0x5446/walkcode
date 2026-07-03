@@ -106,6 +106,28 @@ class LarkAdapterTests(unittest.TestCase):
         self.assertEqual(event.callback["action"], "allow")
         self.assertEqual(event.message_id, "om_card")
 
+    def test_parse_form_submit_callback_carries_form_values(self):
+        adapter = LarkChannelAdapter(LarkBotApi(caller=lambda *_: {}))
+        event = adapter.parse_event(
+            {
+                "event_id": "evt-form",
+                "event": {
+                    "message_id": "om_card",
+                    "chat_id": "oc_chat",
+                    "open_id": "ou_user",
+                    "action": {
+                        "value": {"token": "tok-submit", "action": "submit_all"},
+                        "form_value": {"q0": "1", "q1": ["0", "1"], "q0_other": "text"},
+                    },
+                },
+            }
+        )
+
+        self.assertEqual(event.callback["token"], "tok-submit")
+        self.assertEqual(
+            event.callback["form"], {"q0": "1", "q1": ["0", "1"], "q0_other": "text"}
+        )
+
     def test_send_interaction_view_uses_card_call(self):
         api = _FakeLarkApi()
         adapter = LarkChannelAdapter(api)

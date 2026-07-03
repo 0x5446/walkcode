@@ -122,7 +122,7 @@ class AskUserQuestionCardTests(unittest.TestCase):
         self.assertEqual(buttons[0]["value"], {"action": "answer:0:0", "token": "t1"})
         self.assertEqual([b["text"]["content"] for b in buttons], ["staging", "production"])
 
-    def test_multi_question_batch_marks_selected_and_has_single_submit(self):
+    def test_batch_questions_render_as_local_state_form(self):
         message = render_lark_message(
             {
                 "type": "ask_user_question",
@@ -130,32 +130,39 @@ class AskUserQuestionCardTests(unittest.TestCase):
                     {
                         "index": 0, "prompt": "周末?", "header": "周末计划", "allow_multiple": False,
                         "options": [
-                            {"action": "set:0:0", "label": "宅", "selected": True, "token": "a"},
+                            {"action": "set:0:0", "label": "宅", "selected": False, "token": "a"},
                             {"action": "set:0:1", "label": "出门浪", "selected": False, "token": "b"},
                         ],
-                        "other": None, "answer_display": "宅",
+                        "other": None, "answer_display": "",
                     },
                     {
                         "index": 1, "prompt": "口味?", "header": "吃啥", "allow_multiple": True,
                         "options": [
-                            {"action": "toggle:1:0", "label": "辣", "selected": True, "token": "c"},
+                            {"action": "toggle:1:0", "label": "辣", "selected": False, "token": "c"},
                             {"action": "toggle:1:1", "label": "清淡", "selected": False, "token": "d"},
                         ],
-                        "other": {"action": "other:1", "token": "e"}, "answer_display": "辣",
+                        "other": {"action": "other:1", "token": "e"}, "answer_display": "",
                     },
                 ],
                 "submit": {"action": "submit_all", "label": "Submit", "token": "s"},
             }
         )
 
-        buttons = _buttons(message["content"])
-        labels = [b["text"]["content"] for b in buttons]
-        self.assertIn("✓ 宅", labels)
-        self.assertIn("✓ 辣", labels)
-        self.assertIn("✏️ 其他", labels)
-        submits = [b for b in buttons if b["value"].get("action") == "submit_all"]
-        self.assertEqual(len(submits), 1)
-        self.assertIn("提交全部", submits[0]["text"]["content"])
+        # Batch mode must be a form container: selections stage client-side and
+        # one form_submit callback carries every field at once.
+        form = message["content"]["elements"][0]
+        self.assertEqual(form["tag"], "form")
+        by_tag: dict[str, list] = {}
+        for element in form["elements"]:
+            by_tag.setdefault(element.get("tag", ""), []).append(element)
+        self.assertEqual([e["name"] for e in by_tag["select_static"]], ["q0"])
+        self.assertEqual([e["name"] for e in by_tag["multi_select_static"]], ["q1"])
+        self.assertEqual([e["name"] for e in by_tag["input"]], ["q1_other"])
+        option_values = [o["value"] for o in by_tag["select_static"][0]["options"]]
+        self.assertEqual(option_values, ["0", "1"])
+        submit = by_tag["button"][0]
+        self.assertEqual(submit["action_type"], "form_submit")
+        self.assertEqual(submit["value"], {"action": "submit_all", "token": "s"})
 
 
 class HealthCardTests(unittest.TestCase):

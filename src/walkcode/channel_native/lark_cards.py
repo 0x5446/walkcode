@@ -163,44 +163,91 @@ def _ask_user_question_card(view: dict[str, Any]) -> dict[str, Any]:
     questions = view.get("questions")
     if not isinstance(questions, list):
         return _card_message("选择一个选项", "blue", [_md_div("⚠️ 无可用问题。")])
+    submit = view.get("submit")
+    if isinstance(submit, dict) and submit.get("token"):
+        return _ask_user_form_card(questions, submit)
+    return _ask_user_button_card(questions)
 
+
+def _ask_user_button_card(questions: list[Any]) -> dict[str, Any]:
+    # Immediate mode (one simple single-select question): plain buttons, one
+    # click answers everything — no form round trip needed.
     elements: list[dict[str, Any]] = []
-    multi_count = 0
     for q_index, question in enumerate(questions):
         if not isinstance(question, dict):
             continue
         title = str(question.get("header") or question.get("prompt") or f"问题 {q_index + 1}")
-        heading = escape_lark_md(_inline(title))
-        multi = bool(question.get("allow_multiple"))
-        if multi:
-            multi_count += 1
-        hint = "（多选）" if multi else "（单选）"
-        elements.append(_md_div(f"**{heading}** {hint}"))
-        option_buttons = []
-        for option in question.get("options", []):
-            if not isinstance(option, dict):
-                continue
-            selected = bool(option.get("selected"))
-            label = str(option.get("label", ""))
-            display = f"✓ {label}" if selected else label
-            option_buttons.append(
-                _button(option, btn_type="primary" if selected else "default", label=display)
-            )
-        other = question.get("other")
-        if isinstance(other, dict) and other.get("token"):
-            option_buttons.append(_button(other, btn_type="default", label="✏️ 其他"))
+        elements.append(_md_div(f"**{escape_lark_md(_inline(title))}**"))
+        option_buttons = [
+            _button(option)
+            for option in question.get("options", [])
+            if isinstance(option, dict)
+        ]
         if option_buttons:
             elements.append(_action_row(option_buttons))
-        answer_display = str(question.get("answer_display", "") or "")
-        if answer_display:
-            elements.append(_md_div(f"当前: {escape_lark_md(_inline(answer_display))}"))
-        elements.append({"tag": "hr"})
+    return _card_message("请选择", "blue", elements)
 
-    submit = view.get("submit")
-    if isinstance(submit, dict) and submit.get("token"):
-        elements.append(_action_row([_button(submit, btn_type="primary", label="✅ 提交全部")]))
-    if multi_count:
-        elements.append(_note("多选项点按钮切换，选好后点「提交全部」。"))
+
+def _ask_user_form_card(questions: list[Any], submit: dict[str, Any]) -> dict[str, Any]:
+    # Batch mode uses a form container: every dropdown/input interaction stays
+    # on the client, and one form_submit callback delivers all field values at
+    # once (field names q{i} / q{i}_other — the server maps them back by
+    # question index).
+    form_elements: list[dict[str, Any]] = []
+    for q_index, question in enumerate(questions):
+        if not isinstance(question, dict):
+            continue
+        header = str(question.get("header") or "")
+        prompt = str(question.get("prompt") or "")
+        title = header or prompt or f"问题 {q_index + 1}"
+        multi = bool(question.get("allow_multiple"))
+        hint = "（多选）" if multi else "（单选）"
+        rows = [f"**{escape_lark_md(_inline(title))}** {hint}"]
+        if header and prompt and prompt != header:
+            rows.append(escape_lark_md(_inline(prompt)))
+        form_elements.append(_md_div("\n".join(rows)))
+        options = [
+            {
+                "text": {"tag": "plain_text", "content": _clip(_inline(str(option.get("label", ""))), 60, "...")},
+                "value": str(o_index),
+            }
+            for o_index, option in enumerate(question.get("options", []))
+            if isinstance(option, dict)
+        ]
+        if options:
+            form_elements.append(
+                {
+                    "tag": "multi_select_static" if multi else "select_static",
+                    "name": f"q{q_index}",
+                    "placeholder": {"tag": "plain_text", "content": "请选择"},
+                    "options": options,
+                }
+            )
+        if question.get("other"):
+            form_elements.append(
+                {
+                    "tag": "input",
+                    "name": f"q{q_index}_other",
+                    "placeholder": {
+                        "tag": "plain_text",
+                        "content": "✏️ 其他答案（选填，优先于上面的选择）",
+                    },
+                }
+            )
+    form_elements.append(
+        {
+            "tag": "button",
+            "action_type": "form_submit",
+            "name": "submit_all",
+            "text": {"tag": "plain_text", "content": "✅ 提交全部"},
+            "type": "primary",
+            "value": {"action": str(submit.get("action", "submit_all")), "token": str(submit.get("token", ""))},
+        }
+    )
+    elements: list[dict[str, Any]] = [
+        {"tag": "form", "name": "ask_form", "elements": form_elements},
+        _note("选择先暂存在本地，点「提交全部」才会一次性提交。"),
+    ]
     return _card_message("请选择", "blue", elements)
 
 

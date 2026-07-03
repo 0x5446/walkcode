@@ -319,6 +319,87 @@ class AskUserQuestionStateMachineTests(unittest.TestCase):
             {"action": "answers", "answers": {0: "custom"}},
         )
 
+    def test_submit_all_without_answers_returns_incomplete_and_token_stays_usable(self):
+        store = InteractionStore(now=_Clock())
+        ctx = store.register_ask_user_question(
+            session_id="s1",
+            generation=2,
+            questions=[{"prompt": "Pick", "options": ["A"], "allow_other": True}],
+        )
+        view = ViewModelFactory(store).ask_user_question_prompt(ctx)
+        submit_token = view["submit"]["token"]
+
+        incomplete = store.decide_from_token(
+            submit_token, actor=_actor("owner"), current_generation=2, binding_key=_binding().key()
+        )
+        self.assertTrue(incomplete.accepted)
+        self.assertEqual(incomplete.decision, {"action": "incomplete", "missing": [0]})
+        self.assertIsNone(store.get(ctx.interaction_id).decision)
+
+        a_token = next(a["token"] for a in view["actions"] if a["label"] == "A")
+        store.decide_from_token(
+            a_token, actor=_actor("owner"), current_generation=2, binding_key=_binding().key()
+        )
+        final = store.decide_from_token(
+            submit_token, actor=_actor("owner"), current_generation=2, binding_key=_binding().key()
+        )
+        self.assertEqual(final.decision, {"action": "answers", "answers": {0: "A"}})
+
+    def test_finalize_clears_stale_awaiting_other_mapping(self):
+        store = InteractionStore(now=_Clock())
+        ctx = store.register_ask_user_question(
+            session_id="s1",
+            generation=2,
+            questions=[{"prompt": "Pick", "options": ["A"], "allow_other": True}],
+        )
+        view = ViewModelFactory(store).ask_user_question_prompt(ctx)
+        other_token = next(a["token"] for a in view["actions"] if a["label"] == "Other")
+        a_token = next(a["token"] for a in view["actions"] if a["label"] == "A")
+
+        # 其他 → 改主意点选项 → 提交：等待态必须被清掉
+        store.decide_from_token(
+            other_token, actor=_actor("owner"), current_generation=2, binding_key=_binding().key()
+        )
+        self.assertEqual(store.awaiting_other_count(), 1)
+        store.decide_from_token(
+            a_token, actor=_actor("owner"), current_generation=2, binding_key=_binding().key()
+        )
+        final = store.decide_from_token(
+            next(a["token"] for a in view["actions"] if a["label"] == "Submit"),
+            actor=_actor("owner"),
+            current_generation=2,
+            binding_key=_binding().key(),
+        )
+
+        self.assertEqual(final.decision["action"], "answers")
+        self.assertEqual(store.awaiting_other_count(), 0)
+        # a later plain message must not be swallowed as an answer
+        swallowed = store.answer_awaiting_other(
+            _binding().key(), actor=_actor("owner"), text="hello", current_generation=2
+        )
+        self.assertFalse(swallowed.accepted)
+
+    def test_apply_ask_user_form_maps_indexes_and_other_override(self):
+        store = InteractionStore(now=_Clock())
+        ctx = store.register_ask_user_question(
+            session_id="s1",
+            generation=2,
+            questions=[
+                {"prompt": "Single", "options": ["A", "B"], "allow_other": True},
+                {"prompt": "Multi", "options": ["X", "Y"], "allow_multiple": True},
+            ],
+        )
+        view = ViewModelFactory(store).ask_user_question_prompt(ctx)
+
+        applied = store.apply_ask_user_form(
+            view["submit"]["token"],
+            {"q0": "0", "q0_other": "custom", "q1": ["1"], "q1_other": ""},
+            current_generation=2,
+        )
+
+        self.assertTrue(applied)
+        self.assertEqual(store.get(ctx.interaction_id).answers, {0: "custom", 1: ["Y"]})
+
     def test_orchestrator_routes_other_callback_and_answer_text_before_agent_turn(self):
         clock = _Clock()
         interactions = InteractionStore(now=clock)
@@ -408,6 +489,43 @@ class AskUserQuestionStateMachineTests(unittest.TestCase):
             interactions.get(ctx.interaction_id).decision,
             {"action": "answers", "answers": {0: "custom answer"}},
         )
+
+
+class BindingSerializationTests(unittest.TestCase):
+    def test_tool_progress_state_is_not_persisted(self):
+        from walkcode.channel_native import _binding_from_dict, _binding_to_dict
+
+        binding = ChannelBinding(
+            "lark",
+            "bot",
+            "chat",
+            "topic",
+            "root",
+            capabilities={
+                "status_card": True,
+                "tool_progress_message_id": "om_1",
+                "tool_progress_lines": [{"tool_name": "Bash", "status": "running"}],
+            },
+        )
+
+        data = _binding_to_dict(binding)
+        self.assertNotIn("tool_progress_message_id", data["capabilities"])
+        self.assertNotIn("tool_progress_lines", data["capabilities"])
+        self.assertTrue(data["capabilities"]["status_card"])
+
+        # even a state file written by an older build must not resurrect them
+        restored = _binding_from_dict(
+            {
+                "channel_kind": "lark",
+                "account_id": "bot",
+                "chat_id": "chat",
+                "thread_id": "topic",
+                "root_message_id": "root",
+                "capabilities": {"tool_progress_message_id": "om_stale", "status_card": True},
+            }
+        )
+        self.assertNotIn("tool_progress_message_id", restored.capabilities)
+        self.assertTrue(restored.capabilities["status_card"])
 
 
 class AuthorizationTests(unittest.TestCase):
