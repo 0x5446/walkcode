@@ -155,6 +155,10 @@ class AskUserQuestionCardTests(unittest.TestCase):
         by_tag: dict[str, list] = {}
         for element in form["elements"]:
             by_tag.setdefault(element.get("tag", ""), []).append(element)
+        # Feishu silently drops the WHOLE form if it contains a div child;
+        # question titles must use the markdown component (live-verified).
+        self.assertNotIn("div", by_tag)
+        self.assertIn("markdown", by_tag)
         self.assertEqual([e["name"] for e in by_tag["select_static"]], ["q0"])
         self.assertEqual([e["name"] for e in by_tag["multi_select_static"]], ["q1"])
         self.assertEqual([e["name"] for e in by_tag["input"]], ["q1_other"])
@@ -189,6 +193,43 @@ class HealthCardTests(unittest.TestCase):
         self.assertIn("运行中", rendered)
         self.assertIn("sess-1234", rendered)
         self.assertIn("2分05秒", rendered)
+
+    def test_health_card_shows_model_and_context_usage(self):
+        message = render_lark_message(
+            {
+                "type": "health",
+                "status": "running",
+                "title": "t",
+                "session_id": "s1",
+                "transport": "claude_headless",
+                "elapsed": 5.0,
+                "cwd": "/tmp",
+                "model": "claude-opus-4-8-20260610",
+                "context_used": 123_456,
+                "context_limit": 200_000,
+            }
+        )
+
+        rendered = json.dumps(message["content"], ensure_ascii=False)
+        self.assertIn("claude-opus-4-8-20260610", rendered)
+        self.assertIn("123.5k / 200k（62%）", rendered)
+
+    def test_health_card_without_model_shows_placeholder(self):
+        message = render_lark_message(
+            {
+                "type": "health",
+                "status": "running",
+                "title": "t",
+                "session_id": "s1",
+                "transport": "codex_app_server",
+                "elapsed": 5.0,
+                "cwd": "/tmp",
+            }
+        )
+
+        rendered = json.dumps(message["content"], ensure_ascii=False)
+        self.assertIn("**模型**: —", rendered)
+        self.assertIn("**上下文**: —", rendered)
 
     def test_readonly_observed_session_mentions_takeover(self):
         message = render_lark_message(

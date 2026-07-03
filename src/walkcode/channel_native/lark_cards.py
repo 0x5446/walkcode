@@ -205,7 +205,9 @@ def _ask_user_form_card(questions: list[Any], submit: dict[str, Any]) -> dict[st
         rows = [f"**{escape_lark_md(_inline(title))}** {hint}"]
         if header and prompt and prompt != header:
             rows.append(escape_lark_md(_inline(prompt)))
-        form_elements.append(_md_div("\n".join(rows)))
+        # Feishu silently drops the ENTIRE form element when it contains a div
+        # child (live-verified 2026-07-03: div → empty card; markdown renders).
+        form_elements.append({"tag": "markdown", "content": "\n".join(rows)})
         options = [
             {
                 "text": {"tag": "plain_text", "content": _clip(_inline(str(option.get("label", ""))), 60, "...")},
@@ -259,8 +261,19 @@ def _health_card(view: dict[str, Any]) -> dict[str, Any]:
     minutes, seconds = divmod(elapsed, 60)
     duration = f"{minutes}分{seconds:02d}秒" if minutes else f"{seconds}秒"
     session_id = str(view.get("session_id", "") or "")
+    model = str(view.get("model", "") or "")
+    context_used = int(view.get("context_used", 0) or 0)
+    context_limit = int(view.get("context_limit", 0) or 0)
+    if context_used and context_limit:
+        percent = round(context_used * 100 / context_limit)
+        context_label = f"{context_used / 1000:.1f}k / {context_limit // 1000}k（{percent}%）"
+    elif context_used:
+        context_label = f"{context_used / 1000:.1f}k"
+    else:
+        context_label = "—"
     elements: list[dict[str, Any]] = [
         {"tag": "markdown", "content": f"**状态**: {status_label}　**Agent**: {view.get('transport', '') or '—'}"},
+        {"tag": "markdown", "content": f"**模型**: {f'`{model}`' if model else '—'}　**上下文**: {context_label}"},
         {"tag": "markdown", "content": f"**Session**: `{session_id}`" if session_id else "**Session**: —"},
         {"tag": "markdown", "content": f"**时长**: {duration}　**目录**: {escape_lark_md(str(view.get('cwd', '') or '—'))}"},
     ]
