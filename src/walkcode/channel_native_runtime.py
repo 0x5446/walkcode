@@ -2026,7 +2026,12 @@ class ChannelNativeRuntime:
             return
         self._loaded_tui_observed_bindings_refreshed = True
         changed = False
-        for summary in self.state.sessions.list_sessions(channel_kind="telegram"):
+        summaries = [
+            summary
+            for kind in ("telegram", "lark")
+            for summary in self.state.sessions.list_sessions(channel_kind=kind)
+        ]
+        for summary in summaries:
             session = self.state.sessions.get(summary.session_id)
             if session.status == "stopped" and session.lifecycle_state not in {
                 "EXTERNAL_DETACHED_IMPORTABLE",
@@ -2035,6 +2040,12 @@ class ChannelNativeRuntime:
                 continue
             if session.writer_owner is None or session.writer_owner.kind != "external_tui":
                 continue
+            if session.channel_binding is not None:
+                # Re-grant on load: owners are granted at creation, but config
+                # (e.g. LARK_ALLOWED_OPEN_IDS) may have been added afterwards.
+                # Detached sessions need this too — importing them requires an
+                # authorized actor just like takeover does.
+                self._grant_tui_channel_owners(session.session_id, session.channel_binding)
             if self._mark_stale_tui_process_detached_if_needed(session):
                 changed = True
                 await self.orchestrator.refresh_session_status_card(session)
@@ -2217,6 +2228,11 @@ class ChannelNativeRuntime:
         if self.state.authz is None:
             return
         actor_ids = list(self.config.channel.options.get("allowed_actor_ids", ()) or ())
+        if binding.channel_kind == "lark":
+            # Lark actors are open_ids (ou_...), never the chat id (oc_...);
+            # without this grant an observed session silently rejects every
+            # takeover request from the chat.
+            actor_ids.extend(self.config.channel.options.get("allowed_open_ids", ()) or ())
         if binding.channel_kind == "telegram" and binding.chat_id and not binding.chat_id.startswith("-"):
             actor_ids.append(binding.chat_id)
         for actor_id in dict.fromkeys(str(item) for item in actor_ids if item):

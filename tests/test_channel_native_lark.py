@@ -591,3 +591,118 @@ class LarkTuiObservationTests(_LarkRuntimeHarness):
             runtime.state.sessions.list_sessions(channel_kind="lark")[0].session_id
         )
         self.assertEqual(session.channel_binding.chat_id, "oc_tui")
+
+
+class LarkTuiTakeoverAuthzTests(_LarkRuntimeHarness):
+    def test_observed_session_grants_owner_from_allowed_open_ids(self):
+        runtime, api, transport = self._runtime(
+            env_extra={
+                "LARK_ALLOWED_CHAT_IDS": "oc_chat",
+                "LARK_ALLOWED_OPEN_IDS": "ou_owner",
+            }
+        )
+
+        asyncio.run(
+            runtime.process_tui_hook(
+                hook_type="sync",
+                agent="claude",
+                payload={
+                    "session_id": "claude-session-9",
+                    "cwd": self._tmp.name,
+                    "terminate_ref": {
+                        "controller_kind": "process",
+                        "process_ref": {"pid": 123, "allow_terminate": True},
+                    },
+                },
+            )
+        )
+
+        session_id = runtime.state.sessions.list_sessions(channel_kind="lark")[0].session_id
+        from walkcode.channel_native import ActorRef
+        result = runtime.state.authz.can_submit(
+            session_id, ActorRef("lark", "ou_owner", "ou_owner")
+        )
+        self.assertTrue(result.allowed)
+
+    def test_observed_session_message_from_owner_blocks_input_and_prompts_takeover(self):
+        runtime, api, transport = self._runtime(
+            env_extra={
+                "LARK_ALLOWED_CHAT_IDS": "oc_chat",
+                "LARK_ALLOWED_OPEN_IDS": "ou_user",
+            }
+        )
+        asyncio.run(
+            runtime.process_tui_hook(
+                hook_type="sync",
+                agent="claude",
+                payload={
+                    "session_id": "claude-session-9",
+                    "cwd": self._tmp.name,
+                    "terminate_ref": {
+                        "controller_kind": "process",
+                        "process_ref": {"pid": 123, "allow_terminate": True},
+                    },
+                },
+            )
+        )
+        session_id = runtime.state.sessions.list_sessions(channel_kind="lark")[0].session_id
+        session = runtime.state.sessions.get(session_id)
+        root = session.channel_binding.root_message_id
+
+        result = asyncio.run(
+            runtime.process_lark_event(
+                self._message_payload(
+                    event_id="evt-to",
+                    message_id="om_to_input",
+                    root_id=root,
+                    text="改成用三句话介绍",
+                )
+            )
+        )
+
+        self.assertTrue(result.blocked_input_id)
+        session = runtime.state.sessions.get(session_id)
+        self.assertTrue(session.blocked_inputs)
+        prompts = [
+            p["view"] for m, p in api.calls
+            if m == "sendCard" and p.get("view", {}).get("type") == "takeover_prompt"
+        ]
+        self.assertEqual(len(prompts), 1)
+        self.assertTrue(prompts[0]["actions"])
+
+    def test_binding_refresh_regrants_owners_for_loaded_lark_sessions(self):
+        runtime, api, transport = self._runtime(
+            env_extra={"LARK_ALLOWED_CHAT_IDS": "oc_chat"}
+        )
+        asyncio.run(
+            runtime.process_tui_hook(
+                hook_type="sync",
+                agent="claude",
+                payload={
+                    "session_id": "claude-session-9",
+                    "cwd": self._tmp.name,
+                    "terminate_ref": {
+                        "controller_kind": "process",
+                        "process_ref": {"pid": 999999, "allow_terminate": True},
+                    },
+                },
+            )
+        )
+        session_id = runtime.state.sessions.list_sessions(channel_kind="lark")[0].session_id
+        from walkcode.channel_native import ActorRef
+        self.assertFalse(
+            runtime.state.authz.can_submit(session_id, ActorRef("lark", "ou_late", "ou_late")).allowed
+        )
+
+        # simulate config gaining the open id afterwards + service restart refresh
+        options = dict(runtime.config.channel.options)
+        options["allowed_open_ids"] = ("ou_late",)
+        object.__setattr__(runtime.config.channel, "options", options)
+        runtime._loaded_tui_observed_bindings_refreshed = False
+        session = runtime.state.sessions.get(session_id)
+        session.transport_ref.pop("terminate_ref", None)
+        asyncio.run(runtime._refresh_loaded_tui_observed_bindings())
+
+        self.assertTrue(
+            runtime.state.authz.can_submit(session_id, ActorRef("lark", "ou_late", "ou_late")).allowed
+        )
