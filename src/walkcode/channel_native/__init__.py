@@ -723,6 +723,8 @@ class Session:
     archived_at: float = 0.0
     archived_by: str = ""
     archive_reason: str = ""
+    model: str = ""
+    last_usage: dict[str, Any] = field(default_factory=dict)
     created_at: float = field(default_factory=time.time)
 
 
@@ -737,6 +739,45 @@ def _session_is_external_tui_takeover_candidate(session: Session) -> bool:
     if session.writer_owner is not None and isinstance(session.writer_owner.external_ref, dict):
         refs.append(session.writer_owner.external_ref)
     return any(str(ref.get("source", "")) == "native_tui_hook" for ref in refs)
+
+
+def _estimate_context_tokens(usage: dict[str, Any]) -> int:
+    """Approximate context occupancy from the last turn's usage.
+
+    Claude's input_tokens / cache_read / cache_creation are disjoint slices of
+    the prompt; adding the turn's output approximates the next turn's prompt.
+    Codex task_complete usage only has input_tokens/output_tokens (its
+    cached_input_tokens is a subset of input_tokens, so it is not summed).
+    """
+    if not isinstance(usage, dict):
+        return 0
+    total = 0
+    for key in (
+        "input_tokens",
+        "cache_read_input_tokens",
+        "cache_creation_input_tokens",
+        "output_tokens",
+    ):
+        try:
+            total += int(usage.get(key, 0) or 0)
+        except (TypeError, ValueError):
+            continue
+    return total
+
+
+def _context_window_limit(model: str) -> int:
+    return 1_000_000 if "[1m]" in model else 200_000
+
+
+def _model_slug_matches(slug: str, current: str) -> bool:
+    """True when a picker slug refers to the session's live model id.
+
+    Assistant events report dated ids (claude-opus-4-8-20260610) or Vertex
+    ids (claude-opus-4-8@20260610) while picker slugs are short aliases.
+    """
+    if not slug or not current:
+        return False
+    return current == slug or current.startswith(slug + "-") or current.startswith(slug + "@")
 
 
 @dataclass(frozen=True)
@@ -1109,6 +1150,8 @@ def _session_to_dict(session: Session) -> dict[str, Any]:
         "archived_at": session.archived_at,
         "archived_by": session.archived_by,
         "archive_reason": session.archive_reason,
+        "model": session.model,
+        "last_usage": dict(session.last_usage),
         "created_at": session.created_at,
     }
 
@@ -1142,6 +1185,8 @@ def _session_from_dict(data: dict[str, Any]) -> Session:
         archived_at=float(data.get("archived_at", 0.0)),
         archived_by=str(data.get("archived_by", "")),
         archive_reason=str(data.get("archive_reason", "")),
+        model=str(data.get("model", "")),
+        last_usage=dict(data.get("last_usage", {}) or {}),
         created_at=float(data.get("created_at", 0.0)),
     )
 
@@ -2470,15 +2515,19 @@ class ViewModelFactory:
         current = str(ctx.tool_input.get("current", "") or "")
         models = ctx.tool_input.get("models", [])
         actions = []
+        matched_slug = ""
         for model in models if isinstance(models, list) else []:
             slug = str(model.get("slug", "") or "")
             if not slug:
                 continue
             display = str(model.get("display_name", "") or slug)
+            is_current = _model_slug_matches(slug, current)
+            if is_current:
+                matched_slug = slug
             actions.append(
                 {
                     "action": slug,
-                    "label": f"✓ {display}" if slug == current else display,
+                    "label": f"✓ {display}（当前）" if is_current else display,
                     "token": self.interactions.create_callback_token(
                         ctx.interaction_id,
                         slug,
@@ -2491,7 +2540,7 @@ class ViewModelFactory:
             "interaction_id": ctx.interaction_id,
             "session_id": ctx.session_id,
             "generation": ctx.generation,
-            "current": current,
+            "current": matched_slug or current,
             "actions": actions,
         }
 
@@ -2734,6 +2783,9 @@ class ViewModelFactory:
         last_event_seq: int = 0,
         readonly: bool = False,
         actions: list[dict[str, Any]] | None = None,
+        model: str = "",
+        context_used: int = 0,
+        context_limit: int = 0,
     ) -> dict[str, Any]:
         return {
             "type": "health",
@@ -2749,6 +2801,9 @@ class ViewModelFactory:
             "last_event_seq": last_event_seq,
             "readonly": readonly,
             "actions": list(actions or []),
+            "model": model,
+            "context_used": context_used,
+            "context_limit": context_limit,
         }
 
     @staticmethod
@@ -5182,6 +5237,14 @@ class ClaudeHeadlessTransport:
                 payload["usage"] = usage
             events.append(AgentEvent(AgentEventType.TURN_COMPLETED, payload))
 
+        # AssistantMessage carries the live model slug (the init system message
+        # is not surfaced by the SDK client); tag it onto the emitted events so
+        # the orchestrator can track the session's current model.
+        model = str(getattr(message, "model", "") or "")
+        if model:
+            for event in events:
+                event.payload.setdefault("model", model)
+
         return events or None
 
     @classmethod
@@ -5205,6 +5268,10 @@ class ClaudeHeadlessTransport:
             if "usage" in message:
                 payload["usage"] = message["usage"]
             events.append(AgentEvent(AgentEventType.TURN_COMPLETED, payload))
+        model = str(message.get("model", "") or "")
+        if model:
+            for event in events:
+                event.payload.setdefault("model", model)
         return events or None
 
     @classmethod
@@ -5247,13 +5314,22 @@ class ClaudeHeadlessTransport:
             or "functioncall" in normalized_block_type
         ):
             tool_input = _sdk_block_field(content, "input")
+            tool_name = _sdk_block_field(content, "name") or _sdk_block_field(content, "tool_name")
+            if str(tool_name) == "AskUserQuestion":
+                # The dedicated question card follows immediately; dumping the
+                # raw questions JSON here would spoil it and flood the card.
+                questions = tool_input.get("questions") if isinstance(tool_input, dict) else None
+                count = len(questions) if isinstance(questions, list) else 0
+                summary = f"向你提了 {count} 个问题" if count else "向你提问"
+            else:
+                summary = _compact_tool_summary(tool_input)
             return [
                 AgentEvent(
                     AgentEventType.TOOL_STARTED,
                     {
                         "tool_id": _sdk_block_field(content, "id"),
-                        "tool_name": _sdk_block_field(content, "name") or _sdk_block_field(content, "tool_name"),
-                        "summary": _compact_tool_summary(tool_input),
+                        "tool_name": tool_name,
+                        "summary": summary,
                     },
                 )
             ]
@@ -6609,13 +6685,16 @@ class Orchestrator:
         actor: ActorRef,
         model: str,
     ) -> ControlResult:
-        return await self._run_transport_control(
+        result = await self._run_transport_control(
             session_id,
             actor=actor,
             action="set_model",
             capability="set_model",
             invoke=lambda transport, handle: transport.set_model(handle, model),
         )
+        if result.accepted:
+            self.sessions.get(session_id).model = model
+        return result
 
     async def set_session_permission_mode(
         self,
@@ -6746,6 +6825,9 @@ class Orchestrator:
             last_progress_event=session.last_progress_event,
             last_event_seq=session.last_event_seq,
             readonly=bool(session.writer_owner and session.writer_owner.kind == "external_tui"),
+            model=session.model,
+            context_used=_estimate_context_tokens(session.last_usage),
+            context_limit=_context_window_limit(session.model),
         )
         view["reason"] = reason
         view["stale"] = stale
@@ -7923,6 +8005,13 @@ class Orchestrator:
     def _record_session_progress(self, session: Session, event: AgentEvent) -> None:
         session.last_progress_at = self._now()
         session.last_progress_event = event.type
+        model = str(event.payload.get("model", "") or "")
+        if model:
+            session.model = model
+        if event.type == AgentEventType.TURN_COMPLETED:
+            usage = event.payload.get("usage")
+            if isinstance(usage, dict) and usage:
+                session.last_usage = dict(usage)
         if session.writer_owner and session.writer_owner.kind == "external_tui":
             return
         if event.type in {

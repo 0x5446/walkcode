@@ -1125,7 +1125,9 @@ class ChannelNativeRuntime:
                     session_id=session.session_id,
                     generation=session.generation,
                     models=models,
-                    current=str(inventory.get("current", "") or ""),
+                    # Prefer the session's live model (from assistant events /
+                    # a prior switch) over the static settings-file default.
+                    current=str(session.model or inventory.get("current", "") or ""),
                 )
                 view = ViewModelFactory(self.orchestrator.interactions).model_choice(ctx)
                 await channel.send_view(binding, view)

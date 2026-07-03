@@ -649,6 +649,33 @@ class ClaudeHeadlessTransportTests(unittest.TestCase):
         self.assertEqual(events[1].payload["message"], "done")
         self.assertEqual(handle.ref["session_id"], "s1")
 
+    def test_sdk_messages_carry_model_and_usage(self):
+        class TextBlock:
+            def __init__(self, text):
+                self.text = text
+
+        class AssistantMessage:
+            def __init__(self):
+                self.content = [TextBlock("working")]
+                self.error = None
+                self.model = "claude-opus-4-8-20260610"
+
+        class ResultMessage:
+            def __init__(self):
+                self.is_error = False
+                self.result = "done"
+                self.session_id = "sid"
+                self.usage = {"input_tokens": 10, "output_tokens": 3}
+
+        deltas = ClaudeHeadlessTransport._convert_sdk_message(AssistantMessage())
+        self.assertEqual(deltas[0].type, AgentEventType.TURN_DELTA)
+        self.assertEqual(deltas[0].payload["model"], "claude-opus-4-8-20260610")
+
+        completed = ClaudeHeadlessTransport._convert_sdk_message(ResultMessage())
+        self.assertEqual(completed[0].type, AgentEventType.TURN_COMPLETED)
+        self.assertEqual(completed[0].payload["usage"], {"input_tokens": 10, "output_tokens": 3})
+        self.assertNotIn("model", completed[0].payload)
+
     def test_real_sdk_shape_converts_tool_use_and_tool_result_messages(self):
         class Client:
             async def connect(self, prompt=None):

@@ -158,6 +158,25 @@ class ViewModelRenderingTests(unittest.TestCase):
         self.assertTrue(result.accepted)
         self.assertEqual(store.get(ctx.interaction_id).answers[0], "custom answer")
 
+    def test_model_choice_marks_current_from_dated_and_vertex_model_ids(self):
+        store = InteractionStore(now=_Clock())
+        models = [
+            {"slug": "claude-opus-4-8", "display_name": "Opus 4.8"},
+            {"slug": "claude-sonnet-5", "display_name": "Sonnet 5"},
+        ]
+        for live_id in ("claude-opus-4-8-20260610", "claude-opus-4-8@20260610", "claude-opus-4-8"):
+            ctx = store.register_model_choice(
+                session_id="s1", generation=1, models=models, current=live_id
+            )
+            view = ViewModelFactory(store).model_choice(ctx)
+
+            labels = [action["label"] for action in view["actions"]]
+            self.assertEqual(labels[0], "✓ Opus 4.8（当前）", live_id)
+            self.assertEqual(labels[1], "Sonnet 5", live_id)
+            # current is normalized to the picker slug so card renderers can
+            # compare it against action slugs directly.
+            self.assertEqual(view["current"], "claude-opus-4-8", live_id)
+
     def test_health_error_command_and_takeover_views_are_platform_neutral(self):
         factory = ViewModelFactory(InteractionStore(now=_Clock()))
 

@@ -188,6 +188,52 @@ class HealthWatchdogTests(unittest.TestCase):
         self.assertEqual(restored_session.last_progress_at, 1010.0)
         self.assertEqual(restored_session.last_progress_event, AgentEventType.TURN_COMPLETED)
 
+    def test_model_and_usage_flow_into_session_and_health_view(self):
+        clock = _Clock()
+        usage = {
+            "input_tokens": 1_200,
+            "cache_read_input_tokens": 80_000,
+            "cache_creation_input_tokens": 2_800,
+            "output_tokens": 6_000,
+        }
+        transport = FakeAgentTransport(
+            "fake-transport",
+            _transport_caps(),
+            scripted_events=[
+                AgentEvent(
+                    AgentEventType.TURN_DELTA,
+                    {"text": "working", "model": "claude-opus-4-8-20260610"},
+                ),
+                AgentEvent(AgentEventType.TURN_COMPLETED, {"message": "done", "usage": usage}),
+            ],
+        )
+        orchestrator, _channel, session = _orchestrator(clock, transport)
+
+        asyncio.run(
+            orchestrator.submit_user_input(
+                session.session_id,
+                TurnInput(text="run"),
+                actor=_actor(),
+                generation=session.generation,
+            )
+        )
+
+        updated = orchestrator.sessions.get(session.session_id)
+        self.assertEqual(updated.model, "claude-opus-4-8-20260610")
+        self.assertEqual(updated.last_usage, usage)
+
+        view = orchestrator.check_session_health(
+            session.session_id, progress_timeout=0
+        ).view_model
+        self.assertEqual(view["model"], "claude-opus-4-8-20260610")
+        self.assertEqual(view["context_used"], 90_000)
+        self.assertEqual(view["context_limit"], 200_000)
+
+        # model / last_usage must survive a state save+load round trip.
+        restored = SessionRegistry.from_dict(orchestrator.sessions.to_dict(), now=clock)
+        self.assertEqual(restored.get(session.session_id).model, "claude-opus-4-8-20260610")
+        self.assertEqual(restored.get(session.session_id).last_usage, usage)
+
 
 if __name__ == "__main__":
     unittest.main()
