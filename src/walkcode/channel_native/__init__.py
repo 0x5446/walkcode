@@ -30,6 +30,39 @@ from typing import Any, Literal, Protocol
 BindingKey = tuple[str, str, str, str, str]
 
 
+def attachment_download_dir() -> Path:
+    """Stable directory that inbound attachments download into.
+
+    Downloads land here (instead of a random spot under the system temp root)
+    so the Claude transport can hand the same directory to ``add_dirs``. That
+    makes the agent's ``Read`` of a downloaded file a read inside an allowed
+    working directory — no permission prompt for every attachment.
+
+    Honors ``WALKCODE_DOWNLOAD_DIR`` when set (per-instance isolation); else
+    defaults to ``<system temp>/walkcode-attachments``.
+    """
+    raw = os.environ.get("WALKCODE_DOWNLOAD_DIR", "").strip()
+    base = Path(raw).expanduser() if raw else Path(tempfile.gettempdir()) / "walkcode-attachments"
+    with contextlib.suppress(OSError):
+        base.mkdir(parents=True, exist_ok=True)
+    return base
+
+
+def _options_supports_field(cls: Any, name: str) -> bool:
+    """Whether an options class accepts ``name`` (dataclass field or kwarg).
+
+    Guards forward/backward compatibility with the Claude Agent SDK: passing an
+    unknown kwarg to the options constructor raises ``TypeError`` and would fail
+    client creation, so optional kwargs are only supplied when supported.
+    """
+    fields = getattr(cls, "__dataclass_fields__", None)
+    if isinstance(fields, dict) and name in fields:
+        return True
+    with contextlib.suppress(ValueError, TypeError):
+        return name in inspect.signature(cls).parameters
+    return False
+
+
 class AgentEventType:
     TURN_DELTA = "turn.delta"
     TURN_COMPLETED = "turn.completed"
@@ -3471,20 +3504,40 @@ def render_view_text(view_model: dict[str, Any]) -> str:
         value = str(view_model.get("input", "") or "").strip()
         return f"TUI input\n\n{value}" if value else "TUI input"
     if view_type == "tool_progress":
-        status = str(view_model.get("status", "") or "running")
-        label = {
-            "running": "RUNNING",
-            "completed": "COMPLETED",
-            "failed": "FAILED",
-        }.get(status, status.upper())
-        rows = [
-            "Agent activity",
-            f"Status: {label}",
-            f"Tool: {view_model.get('tool_name', '') or 'tool'}",
-        ]
-        summary = str(view_model.get("summary", "") or "").strip()
-        if summary:
-            rows.append(f"Summary: {summary}")
+        def _status_label(value: str) -> str:
+            return {
+                "running": "RUNNING",
+                "completed": "COMPLETED",
+                "failed": "FAILED",
+            }.get(value, value.upper())
+
+        lines = view_model.get("lines")
+        entries = (
+            [e for e in lines if isinstance(e, dict)]
+            if isinstance(lines, list) and lines
+            else [view_model]
+        )
+        # One tool keeps the original single-block layout; a coalesced burst
+        # lists each tool on its own line.
+        if len(entries) == 1:
+            entry = entries[0]
+            rows = [
+                "Agent activity",
+                f"Status: {_status_label(str(entry.get('status', '') or 'running'))}",
+                f"Tool: {entry.get('tool_name', '') or 'tool'}",
+            ]
+            summary = str(entry.get("summary", "") or "").strip()
+            if summary:
+                rows.append(f"Summary: {summary}")
+            return "\n".join(rows)
+        rows = ["Agent activity"]
+        for entry in entries:
+            label = _status_label(str(entry.get("status", "") or "running"))
+            row = f"Status: {label} — {entry.get('tool_name', '') or 'tool'}"
+            summary = str(entry.get("summary", "") or "").strip()
+            if summary:
+                row += f" — {summary}"
+            rows.append(row)
         return "\n".join(rows)
     if view_type == "health":
         elapsed = float(view_model.get("elapsed", 0.0) or 0.0)
@@ -3954,6 +4007,7 @@ class TelegramChannelAdapter:
             "wb",
             prefix="walkcode-telegram-",
             suffix=suffix,
+            dir=attachment_download_dir(),
             delete=False,
         ) as tmp:
             tmp.write(content)
@@ -4187,6 +4241,7 @@ class LarkChannelAdapter:
             "wb",
             prefix="walkcode-lark-",
             suffix=suffix,
+            dir=attachment_download_dir(),
             delete=False,
         ) as tmp:
             tmp.write(content)
@@ -4879,6 +4934,12 @@ class ClaudeHeadlessTransport:
             raise TransportUnavailable("claude_agent_sdk.ClaudeSDKClient is not available")
         options_cls = getattr(sdk, "ClaudeAgentOptions", None)
         option_kwargs = self._option_kwargs(spec, resume_id=resume_id)
+        # Downloaded attachments live under attachment_download_dir(); adding it
+        # as a working directory means the agent's Read of a file it received
+        # doesn't trip a permission prompt for a path outside cwd.
+        if options_cls is not None and _options_supports_field(options_cls, "add_dirs"):
+            existing = list(option_kwargs.get("add_dirs") or [])
+            option_kwargs["add_dirs"] = [*existing, str(attachment_download_dir())]
         bridge: _ClaudePermissionBridge | None = None
         if options_cls is not None and self._permission_bridging_supported(sdk):
             bridge = _ClaudePermissionBridge(
@@ -7600,6 +7661,9 @@ class Orchestrator:
             if event.type == AgentEventType.TURN_COMPLETED and visible_text == last_visible_text:
                 continue
             last_visible_text = visible_text
+            # This message breaks any in-flight tool burst; seal it so the next
+            # tools open a new progress card instead of editing a stale one.
+            self._seal_tool_progress_burst(session)
             self.outbox.enqueue(
                 channel_binding_key=session.channel_binding.key(),
                 view_model=view,
@@ -7624,21 +7688,62 @@ class Orchestrator:
         binding = session.channel_binding
         if binding is None:
             return
+        # Accumulate a burst of consecutive tool events into one card that is
+        # patched in place. A tool_result (completed/failed) updates its own
+        # started line (matched by tool_id) instead of appending a new one.
+        lines = binding.capabilities.get("tool_progress_lines")
+        if not isinstance(lines, list):
+            lines = []
+        entry = {
+            "tool_name": str(view.get("tool_name", "") or "tool"),
+            "status": str(view.get("status", "") or "running"),
+            "summary": str(view.get("summary", "") or ""),
+            "tool_id": str(view.get("tool_id", "") or ""),
+        }
+        merged = False
+        if entry["tool_id"]:
+            for index, existing in enumerate(lines):
+                if isinstance(existing, dict) and existing.get("tool_id") == entry["tool_id"]:
+                    # tool_result blocks usually omit the tool name/summary, so
+                    # keep the ones the tool_use (started) line already carried.
+                    if entry["tool_name"] in ("", "tool") and existing.get("tool_name"):
+                        entry["tool_name"] = existing["tool_name"]
+                    if not entry["summary"] and existing.get("summary"):
+                        entry["summary"] = existing["summary"]
+                    lines[index] = entry
+                    merged = True
+                    break
+        if not merged:
+            lines.append(entry)
+        binding.capabilities["tool_progress_lines"] = lines
+        aggregate = {"type": "tool_progress", "lines": [dict(line) for line in lines]}
+
         message_id = str(binding.capabilities.get("tool_progress_message_id", "") or "")
         if message_id and channel.capabilities().editable_message:
             try:
-                edited = await channel.edit_view(binding, message_id, view)
+                edited = await channel.edit_view(binding, message_id, aggregate)
             except Exception:
                 edited = False
             if edited:
                 return
             binding.capabilities.pop("tool_progress_message_id", None)
         try:
-            new_message_id = await channel.send_view(binding, view)
+            new_message_id = await channel.send_view(binding, aggregate)
         except Exception:
             return
         if new_message_id:
             binding.capabilities["tool_progress_message_id"] = str(new_message_id)
+
+    @staticmethod
+    def _seal_tool_progress_burst(session: Session) -> None:
+        # A non-tool message (agent text, turn end, a prompt) breaks the burst:
+        # drop the rolling handle so the next run of tools starts a fresh card
+        # rather than editing one stranded above newer messages.
+        binding = session.channel_binding
+        if binding is None:
+            return
+        binding.capabilities.pop("tool_progress_message_id", None)
+        binding.capabilities.pop("tool_progress_lines", None)
 
     def _record_session_progress(self, session: Session, event: AgentEvent) -> None:
         session.last_progress_at = self._now()

@@ -2291,6 +2291,8 @@ class ChannelNativeRuntime:
         session.last_progress_event = f"external_tui.{hook_type}"
         if not text:
             return
+        # A user prompt / turn end breaks the tool burst; next tools open a new card.
+        self.orchestrator._seal_tool_progress_burst(session)
         await self.orchestrator.refresh_session_status_card(session)
         session.last_event_seq += 1
         view = (

@@ -233,15 +233,33 @@ class OtherViewTests(unittest.TestCase):
         text = message["content"]["zh_cn"]["content"][0][0]["text"]
         self.assertLessEqual(len(text), POST_TEXT_LIMIT + 10)
 
-    def test_tool_progress_renders_compact_post(self):
+    def test_tool_progress_renders_editable_card(self):
         message = render_lark_message(
             {"type": "tool_progress", "status": "completed", "tool_name": "Bash", "summary": "ls -la"}
         )
 
-        self.assertEqual(message["msg_type"], "post")
-        text = message["content"]["zh_cn"]["content"][0][0]["text"]
-        self.assertIn("✅", text)
-        self.assertIn("Bash", text)
+        # Must be an interactive card so a burst can be patched in place
+        # (post messages are not patchable via im.message.patch).
+        self.assertEqual(message["msg_type"], "interactive")
+        body = message["content"]["elements"][0]["text"]["content"]
+        self.assertIn("✅", body)
+        self.assertIn("Bash", body)
+
+    def test_tool_progress_lines_coalesce_into_one_card(self):
+        message = render_lark_message(
+            {
+                "type": "tool_progress",
+                "lines": [
+                    {"tool_name": "Bash", "status": "completed", "summary": "ls"},
+                    {"tool_name": "Read", "status": "running", "summary": ""},
+                ],
+            }
+        )
+
+        self.assertEqual(message["msg_type"], "interactive")
+        body = message["content"]["elements"][0]["text"]["content"]
+        self.assertIn("✅ `Bash`", body)
+        self.assertIn("⏳ `Read`", body)
 
     def test_takeover_confirmation_renders_all_three_buttons(self):
         message = render_lark_message(

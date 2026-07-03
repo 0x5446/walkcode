@@ -238,14 +238,34 @@ def _health_card(view: dict[str, Any]) -> dict[str, Any]:
     return _card_message(title, template, elements)
 
 
-def _tool_progress_card(view: dict[str, Any]) -> dict[str, Any]:
-    status = str(view.get("status", "") or "running")
+def _tool_progress_line(entry: dict[str, Any]) -> str:
+    status = str(entry.get("status", "") or "running")
     icon = {"running": "⏳", "completed": "✅", "failed": "❌"}.get(status, "⏳")
-    rows = [f"{icon} `{escape_lark_md(str(view.get('tool_name', '') or 'tool'))}`"]
-    summary = str(view.get("summary", "") or "").strip()
+    row = f"{icon} `{escape_lark_md(str(entry.get('tool_name', '') or 'tool'))}`"
+    summary = str(entry.get("summary", "") or "").strip()
     if summary:
-        rows.append(escape_lark_md(_inline(summary)))
-    return _post_message("\n".join(rows))
+        row += f" — {escape_lark_md(_inline(summary))}"
+    return row
+
+
+def _tool_progress_card(view: dict[str, Any]) -> dict[str, Any]:
+    # A burst of consecutive tool calls/results is coalesced into one card that
+    # is patched in place (interactive cards are patchable via im.message.patch;
+    # a post message is not, which is why appending was the only prior option).
+    lines = view.get("lines")
+    if isinstance(lines, list) and lines:
+        entries = [ln for ln in lines if isinstance(ln, dict)]
+    else:
+        entries = [view]
+    statuses = {str(e.get("status", "") or "running") for e in entries}
+    if statuses == {"completed"}:
+        template = "green"
+    elif "failed" in statuses:
+        template = "red"
+    else:
+        template = "grey"
+    body = "\n".join(_tool_progress_line(e) for e in entries) or "⏳ `tool`"
+    return _card_message("🔧 工具执行", template, [_md_div(body)])
 
 
 def _takeover_prompt_card(view: dict[str, Any]) -> dict[str, Any]:

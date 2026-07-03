@@ -433,8 +433,8 @@ class TelegramOrchestratorTests(unittest.TestCase):
             "fake-transport",
             _transport_caps(),
             scripted_events=[
-                AgentEvent(AgentEventType.TOOL_STARTED, {"tool_name": "Bash", "summary": "Running command"}),
-                AgentEvent(AgentEventType.TOOL_COMPLETED, {"tool_name": "Bash", "summary": "Command finished", "output": "very long"}),
+                AgentEvent(AgentEventType.TOOL_STARTED, {"tool_id": "t1", "tool_name": "Bash", "summary": "Running command"}),
+                AgentEvent(AgentEventType.TOOL_COMPLETED, {"tool_id": "t1", "tool_name": "Bash", "summary": "Command finished", "output": "very long"}),
                 AgentEvent(AgentEventType.TURN_COMPLETED, {"message": "ok"}),
             ],
         )
@@ -477,8 +477,14 @@ class TelegramOrchestratorTests(unittest.TestCase):
         ]
         self.assertEqual(len(sent_tool_cards), 1)
         self.assertTrue(any("Status: COMPLETED" in text for text in edited_tool_cards))
+        self.assertTrue(any("Tool: Bash" in text for text in edited_tool_cards))
         self.assertFalse(any("very long" in text for text in sent_tool_cards + edited_tool_cards))
-        self.assertEqual(session.channel_binding.capabilities["tool_progress_message_id"], "1")
+        # started + completed share tool_id "t1" → one coalesced line (single
+        # block layout), never a residual "RUNNING" line after completion.
+        self.assertFalse(any("RUNNING" in text for text in edited_tool_cards))
+        # the turn-completed message seals the burst so the next run starts fresh.
+        self.assertNotIn("tool_progress_message_id", session.channel_binding.capabilities)
+        self.assertNotIn("tool_progress_lines", session.channel_binding.capabilities)
 
 
 class ClaudeHeadlessTransportTests(unittest.TestCase):
@@ -728,6 +734,63 @@ class ClaudeHeadlessTransportTests(unittest.TestCase):
         self.assertEqual(created_options[0].kwargs["resume"], "claude-agent-session")
         self.assertEqual(handle.ref["agent_session_id"], "claude-agent-session")
         self.assertEqual(handle.ref["session_id"], "claude-agent-session")
+
+
+class ClaudeAddDirsOptionTests(unittest.TestCase):
+    def test_download_dir_is_added_as_working_dir_when_options_support_it(self):
+        import dataclasses
+
+        from walkcode.channel_native import attachment_download_dir
+
+        created_options = []
+
+        @dataclasses.dataclass
+        class Options:
+            cwd: str = ""
+            add_dirs: list = dataclasses.field(default_factory=list)
+
+            def __post_init__(self):
+                created_options.append(self)
+
+        class Client:
+            def __init__(self, options=None, transport=None):
+                self.options = options
+
+            async def connect(self, prompt=None):
+                return None
+
+        class SDK:
+            ClaudeAgentOptions = Options
+            ClaudeSDKClient = Client
+
+        transport = ClaudeHeadlessTransport(sdk_loader=lambda: SDK)
+        asyncio.run(transport.launch_session(cwd="/tmp/project", session_id="s1"))
+
+        self.assertIn(str(attachment_download_dir()), created_options[0].add_dirs)
+
+    def test_add_dirs_skipped_when_options_do_not_declare_it(self):
+        created_options = []
+
+        class Options:
+            def __init__(self, **kwargs):
+                self.kwargs = dict(kwargs)
+                created_options.append(self)
+
+        class Client:
+            def __init__(self, options=None, transport=None):
+                self.options = options
+
+            async def connect(self, prompt=None):
+                return None
+
+        class SDK:
+            ClaudeAgentOptions = Options
+            ClaudeSDKClient = Client
+
+        transport = ClaudeHeadlessTransport(sdk_loader=lambda: SDK)
+        asyncio.run(transport.launch_session(cwd="/tmp/project", session_id="s1"))
+
+        self.assertNotIn("add_dirs", created_options[0].kwargs)
 
 
 class ClaudePermissionModeOptionTests(unittest.TestCase):
