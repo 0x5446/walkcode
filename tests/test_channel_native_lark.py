@@ -806,3 +806,81 @@ class LarkSlashPassthroughTests(_LarkRuntimeHarness):
 
         self.assertTrue(result.accepted)
         self.assertEqual(transport.submitted_turns, [])
+
+
+class LarkModelChoiceCardTests(_LarkRuntimeHarness):
+    def _runtime_with_models(self, settings_models):
+        import json as _json
+        from pathlib import Path as _Path
+        cdir = _Path(self._tmp.name) / "claude-cfg"
+        cdir.mkdir(parents=True, exist_ok=True)
+        (cdir / "settings.json").write_text(_json.dumps({"env": settings_models}))
+        return self._runtime(
+            env_extra={
+                "LARK_ALLOWED_CHAT_IDS": "oc_chat",
+                "LARK_ALLOWED_OPEN_IDS": "ou_user",
+                "WALKCODE_CLAUDE_CONFIG_DIR": str(cdir),
+            },
+            scripted_events=[
+                AgentEvent(AgentEventType.TURN_COMPLETED, {"message": "ok", "agent_session_id": "a1"})
+            ],
+        )
+
+    def test_slash_model_sends_choice_card_and_click_switches(self):
+        runtime, api, transport = self._runtime_with_models(
+            {"ANTHROPIC_MODEL": "opus", "ANTHROPIC_SMALL_FAST_MODEL": "haiku"}
+        )
+        asyncio.run(runtime.process_lark_event(self._message_payload(text="建会话")))
+        api.calls.clear()
+
+        result = asyncio.run(
+            runtime.process_lark_event(
+                self._message_payload(event_id="evt-m", message_id="om_m", root_id="lark-msg-1", text="/model")
+            )
+        )
+        self.assertTrue(result.accepted)
+        cards = [p for m, p in api.calls if m == "sendCard" and p.get("view", {}).get("type") == "model_choice"]
+        self.assertEqual(len(cards), 1)
+        actions = cards[0]["view"]["actions"]
+        self.assertEqual([a["action"] for a in actions], ["opus", "haiku"])
+        token = next(a["token"] for a in actions if a["action"] == "haiku")
+
+        api.calls.clear()
+        click = asyncio.run(
+            runtime.process_lark_event(
+                {
+                    "event_id": "evt-click",
+                    "event": {
+                        "message_id": "om_m",
+                        "chat_id": "oc_chat",
+                        "open_id": "ou_user",
+                        "root_id": "lark-msg-1",
+                        "action": {"value": {"token": token, "action": "haiku"}},
+                    },
+                }
+            )
+        )
+        self.assertTrue(click.accepted)
+        self.assertEqual(transport.model_calls[-1], "haiku")
+        confirms = [p for m, p in api.calls if m == "sendMessage" and "haiku" in p.get("view", {}).get("text", "")]
+        self.assertTrue(confirms)
+
+    def test_slash_model_without_models_falls_back_to_text(self):
+        runtime, api, transport = self._runtime(
+            env_extra={"LARK_ALLOWED_CHAT_IDS": "oc_chat"},
+            scripted_events=[
+                AgentEvent(AgentEventType.TURN_COMPLETED, {"message": "ok", "agent_session_id": "a1"})
+            ],
+        )
+        asyncio.run(runtime.process_lark_event(self._message_payload(text="建会话")))
+        api.calls.clear()
+
+        asyncio.run(
+            runtime.process_lark_event(
+                self._message_payload(event_id="evt-m", message_id="om_m", root_id="lark-msg-1", text="/model")
+            )
+        )
+        cards = [p for m, p in api.calls if p.get("view", {}).get("type") == "model_choice"]
+        self.assertEqual(cards, [])
+        texts = [p for m, p in api.calls if p.get("view", {}).get("type") == "text"]
+        self.assertTrue(texts)

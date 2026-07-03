@@ -1119,6 +1119,17 @@ class ChannelNativeRuntime:
         if not argument:
             available = bool(caps and caps.set_model)
             inventory = _local_model_inventory(self.config, session.transport_kind)
+            models = inventory.get("models") or []
+            if available and models:
+                ctx = self.orchestrator.interactions.register_model_choice(
+                    session_id=session.session_id,
+                    generation=session.generation,
+                    models=models,
+                    current=str(inventory.get("current", "") or ""),
+                )
+                view = ViewModelFactory(self.orchestrator.interactions).model_choice(ctx)
+                await channel.send_view(binding, view)
+                return
             await channel.send_view(
                 binding,
                 {

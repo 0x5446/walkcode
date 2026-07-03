@@ -1908,6 +1908,30 @@ class InteractionStore:
         self._interactions[interaction_id] = ctx
         return ctx
 
+    def register_model_choice(
+        self,
+        *,
+        session_id: str,
+        generation: int,
+        models: list[dict[str, Any]],
+        current: str = "",
+    ) -> InteractionContext:
+        interaction_id = f"int-{uuid.uuid4().hex}"
+        now = self._now()
+        ctx = InteractionContext(
+            interaction_id=interaction_id,
+            session_id=session_id,
+            generation=generation,
+            created_at=now,
+            expires_at=now + self._token_ttl,
+            tool_name="",
+            tool_input={"models": [dict(m) for m in models], "current": current},
+            actions=[str(m.get("slug", "")) for m in models if m.get("slug")],
+            kind="model_choice",
+        )
+        self._interactions[interaction_id] = ctx
+        return ctx
+
     def get(self, interaction_id: str) -> InteractionContext:
         return self._interactions[interaction_id]
 
@@ -2299,6 +2323,35 @@ class ViewModelFactory:
                 }
                 for action in ctx.actions
             ],
+        }
+
+    def model_choice(self, ctx: InteractionContext) -> dict[str, Any]:
+        current = str(ctx.tool_input.get("current", "") or "")
+        models = ctx.tool_input.get("models", [])
+        actions = []
+        for model in models if isinstance(models, list) else []:
+            slug = str(model.get("slug", "") or "")
+            if not slug:
+                continue
+            display = str(model.get("display_name", "") or slug)
+            actions.append(
+                {
+                    "action": slug,
+                    "label": f"✓ {display}" if slug == current else display,
+                    "token": self.interactions.create_callback_token(
+                        ctx.interaction_id,
+                        slug,
+                        generation=ctx.generation,
+                    ),
+                }
+            )
+        return {
+            "type": "model_choice",
+            "interaction_id": ctx.interaction_id,
+            "session_id": ctx.session_id,
+            "generation": ctx.generation,
+            "current": current,
+            "actions": actions,
         }
 
     def ask_user_question_prompt(self, ctx: InteractionContext) -> dict[str, Any]:
@@ -3394,6 +3447,8 @@ def render_view_text(view_model: dict[str, Any]) -> str:
         return f"{view_model.get('code', 'error')}: {view_model.get('message', '')}"
     if view_type == "command_menu":
         return "Commands"
+    if view_type == "model_choice":
+        return "Choose a model"
     if view_type == "session_chooser":
         rows = [
             "Multiple active sessions match this chat.",
@@ -4092,6 +4147,7 @@ class LarkChannelAdapter:
             "takeover_confirmation",
             "takeover_progress",
             "manual_only",
+            "model_choice",
         }
 
     @staticmethod
@@ -6349,6 +6405,14 @@ class Orchestrator:
                     return SubmitResult(False, authz_result.reason)
             if ctx.generation != session.generation:
                 return SubmitResult(False, BlockedReason.STALE_GENERATION)
+        elif ctx.kind == "model_choice":
+            transport = self.transports[session.transport_kind]
+            if self.authz is not None:
+                authz_result = self.authz.can_submit(ctx.session_id, actor)
+                if not authz_result.allowed:
+                    return SubmitResult(False, authz_result.reason)
+            if not transport.capabilities().set_model:
+                return SubmitResult(False, BlockedReason.CAPABILITY_DISABLED)
         decision = self.interactions.decide_from_token(
             token,
             actor=actor,
@@ -6388,6 +6452,21 @@ class Orchestrator:
                 decision,
                 actor=actor,
             )
+        if decision.accepted and ctx.kind == "model_choice":
+            model = str((decision.decision or {}).get("action", ""))
+            result = await self.set_session_model(session.session_id, actor=actor, model=model)
+            channel = self.channels.get(inbound.channel_kind)
+            if channel is not None:
+                reply_binding = session.channel_binding or ChannelBinding(
+                    channel_kind=inbound.channel_kind,
+                    account_id=inbound.account_id,
+                    chat_id=inbound.chat_id,
+                    thread_id=inbound.thread_id,
+                    root_message_id=inbound.root_message_id or inbound.message_id,
+                )
+                text = f"✅ 模型已切换：{model}" if result.accepted else f"模型切换失败：{result.reason}"
+                await channel.send_view(reply_binding, {"type": "text", "text": text})
+            return SubmitResult(result.accepted, result.reason)
         return SubmitResult(decision.accepted, decision.reason)
 
     async def _handle_takeover_request_callback(self, inbound: InboundEvent) -> SubmitResult:

@@ -617,11 +617,18 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
 
             self.assertTrue(result.accepted)
             self.assertEqual([turn.text for turn in transport.submitted_turns], ["start"])
+            # With configured models + set_model capability, /model now sends an
+            # interactive model_choice card; on Telegram the models are button
+            # labels in the inline keyboard, not message body text.
             sent = [payload for method, payload in api.calls if method == "sendMessage"]
-            model_text = "\n".join(payload.get("text", "") for payload in sent)
-            self.assertIn("claude-opus-4-8[1m]", model_text)
-            self.assertIn("claude-haiku-4-5", model_text)
-            self.assertIn("Local model source:", model_text)
+            button_labels = [
+                btn.get("text", "")
+                for payload in sent
+                for row in payload.get("reply_markup", {}).get("inline_keyboard", [])
+                for btn in row
+            ]
+            self.assertTrue(any("claude-opus-4-8[1m]" in label for label in button_labels))
+            self.assertTrue(any("claude-haiku-4-5" in label for label in button_labels))
 
     def test_process_telegram_model_command_lists_codex_cached_models(self):
         with tempfile.TemporaryDirectory() as tmp:

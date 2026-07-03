@@ -322,6 +322,21 @@ def _session_chooser_card(view: dict[str, Any]) -> dict[str, Any]:
     return _card_message("🧭 选择会话", "blue", [_md_div("\n".join(rows))])
 
 
+def _model_choice_card(view: dict[str, Any]) -> dict[str, Any]:
+    current = str(view.get("current", "") or "")
+    buttons = [
+        _button(action, btn_type="primary" if str(action.get("action", "")) == current else "default")
+        for action in view.get("actions", [])
+        if isinstance(action, dict) and action.get("token")
+    ]
+    elements: list[dict[str, Any]] = [_md_div("选择要切换到的模型：")]
+    if buttons:
+        elements.append(_action_row(buttons))
+    else:
+        elements = [_md_div("当前没有可切换的模型。")]
+    return _card_message("🧠 切换模型", "blue", elements)
+
+
 def _command_menu_card(view: dict[str, Any]) -> dict[str, Any]:
     buttons = [
         _button(action)
@@ -350,6 +365,7 @@ _CARD_RENDERERS = {
     "error": _error_card,
     "session_chooser": _session_chooser_card,
     "command_menu": _command_menu_card,
+    "model_choice": _model_choice_card,
 }
 
 
