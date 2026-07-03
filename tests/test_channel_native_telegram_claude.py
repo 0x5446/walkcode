@@ -728,3 +728,15 @@ class ClaudeHeadlessTransportTests(unittest.TestCase):
         self.assertEqual(created_options[0].kwargs["resume"], "claude-agent-session")
         self.assertEqual(handle.ref["agent_session_id"], "claude-agent-session")
         self.assertEqual(handle.ref["session_id"], "claude-agent-session")
+
+
+class ClaudePermissionModeOptionTests(unittest.TestCase):
+    def test_permission_mode_flows_into_agent_options(self):
+        transport = ClaudeHeadlessTransport(permission_mode="acceptEdits")
+        kwargs = transport._option_kwargs(LaunchSpec(cwd="/tmp/p", session_id="s1"))
+        self.assertEqual(kwargs["permission_mode"], "acceptEdits")
+
+    def test_no_permission_mode_leaves_kwargs_clean(self):
+        transport = ClaudeHeadlessTransport()
+        kwargs = transport._option_kwargs(LaunchSpec(cwd="/tmp/p", session_id="s1"))
+        self.assertNotIn("permission_mode", kwargs)

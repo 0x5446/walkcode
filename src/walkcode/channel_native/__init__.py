@@ -370,6 +370,15 @@ def _configured_agent_options(source: Any) -> dict[str, dict[str, Any]]:
     claude_config_dir = str(source.get("WALKCODE_CLAUDE_CONFIG_DIR") or "").strip()
     if claude_config_dir:
         claude["config_dir"] = str(Path(claude_config_dir).expanduser())
+    claude_permission_mode = str(source.get("WALKCODE_CLAUDE_PERMISSION_MODE") or "").strip()
+    if claude_permission_mode:
+        allowed_modes = {"default", "acceptEdits", "plan", "bypassPermissions", "dontAsk", "auto"}
+        if claude_permission_mode not in allowed_modes:
+            raise ChannelConfigError(
+                f"invalid WALKCODE_CLAUDE_PERMISSION_MODE: {claude_permission_mode}; "
+                f"use one of {', '.join(sorted(allowed_modes))}"
+            )
+        claude["permission_mode"] = claude_permission_mode
     codex: dict[str, Any] = {}
     codex_home = str(source.get("WALKCODE_CODEX_HOME") or "").strip()
     if codex_home:
@@ -4173,12 +4182,14 @@ class ClaudeHeadlessTransport:
         settings: str | None = None,
         cli_path: str | None = None,
         config_dir: str | None = None,
+        permission_mode: str | None = None,
     ):
         self._client_factory = client_factory
         self._sdk_loader = sdk_loader or self._default_sdk_loader
         self.settings = settings
         self.cli_path = cli_path
         self.config_dir = config_dir
+        self.permission_mode = permission_mode
         self._clients: dict[str, Any] = {}
 
     def capabilities(self) -> TransportCapabilities:
@@ -4373,6 +4384,12 @@ class ClaudeHeadlessTransport:
             # profile's Claude config dir (credentials, settings, history) without
             # touching the runtime's own environment.
             option_kwargs["env"] = {"CLAUDE_CONFIG_DIR": self.config_dir}
+        if self.permission_mode:
+            # Without an interactive can_use_tool callback, default mode denies
+            # non-allowlisted tools. Per-instance mode (e.g. acceptEdits) makes
+            # headless sessions usable; interactive permission cards are a
+            # separate, larger feature.
+            option_kwargs["permission_mode"] = self.permission_mode
         if resume_id:
             option_kwargs["resume"] = resume_id
         return option_kwargs

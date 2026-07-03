@@ -2872,6 +2872,7 @@ def _build_transports(config: ChannelNativeConfig) -> dict[str, AgentTransport]:
             settings=claude_options.get("settings"),
             cli_path=claude_options.get("cli_path"),
             config_dir=claude_options.get("config_dir"),
+            permission_mode=claude_options.get("permission_mode"),
         )
     elif kind == "codex_app_server":
         if shutil.which("codex"):

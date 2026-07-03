@@ -274,3 +274,40 @@ class ChannelNativeConfigTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ClaudePermissionModeTests(unittest.TestCase):
+    def test_valid_permission_mode_is_agent_option(self):
+        cfg = ChannelNativeConfig.from_env(
+            {
+                "WALKCODE_CHANNEL": "lark",
+                "LARK_APP_ID": "a",
+                "LARK_APP_SECRET": "s",
+                "WALKCODE_AGENT": "claude",
+                "WALKCODE_CLAUDE_PERMISSION_MODE": "acceptEdits",
+            }
+        )
+        self.assertEqual(cfg.agent_options["claude"]["permission_mode"], "acceptEdits")
+
+    def test_invalid_permission_mode_is_rejected(self):
+        with self.assertRaisesRegex(ChannelConfigError, "invalid WALKCODE_CLAUDE_PERMISSION_MODE"):
+            ChannelNativeConfig.from_env(
+                {
+                    "WALKCODE_CHANNEL": "lark",
+                    "LARK_APP_ID": "a",
+                    "LARK_APP_SECRET": "s",
+                    "WALKCODE_AGENT": "claude",
+                    "WALKCODE_CLAUDE_PERMISSION_MODE": "yolo",
+                }
+            )
+
+    def test_permission_mode_absent_by_default(self):
+        cfg = ChannelNativeConfig.from_env(
+            {
+                "WALKCODE_CHANNEL": "lark",
+                "LARK_APP_ID": "a",
+                "LARK_APP_SECRET": "s",
+                "WALKCODE_AGENT": "claude",
+            }
+        )
+        self.assertNotIn("permission_mode", cfg.agent_options["claude"])
