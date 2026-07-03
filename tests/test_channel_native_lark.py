@@ -742,3 +742,67 @@ class LarkStatusCardCallbackTests(unittest.TestCase):
         )
 
         self.assertEqual(event.callback["data"], "tok-1")
+
+
+class LarkSlashPassthroughTests(_LarkRuntimeHarness):
+    def test_double_slash_bypasses_walkcode_command_and_reaches_agent(self):
+        runtime, api, transport = self._runtime(
+            scripted_events=[
+                AgentEvent(
+                    AgentEventType.TURN_COMPLETED,
+                    {"message": "ok", "agent_session_id": "agent-1"},
+                )
+            ]
+        )
+        asyncio.run(runtime.process_lark_event(self._message_payload(text="先建个会话")))
+
+        result = asyncio.run(
+            runtime.process_lark_event(
+                self._message_payload(
+                    event_id="evt-2",
+                    message_id="om_slash",
+                    root_id="lark-msg-1",
+                    text="//model",
+                )
+            )
+        )
+
+        self.assertTrue(result.accepted)
+        self.assertEqual(
+            [t.text for t in transport.submitted_turns], ["先建个会话", "/model"]
+        )
+
+    def test_unknown_slash_inside_session_passes_through_verbatim(self):
+        runtime, api, transport = self._runtime(
+            scripted_events=[
+                AgentEvent(
+                    AgentEventType.TURN_COMPLETED,
+                    {"message": "ok", "agent_session_id": "agent-1"},
+                )
+            ]
+        )
+        asyncio.run(runtime.process_lark_event(self._message_payload(text="先建个会话")))
+
+        result = asyncio.run(
+            runtime.process_lark_event(
+                self._message_payload(
+                    event_id="evt-3",
+                    message_id="om_slash2",
+                    root_id="lark-msg-1",
+                    text="/compact",
+                )
+            )
+        )
+
+        self.assertTrue(result.accepted)
+        self.assertIn("/compact", [t.text for t in transport.submitted_turns])
+
+    def test_walkcode_command_still_intercepted_without_double_slash(self):
+        runtime, api, transport = self._runtime()
+
+        result = asyncio.run(
+            runtime.process_lark_event(self._message_payload(text="/status"))
+        )
+
+        self.assertTrue(result.accepted)
+        self.assertEqual(transport.submitted_turns, [])

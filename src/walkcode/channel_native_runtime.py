@@ -1227,6 +1227,26 @@ class ChannelNativeRuntime:
                 thread_id=inbound.thread_id,
                 root_message_id=inbound.root_message_id or inbound.message_id,
             )
+            if str(inbound.text or "").lstrip().startswith("//"):
+                # Escape hatch for agent-native commands shadowed by WalkCode
+                # ones: //model reaches the agent as /model. Claude executes
+                # slash commands natively on the headless channel.
+                raw_text = str(inbound.text or "")
+                stripped = raw_text.lstrip()
+                inbound = replace(
+                    inbound,
+                    text=raw_text[: len(raw_text) - len(stripped)] + stripped[1:],
+                )
+                if _telegram_message_is_empty(inbound):
+                    return SubmitResult(True, "empty_message_ignored")
+                inbound = await self._place_lark_new_session(channel, inbound)
+                result = await self.orchestrator.handle_inbound_event(
+                    inbound,
+                    agent_transport_kind=self.config.agent_transport_kind,
+                    cwd=self.config.cwd,
+                )
+                self.save_state()
+                return result
             command = _telegram_bot_command(inbound)
             if command:
                 result = await self._handle_telegram_bot_command(channel, inbound, command)
