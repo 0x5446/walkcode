@@ -892,6 +892,34 @@ class LarkModelChoiceCardTests(_LarkRuntimeHarness):
         self.assertEqual(len(flips), 1)
         self.assertEqual(flips[0]["view"]["kind"], "model_choice")
 
+    def test_slash_model_marks_session_live_model_as_current(self):
+        runtime, api, transport = self._runtime_with_models(
+            {"ANTHROPIC_MODEL": "opus", "ANTHROPIC_SMALL_FAST_MODEL": "haiku"}
+        )
+        # The agent reports a dated live id during the first turn; the picker
+        # must normalize it back to the short slug and mark it current.
+        transport._scripted_events[:] = [
+            AgentEvent(
+                AgentEventType.TURN_COMPLETED,
+                {"message": "ok", "agent_session_id": "a1", "model": "opus-20260610"},
+            )
+        ]
+        asyncio.run(runtime.process_lark_event(self._message_payload(text="建会话")))
+        api.calls.clear()
+
+        asyncio.run(
+            runtime.process_lark_event(
+                self._message_payload(event_id="evt-m2", message_id="om_m2", root_id="lark-msg-1", text="/model")
+            )
+        )
+
+        cards = [p for m, p in api.calls if p.get("view", {}).get("type") == "model_choice"]
+        self.assertEqual(len(cards), 1)
+        self.assertEqual(cards[0]["view"]["current"], "opus")
+        labels = [a["label"] for a in cards[0]["view"]["actions"]]
+        self.assertEqual(labels[0], "✓ opus（当前）")
+        self.assertEqual(labels[1], "haiku")
+
     def test_slash_model_without_models_falls_back_to_text(self):
         runtime, api, transport = self._runtime(
             env_extra={"LARK_ALLOWED_CHAT_IDS": "oc_chat"},
@@ -941,6 +969,42 @@ class LarkRejectionNoteTests(_LarkRuntimeHarness):
             if m == "sendMessage" and "没有提交" in p.get("view", {}).get("text", "")
         ]
         self.assertEqual(len(notes), 1)
+
+    def test_session_stopped_rejection_gets_note_and_completes_ledger(self):
+        from walkcode.channel_native import SubmitResult, _submit_result_completes_inbound_ledger
+
+        runtime, api, transport = self._runtime(
+            env_extra={"LARK_ALLOWED_CHAT_IDS": "oc_chat", "LARK_ALLOWED_OPEN_IDS": "ou_user"},
+            scripted_events=[
+                AgentEvent(AgentEventType.TURN_COMPLETED, {"message": "ok", "agent_session_id": "a1"})
+            ],
+        )
+
+        async def deny(inbound, **kwargs):
+            return SubmitResult(False, BlockedReason.SESSION_STOPPED)
+
+        runtime.orchestrator.handle_inbound_event = deny
+        result = asyncio.run(
+            runtime.process_lark_event(
+                self._message_payload(text="hi", root_id="lark-root", message_id="om_stop")
+            )
+        )
+
+        self.assertFalse(result.accepted)
+        notes = [
+            p
+            for m, p in api.calls
+            if m == "sendMessage" and "会话已结束" in p.get("view", {}).get("text", "")
+        ]
+        self.assertEqual(len(notes), 1)
+        # Noted rejections must be ledger-terminal: a WS redelivery of the
+        # same event would otherwise re-send the note (or re-submit a message
+        # the user was told did not go through). LEASE_EXPIRED stays
+        # non-terminal (and note-less): redelivery retries the submit.
+        self.assertTrue(_submit_result_completes_inbound_ledger(result))
+        self.assertFalse(
+            _submit_result_completes_inbound_ledger(SubmitResult(False, BlockedReason.LEASE_EXPIRED))
+        )
 
     def test_allowlist_rejection_stays_silent(self):
         runtime, api, transport = self._runtime(

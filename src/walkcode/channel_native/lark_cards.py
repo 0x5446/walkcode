@@ -261,7 +261,9 @@ def _health_card(view: dict[str, Any]) -> dict[str, Any]:
     minutes, seconds = divmod(elapsed, 60)
     duration = f"{minutes}分{seconds:02d}秒" if minutes else f"{seconds}秒"
     session_id = str(view.get("session_id", "") or "")
-    model = str(view.get("model", "") or "")
+    # Model ids come from SDK events / config; strip backticks so a hostile
+    # value cannot break out of the code span (V2 escape rationale applies).
+    model = _inline(str(view.get("model", "") or "")).replace("`", "")
     context_used = int(view.get("context_used", 0) or 0)
     context_limit = int(view.get("context_limit", 0) or 0)
     if context_used and context_limit:

@@ -234,6 +234,41 @@ class HealthWatchdogTests(unittest.TestCase):
         self.assertEqual(restored.get(session.session_id).model, "claude-opus-4-8-20260610")
         self.assertEqual(restored.get(session.session_id).last_usage, usage)
 
+    def test_context_limit_upgrades_when_usage_exceeds_default_window(self):
+        # A [1m] session's marker is lost once the dated live id overwrites
+        # session.model; the display limit must not read as >100%.
+        clock = _Clock()
+        transport = FakeAgentTransport(
+            "fake-transport",
+            _transport_caps(),
+            scripted_events=[
+                AgentEvent(
+                    AgentEventType.TURN_COMPLETED,
+                    {
+                        "message": "done",
+                        "model": "claude-opus-4-6-20260610",
+                        "usage": {"input_tokens": 5_000, "cache_read_input_tokens": 400_000},
+                    },
+                ),
+            ],
+        )
+        orchestrator, _channel, session = _orchestrator(clock, transport)
+
+        asyncio.run(
+            orchestrator.submit_user_input(
+                session.session_id,
+                TurnInput(text="run"),
+                actor=_actor(),
+                generation=session.generation,
+            )
+        )
+
+        view = orchestrator.check_session_health(
+            session.session_id, progress_timeout=0
+        ).view_model
+        self.assertEqual(view["context_used"], 405_000)
+        self.assertEqual(view["context_limit"], 1_000_000)
+
 
 if __name__ == "__main__":
     unittest.main()

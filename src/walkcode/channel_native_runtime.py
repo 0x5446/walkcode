@@ -1322,8 +1322,17 @@ class ChannelNativeRuntime:
                         ),
                         {"type": "text", "text": note},
                     )
-                except Exception:
-                    pass
+                except Exception as exc:
+                    from .channel_native import _log_degrade
+
+                    _log_degrade(
+                        "lark_rejection_note_send_failed",
+                        reason=str(result.reason or ""),
+                        chat_id=inbound.chat_id,
+                        message_id=inbound.message_id,
+                        sender_id=inbound.sender_id,
+                        error=f"{type(exc).__name__}: {exc}",
+                    )
         return result
 
     async def _place_lark_new_session(self, channel, inbound):
@@ -3019,9 +3028,12 @@ def _telegram_update_id(update: dict[str, Any]) -> int | None:
 # Reply text for silently-rejected Lark messages from authorized senders.
 # Reasons with their own feedback card (external_tui_readonly → takeover
 # prompt, ambiguous_session → session chooser) are intentionally absent.
+# LEASE_EXPIRED is deliberately absent: it does not complete the inbound
+# ledger, so channel redelivery retries the submit once the lease recovers —
+# telling the user to "resend" would conflict with that automatic retry.
 _LARK_REJECTION_NOTES = {
     BlockedReason.UNAUTHORIZED: "⛔ 这条消息没有提交：你没有操作这个会话的权限。",
-    BlockedReason.LEASE_EXPIRED: "⚠️ 这条消息没有提交：写入权已过期，请重发一次。",
+    BlockedReason.SESSION_STOPPED: "⚪ 这条消息没有提交：会话已结束。到根会话发新消息即可开新任务。",
 }
 
 

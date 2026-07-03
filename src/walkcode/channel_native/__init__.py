@@ -765,8 +765,18 @@ def _estimate_context_tokens(usage: dict[str, Any]) -> int:
     return total
 
 
-def _context_window_limit(model: str) -> int:
-    return 1_000_000 if "[1m]" in model else 200_000
+def _context_window_limit(model: str, used: int = 0) -> int:
+    """Estimated context window for display.
+
+    Assistant events report dated ids without the [1m] routing marker, so a
+    long-context session's marker is lost once the live id overwrites
+    session.model. Bump the estimate when observed usage already exceeds the
+    default window — better an upgraded limit than a >100% readout.
+    """
+    limit = 1_000_000 if "[1m]" in model else 200_000
+    if used > limit:
+        limit = 1_000_000
+    return limit
 
 
 def _model_slug_matches(slug: str, current: str) -> bool:
@@ -2514,20 +2524,24 @@ class ViewModelFactory:
     def model_choice(self, ctx: InteractionContext) -> dict[str, Any]:
         current = str(ctx.tool_input.get("current", "") or "")
         models = ctx.tool_input.get("models", [])
+        entries = [
+            (str(model.get("slug", "") or ""), str(model.get("display_name", "") or "") or str(model.get("slug", "") or ""))
+            for model in (models if isinstance(models, list) else [])
+            if isinstance(model, dict) and str(model.get("slug", "") or "")
+        ]
+        # Prefix-related slugs (claude-opus-4 vs claude-opus-4-8) can both
+        # match a dated live id; mark only the LONGEST match as current.
+        matched_slug = max(
+            (slug for slug, _ in entries if _model_slug_matches(slug, current)),
+            key=len,
+            default="",
+        )
         actions = []
-        matched_slug = ""
-        for model in models if isinstance(models, list) else []:
-            slug = str(model.get("slug", "") or "")
-            if not slug:
-                continue
-            display = str(model.get("display_name", "") or slug)
-            is_current = _model_slug_matches(slug, current)
-            if is_current:
-                matched_slug = slug
+        for slug, display in entries:
             actions.append(
                 {
                     "action": slug,
-                    "label": f"✓ {display}（当前）" if is_current else display,
+                    "label": f"✓ {display}（当前）" if slug == matched_slug else display,
                     "token": self.interactions.create_callback_token(
                         ctx.interaction_id,
                         slug,
@@ -3709,10 +3723,20 @@ def render_view_text(view_model: dict[str, Any]) -> str:
         return "\n".join(rows)
     if view_type == "health":
         elapsed = float(view_model.get("elapsed", 0.0) or 0.0)
+        context_used = int(view_model.get("context_used", 0) or 0)
+        context_limit = int(view_model.get("context_limit", 0) or 0)
+        if context_used and context_limit:
+            context_text = f"{context_used}/{context_limit} ({round(context_used * 100 / context_limit)}%)"
+        elif context_used:
+            context_text = str(context_used)
+        else:
+            context_text = "-"
         rows = [
             f"WalkCode session: {view_model.get('title', '')}".strip(),
             f"Status: {view_model.get('status', '')}",
             f"Agent: {view_model.get('transport', '')}",
+            f"Model: {view_model.get('model', '') or '-'}",
+            f"Context: {context_text}",
             f"Session: {view_model.get('session_id', '')}",
             f"State: {view_model.get('lifecycle_state', '') or '-'}",
             f"Writer: {view_model.get('writer_owner', '') or '-'}",
@@ -6827,7 +6851,9 @@ class Orchestrator:
             readonly=bool(session.writer_owner and session.writer_owner.kind == "external_tui"),
             model=session.model,
             context_used=_estimate_context_tokens(session.last_usage),
-            context_limit=_context_window_limit(session.model),
+            context_limit=_context_window_limit(
+                session.model, _estimate_context_tokens(session.last_usage)
+            ),
         )
         view["reason"] = reason
         view["stale"] = stale
@@ -8188,6 +8214,10 @@ def _submit_result_completes_inbound_ledger(result: SubmitResult) -> bool:
         BlockedReason.STALE_GENERATION,
         BlockedReason.NOT_FOUND,
         BlockedReason.EXTERNAL_TUI_READONLY,
+        # Terminal rejection that replies a note to the sender: retrying the
+        # same event would only re-send the note. LEASE_EXPIRED deliberately
+        # stays out — redelivery retries the submit once the lease recovers.
+        BlockedReason.SESSION_STOPPED,
         "keep_readonly",
     }
 

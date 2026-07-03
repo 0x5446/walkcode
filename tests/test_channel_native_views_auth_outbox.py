@@ -177,6 +177,21 @@ class ViewModelRenderingTests(unittest.TestCase):
             # compare it against action slugs directly.
             self.assertEqual(view["current"], "claude-opus-4-8", live_id)
 
+    def test_model_choice_prefix_related_slugs_mark_only_longest_match(self):
+        store = InteractionStore(now=_Clock())
+        models = [
+            {"slug": "claude-opus-4", "display_name": "Opus 4"},
+            {"slug": "claude-opus-4-8", "display_name": "Opus 4.8"},
+        ]
+        ctx = store.register_model_choice(
+            session_id="s1", generation=1, models=models, current="claude-opus-4-8-20260610"
+        )
+        view = ViewModelFactory(store).model_choice(ctx)
+
+        labels = [action["label"] for action in view["actions"]]
+        self.assertEqual(labels, ["Opus 4", "✓ Opus 4.8（当前）"])
+        self.assertEqual(view["current"], "claude-opus-4-8")
+
     def test_health_error_command_and_takeover_views_are_platform_neutral(self):
         factory = ViewModelFactory(InteractionStore(now=_Clock()))
 
