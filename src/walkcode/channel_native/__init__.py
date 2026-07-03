@@ -2583,6 +2583,17 @@ class ViewModelFactory:
         }
 
     @staticmethod
+    def decision_result(*, kind: str, tool_name: str, action: str) -> dict[str, Any]:
+        # Terminal card shown in place of an interactive prompt once decided, so
+        # a settled request no longer shows live buttons (V2 result-card parity).
+        return {
+            "type": "decision_result",
+            "kind": kind,
+            "tool_name": tool_name,
+            "action": action,
+        }
+
+    @staticmethod
     def error_view(*, code: str, message: str, retryable: bool) -> dict[str, Any]:
         return {"type": "error", "code": code, "message": message, "retryable": retryable}
 
@@ -3450,6 +3461,8 @@ def render_view_text(view_model: dict[str, Any]) -> str:
         return "Commands"
     if view_type == "model_choice":
         return "Choose a model"
+    if view_type == "decision_result":
+        return f"{view_model.get('action', 'decided')}: {view_model.get('tool_name', '')}".strip()
     if view_type == "session_chooser":
         rows = [
             "Multiple active sessions match this chat.",
@@ -6753,6 +6766,36 @@ class Orchestrator:
             return
         await channel.ack_callback(inbound)
 
+    async def _flip_decided_card(
+        self,
+        inbound: InboundEvent,
+        *,
+        kind: str,
+        tool_name: str,
+        action: str,
+    ) -> None:
+        # Replace the interactive prompt with a terminal result card so a
+        # settled request stops showing live buttons (avoids the "ran without
+        # my approval?" confusion and blocks stale double-clicks). Best-effort:
+        # the decision already took effect regardless of this edit.
+        channel = self.channels.get(inbound.channel_kind)
+        if channel is None or not inbound.message_id:
+            return
+        if not channel.capabilities().editable_message:
+            return
+        binding = ChannelBinding(
+            channel_kind=inbound.channel_kind,
+            account_id=inbound.account_id,
+            chat_id=inbound.chat_id,
+            thread_id=inbound.thread_id,
+            root_message_id=inbound.root_message_id or inbound.message_id,
+        )
+        view = ViewModelFactory.decision_result(kind=kind, tool_name=tool_name, action=action)
+        try:
+            await channel.edit_view(binding, inbound.message_id, view)
+        except Exception:
+            return
+
     async def _handle_callback_event(self, inbound: InboundEvent) -> SubmitResult:
         token = str((inbound.callback or {}).get("token", ""))
         data = str((inbound.callback or {}).get("data", "") or token)
@@ -6827,6 +6870,12 @@ class Orchestrator:
                     native_response=approval_decision,
                     delivery_status=DeliveryStatus.SENT,
                 )
+            await self._flip_decided_card(
+                inbound,
+                kind="permission",
+                tool_name=ctx.tool_name,
+                action=str(approval_decision.get("action", "")),
+            )
         if decision.accepted and ctx.kind == "ask_user_question":
             await self._handle_ask_user_decision(
                 session,

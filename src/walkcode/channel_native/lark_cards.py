@@ -301,6 +301,26 @@ def _hitl_stale_card(view: dict[str, Any]) -> dict[str, Any]:
     return _card_message("⌛ 请求已失效", "grey", [_md_div("\n".join(rows))])
 
 
+_DECISION_LABELS = {
+    "allow": ("✅ 已允许", "green"),
+    "allow_once": ("✅ 已允许（本次）", "green"),
+    "always_allow": ("✅ 已始终允许", "green"),
+    "accept": ("✅ 已接受", "green"),
+    "acceptForSession": ("✅ 本会话内接受", "green"),
+    "deny": ("🚫 已拒绝", "grey"),
+    "decline": ("🚫 已拒绝", "grey"),
+    "cancel": ("🚫 已取消", "grey"),
+}
+
+
+def _decision_result_card(view: dict[str, Any]) -> dict[str, Any]:
+    action = str(view.get("action", "") or "")
+    label, template = _DECISION_LABELS.get(action, (f"已处理：{action}" if action else "已处理", "grey"))
+    tool = str(view.get("tool_name", "") or "")
+    body = f"**Tool:** `{escape_lark_md(tool)}`" if tool else label
+    return _card_message(label, template, [_md_div(body)])
+
+
 def _error_card(view: dict[str, Any]) -> dict[str, Any]:
     code = str(view.get("code", "") or "error")
     message = escape_lark_md(str(view.get("message", "") or ""))
@@ -366,6 +386,7 @@ _CARD_RENDERERS = {
     "session_chooser": _session_chooser_card,
     "command_menu": _command_menu_card,
     "model_choice": _model_choice_card,
+    "decision_result": _decision_result_card,
 }
 
 

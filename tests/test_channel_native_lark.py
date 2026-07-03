@@ -884,3 +884,54 @@ class LarkModelChoiceCardTests(_LarkRuntimeHarness):
         self.assertEqual(cards, [])
         texts = [p for m, p in api.calls if p.get("view", {}).get("type") == "text"]
         self.assertTrue(texts)
+
+
+class LarkPermissionCardFlipTests(_LarkRuntimeHarness):
+    def test_permission_decision_flips_card_to_result(self):
+        from walkcode.channel_native import ViewModelFactory
+        runtime, api, transport = self._runtime(
+            env_extra={"LARK_ALLOWED_CHAT_IDS": "oc_chat", "LARK_ALLOWED_OPEN_IDS": "ou_user"},
+            scripted_events=[
+                AgentEvent(AgentEventType.TURN_COMPLETED, {"message": "ok", "agent_session_id": "a1"})
+            ],
+        )
+        asyncio.run(runtime.process_lark_event(self._message_payload(text="建会话")))
+        session = runtime.state.sessions.get(
+            runtime.state.sessions.list_sessions(channel_kind="lark")[0].session_id
+        )
+        # register a permission interaction + token as the orchestrator would
+        store = runtime.orchestrator.interactions
+        ctx = store.register_permission(
+            session_id=session.session_id,
+            generation=session.generation,
+            tool_name="Bash",
+            tool_input={"command": "gcloud auth ..."},
+            actions=["allow", "always_allow", "deny"],
+            high_risk=True,
+        )
+        token = store.create_callback_token(ctx.interaction_id, "always_allow", generation=session.generation)
+        api.calls.clear()
+
+        result = asyncio.run(
+            runtime.process_lark_event(
+                {
+                    "event_id": "evt-perm",
+                    "event": {
+                        "message_id": "om_permcard",
+                        "chat_id": "oc_chat",
+                        "open_id": "ou_user",
+                        "root_id": session.channel_binding.root_message_id,
+                        "action": {"value": {"token": token, "action": "always_allow"}},
+                    },
+                }
+            )
+        )
+        self.assertTrue(result.accepted)
+        self.assertEqual(transport.permission_approval_calls[-1][1].get("action"), "always_allow")
+        patches = [
+            p for m, p in api.calls
+            if m == "editCard" and p.get("message_id") == "om_permcard"
+            and p.get("view", {}).get("type") == "decision_result"
+        ]
+        self.assertEqual(len(patches), 1)
+        self.assertEqual(patches[0]["view"]["action"], "always_allow")
