@@ -3719,3 +3719,60 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ClaudeModelChoiceInventoryTests(unittest.TestCase):
+    def test_walkcode_model_choices_yields_full_picker_list(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cdir = Path(tmp) / "cfg"
+            cdir.mkdir()
+            (cdir / "settings.json").write_text(
+                json.dumps(
+                    {
+                        "env": {"ANTHROPIC_MODEL": "claude-opus-4-8"},
+                        "walkcode_model_choices": [
+                            {"slug": "claude-opus-4-8", "display_name": "Opus 4.8"},
+                            "claude-sonnet-5",
+                            {"slug": "claude-haiku-4-5", "display_name": "Haiku 4.5"},
+                        ],
+                    }
+                )
+            )
+            cfg = ChannelNativeConfig.from_env(
+                {
+                    "WALKCODE_CHANNEL": "lark",
+                    "LARK_APP_ID": "a",
+                    "LARK_APP_SECRET": "s",
+                    "WALKCODE_AGENT": "claude",
+                    "WALKCODE_CLAUDE_CONFIG_DIR": str(cdir),
+                }
+            )
+            inv = runtime_module._local_model_inventory(cfg, "claude_headless")
+            self.assertEqual(
+                [(m["slug"], m["display_name"]) for m in inv["models"]],
+                [
+                    ("claude-opus-4-8", "Opus 4.8"),
+                    ("claude-sonnet-5", "claude-sonnet-5"),
+                    ("claude-haiku-4-5", "Haiku 4.5"),
+                ],
+            )
+            self.assertEqual(inv["current"], "claude-opus-4-8")
+
+    def test_no_explicit_choices_falls_back_to_model_env(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cdir = Path(tmp) / "cfg"
+            cdir.mkdir()
+            (cdir / "settings.json").write_text(
+                json.dumps({"env": {"ANTHROPIC_MODEL": "opus", "ANTHROPIC_SMALL_FAST_MODEL": "haiku"}})
+            )
+            cfg = ChannelNativeConfig.from_env(
+                {
+                    "WALKCODE_CHANNEL": "lark",
+                    "LARK_APP_ID": "a",
+                    "LARK_APP_SECRET": "s",
+                    "WALKCODE_AGENT": "claude",
+                    "WALKCODE_CLAUDE_CONFIG_DIR": str(cdir),
+                }
+            )
+            inv = runtime_module._local_model_inventory(cfg, "claude_headless")
+            self.assertEqual([m["slug"] for m in inv["models"]], ["opus", "haiku"])

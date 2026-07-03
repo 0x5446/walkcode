@@ -8,6 +8,7 @@ smaller modules once the boundaries settle.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import signal
 import subprocess
 import time
@@ -4227,6 +4228,250 @@ class LarkChannelAdapter:
         return ""
 
 
+# Tools that only read or observe are low-risk: any authorized collaborator may
+# approve them. Everything else (writes, command execution, MCP tools, unknown
+# tools) is treated as high-risk so approval is gated to owner/admin — matching
+# the fail-safe posture of denying/escalating when the blast radius is unclear.
+_CLAUDE_LOW_RISK_TOOLS = frozenset(
+    {
+        "Read",
+        "Glob",
+        "Grep",
+        "LS",
+        "WebFetch",
+        "WebSearch",
+        "NotebookRead",
+        "TodoRead",
+        "TodoWrite",
+    }
+)
+
+
+def _claude_tool_is_high_risk(tool_name: str) -> bool:
+    return str(tool_name or "") not in _CLAUDE_LOW_RISK_TOOLS
+
+
+class _ClaudePermissionBridge:
+    """Bridges the Claude Agent SDK ``can_use_tool`` callback to channel-native
+    permission / AskUserQuestion events and back.
+
+    The SDK invokes ``can_use_tool`` from a *separate* spawned task while its read
+    loop keeps running (``query.py:_spawn_control_request_handler``), so the
+    callback is free to ``await`` a Future that only resolves when a human taps a
+    card button — the SDK layer never deadlocks. This bridge owns:
+
+    - ``_queue``: floats ``PERMISSION_REQUESTED`` / ``ASK_USER_REQUESTED`` events
+      into the transport's event stream so the orchestrator can post a card
+      mid-turn instead of waiting for the turn to finish.
+    - ``_pending``: rid -> Future the callback awaits and that
+      ``approve_permission`` / ``answer_user_question`` resolve (write-once).
+    - ``_entries``: rid -> request metadata used to build the SDK PermissionResult
+      (kind, tool name, original input, ToolPermissionContext for suggestions).
+
+    Fail-safe: on timeout, cancellation, or any error the pending decision
+    resolves to *deny*. There is no terminal fallback here, so allowing an
+    un-acknowledged tool would be an escalation — we never fail open.
+    """
+
+    _ASK_USER_TOOL_NAMES = frozenset({"AskUserQuestion", "ask_user_question"})
+
+    def __init__(self, *, sdk: Any, timeout: float = 1800.0, on_always_allow: Callable[[str], None] | None = None):
+        self._sdk = sdk
+        self._timeout = timeout
+        self._on_always_allow = on_always_allow
+        self._queue: asyncio.Queue[AgentEvent] = asyncio.Queue()
+        self._pending: dict[str, asyncio.Future] = {}
+        self._entries: dict[str, dict[str, Any]] = {}
+        self._resolved: set[str] = set()
+
+    async def can_use_tool(self, tool_name: str, tool_input: dict[str, Any], ctx: Any) -> Any:
+        rid = str(getattr(ctx, "tool_use_id", "") or "") or f"perm-{uuid.uuid4().hex}"
+        # Dedupe on (tool_use_id): a replayed callback for an already-settled rid
+        # must not float a second card. Deny the replay fail-safe.
+        if rid in self._resolved:
+            return self._deny_result("Duplicate permission request")
+        is_ask = str(tool_name or "") in self._ASK_USER_TOOL_NAMES
+        future: asyncio.Future = asyncio.get_running_loop().create_future()
+        self._pending[rid] = future
+        self._entries[rid] = {
+            "kind": "ask_user_question" if is_ask else "permission",
+            "tool_name": str(tool_name or ""),
+            "tool_input": dict(tool_input or {}),
+            "ctx": ctx,
+        }
+        await self._queue.put(self._build_event(rid, tool_name, dict(tool_input or {}), ctx, is_ask))
+        try:
+            decision = await asyncio.wait_for(future, timeout=self._timeout)
+        except asyncio.TimeoutError:
+            decision = {"action": "deny", "reason": "timeout"}
+        except asyncio.CancelledError:
+            self._resolved.add(rid)
+            self._pending.pop(rid, None)
+            return self._result_from_decision(rid, {"action": "deny", "reason": "cancelled"})
+        except Exception:
+            decision = {"action": "deny", "reason": "error"}
+        self._resolved.add(rid)
+        self._pending.pop(rid, None)
+        return self._result_from_decision(rid, decision)
+
+    async def next_event(self) -> AgentEvent:
+        return await self._queue.get()
+
+    def drain_ready_events(self) -> list[AgentEvent]:
+        events: list[AgentEvent] = []
+        while not self._queue.empty():
+            events.append(self._queue.get_nowait())
+        return events
+
+    def has_pending(self, rid: str) -> bool:
+        future = self._pending.get(rid)
+        return future is not None and not future.done()
+
+    def resolve(self, rid: str, decision: dict[str, Any]) -> bool:
+        """Write-once: only the first decision for an rid takes effect."""
+        future = self._pending.get(rid)
+        if future is None or future.done():
+            return False
+        future.set_result(dict(decision))
+        return True
+
+    def fail_pending_default_deny(self, reason: str = "aborted") -> None:
+        for future in list(self._pending.values()):
+            if not future.done():
+                future.set_result({"action": "deny", "reason": reason})
+
+    def _build_event(
+        self,
+        rid: str,
+        tool_name: str,
+        tool_input: dict[str, Any],
+        ctx: Any,
+        is_ask: bool,
+    ) -> AgentEvent:
+        if is_ask:
+            return AgentEvent(
+                AgentEventType.ASK_USER_REQUESTED,
+                {
+                    "rid": rid,
+                    "questions": self._map_ask_questions(tool_input),
+                    "native_method": "can_use_tool",
+                },
+            )
+        return AgentEvent(
+            AgentEventType.PERMISSION_REQUESTED,
+            {
+                "rid": rid,
+                "tool_name": str(tool_name or ""),
+                "tool_input": tool_input,
+                "actions": ["allow", "always_allow", "deny"],
+                "high_risk": _claude_tool_is_high_risk(tool_name),
+                "native_method": "can_use_tool",
+                "title": str(getattr(ctx, "title", "") or ""),
+                "description": str(getattr(ctx, "description", "") or ""),
+            },
+        )
+
+    @staticmethod
+    def _map_ask_questions(tool_input: dict[str, Any]) -> list[dict[str, Any]]:
+        raw_questions = tool_input.get("questions")
+        if not isinstance(raw_questions, list) or not raw_questions:
+            return [{"prompt": str(tool_input.get("prompt", "") or ""), "options": [], "allow_other": True}]
+        mapped: list[dict[str, Any]] = []
+        for question in raw_questions:
+            if not isinstance(question, dict):
+                continue
+            options: list[str] = []
+            for option in question.get("options", []) or []:
+                if isinstance(option, dict):
+                    options.append(str(option.get("label", option.get("value", "")) or ""))
+                else:
+                    options.append(str(option))
+            mapped.append(
+                {
+                    "prompt": str(
+                        question.get("question")
+                        or question.get("header")
+                        or question.get("prompt")
+                        or ""
+                    ),
+                    "options": options,
+                    "allow_multiple": bool(question.get("multiSelect") or question.get("allow_multiple")),
+                    "allow_other": True,
+                }
+            )
+        if not mapped:
+            mapped = [{"prompt": str(tool_input.get("prompt", "") or ""), "options": [], "allow_other": True}]
+        return mapped
+
+    def _result_from_decision(self, rid: str, decision: dict[str, Any]) -> Any:
+        entry = self._entries.get(rid, {})
+        allow_cls = getattr(self._sdk, "PermissionResultAllow", None)
+        if allow_cls is None:
+            return self._deny_result(str(decision.get("reason", "") or "denied"))
+        if entry.get("kind") == "ask_user_question":
+            answers = decision.get("answers", {})
+            if not isinstance(answers, dict):
+                answers = {}
+            return allow_cls(updated_input=self._build_ask_updated_input(entry, answers))
+        action = str(decision.get("action", "deny"))
+        if action in {"allow", "allow_once", "accept", "acceptForSession"}:
+            return allow_cls()
+        if action == "always_allow":
+            updates = self._always_allow_updates(entry)
+            if self._on_always_allow is not None:
+                with contextlib.suppress(Exception):
+                    self._on_always_allow(str(entry.get("tool_name", "") or ""))
+            return allow_cls(updated_permissions=updates or None)
+        return self._deny_result(str(decision.get("reason", "") or "Denied via WalkCode"))
+
+    def _deny_result(self, message: str) -> Any:
+        deny_cls = getattr(self._sdk, "PermissionResultDeny", None)
+        if deny_cls is None:
+            raise CapabilityUnsupported("Claude Agent SDK PermissionResultDeny is unavailable")
+        return deny_cls(message=message or "Denied via WalkCode", interrupt=False)
+
+    def _build_ask_updated_input(self, entry: dict[str, Any], answers: dict[Any, Any]) -> dict[str, Any]:
+        questions = entry.get("tool_input", {}).get("questions", [])
+        if not isinstance(questions, list):
+            questions = []
+        answers_map: dict[str, str] = {}
+        for index, question in enumerate(questions):
+            if not isinstance(question, dict):
+                continue
+            question_text = str(
+                question.get("question") or question.get("header") or question.get("prompt") or ""
+            )
+            if not question_text:
+                continue
+            value = answers.get(index)
+            if value is None:
+                value = answers.get(str(index))
+            if value is None:
+                continue
+            if isinstance(value, (list, tuple)):
+                value = ",".join(str(item) for item in value)
+            answers_map[question_text] = str(value)
+        return {"questions": questions, "answers": answers_map}
+
+    def _always_allow_updates(self, entry: dict[str, Any]) -> list[Any]:
+        suggestions = list(getattr(entry.get("ctx"), "suggestions", []) or [])
+        if suggestions:
+            return suggestions
+        update_cls = getattr(self._sdk, "PermissionUpdate", None)
+        rule_cls = getattr(self._sdk, "PermissionRuleValue", None)
+        tool_name = str(entry.get("tool_name", "") or "")
+        if update_cls is None or rule_cls is None or not tool_name:
+            return []
+        return [
+            update_cls(
+                type="addRules",
+                rules=[rule_cls(tool_name=tool_name)],
+                behavior="allow",
+                destination="localSettings",
+            )
+        ]
+
+
 class ClaudeHeadlessTransport:
     kind = "claude_headless"
 
@@ -4239,6 +4484,7 @@ class ClaudeHeadlessTransport:
         cli_path: str | None = None,
         config_dir: str | None = None,
         permission_mode: str | None = None,
+        permission_timeout: float = 1800.0,
     ):
         self._client_factory = client_factory
         self._sdk_loader = sdk_loader or self._default_sdk_loader
@@ -4246,7 +4492,9 @@ class ClaudeHeadlessTransport:
         self.cli_path = cli_path
         self.config_dir = config_dir
         self.permission_mode = permission_mode
+        self.permission_timeout = permission_timeout
         self._clients: dict[str, Any] = {}
+        self._bridges: dict[str, _ClaudePermissionBridge] = {}
 
     def capabilities(self) -> TransportCapabilities:
         available = self._available()
@@ -4272,7 +4520,7 @@ class ClaudeHeadlessTransport:
     async def launch(self, spec: LaunchSpec) -> TransportHandle:
         if not self._available():
             raise TransportUnavailable("claude_agent_sdk is not installed or no client factory is configured")
-        client = self._create_client(spec)
+        client, bridge = self._create_client(spec)
         await self._connect_client(client)
         handle = TransportHandle(
             handle_id=f"claude-{uuid.uuid4().hex}",
@@ -4280,6 +4528,8 @@ class ClaudeHeadlessTransport:
             ref={"session_id": spec.session_id, "cwd": spec.cwd},
         )
         self._clients[handle.handle_id] = client
+        if bridge is not None:
+            self._bridges[handle.handle_id] = bridge
         return handle
 
     async def resume(self, spec: ResumeSpec) -> TransportHandle:
@@ -4293,7 +4543,7 @@ class ClaudeHeadlessTransport:
         )
         if not resume_id:
             raise CapabilityUnsupported("Claude headless resume requires an agent session id")
-        client = self._create_client(
+        client, bridge = self._create_client(
             LaunchSpec(cwd=spec.cwd, session_id=spec.session_id),
             resume_id=resume_id,
         )
@@ -4308,6 +4558,8 @@ class ClaudeHeadlessTransport:
             ref={"session_id": resumed_session_id, "agent_session_id": resumed_session_id, "cwd": spec.cwd},
         )
         self._clients[handle.handle_id] = client
+        if bridge is not None:
+            self._bridges[handle.handle_id] = bridge
         return handle
 
     async def submit_turn(
@@ -4330,8 +4582,17 @@ class ClaudeHeadlessTransport:
         except TypeError:
             await _maybe_await(query(turn.text))
 
-    async def events(self, handle: TransportHandle) -> list[AgentEvent]:
+    async def events(self, handle: TransportHandle):
         client = self._clients[handle.handle_id]
+        bridge = self._bridges.get(handle.handle_id)
+        if bridge is not None:
+            # can_use_tool bridging is active: stream events so mid-turn
+            # permission / AskUserQuestion cards float before the turn ends. The
+            # returned async iterator is consumed by the orchestrator's single
+            # drain pass, which also picks up events emitted after the human's
+            # decision unblocks the SDK.
+            return self._bridged_event_stream(handle, client, bridge)
+
         events = getattr(client, "events", None)
         if events is not None:
             raw_events = await self._collect_client_items(events())
@@ -4346,14 +4607,72 @@ class ClaudeHeadlessTransport:
         sdk_messages = await self._collect_client_items(receiver())
         converted: list[AgentEvent] = []
         for message in sdk_messages:
-            item = self._convert_sdk_message(message)
-            if item is None:
-                continue
-            if isinstance(item, list):
-                converted.extend(item)
-            else:
-                converted.append(item)
+            converted.extend(self._convert_sdk_message_to_events(message))
         return converted
+
+    async def _bridged_event_stream(self, handle: TransportHandle, client: Any, bridge: _ClaudePermissionBridge):
+        """Yield SDK events while concurrently floating bridge permission events.
+
+        The SDK message stream and the bridge's permission queue are awaited
+        together with ``FIRST_COMPLETED`` so neither starves the other: while
+        ``can_use_tool`` is blocked inside the SDK (waiting on a card decision),
+        the message stream is naturally idle, yet the floated permission event
+        still surfaces immediately. Once the human decides, ``approve_permission``
+        resolves the Future, the SDK resumes, and the message stream yields the
+        tool result and the turn's completion within this same pass.
+        """
+        receiver = getattr(client, "receive_response", None)
+        if receiver is None:
+            receiver = getattr(client, "receive_messages", None)
+        if receiver is None:
+            raise CapabilityUnsupported("Claude headless event stream is not available")
+        stream_iter = receiver().__aiter__()
+        msg_task: asyncio.Future | None = asyncio.ensure_future(stream_iter.__anext__())
+        queue_task: asyncio.Future = asyncio.ensure_future(bridge.next_event())
+        try:
+            while True:
+                if msg_task is None:
+                    # SDK stream is exhausted (turn finished). Flush any residual
+                    # floated permission events, then stop.
+                    for event in bridge.drain_ready_events():
+                        yield event
+                    break
+                done, _pending = await asyncio.wait(
+                    {msg_task, queue_task},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if queue_task in done:
+                    floated = queue_task.result()
+                    queue_task = asyncio.ensure_future(bridge.next_event())
+                    if floated is not None:
+                        yield floated
+                    continue
+                try:
+                    message = msg_task.result()
+                except StopAsyncIteration:
+                    msg_task = None
+                    continue
+                msg_task = asyncio.ensure_future(stream_iter.__anext__())
+                for event in self._convert_sdk_message_to_events(message):
+                    yield event
+        finally:
+            for task in (msg_task, queue_task):
+                if task is not None and not task.done():
+                    task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError, Exception):
+                        await task
+            # Fail-safe: unblock any callback still awaiting a decision so the
+            # SDK's spawned task returns (deny) instead of leaking.
+            bridge.fail_pending_default_deny()
+
+    @classmethod
+    def _convert_sdk_message_to_events(cls, message: Any) -> list[AgentEvent]:
+        item = cls._convert_sdk_message(message)
+        if item is None:
+            return []
+        if isinstance(item, list):
+            return item
+        return [item]
 
     async def approve_permission(
         self,
@@ -4361,6 +4680,12 @@ class ClaudeHeadlessTransport:
         rid: str,
         decision: dict[str, Any],
     ) -> None:
+        bridge = self._bridges.get(handle.handle_id)
+        if bridge is not None and bridge.has_pending(rid):
+            # can_use_tool path: resolve the Future the blocked SDK callback is
+            # awaiting. Write-once is enforced inside the bridge.
+            bridge.resolve(rid, dict(decision))
+            return
         client = self._clients[handle.handle_id]
         approve = getattr(client, "approve_permission", None)
         if approve is None:
@@ -4373,6 +4698,10 @@ class ClaudeHeadlessTransport:
         rid: str,
         answers: dict[str, Any],
     ) -> None:
+        bridge = self._bridges.get(handle.handle_id)
+        if bridge is not None and bridge.has_pending(rid):
+            bridge.resolve(rid, {"action": "answers", "answers": dict(answers)})
+            return
         client = self._clients[handle.handle_id]
         answer = getattr(client, "answer_user_question", None)
         if answer is None:
@@ -4380,9 +4709,17 @@ class ClaudeHeadlessTransport:
         await _maybe_await(answer(rid, answers))
 
     async def interrupt(self, handle: TransportHandle, reason: str) -> ControlResult:
+        bridge = self._bridges.get(handle.handle_id)
+        if bridge is not None:
+            # Release callbacks awaiting a decision so the interrupted turn's
+            # blocked can_use_tool returns (deny) instead of hanging.
+            bridge.fail_pending_default_deny(reason="interrupted")
         return await self._call_client_control(handle, "interrupt", reason, state="interrupted")
 
     async def shutdown(self, handle: TransportHandle, mode: str) -> ControlResult:
+        bridge = self._bridges.pop(handle.handle_id, None)
+        if bridge is not None:
+            bridge.fail_pending_default_deny(reason="shutdown")
         return await self._call_client_control(handle, "shutdown", mode, state="stopped")
 
     async def set_model(self, handle: TransportHandle, model: str) -> ControlResult:
@@ -4452,18 +4789,71 @@ class ClaudeHeadlessTransport:
 
     def _create_client(self, spec: LaunchSpec, *, resume_id: str = ""):
         if self._client_factory is not None:
-            return self._client_factory(spec)
+            return self._client_factory(spec), None
         sdk = self._sdk_loader()
         client_cls = getattr(sdk, "ClaudeSDKClient", None)
         if client_cls is None:
             raise TransportUnavailable("claude_agent_sdk.ClaudeSDKClient is not available")
         options_cls = getattr(sdk, "ClaudeAgentOptions", None)
+        option_kwargs = self._option_kwargs(spec, resume_id=resume_id)
+        bridge: _ClaudePermissionBridge | None = None
+        if options_cls is not None and self._permission_bridging_supported(sdk):
+            bridge = _ClaudePermissionBridge(
+                sdk=sdk,
+                timeout=self.permission_timeout,
+                on_always_allow=self._write_always_allow_rule,
+            )
+            option_kwargs["can_use_tool"] = bridge.can_use_tool
         try:
             if options_cls is not None:
-                return client_cls(options=options_cls(**self._option_kwargs(spec, resume_id=resume_id)))
-            return client_cls()
+                return client_cls(options=options_cls(**option_kwargs)), bridge
+            return client_cls(), None
         except TypeError as exc:
             raise TransportUnavailable("claude_agent_sdk.ClaudeSDKClient cannot be constructed") from exc
+
+    def _permission_bridging_supported(self, sdk: Any) -> bool:
+        # Only wire can_use_tool when the SDK exposes the PermissionResult types
+        # the bridge returns, and only when the mode isn't blanket-bypass. A
+        # bypass mode auto-approves everything, so there is nothing to card.
+        if str(self.permission_mode or "") == "bypassPermissions":
+            return False
+        return (
+            getattr(sdk, "PermissionResultAllow", None) is not None
+            and getattr(sdk, "PermissionResultDeny", None) is not None
+        )
+
+    def _write_always_allow_rule(self, tool_name: str) -> None:
+        """Persist an always-allow rule into the profile's settings.json.
+
+        Mirrors V2's ``_add_permission_rule``: append the tool to
+        ``permissions.allow`` in the profile settings file. Best-effort — any
+        failure (missing file, unwritable, malformed JSON) is silently skipped so
+        a persistence hiccup never blocks the live decision.
+        """
+        tool_name = str(tool_name or "").strip()
+        if not tool_name:
+            return
+        try:
+            if self.config_dir:
+                settings_path = Path(self.config_dir).expanduser() / "settings.json"
+            else:
+                settings_path = Path.home() / ".claude" / "settings.json"
+            if not settings_path.exists():
+                return
+            settings = json.loads(settings_path.read_text())
+            if not isinstance(settings, dict):
+                return
+            permissions = settings.setdefault("permissions", {})
+            if not isinstance(permissions, dict):
+                return
+            allow = permissions.setdefault("allow", [])
+            if not isinstance(allow, list):
+                return
+            if tool_name not in allow:
+                allow.append(tool_name)
+                settings_path.write_text(json.dumps(settings, indent=2, ensure_ascii=False) + "\n")
+        except Exception:
+            return
 
     @staticmethod
     async def _connect_client(client: Any) -> None:

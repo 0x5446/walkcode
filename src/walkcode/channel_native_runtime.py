@@ -3264,16 +3264,31 @@ def _claude_local_model_inventory(config: ChannelNativeConfig) -> dict[str, Any]
     current = str(env.get("ANTHROPIC_MODEL", "") or "").strip()
     small_fast = str(env.get("ANTHROPIC_SMALL_FAST_MODEL", "") or "").strip()
     models: list[dict[str, str]] = []
-    if current:
-        models.append({"slug": current, "display_name": current, "marker": "ANTHROPIC_MODEL"})
-    if small_fast and small_fast != current:
-        models.append(
-            {
-                "slug": small_fast,
-                "display_name": small_fast,
-                "marker": "ANTHROPIC_SMALL_FAST_MODEL",
-            }
-        )
+    # Explicit picker list (settings.json "walkcode_model_choices"): entries are
+    # either "slug" or {"slug","display_name"}. This is what /model offers; it
+    # does not change routing (ANTHROPIC_MODEL stays the default).
+    explicit = data.get("walkcode_model_choices") if isinstance(data, dict) else None
+    if isinstance(explicit, list) and explicit:
+        for entry in explicit:
+            if isinstance(entry, str) and entry.strip():
+                slug = entry.strip()
+                models.append({"slug": slug, "display_name": slug})
+            elif isinstance(entry, dict) and str(entry.get("slug", "")).strip():
+                slug = str(entry["slug"]).strip()
+                models.append(
+                    {"slug": slug, "display_name": str(entry.get("display_name", "") or slug)}
+                )
+    else:
+        if current:
+            models.append({"slug": current, "display_name": current, "marker": "ANTHROPIC_MODEL"})
+        if small_fast and small_fast != current:
+            models.append(
+                {
+                    "slug": small_fast,
+                    "display_name": small_fast,
+                    "marker": "ANTHROPIC_SMALL_FAST_MODEL",
+                }
+            )
     notes = ["Claude list is derived from the configured settings file, not a live provider query."]
     return {
         "source": str(path),
