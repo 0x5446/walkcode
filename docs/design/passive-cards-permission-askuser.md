@@ -56,3 +56,23 @@
 - **不要重启任何 launchd 服务,不要 git commit**。做完把工作树留给主会话 review + 真机验证。
 - 全程加/改单测,用 fake SDK client（模拟 can_use_tool 触发、模拟 Result 消息）覆盖：权限 allow/deny/always_allow、去重、write-once、超时默认 deny、AskUserQuestion 三模式 + Other 文本回收。跑 `uv run --with pytest python -m pytest tests/ -q` 必须全绿。
 - 完成后报告：你对 AskUserQuestion 走 can_use_tool 还是普通 tool_use 的假设、events() 并发改造的具体做法、新增/改动的测试清单、任何拿不准需要主会话真机验证的点。
+
+## 实施结果与真机发现（2026-07-03/04 追记，实现已落地）
+
+- **AskUserQuestion 路由已实证**：走 `can_use_tool(tool_name="AskUserQuestion")`，
+  `input={questions:[{question,header,options:[{label,description}],multiSelect}]}`，
+  答案经 `PermissionResultAllow.updated_input.answers={问题文本: label}` 回填
+  （真 SDK 探针 + 真机飞书全链路验证）。
+- **批量卡演进**：多问题/多选/Other 场景从"toggle 按钮 + Submit"（每次点击一次
+  服务端回调）演进为**飞书 form 容器**（`select_static` / `multi_select_static` /
+  `input` + `action_type=form_submit` 按钮）：选择暂存客户端，一次 form_submit
+  回调携带全部 `form_value`，服务端 `InteractionStore.apply_ask_user_form` 按
+  q{i}/q{i}_other 映射回问题索引后走原 submit token 决定路径。
+- **⚠️ 飞书 form 容器硬约束（真机踩坑）**：form 元素内**不能包含 `div` 子组件**，
+  否则客户端**静默丢弃整个 form**（卡片只剩 header/note，API 返回 code=0 不报错）。
+  form 内文本一律用 `{"tag":"markdown"}` 组件。`update_multi` 与 form 渲染无关；
+  上述表单组件在卡片 JSON 1.0 全部可用。测试
+  `test_batch_questions_render_as_local_state_form` 钉死了 no-div-in-form 约束。
+- Bash 在本机 claude 环境默认放行（不触发 can_use_tool），权限卡只在真被 gate
+  的操作出现；权限/AskUser/model_choice 卡决定后均翻转为 decision_result 结果卡，
+  杜绝二次点击踩已消费 token。

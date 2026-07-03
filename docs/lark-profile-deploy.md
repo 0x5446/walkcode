@@ -27,10 +27,15 @@ work 可复用 V2 时代已配好的两个公司飞书 bot；personal 在 Lark �
 
 | wrapper | 等价于 |
 |---|---|
-| `claude-work` | `CLAUDE_CONFIG_DIR=~/.claude-profiles/work claude` |
+| `claude-work` | `CLAUDE_CONFIG_DIR=~/.claude-profiles/work claude`（enterprise 订阅路由） |
+| `claude-work2` | 同上 + `--settings ~/.claude-profiles/work/routes/vertex.json`（同 profile 换 Vertex 路由；订阅报错/超额时 `/exit` 后 `claude-work2 -c` 无损续会话） |
 | `claude-personal` | `CLAUDE_CONFIG_DIR=~/.claude-profiles/personal claude` |
-| `codex-work` | `CODEX_HOME=~/.codex-profiles/work codex` |
+| `codex-work` | `CODEX_HOME=~/.codex-profiles/work codex`（经公司 llm-proxy，key 走 env `CODEX_LLM_PROXY_API_KEY`，写在 `~/.zprofile` 与 `~/.walkcode/work-codex.env`） |
 | `codex-personal` | `CODEX_HOME=~/.codex-profiles/personal codex` |
+
+历史 wrapper `cc`/`ccv`/`ccp`（`~/.agent-control-plane/agent-wrappers.sh` 中的
+shell 函数）已于 2026-07-03 移除；`ccs`/`codex-api` 归档在
+`~/.walkcode-attic/20260703-wrappers/`。
 
 首次登录（每 profile 一次）：
 
