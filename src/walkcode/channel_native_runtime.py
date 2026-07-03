@@ -1305,6 +1305,25 @@ class ChannelNativeRuntime:
             cwd=self.config.cwd,
         )
         self.save_state()
+        # Authorized senders whose message is rejected must not be left
+        # guessing (readonly/ambiguous cases already send their own cards;
+        # allowlist rejections above stay deliberately silent).
+        if not result.accepted and inbound.callback is None:
+            note = _LARK_REJECTION_NOTES.get(str(result.reason or ""), "")
+            if note:
+                try:
+                    await channel.send_view(
+                        ChannelBinding(
+                            channel_kind=inbound.channel_kind,
+                            account_id=inbound.account_id,
+                            chat_id=inbound.chat_id,
+                            thread_id=inbound.thread_id,
+                            root_message_id=inbound.root_message_id or inbound.message_id,
+                        ),
+                        {"type": "text", "text": note},
+                    )
+                except Exception:
+                    pass
         return result
 
     async def _place_lark_new_session(self, channel, inbound):
@@ -2995,6 +3014,15 @@ def _telegram_update_id(update: dict[str, Any]) -> int | None:
         return int(update.get("update_id"))
     except (TypeError, ValueError):
         return None
+
+
+# Reply text for silently-rejected Lark messages from authorized senders.
+# Reasons with their own feedback card (external_tui_readonly → takeover
+# prompt, ambiguous_session → session chooser) are intentionally absent.
+_LARK_REJECTION_NOTES = {
+    BlockedReason.UNAUTHORIZED: "⛔ 这条消息没有提交：你没有操作这个会话的权限。",
+    BlockedReason.LEASE_EXPIRED: "⚠️ 这条消息没有提交：写入权已过期，请重发一次。",
+}
 
 
 def _telegram_result_confirms_offset(result: SubmitResult) -> bool:

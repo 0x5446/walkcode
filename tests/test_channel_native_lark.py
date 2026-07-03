@@ -913,6 +913,52 @@ class LarkModelChoiceCardTests(_LarkRuntimeHarness):
         self.assertTrue(texts)
 
 
+class LarkRejectionNoteTests(_LarkRuntimeHarness):
+    def test_rejected_message_from_authorized_sender_gets_note(self):
+        from walkcode.channel_native import SubmitResult
+
+        runtime, api, transport = self._runtime(
+            env_extra={"LARK_ALLOWED_CHAT_IDS": "oc_chat", "LARK_ALLOWED_OPEN_IDS": "ou_user"},
+            scripted_events=[
+                AgentEvent(AgentEventType.TURN_COMPLETED, {"message": "ok", "agent_session_id": "a1"})
+            ],
+        )
+
+        async def deny(inbound, **kwargs):
+            return SubmitResult(False, BlockedReason.UNAUTHORIZED)
+
+        runtime.orchestrator.handle_inbound_event = deny
+        result = asyncio.run(
+            runtime.process_lark_event(
+                self._message_payload(text="hi", root_id="lark-root", message_id="om_rej")
+            )
+        )
+
+        self.assertFalse(result.accepted)
+        notes = [
+            p
+            for m, p in api.calls
+            if m == "sendMessage" and "没有提交" in p.get("view", {}).get("text", "")
+        ]
+        self.assertEqual(len(notes), 1)
+
+    def test_allowlist_rejection_stays_silent(self):
+        runtime, api, transport = self._runtime(
+            env_extra={"LARK_ALLOWED_CHAT_IDS": "oc_chat", "LARK_ALLOWED_OPEN_IDS": "ou_user"},
+            scripted_events=[],
+        )
+
+        result = asyncio.run(
+            runtime.process_lark_event(
+                self._message_payload(text="hi", sender="ou_stranger", message_id="om_str")
+            )
+        )
+
+        self.assertFalse(result.accepted)
+        self.assertEqual(result.reason, BlockedReason.UNAUTHORIZED)
+        self.assertEqual(api.calls, [])
+
+
 class LarkPermissionCardFlipTests(_LarkRuntimeHarness):
     def test_permission_decision_flips_card_to_result(self):
         from walkcode.channel_native import ViewModelFactory
