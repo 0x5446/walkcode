@@ -935,3 +935,50 @@ class LarkPermissionCardFlipTests(_LarkRuntimeHarness):
         ]
         self.assertEqual(len(patches), 1)
         self.assertEqual(patches[0]["view"]["action"], "always_allow")
+
+
+class LarkAskUserCardFlipTests(_LarkRuntimeHarness):
+    def test_single_select_answer_flips_card_to_result(self):
+        runtime, api, transport = self._runtime(
+            env_extra={"LARK_ALLOWED_CHAT_IDS": "oc_chat", "LARK_ALLOWED_OPEN_IDS": "ou_user"},
+            scripted_events=[
+                AgentEvent(AgentEventType.TURN_COMPLETED, {"message": "ok", "agent_session_id": "a1"})
+            ],
+        )
+        asyncio.run(runtime.process_lark_event(self._message_payload(text="建会话")))
+        session = runtime.state.sessions.get(
+            runtime.state.sessions.list_sessions(channel_kind="lark")[0].session_id
+        )
+        store = runtime.orchestrator.interactions
+        ctx = store.register_ask_user_question(
+            session_id=session.session_id,
+            generation=session.generation,
+            questions=[{"question": "部署到哪?", "header": "环境",
+                        "options": [{"label": "staging"}, {"label": "production"}]}],
+        )
+        token = store.create_callback_token(ctx.interaction_id, "answer:0:0", generation=session.generation)
+        api.calls.clear()
+
+        result = asyncio.run(
+            runtime.process_lark_event(
+                {
+                    "event_id": "evt-au",
+                    "event": {
+                        "message_id": "om_aucard",
+                        "chat_id": "oc_chat",
+                        "open_id": "ou_user",
+                        "root_id": session.channel_binding.root_message_id,
+                        "action": {"value": {"token": token, "action": "answer:0:0"}},
+                    },
+                }
+            )
+        )
+        self.assertTrue(result.accepted)
+        patches = [
+            p for m, p in api.calls
+            if m == "editCard" and p.get("message_id") == "om_aucard"
+            and p.get("view", {}).get("type") == "decision_result"
+        ]
+        self.assertEqual(len(patches), 1)
+        self.assertEqual(patches[0]["view"]["action"], "answers")
+        self.assertIn("staging", patches[0]["view"]["detail"])

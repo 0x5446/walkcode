@@ -315,6 +315,10 @@ _DECISION_LABELS = {
 
 def _decision_result_card(view: dict[str, Any]) -> dict[str, Any]:
     action = str(view.get("action", "") or "")
+    detail = str(view.get("detail", "") or "")
+    if str(view.get("kind", "")) == "ask_user_question" or action == "answers":
+        body = f"✅ {escape_lark_md(_inline(detail))}" if detail else "✅ 已回答"
+        return _card_message("✅ 已回答", "green", [_md_div(body)])
     label, template = _DECISION_LABELS.get(action, (f"已处理：{action}" if action else "已处理", "grey"))
     tool = str(view.get("tool_name", "") or "")
     body = f"**Tool:** `{escape_lark_md(tool)}`" if tool else label

@@ -2583,7 +2583,9 @@ class ViewModelFactory:
         }
 
     @staticmethod
-    def decision_result(*, kind: str, tool_name: str, action: str) -> dict[str, Any]:
+    def decision_result(
+        *, kind: str, tool_name: str = "", action: str = "", detail: str = ""
+    ) -> dict[str, Any]:
         # Terminal card shown in place of an interactive prompt once decided, so
         # a settled request no longer shows live buttons (V2 result-card parity).
         return {
@@ -2591,6 +2593,7 @@ class ViewModelFactory:
             "kind": kind,
             "tool_name": tool_name,
             "action": action,
+            "detail": detail,
         }
 
     @staticmethod
@@ -6771,8 +6774,9 @@ class Orchestrator:
         inbound: InboundEvent,
         *,
         kind: str,
-        tool_name: str,
-        action: str,
+        tool_name: str = "",
+        action: str = "",
+        detail: str = "",
     ) -> None:
         # Replace the interactive prompt with a terminal result card so a
         # settled request stops showing live buttons (avoids the "ran without
@@ -6790,7 +6794,9 @@ class Orchestrator:
             thread_id=inbound.thread_id,
             root_message_id=inbound.root_message_id or inbound.message_id,
         )
-        view = ViewModelFactory.decision_result(kind=kind, tool_name=tool_name, action=action)
+        view = ViewModelFactory.decision_result(
+            kind=kind, tool_name=tool_name, action=action, detail=detail
+        )
         try:
             await channel.edit_view(binding, inbound.message_id, view)
         except Exception:
@@ -6884,6 +6890,18 @@ class Orchestrator:
                 actor=actor,
                 idempotency_key=f"{inbound.event_id}:ask_user_view",
             )
+            # Final answer (all questions done) → flip the clicked card to a
+            # result; toggle/next-question keep the card interactive.
+            if str((decision.decision or {}).get("action", "")) == "answers":
+                answers = (decision.decision or {}).get("answers", {})
+                detail = (
+                    "、".join(f"{k}: {v}" for k, v in answers.items())
+                    if isinstance(answers, dict)
+                    else ""
+                )
+                await self._flip_decided_card(
+                    inbound, kind="ask_user_question", tool_name="", action="answers", detail=detail
+                )
         if decision.accepted and ctx.kind == "takeover":
             return await self._handle_takeover_decision(
                 session,
