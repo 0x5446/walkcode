@@ -548,7 +548,7 @@ class LarkTuiObservationTests(_LarkRuntimeHarness):
         root_call = api.calls[0]
         self.assertEqual(root_call[0], "sendMessage")
         self.assertEqual(root_call[1]["chat_id"], "oc_chat")
-        self.assertIn("TUI 观察会话", root_call[1]["text"])
+        self.assertIn("👀 TUI: ", root_call[1]["text"])
         summaries = runtime.state.sessions.list_sessions(channel_kind="lark")
         self.assertEqual(len(summaries), 1)
         session = runtime.state.sessions.get(summaries[0].session_id)

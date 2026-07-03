@@ -2219,7 +2219,7 @@ class ChannelNativeRuntime:
                 {
                     "type": "text",
                     "text": (
-                        f"👀 TUI 观察会话：{agent_name} "
+                        f"👀 TUI: {agent_name} "
                         f"{_resume_ref_identity(transport_kind, resume_ref)}"
                     ),
                 },
