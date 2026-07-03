@@ -3982,6 +3982,7 @@ class LarkChannelAdapter:
         action = event.get("action", {})
         value = action.get("value", {}) if isinstance(action, dict) else {}
         token = str(value.get("token", "") or value.get("callback_token", ""))
+        action_name = str(value.get("action", ""))
         root_id = str(event.get("root_id", "") or "")
         message_id = str(event.get("message_id", "") or "")
         root = root_id or message_id
@@ -3996,7 +3997,14 @@ class LarkChannelAdapter:
             sender_id=str(event.get("open_id", "") or event.get("operator", {}).get("open_id", "")),
             sender_display="",
             text=token,
-            callback={"token": token, "action": str(value.get("action", "")), "value": value},
+            # "data" mirrors Telegram's callback_data: tokenless buttons (e.g.
+            # the status card's request_takeover) are routed by action name.
+            callback={
+                "token": token,
+                "action": action_name,
+                "data": token or action_name,
+                "value": value,
+            },
             raw=payload,
         )
 

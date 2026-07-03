@@ -706,3 +706,39 @@ class LarkTuiTakeoverAuthzTests(_LarkRuntimeHarness):
         self.assertTrue(
             runtime.state.authz.can_submit(session_id, ActorRef("lark", "ou_late", "ou_late")).allowed
         )
+
+
+class LarkStatusCardCallbackTests(unittest.TestCase):
+    def test_tokenless_card_action_routes_by_action_name(self):
+        adapter = LarkChannelAdapter(LarkBotApi(caller=lambda *_: {}))
+
+        event = adapter.parse_event(
+            {
+                "event_id": "evt-cb",
+                "event": {
+                    "message_id": "om_card",
+                    "chat_id": "oc_chat",
+                    "open_id": "ou_user",
+                    "action": {"value": {"action": "request_takeover"}},
+                },
+            }
+        )
+
+        self.assertEqual(event.callback["data"], "request_takeover")
+        self.assertEqual(event.callback["token"], "")
+
+    def test_tokened_card_action_keeps_token_as_data(self):
+        adapter = LarkChannelAdapter(LarkBotApi(caller=lambda *_: {}))
+
+        event = adapter.parse_event(
+            {
+                "event_id": "evt-cb2",
+                "event": {
+                    "message_id": "om_card",
+                    "chat_id": "oc_chat",
+                    "action": {"value": {"token": "tok-1", "action": "allow_once"}},
+                },
+            }
+        )
+
+        self.assertEqual(event.callback["data"], "tok-1")

@@ -2102,7 +2102,7 @@ class ChannelNativeRuntime:
         if binding.channel_kind == "telegram":
             keys = ("status_card", "native_topic", "readonly_topic", "pin_status_card", "static_status_card")
         else:
-            keys = ("status_card", "readonly_topic", "static_status_card")
+            keys = ("status_card", "readonly_topic")
         for key in keys:
             if key not in binding.capabilities:
                 binding.capabilities[key] = True
@@ -2216,10 +2216,12 @@ class ChannelNativeRuntime:
             chat_id=chat_id,
             thread_id=root_id,
             root_message_id=root_id,
+            # No static_status_card: Lark card patches are uncapped, so the
+            # observation card keeps refreshing (e.g. drops the Take over
+            # button once the session is taken over).
             capabilities={
                 "status_card": True,
                 "readonly_topic": True,
-                "static_status_card": True,
                 "origin": "external_tui",
             },
         )
@@ -3201,6 +3203,14 @@ def _local_model_inventory(config: ChannelNativeConfig, transport_kind: str) -> 
 def _claude_local_model_inventory(config: ChannelNativeConfig) -> dict[str, Any]:
     options = config.agent_options.get("claude", {})
     settings_path = str(options.get("settings", "") or "").strip()
+    if not settings_path:
+        # Fall back to the profile's own settings.json so a configured
+        # CLAUDE_CONFIG_DIR surfaces its model env without extra wiring.
+        config_dir = str(options.get("config_dir", "") or "").strip()
+        if config_dir:
+            candidate = Path(config_dir).expanduser() / "settings.json"
+            if candidate.exists():
+                settings_path = str(candidate)
     if not settings_path:
         return {
             "source": "",
