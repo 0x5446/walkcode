@@ -160,39 +160,48 @@ def _permission_card(view: dict[str, Any]) -> dict[str, Any]:
 
 
 def _ask_user_question_card(view: dict[str, Any]) -> dict[str, Any]:
-    prompt = str(view.get("prompt", "") or "选择一个选项")
-    option_buttons: list[dict[str, Any]] = []
-    control_buttons: list[dict[str, Any]] = []
-    for action in view.get("actions", []):
-        if not isinstance(action, dict):
-            continue
-        name = str(action.get("action", ""))
-        label = str(action.get("label", ""))
-        if name.startswith("toggle:"):
-            selected = label.startswith("[x] ")
-            display = f"✓ {label[4:]}" if selected else label
-            option_buttons.append(
-                _button(action, btn_type="primary" if selected else "default", label=display)
-            )
-        elif name.startswith("answer:"):
-            option_buttons.append(_button(action, btn_type="primary"))
-        elif name.startswith("submit:"):
-            control_buttons.append(_button(action, btn_type="primary", label=f"✅ {label}"))
-        elif name.startswith("other:"):
-            control_buttons.append(_button(action, btn_type="default", label="✏️ 其他（自定义文本）"))
-        else:
-            control_buttons.append(_button(action))
+    questions = view.get("questions")
+    if not isinstance(questions, list):
+        return _card_message("选择一个选项", "blue", [_md_div("⚠️ 无可用问题。")])
 
     elements: list[dict[str, Any]] = []
-    if option_buttons:
-        elements.append(_action_row(option_buttons))
-    if control_buttons:
+    multi_count = 0
+    for q_index, question in enumerate(questions):
+        if not isinstance(question, dict):
+            continue
+        title = str(question.get("header") or question.get("prompt") or f"问题 {q_index + 1}")
+        heading = escape_lark_md(_inline(title))
+        multi = bool(question.get("allow_multiple"))
+        if multi:
+            multi_count += 1
+        hint = "（多选）" if multi else "（单选）"
+        elements.append(_md_div(f"**{heading}** {hint}"))
+        option_buttons = []
+        for option in question.get("options", []):
+            if not isinstance(option, dict):
+                continue
+            selected = bool(option.get("selected"))
+            label = str(option.get("label", ""))
+            display = f"✓ {label}" if selected else label
+            option_buttons.append(
+                _button(option, btn_type="primary" if selected else "default", label=display)
+            )
+        other = question.get("other")
+        if isinstance(other, dict) and other.get("token"):
+            option_buttons.append(_button(other, btn_type="default", label="✏️ 其他"))
         if option_buttons:
-            elements.append({"tag": "hr"})
-        elements.append(_action_row(control_buttons))
-    if not elements:
-        elements.append(_md_div("⚠️ 该问题没有可选项，请在话题里直接回复文本。"))
-    return _card_message(prompt, "blue", elements)
+            elements.append(_action_row(option_buttons))
+        answer_display = str(question.get("answer_display", "") or "")
+        if answer_display:
+            elements.append(_md_div(f"当前: {escape_lark_md(_inline(answer_display))}"))
+        elements.append({"tag": "hr"})
+
+    submit = view.get("submit")
+    if isinstance(submit, dict) and submit.get("token"):
+        elements.append(_action_row([_button(submit, btn_type="primary", label="✅ 提交全部")]))
+    if multi_count:
+        elements.append(_note("多选项点按钮切换，选好后点「提交全部」。"))
+    return _card_message("请选择", "blue", elements)
 
 
 def _health_card(view: dict[str, Any]) -> dict[str, Any]:

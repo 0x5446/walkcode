@@ -145,7 +145,7 @@ class ViewModelRenderingTests(unittest.TestCase):
         view = ViewModelFactory(store).ask_user_question_prompt(ctx)
 
         labels = [action["label"] for action in view["actions"]]
-        self.assertEqual(labels, ["A", "B", "Other"])
+        self.assertEqual(labels, ["A", "B", "Other", "Submit"])
 
         store.begin_awaiting_other(ctx.interaction_id, _binding("telegram").key(), question_index=0)
         result = store.answer_awaiting_other(
@@ -186,7 +186,7 @@ class ViewModelRenderingTests(unittest.TestCase):
 
 
 class AskUserQuestionStateMachineTests(unittest.TestCase):
-    def test_multi_question_single_select_advances_then_finalizes(self):
+    def test_multi_question_batch_selects_all_then_submit_finalizes(self):
         store = InteractionStore(now=_Clock())
         ctx = store.register_ask_user_question(
             session_id="s1",
@@ -197,32 +197,30 @@ class AskUserQuestionStateMachineTests(unittest.TestCase):
             ],
         )
         factory = ViewModelFactory(store)
-        first = factory.ask_user_question_prompt(ctx)
-        first_token = next(action["token"] for action in first["actions"] if action["label"] == "A")
+        # Both questions live in one card; selecting an option just updates.
+        view = factory.ask_user_question_prompt(ctx)
+        a_token = next(a["token"] for a in view["actions"] if a["label"] == "A")
+        y_token = next(a["token"] for a in view["actions"] if a["label"] == "Y")
 
-        first_result = store.decide_from_token(
-            first_token,
-            actor=_actor("owner"),
-            current_generation=2,
-            binding_key=_binding().key(),
+        a_result = store.decide_from_token(
+            a_token, actor=_actor("owner"), current_generation=2, binding_key=_binding().key()
         )
-
-        self.assertTrue(first_result.accepted)
+        self.assertTrue(a_result.accepted)
         self.assertIsNone(store.get(ctx.interaction_id).decision)
-        self.assertEqual(store.get(ctx.interaction_id).current_index, 1)
         self.assertEqual(store.get(ctx.interaction_id).answers[0], "A")
 
-        second = factory.ask_user_question_prompt(ctx)
-        self.assertEqual(second["prompt"], "Second")
-        second_token = next(action["token"] for action in second["actions"] if action["label"] == "Y")
-        second_result = store.decide_from_token(
-            second_token,
-            actor=_actor("owner"),
-            current_generation=2,
-            binding_key=_binding().key(),
+        y_result = store.decide_from_token(
+            y_token, actor=_actor("owner"), current_generation=2, binding_key=_binding().key()
         )
+        self.assertTrue(y_result.accepted)
+        self.assertIsNone(store.get(ctx.interaction_id).decision)
+        self.assertEqual(store.get(ctx.interaction_id).answers[1], "Y")
 
-        self.assertTrue(second_result.accepted)
+        submit_token = next(a["token"] for a in view["actions"] if a["label"] == "Submit")
+        submit_result = store.decide_from_token(
+            submit_token, actor=_actor("owner"), current_generation=2, binding_key=_binding().key()
+        )
+        self.assertTrue(submit_result.accepted)
         self.assertEqual(
             store.get(ctx.interaction_id).decision,
             {"action": "answers", "answers": {0: "A", 1: "Y"}},
@@ -252,7 +250,9 @@ class AskUserQuestionStateMachineTests(unittest.TestCase):
         self.assertEqual(store.get(ctx.interaction_id).answers[0], ["A"])
 
         selected_view = factory.ask_user_question_prompt(ctx)
-        self.assertEqual(selected_view["actions"][0]["label"], "[x] A")
+        first_option = selected_view["questions"][0]["options"][0]
+        self.assertEqual(first_option["label"], "A")
+        self.assertTrue(first_option["selected"])
         b_token = next(action["token"] for action in selected_view["actions"] if action["label"] == "B")
         submit_token = next(action["token"] for action in selected_view["actions"] if action["label"] == "Submit")
         store.decide_from_token(
@@ -274,7 +274,7 @@ class AskUserQuestionStateMachineTests(unittest.TestCase):
             {"action": "answers", "answers": {0: ["A", "B"]}},
         )
 
-    def test_other_callback_enters_awaiting_state_and_text_finalizes(self):
+    def test_other_callback_enters_awaiting_state_and_text_sets_answer(self):
         store = InteractionStore(now=_Clock())
         ctx = store.register_ask_user_question(
             session_id="s1",
@@ -302,12 +302,22 @@ class AskUserQuestionStateMachineTests(unittest.TestCase):
             current_generation=2,
         )
 
+        # Batch model: free text fills the answer but does not finalize; the
+        # user still submits the whole card.
         self.assertTrue(answered.accepted)
+        self.assertIsNone(store.get(ctx.interaction_id).decision)
+        self.assertEqual(store.get(ctx.interaction_id).answers[0], "custom")
+        self.assertEqual(store.awaiting_other_count(), 0)
+
+        submit_token = next(a["token"] for a in view["actions"] if a["label"] == "Submit")
+        submitted = store.decide_from_token(
+            submit_token, actor=_actor("owner"), current_generation=2, binding_key=_binding().key()
+        )
+        self.assertTrue(submitted.accepted)
         self.assertEqual(
             store.get(ctx.interaction_id).decision,
             {"action": "answers", "answers": {0: "custom"}},
         )
-        self.assertEqual(store.awaiting_other_count(), 0)
 
     def test_orchestrator_routes_other_callback_and_answer_text_before_agent_turn(self):
         clock = _Clock()
@@ -367,7 +377,32 @@ class AskUserQuestionStateMachineTests(unittest.TestCase):
             orchestrator.handle_inbound_event(text, agent_transport_kind="fake-transport", cwd="/tmp/project")
         )
 
+        # Batch model: free text fills the answer but does not finalize.
         self.assertTrue(text_result.accepted)
+        self.assertEqual(transport.submitted_turns, [])
+        self.assertIsNone(interactions.get(ctx.interaction_id).decision)
+
+        submit_view = ViewModelFactory(interactions).ask_user_question_prompt(ctx)
+        submit_token = submit_view["submit"]["token"]
+        submit_event = InboundEvent(
+            event_id="cb-2",
+            channel_kind="telegram",
+            account_id="bot",
+            chat_id="chat",
+            thread_id="topic",
+            message_id="m-cb2",
+            root_message_id="root",
+            sender_id="owner",
+            sender_display="Owner",
+            text=f"cb:{submit_token}",
+            callback={"token": submit_token},
+        )
+        submit_result = asyncio.run(
+            orchestrator.handle_inbound_event(
+                submit_event, agent_transport_kind="fake-transport", cwd="/tmp/project"
+            )
+        )
+        self.assertTrue(submit_result.accepted)
         self.assertEqual(transport.submitted_turns, [])
         self.assertEqual(
             interactions.get(ctx.interaction_id).decision,

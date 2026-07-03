@@ -2034,12 +2034,15 @@ class InteractionStore:
         if not ctx.awaiting_other:
             return DecisionResult(False, BlockedReason.NOT_FOUND)
         question_index = int(ctx.awaiting_other["question_index"])
-        if question_index != ctx.current_index:
+        if question_index < 0 or question_index >= len(ctx.questions):
             return DecisionResult(False, BlockedReason.INVALID_TOKEN)
         ctx.answers[question_index] = text
         ctx.awaiting_other = None
         self._awaiting_other_by_binding.pop(binding_key, None)
-        return self._advance_or_finalize_question(ctx, actor)
+        # Free-text just fills that question; the user still submits the batch.
+        return DecisionResult(
+            True, decision={"action": "update", "question_index": question_index}
+        )
 
     def interaction_count(self) -> int:
         return len(self._interactions)
@@ -2091,6 +2094,10 @@ class InteractionStore:
         actor: ActorRef,
         binding_key: BindingKey | None,
     ) -> DecisionResult:
+        # Batch model: all questions on one card. set/toggle mutate a pending
+        # answer and re-render (no finalize); submit_all commits everything.
+        if action == "submit_all":
+            return self._finalize_ask_user(ctx, actor)
         parts = action.split(":")
         if len(parts) < 2:
             return DecisionResult(False, BlockedReason.INVALID_TOKEN)
@@ -2099,11 +2106,11 @@ class InteractionStore:
             question_index = int(parts[1])
         except ValueError:
             return DecisionResult(False, BlockedReason.INVALID_TOKEN)
-        if question_index != ctx.current_index or question_index >= len(ctx.questions):
+        if question_index < 0 or question_index >= len(ctx.questions):
             return DecisionResult(False, BlockedReason.INVALID_TOKEN)
         question = ctx.questions[question_index]
 
-        if command == "answer" and len(parts) == 3:
+        if command in {"set", "answer"} and len(parts) == 3 and not question.get("allow_multiple"):
             try:
                 option_index = int(parts[2])
             except ValueError:
@@ -2112,7 +2119,11 @@ class InteractionStore:
             if option_index < 0 or option_index >= len(options):
                 return DecisionResult(False, BlockedReason.INVALID_TOKEN)
             ctx.answers[question_index] = options[option_index]
-            return self._advance_or_finalize_question(ctx, actor)
+            # "answer" = single simple question → finalize on click; "set" =
+            # batch radio → just update, wait for Submit.
+            if command == "answer":
+                return self._finalize_ask_user(ctx, actor)
+            return DecisionResult(True, decision={"action": "update"})
 
         if command == "toggle" and len(parts) == 3 and question.get("allow_multiple"):
             try:
@@ -2129,18 +2140,7 @@ class InteractionStore:
             else:
                 selected.append(value)
             ctx.answers[question_index] = selected
-            return DecisionResult(
-                True,
-                decision={
-                    "action": "toggle",
-                    "question_index": question_index,
-                    "selected": selected,
-                },
-            )
-
-        if command == "submit" and question.get("allow_multiple"):
-            ctx.answers.setdefault(question_index, [])
-            return self._advance_or_finalize_question(ctx, actor)
+            return DecisionResult(True, decision={"action": "update"})
 
         if command == "other" and question.get("allow_other"):
             if binding_key is None:
@@ -2153,17 +2153,11 @@ class InteractionStore:
 
         return DecisionResult(False, BlockedReason.INVALID_TOKEN)
 
-    def _advance_or_finalize_question(
+    def _finalize_ask_user(
         self,
         ctx: InteractionContext,
         actor: ActorRef,
     ) -> DecisionResult:
-        if ctx.current_index < len(ctx.questions) - 1:
-            ctx.current_index += 1
-            return DecisionResult(
-                True,
-                decision={"action": "next_question", "question_index": ctx.current_index},
-            )
         decision = {"action": "answers", "answers": dict(ctx.answers)}
         ctx.decision = decision
         ctx.decided_by = actor
@@ -2356,61 +2350,90 @@ class ViewModelFactory:
         }
 
     def ask_user_question_prompt(self, ctx: InteractionContext) -> dict[str, Any]:
-        question = ctx.questions[ctx.current_index]
-        actions = []
-        for index, option in enumerate(question.get("options", [])):
-            if question.get("allow_multiple"):
-                selected = list(ctx.answers.get(ctx.current_index, []))
-                action = f"toggle:{ctx.current_index}:{index}"
-                label = f"[x] {option}" if option in selected else str(option)
-            else:
-                action = f"answer:{ctx.current_index}:{index}"
-                label = str(option)
-            actions.append(
+        # All questions live in a single card: each question is its own section
+        # with option buttons (single-select = radio, multi-select = toggle),
+        # answers are changeable, and one global Submit finalizes everything.
+        # (Feishu has no tab widget, so sections are stacked vertically.)
+        def tok(action: str) -> str:
+            return self.interactions.create_callback_token(
+                ctx.interaction_id, action, generation=ctx.generation
+            )
+
+        # One simple question (single-select, no free-text) finalizes on a
+        # single click — no separate Submit step. Any other shape (multiple
+        # questions, multi-select, or free-text) uses the batch card where
+        # answers are changeable and one Submit commits them all.
+        immediate = (
+            len(ctx.questions) == 1
+            and not bool(ctx.questions[0].get("allow_multiple"))
+            and not bool(ctx.questions[0].get("allow_other"))
+        )
+        questions: list[dict[str, Any]] = []
+        for q_index, question in enumerate(ctx.questions):
+            multi = bool(question.get("allow_multiple"))
+            answer = ctx.answers.get(q_index)
+            selected_set = set(answer) if isinstance(answer, list) else ({answer} if answer else set())
+            options = []
+            for o_index, option in enumerate(question.get("options", [])):
+                if immediate:
+                    action = f"answer:{q_index}:{o_index}"
+                else:
+                    action = f"{'toggle' if multi else 'set'}:{q_index}:{o_index}"
+                options.append(
+                    {
+                        "action": action,
+                        "label": str(option),
+                        "selected": str(option) in {str(s) for s in selected_set},
+                        "token": tok(action),
+                    }
+                )
+            other = None
+            if question.get("allow_other"):
+                other_action = f"other:{q_index}"
+                other = {"action": other_action, "token": tok(other_action)}
+            # Answer chosen via free text (not one of the options) is shown too.
+            answer_text = ""
+            if isinstance(answer, str) and answer and answer not in {str(o["label"]) for o in options}:
+                answer_text = answer
+            elif isinstance(answer, list):
+                answer_text = ", ".join(str(v) for v in answer)
+            elif isinstance(answer, str):
+                answer_text = answer
+            questions.append(
                 {
-                    "action": action,
-                    "label": label,
-                    "token": self.interactions.create_callback_token(
-                        ctx.interaction_id,
-                        action,
-                        generation=ctx.generation,
-                    ),
+                    "index": q_index,
+                    "prompt": str(question.get("prompt", "")),
+                    "header": str(question.get("header", "") or ""),
+                    "allow_multiple": multi,
+                    "options": options,
+                    "other": other,
+                    "answer_display": answer_text,
                 }
             )
-        if question.get("allow_multiple"):
-            action = f"submit:{ctx.current_index}"
-            actions.append(
-                {
-                    "action": action,
-                    "label": "Submit",
-                    "token": self.interactions.create_callback_token(
-                        ctx.interaction_id,
-                        action,
-                        generation=ctx.generation,
-                    ),
-                }
-            )
-        if question.get("allow_other"):
-            action = f"other:{ctx.current_index}"
-            actions.append(
-                {
-                    "action": action,
-                    "label": "Other",
-                    "token": self.interactions.create_callback_token(
-                        ctx.interaction_id,
-                        action,
-                        generation=ctx.generation,
-                    ),
-                }
-            )
+        submit = None if immediate else {"action": "submit_all", "label": "Submit", "token": tok("submit_all")}
+        # Flattened actions for channels with a generic button renderer
+        # (e.g. Telegram inline keyboard); the Lark card renderer uses the
+        # structured `questions` layout instead.
+        flat_actions: list[dict[str, Any]] = []
+        for q in questions:
+            for opt in q["options"]:
+                flat_actions.append(
+                    {"action": opt["action"], "label": opt["label"], "token": opt["token"]}
+                )
+            if q["other"]:
+                flat_actions.append(
+                    {"action": q["other"]["action"], "label": "Other", "token": q["other"]["token"]}
+                )
+        if submit is not None:
+            flat_actions.append(submit)
         return {
             "type": "ask_user_question",
             "interaction_id": ctx.interaction_id,
             "session_id": ctx.session_id,
             "generation": ctx.generation,
-            "question_index": ctx.current_index,
-            "prompt": str(question.get("prompt", "")),
-            "actions": actions,
+            "questions": questions,
+            "submit": submit,
+            "actions": flat_actions,
         }
 
     def takeover_prompt_for_context(
@@ -3435,7 +3458,15 @@ def render_view_text(view_model: dict[str, Any]) -> str:
     if view_type == "permission_prompt":
         return f"Permission requested: {view_model.get('tool_name', '')}"
     if view_type == "ask_user_question":
-        return str(view_model.get("prompt", ""))
+        questions = view_model.get("questions")
+        if isinstance(questions, list) and questions:
+            titles = [
+                str(q.get("header") or q.get("prompt") or "")
+                for q in questions
+                if isinstance(q, dict)
+            ]
+            return "请选择：" + " / ".join(t for t in titles if t)
+        return str(view_model.get("prompt", "请选择"))
     if view_type == "tui_user_input":
         value = str(view_model.get("input", "") or "").strip()
         return f"TUI input\n\n{value}" if value else "TUI input"
@@ -7493,12 +7524,21 @@ class Orchestrator:
                     delivery_status=DeliveryStatus.SENT,
                 )
             return
-        if action in {"next_question", "toggle"}:
+        if action == "awaiting_other":
+            # Keep the all-questions card intact; just prompt for the free-text
+            # reply that will fill this one question.
+            binding = session.channel_binding
+            channel = self.channels.get(binding.channel_kind) if binding is not None else None
+            if channel is not None and binding is not None:
+                await channel.send_view(
+                    binding,
+                    {"type": "text", "text": "✏️ 请在本话题里直接回复你的自定义答案文本。"},
+                )
+            return
+        if action == "update":
+            # set/toggle/free-text mutated a pending answer → re-render the same
+            # card in place (edit) so the batch card doesn't spam new copies.
             view = ViewModelFactory(self.interactions).ask_user_question_prompt(ctx)
-            # Edit the clicked card in place (toggle checkmarks, advance to the
-            # next question) instead of sending a fresh card each time — a
-            # multi-select / multi-question prompt otherwise spams a new card
-            # per click.
             binding = session.channel_binding
             channel = self.channels.get(binding.channel_kind) if binding is not None else None
             if (

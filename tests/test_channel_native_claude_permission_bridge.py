@@ -575,9 +575,15 @@ class PermissionBridgeOrchestratorTests(unittest.TestCase):
                     break
                 await asyncio.sleep(0)
             self.assertIsNotNone(card, "ask_user card never floated")
-            token = next(a["token"] for a in card["actions"] if a["action"] == "answer:0:0")
+            # Claude questions always allow a typed answer, so the card is the
+            # batch form: select an option (set), then submit the whole card.
+            set_token = next(a["token"] for a in card["actions"] if a["action"] == "set:0:0")
             await orch.handle_inbound_event(
-                self._callback(token), agent_transport_kind="claude_headless", cwd="/tmp/project"
+                self._callback(set_token), agent_transport_kind="claude_headless", cwd="/tmp/project"
+            )
+            submit_token = card["submit"]["token"]
+            await orch.handle_inbound_event(
+                self._callback(submit_token), agent_transport_kind="claude_headless", cwd="/tmp/project"
             )
             drains = list(orch._background_event_drains)
             if drains:

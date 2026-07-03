@@ -151,9 +151,9 @@ def _token_for(view: dict, label: str) -> str:
 
 
 class AskUserQuestionRoundTripTests(unittest.TestCase):
-    def test_transport_question_event_renders_prompt_and_single_select_calls_transport(self):
+    def test_single_simple_question_finalizes_on_one_click(self):
         orchestrator, transport, channel, _interactions, session = _orchestrator(
-            scripted_events=[_ask_event()]
+            scripted_events=[_ask_event([{"prompt": "Pick one", "options": ["A", "B"]}])]
         )
         asyncio.run(
             orchestrator.submit_user_input(
@@ -165,7 +165,8 @@ class AskUserQuestionRoundTripTests(unittest.TestCase):
         )
         prompt = channel.sent_views[0]["view"]
         self.assertEqual(prompt["type"], "ask_user_question")
-        self.assertEqual(prompt["prompt"], "Pick one")
+        self.assertEqual(prompt["questions"][0]["prompt"], "Pick one")
+        self.assertIsNone(prompt["submit"])
 
         result = asyncio.run(
             orchestrator.handle_inbound_event(
@@ -197,22 +198,31 @@ class AskUserQuestionRoundTripTests(unittest.TestCase):
                 generation=session.generation,
             )
         )
-        first = channel.sent_views[0]["view"]
-        first_result = asyncio.run(
+        card = channel.sent_views[0]["view"]
+        # both questions live in one card; selecting each just updates
+        set_a = asyncio.run(
             orchestrator.handle_inbound_event(
-                _callback(_token_for(first, "A"), actor_id="owner"),
+                _callback(_token_for(card, "A"), actor_id="owner"),
                 agent_transport_kind="fake-transport",
                 cwd="/tmp/project",
             )
         )
-        self.assertTrue(first_result.accepted)
+        self.assertTrue(set_a.accepted)
+        self.assertEqual(transport.question_answer_calls, [])
+        set_y = asyncio.run(
+            orchestrator.handle_inbound_event(
+                _callback(_token_for(card, "Y"), actor_id="owner"),
+                agent_transport_kind="fake-transport",
+                cwd="/tmp/project",
+            )
+        )
+        self.assertTrue(set_y.accepted)
         self.assertEqual(transport.question_answer_calls, [])
 
-        second = channel.sent_views[-1]["view"]
-        self.assertEqual(second["prompt"], "Second")
+        submit_token = card["submit"]["token"]
         final = asyncio.run(
             orchestrator.handle_inbound_event(
-                _callback(_token_for(second, "Y"), actor_id="owner"),
+                _callback(submit_token, actor_id="owner"),
                 agent_transport_kind="fake-transport",
                 cwd="/tmp/project",
             )
@@ -250,8 +260,19 @@ class AskUserQuestionRoundTripTests(unittest.TestCase):
                 cwd="/tmp/project",
             )
         )
-
         self.assertTrue(answered.accepted)
+        # free text fills the answer; batch still needs an explicit submit
+        self.assertEqual(transport.question_answer_calls, [])
+
+        submit_token = channel.sent_views[0]["view"]["submit"]["token"]
+        final = asyncio.run(
+            orchestrator.handle_inbound_event(
+                _callback(submit_token, actor_id="owner"),
+                agent_transport_kind="fake-transport",
+                cwd="/tmp/project",
+            )
+        )
+        self.assertTrue(final.accepted)
         self.assertEqual(transport.question_answer_calls, [("ask-1", {0: "custom"})])
         self.assertEqual([turn.text for turn in transport.submitted_turns], ["run"])
 
@@ -284,10 +305,18 @@ class AskUserQuestionRoundTripTests(unittest.TestCase):
                 cwd="/tmp/project",
             )
         )
+        submitted = asyncio.run(
+            orchestrator.handle_inbound_event(
+                _callback(prompt["submit"]["token"], actor_id="owner"),
+                agent_transport_kind="fake-transport",
+                cwd="/tmp/project",
+            )
+        )
 
         self.assertFalse(denied.accepted)
         self.assertEqual(denied.reason, BlockedReason.UNAUTHORIZED)
         self.assertTrue(accepted.accepted)
+        self.assertTrue(submitted.accepted)
         self.assertEqual(len(transport.question_answer_calls), 1)
 
     def test_disabled_question_capability_does_not_consume_token(self):

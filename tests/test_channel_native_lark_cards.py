@@ -96,51 +96,66 @@ class PermissionCardTests(unittest.TestCase):
 
 
 class AskUserQuestionCardTests(unittest.TestCase):
-    def test_single_select_renders_primary_option_buttons(self):
+    def test_single_question_renders_option_buttons(self):
         message = render_lark_message(
             {
                 "type": "ask_user_question",
-                "prompt": "选择部署环境",
-                "actions": [
-                    {"action": "answer:0:0", "label": "staging", "token": "t1"},
-                    {"action": "answer:0:1", "label": "production", "token": "t2"},
-                    {"action": "other:0", "label": "Other", "token": "t3"},
+                "questions": [
+                    {
+                        "index": 0,
+                        "prompt": "选择部署环境",
+                        "header": "部署环境",
+                        "allow_multiple": False,
+                        "options": [
+                            {"action": "answer:0:0", "label": "staging", "selected": False, "token": "t1"},
+                            {"action": "answer:0:1", "label": "production", "selected": False, "token": "t2"},
+                        ],
+                        "other": None,
+                        "answer_display": "",
+                    }
                 ],
-            }
-        )
-
-        content = message["content"]
-        self.assertEqual(content["header"]["title"]["content"], "选择部署环境")
-        buttons = _buttons(content)
-        self.assertEqual(buttons[0]["value"], {"action": "answer:0:0", "token": "t1"})
-        self.assertEqual(buttons[0]["type"], "primary")
-        self.assertIn("其他", buttons[2]["text"]["content"])
-
-    def test_multi_select_marks_toggled_options_and_submit(self):
-        message = render_lark_message(
-            {
-                "type": "ask_user_question",
-                "prompt": "选择要启用的功能",
-                "actions": [
-                    {"action": "toggle:0:0", "label": "[x] cache", "token": "t1"},
-                    {"action": "toggle:0:1", "label": "metrics", "token": "t2"},
-                    {"action": "submit:0", "label": "Submit", "token": "t3"},
-                ],
+                "submit": None,
             }
         )
 
         buttons = _buttons(message["content"])
-        self.assertEqual(buttons[0]["text"]["content"], "✓ cache")
-        self.assertEqual(buttons[0]["type"], "primary")
-        self.assertEqual(buttons[1]["text"]["content"], "metrics")
-        self.assertEqual(buttons[1]["type"], "default")
-        self.assertIn("✅", buttons[2]["text"]["content"])
+        self.assertEqual(buttons[0]["value"], {"action": "answer:0:0", "token": "t1"})
+        self.assertEqual([b["text"]["content"] for b in buttons], ["staging", "production"])
 
-    def test_question_without_options_prompts_thread_reply(self):
-        message = render_lark_message({"type": "ask_user_question", "prompt": "只能自由回答"})
+    def test_multi_question_batch_marks_selected_and_has_single_submit(self):
+        message = render_lark_message(
+            {
+                "type": "ask_user_question",
+                "questions": [
+                    {
+                        "index": 0, "prompt": "周末?", "header": "周末计划", "allow_multiple": False,
+                        "options": [
+                            {"action": "set:0:0", "label": "宅", "selected": True, "token": "a"},
+                            {"action": "set:0:1", "label": "出门浪", "selected": False, "token": "b"},
+                        ],
+                        "other": None, "answer_display": "宅",
+                    },
+                    {
+                        "index": 1, "prompt": "口味?", "header": "吃啥", "allow_multiple": True,
+                        "options": [
+                            {"action": "toggle:1:0", "label": "辣", "selected": True, "token": "c"},
+                            {"action": "toggle:1:1", "label": "清淡", "selected": False, "token": "d"},
+                        ],
+                        "other": {"action": "other:1", "token": "e"}, "answer_display": "辣",
+                    },
+                ],
+                "submit": {"action": "submit_all", "label": "Submit", "token": "s"},
+            }
+        )
 
-        body = message["content"]["elements"][0]["text"]["content"]
-        self.assertIn("回复文本", body)
+        buttons = _buttons(message["content"])
+        labels = [b["text"]["content"] for b in buttons]
+        self.assertIn("✓ 宅", labels)
+        self.assertIn("✓ 辣", labels)
+        self.assertIn("✏️ 其他", labels)
+        submits = [b for b in buttons if b["value"].get("action") == "submit_all"]
+        self.assertEqual(len(submits), 1)
+        self.assertIn("提交全部", submits[0]["text"]["content"])
 
 
 class HealthCardTests(unittest.TestCase):
