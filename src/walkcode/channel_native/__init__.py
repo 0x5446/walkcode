@@ -3409,6 +3409,23 @@ def _telegram_inline_markdown_to_html(text: str) -> str:
     return escaped
 
 
+def _format_ask_answers(ctx: "InteractionContext") -> str:
+    # "周末计划: 出门浪、吃啥: 碳水快乐" — keyed by each question's header,
+    # multi-select labels comma-joined (not a Python list repr).
+    parts: list[str] = []
+    for index, question in enumerate(ctx.questions):
+        if index not in ctx.answers:
+            continue
+        label = str(question.get("header") or question.get("prompt") or f"Q{index + 1}")
+        value = ctx.answers[index]
+        if isinstance(value, list):
+            shown = ", ".join(str(v) for v in value)
+        else:
+            shown = str(value)
+        parts.append(f"{label}: {shown}")
+    return "、".join(parts)
+
+
 def render_view_text(view_model: dict[str, Any]) -> str:
     if "text" in view_model:
         return str(view_model["text"])
@@ -4410,6 +4427,7 @@ class _ClaudePermissionBridge:
                         or question.get("prompt")
                         or ""
                     ),
+                    "header": str(question.get("header", "") or ""),
                     "options": options,
                     "allow_multiple": bool(question.get("multiSelect") or question.get("allow_multiple")),
                     "allow_other": True,
@@ -4593,10 +4611,28 @@ class ClaudeHeadlessTransport:
         query = getattr(client, "query", None)
         if query is None:
             raise CapabilityUnsupported("Claude headless turn submission is not available")
+        # query(text) has no attachment channel, so downloaded files are named
+        # by absolute path in the prompt for Claude to open with Read. Without
+        # this an attachment-only message reaches Claude as empty text.
+        text = self._compose_turn_text(turn)
         try:
-            await _maybe_await(query(turn.text, session_id="default"))
+            await _maybe_await(query(text, session_id="default"))
         except TypeError:
-            await _maybe_await(query(turn.text))
+            await _maybe_await(query(text))
+
+    @staticmethod
+    def _compose_turn_text(turn: TurnInput) -> str:
+        paths = [
+            str(a.local_path)
+            for a in (turn.attachments or [])
+            if getattr(a, "local_path", "")
+        ]
+        text = turn.text or ""
+        if not paths:
+            return text
+        refs = "\n".join(f"- {p}" for p in paths)
+        note = f"[用户发送了附件，已下载到本地，可用 Read 工具查看]\n{refs}"
+        return f"{text}\n\n{note}" if text.strip() else note
 
     async def events(self, handle: TransportHandle):
         client = self._clients[handle.handle_id]
@@ -6889,18 +6925,16 @@ class Orchestrator:
                 decision,
                 actor=actor,
                 idempotency_key=f"{inbound.event_id}:ask_user_view",
+                edit_card=inbound,
             )
             # Final answer (all questions done) → flip the clicked card to a
             # result; toggle/next-question keep the card interactive.
             if str((decision.decision or {}).get("action", "")) == "answers":
-                answers = (decision.decision or {}).get("answers", {})
-                detail = (
-                    "、".join(f"{k}: {v}" for k, v in answers.items())
-                    if isinstance(answers, dict)
-                    else ""
-                )
                 await self._flip_decided_card(
-                    inbound, kind="ask_user_question", tool_name="", action="answers", detail=detail
+                    inbound,
+                    kind="ask_user_question",
+                    action="answers",
+                    detail=_format_ask_answers(ctx),
                 )
         if decision.accepted and ctx.kind == "takeover":
             return await self._handle_takeover_decision(
@@ -7432,6 +7466,7 @@ class Orchestrator:
         *,
         actor: ActorRef,
         idempotency_key: str,
+        edit_card: InboundEvent | None = None,
     ) -> None:
         payload = decision.decision or {}
         action = payload.get("action")
@@ -7459,11 +7494,26 @@ class Orchestrator:
                 )
             return
         if action in {"next_question", "toggle"}:
-            await self._send_session_view(
-                session,
-                ViewModelFactory(self.interactions).ask_user_question_prompt(ctx),
-                idempotency_key=idempotency_key,
-            )
+            view = ViewModelFactory(self.interactions).ask_user_question_prompt(ctx)
+            # Edit the clicked card in place (toggle checkmarks, advance to the
+            # next question) instead of sending a fresh card each time — a
+            # multi-select / multi-question prompt otherwise spams a new card
+            # per click.
+            binding = session.channel_binding
+            channel = self.channels.get(binding.channel_kind) if binding is not None else None
+            if (
+                edit_card is not None
+                and edit_card.message_id
+                and channel is not None
+                and channel.capabilities().editable_message
+                and binding is not None
+            ):
+                try:
+                    await channel.edit_view(binding, edit_card.message_id, view)
+                    return
+                except Exception:
+                    pass
+            await self._send_session_view(session, view, idempotency_key=idempotency_key)
 
     async def _send_session_view(
         self,

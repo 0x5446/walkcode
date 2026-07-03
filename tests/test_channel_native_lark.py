@@ -982,3 +982,95 @@ class LarkAskUserCardFlipTests(_LarkRuntimeHarness):
         self.assertEqual(len(patches), 1)
         self.assertEqual(patches[0]["view"]["action"], "answers")
         self.assertIn("staging", patches[0]["view"]["detail"])
+
+
+class LarkAttachmentAndMultiTabTests(_LarkRuntimeHarness):
+    def test_file_message_extracts_attachment(self):
+        from walkcode.channel_native import LarkChannelAdapter, LarkBotApi
+        adapter = LarkChannelAdapter(LarkBotApi(caller=lambda *_: {}))
+        ev = adapter.parse_event(
+            {
+                "event_id": "evt-pdf",
+                "event": {
+                    "message": {
+                        "message_id": "om_pdf",
+                        "chat_id": "oc_chat",
+                        "root_id": "",
+                        "message_type": "file",
+                        "content": "{\"file_key\":\"file_v3_abc\",\"file_name\":\"报告.pdf\"}",
+                    },
+                    "sender": {"sender_id": {"open_id": "ou_user"}},
+                },
+            }
+        )
+        self.assertEqual(len(ev.attachments), 1)
+        self.assertEqual(ev.attachments[0].source_id, "file_v3_abc")
+        self.assertEqual(ev.attachments[0].source_message_id, "om_pdf")
+
+    def test_claude_submit_turn_names_attachment_paths_in_prompt(self):
+        from walkcode.channel_native import ClaudeHeadlessTransport, TurnInput, AttachmentRef
+
+        captured = []
+
+        class _Client:
+            async def query(self, text, session_id="default"):
+                captured.append(text)
+
+        tp = ClaudeHeadlessTransport(client_factory=lambda spec: _Client())
+        handle = asyncio.run(tp.launch_session(cwd="/tmp/p", session_id="s1"))
+        asyncio.run(
+            tp.submit_turn(
+                handle,
+                TurnInput(text="", attachments=[AttachmentRef(source_id="k", mime="application/pdf", local_path="/tmp/x/报告.pdf")]),
+                "k1",
+            )
+        )
+        self.assertTrue(captured)
+        self.assertIn("/tmp/x/报告.pdf", captured[0])
+        self.assertIn("Read", captured[0])
+
+    def test_multiselect_toggle_edits_card_in_place_not_spam(self):
+        runtime, api, transport = self._runtime(
+            env_extra={"LARK_ALLOWED_CHAT_IDS": "oc_chat", "LARK_ALLOWED_OPEN_IDS": "ou_user"},
+            scripted_events=[
+                AgentEvent(AgentEventType.TURN_COMPLETED, {"message": "ok", "agent_session_id": "a1"})
+            ],
+        )
+        asyncio.run(runtime.process_lark_event(self._message_payload(text="建会话")))
+        session = runtime.state.sessions.get(
+            runtime.state.sessions.list_sessions(channel_kind="lark")[0].session_id
+        )
+        store = runtime.orchestrator.interactions
+        ctx = store.register_ask_user_question(
+            session_id=session.session_id, generation=session.generation,
+            questions=[{"prompt": "口味?", "header": "吃啥",
+                        "options": ["川湘辣", "清淡养生"], "allow_multiple": True}],
+        )
+        tok = store.create_callback_token(ctx.interaction_id, "toggle:0:0", generation=session.generation)
+        api.calls.clear()
+        asyncio.run(runtime.process_lark_event({
+            "event_id": "evt-tg", "event": {
+                "message_id": "om_msq", "chat_id": "oc_chat", "open_id": "ou_user",
+                "root_id": session.channel_binding.root_message_id,
+                "action": {"value": {"token": tok, "action": "toggle:0:0"}},
+            }}))
+        sends = [1 for m, p in api.calls if m == "sendCard"]
+        edits = [p for m, p in api.calls if m == "editCard" and p.get("message_id") == "om_msq"]
+        self.assertEqual(sends, [], "toggle must not spawn a new card")
+        self.assertEqual(len(edits), 1, "toggle must edit the clicked card in place")
+
+    def test_format_ask_answers_uses_headers_and_joins_lists(self):
+        from walkcode.channel_native import InteractionStore, _format_ask_answers
+        store = InteractionStore()
+        ctx = store.register_ask_user_question(
+            session_id="s", generation=0,
+            questions=[
+                {"prompt": "周末?", "header": "周末计划", "options": ["宅", "出门浪"]},
+                {"prompt": "口味?", "header": "吃啥", "options": ["辣", "碳水快乐"], "allow_multiple": True},
+            ],
+        )
+        ctx.answers = {0: "出门浪", 1: ["碳水快乐", "辣"]}
+        detail = _format_ask_answers(ctx)
+        self.assertIn("周末计划: 出门浪", detail)
+        self.assertIn("吃啥: 碳水快乐, 辣", detail)
+        self.assertNotIn("[", detail)
