@@ -886,6 +886,11 @@ class LarkModelChoiceCardTests(_LarkRuntimeHarness):
         self.assertEqual(transport.model_calls[-1], "haiku")
         confirms = [p for m, p in api.calls if m == "sendMessage" and "haiku" in p.get("view", {}).get("text", "")]
         self.assertTrue(confirms)
+        # The picker card must flip to a terminal result so its buttons are
+        # gone — a second click on the consumed token reads as an error.
+        flips = [p for m, p in api.calls if m == "editCard" and p.get("view", {}).get("type") == "decision_result"]
+        self.assertEqual(len(flips), 1)
+        self.assertEqual(flips[0]["view"]["kind"], "model_choice")
 
     def test_slash_model_without_models_falls_back_to_text(self):
         runtime, api, transport = self._runtime(

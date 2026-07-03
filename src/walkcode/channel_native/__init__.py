@@ -7255,6 +7255,16 @@ class Orchestrator:
                 )
                 text = f"✅ 模型已切换：{model}" if result.accepted else f"模型切换失败：{result.reason}"
                 await channel.send_view(reply_binding, {"type": "text", "text": text})
+            if result.accepted:
+                # Flip the picker to a result card so the settled choice stops
+                # showing live buttons (a second click would hit the consumed
+                # token and read as an error).
+                await self._flip_decided_card(
+                    inbound,
+                    kind="model_choice",
+                    action=model,
+                    detail=f"模型已切换：{model}",
+                )
             return SubmitResult(result.accepted, result.reason)
         return SubmitResult(decision.accepted, decision.reason)
 

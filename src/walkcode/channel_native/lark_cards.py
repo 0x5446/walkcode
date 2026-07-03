@@ -405,6 +405,9 @@ _DECISION_LABELS = {
 def _decision_result_card(view: dict[str, Any]) -> dict[str, Any]:
     action = str(view.get("action", "") or "")
     detail = str(view.get("detail", "") or "")
+    if str(view.get("kind", "")) == "model_choice":
+        body = f"✅ {escape_lark_md(_inline(detail))}" if detail else "✅ 模型已切换"
+        return _card_message("🧠 模型已切换", "green", [_md_div(body)])
     if str(view.get("kind", "")) == "ask_user_question" or action == "answers":
         body = f"✅ {escape_lark_md(_inline(detail))}" if detail else "✅ 已回答"
         return _card_message("✅ 已回答", "green", [_md_div(body)])

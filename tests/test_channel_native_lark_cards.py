@@ -326,6 +326,21 @@ class OtherViewTests(unittest.TestCase):
         self.assertEqual(len(buttons), 3)
         self.assertEqual(buttons[0]["type"], "primary")
 
+    def test_model_choice_decision_result_renders_green_switch_card(self):
+        message = render_lark_message(
+            {
+                "type": "decision_result",
+                "kind": "model_choice",
+                "action": "claude-fable-5",
+                "detail": "模型已切换：claude-fable-5",
+            }
+        )
+
+        content = message["content"]
+        self.assertEqual(content["header"]["template"], "green")
+        rendered = json.dumps(content, ensure_ascii=False)
+        self.assertIn("claude-fable-5", rendered)
+
     def test_unknown_view_falls_back_to_text(self):
         message = render_lark_message(
             {"type": "some_new_view"}, fallback_text="fallback body"
