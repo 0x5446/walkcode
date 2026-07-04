@@ -25,17 +25,27 @@ work 可复用 V2 时代已配好的两个公司飞书 bot；personal 在 Lark �
 
 `~/.local/bin` 下有四个 profile wrapper（独立可执行脚本，任何 shell 上下文都生效）：
 
-| wrapper | 等价于 |
-|---|---|
-| `claude-work` | `CLAUDE_CONFIG_DIR=~/.claude-profiles/work claude`（enterprise 订阅路由） |
-| `claude-work2` | 同上 + `--settings ~/.claude-profiles/work/routes/vertex.json`（同 profile 换 Vertex 路由；订阅报错/超额时 `/exit` 后 `claude-work2 -c` 无损续会话） |
-| `claude-personal` | `CLAUDE_CONFIG_DIR=~/.claude-profiles/personal claude` |
-| `codex-work` | `CODEX_HOME=~/.codex-profiles/work codex`（经公司 llm-proxy，key 走 env `CODEX_LLM_PROXY_API_KEY`，写在 `~/.zprofile` 与 `~/.walkcode/work-codex.env`） |
-| `codex-personal` | `CODEX_HOME=~/.codex-profiles/personal codex` |
+5 wrapper ↔ 5 实例 ↔ 5 bot 对应（2026-07-04 定型）：
 
-历史 wrapper `cc`/`ccv`/`ccp`（`~/.agent-control-plane/agent-wrappers.sh` 中的
-shell 函数）已于 2026-07-03 移除；`ccs`/`codex-api` 归档在
-`~/.walkcode-attic/20260703-wrappers/`。
+| wrapper | 路由 | walkcode 实例 | bot |
+|---|---|---|---|
+| `claude-work` | enterprise 订阅 OAuth | work-claude | 飞书 Claude Code |
+| `claude-work2` | 公司 Claude llm-proxy（Vela key，`~/.claude-profiles/work2` 独立 profile） | work2-claude | 飞书 ccp |
+| `claude-personal` | Vertex 直连 | personal-claude | Lark Claude Code |
+| `codex-work` | 公司 Codex llm-proxy（Vela key） | work-codex | 飞书 Codex |
+| `codex-personal` | Azure（本地 proxy） | personal-codex | Lark Codex |
+
+应急 Vertex 路由片段保留在 `~/.claude-profiles/work/routes/vertex.json`
+（`claude --settings` 按次注入，或写 `WALKCODE_CLAUDE_SETTINGS` 给实例用）。
+
+⚠️ 建新 bot 的两个坑（ccp 实测）：p2p 消息事件投递必须加**专用 scope**
+`im:message.p2p_msg:readonly`（大 scope `im:message` 不够），且 scope 要随
+版本发布才对事件路由生效；`open_id` 按应用隔离，白名单不能复用其他 bot 的
+open_id——先放空白名单收首条事件抓真实值再回填。
+
+历史 wrapper `cc`/`ccv`/`ccp` shell 函数（`~/.agent-control-plane/agent-wrappers.sh`）
+已于 2026-07-03 移除；`ccs`/`codex-api` 归档在 `~/.walkcode-attic/20260703-wrappers/`。
+telegram 双实例已于 2026-07-04 退役（plist 在 `~/.walkcode-attic/20260704-telegram/`）。
 
 首次登录（每 profile 一次）：
 
