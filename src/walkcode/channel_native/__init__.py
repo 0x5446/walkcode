@@ -3363,6 +3363,14 @@ class FakeExternalTuiController:
         return ControlResult(True, state="terminated")
 
 
+_TERMINATE_SESSION_ID_RE = re.compile(r"--session-id[ =]([0-9a-fA-F-]{8,64})")
+
+
+def _terminate_ref_session_id(ref: dict[str, Any]) -> str:
+    match = _TERMINATE_SESSION_ID_RE.search(str(ref.get("command", "") or ""))
+    return match.group(1) if match else ""
+
+
 class LocalProcessController:
     kind = "process"
 
@@ -3389,6 +3397,28 @@ class LocalProcessController:
             return ControlResult(False, "invalid_pid")
         if not bool(ref.get("allow_terminate")):
             return ControlResult(False, "termination_not_authorized")
+        # Claude Code >= 2.1.2xx runs TUI sessions as daemon-managed workers:
+        # the hook-recorded pid is often just the pty host, and the session
+        # keeps running in a `--session-id <id>` worker. Unless every process
+        # of the session dies, headless resume is refused with "currently
+        # running as a background agent".
+        targets = [pid]
+        session_id = _terminate_ref_session_id(ref)
+        if session_id:
+            targets.extend(self._pids_for_session(session_id))
+        targets = [
+            p for p in dict.fromkeys(targets) if p > 1 and p != os.getpid()
+        ]
+        final_state = "already_exited"
+        for target in targets:
+            result = self._kill_one(target)
+            if not result.accepted:
+                return result
+            if result.state != "already_exited":
+                final_state = result.state
+        return ControlResult(True, state=final_state)
+
+    def _kill_one(self, pid: int) -> ControlResult:
         if not self._pid_running(pid):
             return ControlResult(True, state="already_exited")
         try:
@@ -3414,6 +3444,25 @@ class LocalProcessController:
         if self._wait_exited(pid):
             return ControlResult(True, state="killed")
         return ControlResult(False, "process_still_running")
+
+    @staticmethod
+    def _pids_for_session(session_id: str) -> list[int]:
+        try:
+            result = subprocess.run(
+                ["pgrep", "-f", f"session-id {session_id}"],
+                capture_output=True,
+                text=True,
+                timeout=2,
+            )
+        except Exception:
+            return []
+        pids: list[int] = []
+        for token in result.stdout.split():
+            try:
+                pids.append(int(token))
+            except ValueError:
+                continue
+        return pids
 
     def _wait_exited(self, pid: int) -> bool:
         deadline = time.monotonic() + self.timeout
@@ -7158,10 +7207,24 @@ class Orchestrator:
         view = ViewModelFactory.decision_result(
             kind=kind, tool_name=tool_name, action=action, detail=detail
         )
-        try:
-            await channel.edit_view(binding, inbound.message_id, view)
-        except Exception:
-            return
+        # Lark patch occasionally fails with transient 2200 Internal Error;
+        # a single silent attempt left live buttons on settled cards. Retry
+        # briefly, then leave a trace instead of vanishing.
+        last_exc: Exception | None = None
+        for delay in (0.0, 0.5, 2.0):
+            if delay:
+                await asyncio.sleep(delay)
+            try:
+                await channel.edit_view(binding, inbound.message_id, view)
+                return
+            except Exception as exc:
+                last_exc = exc
+        _log_degrade(
+            "decided_card_flip_failed",
+            kind=kind,
+            message_id=inbound.message_id,
+            error=f"{type(last_exc).__name__}: {last_exc}" if last_exc else "unknown",
+        )
 
     async def _handle_callback_event(self, inbound: InboundEvent) -> SubmitResult:
         token = str((inbound.callback or {}).get("token", ""))

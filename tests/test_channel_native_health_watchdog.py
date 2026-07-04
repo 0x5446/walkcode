@@ -234,6 +234,47 @@ class HealthWatchdogTests(unittest.TestCase):
         self.assertEqual(restored.get(session.session_id).model, "claude-opus-4-8-20260610")
         self.assertEqual(restored.get(session.session_id).last_usage, usage)
 
+    def test_flip_decided_card_retries_transient_edit_failures(self):
+        from walkcode.channel_native import InboundEvent, TransientDeliveryError
+
+        clock = _Clock()
+        transport = FakeAgentTransport("fake-transport", _transport_caps(), scripted_events=[])
+        orchestrator, channel, _session = _orchestrator(clock, transport)
+
+        attempts = []
+        original_edit = channel.edit_view
+
+        async def flaky_edit(binding, message_id, view):
+            attempts.append(1)
+            if len(attempts) < 3:
+                raise TransientDeliveryError("Lark reply failed: 2200 Internal Error")
+            return await original_edit(binding, message_id, view)
+
+        channel.edit_view = flaky_edit
+        inbound = InboundEvent(
+            event_id="evt-flip",
+            channel_kind="telegram",
+            account_id="bot",
+            chat_id="chat",
+            thread_id="topic",
+            message_id="m-perm",
+            root_message_id="root",
+            sender_id="owner",
+            sender_display="Owner",
+            text="",
+            callback={"token": "t"},
+        )
+
+        asyncio.run(
+            orchestrator._flip_decided_card(
+                inbound, kind="permission", tool_name="WebFetch", action="allow_once"
+            )
+        )
+
+        # Two transient 2200s then success: the settled card must not keep
+        # live buttons just because the first patch attempt failed.
+        self.assertEqual(len(attempts), 3)
+
     def test_context_limit_upgrades_when_usage_exceeds_default_window(self):
         # A [1m] session's marker is lost once the dated live id overwrites
         # session.model; the display limit must not read as >100%.

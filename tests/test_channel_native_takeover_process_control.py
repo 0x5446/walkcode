@@ -1,5 +1,6 @@
 import asyncio
 import subprocess
+import sys
 import unittest
 
 from walkcode.channel_native import (
@@ -155,6 +156,45 @@ class TakeoverProcessControlTests(unittest.TestCase):
             if proc.poll() is None:
                 proc.kill()
                 proc.wait(timeout=2.0)
+
+    def test_terminate_sweeps_daemon_workers_of_the_same_session(self):
+        # Claude Code >=2.1.2xx: the hook-recorded pid is the pty host while
+        # the session lives on in a daemon worker whose cmdline carries
+        # `--session-id <id>`. Terminate must kill both or headless resume is
+        # refused with "currently running as a background agent".
+        session_id = "cafecafe-0000-4000-8000-feedfeedfeed"
+        pty_host = subprocess.Popen(["sleep", "60"])
+        # A stand-in for the daemon worker: its argv carries the session id,
+        # exactly like `claude --session-id <id> ...` does.
+        worker = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(60)", f"--session-id {session_id}"]
+        )
+        try:
+            import time as _time
+
+            _time.sleep(0.2)
+            controller = LocalProcessController(timeout=2.0)
+            result = asyncio.run(
+                controller.terminate(
+                    {
+                        "pid": pty_host.pid,
+                        "allow_terminate": True,
+                        "command": f"claude --bg-pty-host x -- claude --session-id {session_id} --resume y",
+                    },
+                    reason="test",
+                )
+            )
+
+            self.assertTrue(result.accepted)
+            pty_host.wait(timeout=2.0)
+            worker.wait(timeout=2.0)
+            self.assertIsNotNone(pty_host.returncode)
+            self.assertIsNotNone(worker.returncode)
+        finally:
+            for proc in (pty_host, worker):
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.wait(timeout=2.0)
 
     def test_local_process_controller_refuses_unauthorized_process(self):
         proc = subprocess.Popen(["sleep", "60"])
