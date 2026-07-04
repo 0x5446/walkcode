@@ -1730,7 +1730,10 @@ class ChannelNativeRuntime:
 
     async def _best_effort_refresh_loaded_tui_observed_bindings(self) -> None:
         try:
-            await asyncio.wait_for(self._refresh_loaded_tui_observed_bindings(), timeout=2.0)
+            # Cold start may pay tenant-token fetch + one lark patch per live
+            # session; 2s cancelled the first pass mid-flight (dropping the
+            # takeover re-grants) and the marker prevented any retry.
+            await asyncio.wait_for(self._refresh_loaded_tui_observed_bindings(), timeout=15.0)
         except Exception as exc:
             print(f"TUI observed binding refresh deferred: {type(exc).__name__}: {exc}", file=sys.stderr)
 
@@ -2085,7 +2088,6 @@ class ChannelNativeRuntime:
     async def _refresh_loaded_tui_observed_bindings(self) -> None:
         if self._loaded_tui_observed_bindings_refreshed:
             return
-        self._loaded_tui_observed_bindings_refreshed = True
         changed = False
         summaries = [
             summary
@@ -2114,6 +2116,9 @@ class ChannelNativeRuntime:
             if self._ensure_tui_observed_binding_capabilities(session):
                 changed = True
             await self.orchestrator.refresh_session_status_card(session)
+        # Mark done only after a full pass: a cancelled/failed first pass must
+        # be retried on the next tick instead of silently skipping re-grants.
+        self._loaded_tui_observed_bindings_refreshed = True
         if changed:
             self.save_state()
 
