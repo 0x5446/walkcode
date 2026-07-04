@@ -2290,6 +2290,22 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
             )
             self.assertEqual(session.lifecycle_state, "WAITING_PERMISSION")
 
+            # Claude's follow-up Notification would duplicate the notice card:
+            # it must be suppressed while the session waits for permission.
+            before = len(api.calls)
+            asyncio.run(
+                runtime.process_tui_hook(
+                    hook_type="notification",
+                    agent="claude",
+                    payload={
+                        "session_id": "claude-session-1",
+                        "cwd": tmp,
+                        "message": "Claude needs your permission",
+                    },
+                )
+            )
+            self.assertEqual(len(api.calls), before)
+
             # The next tool lifecycle hook means the prompt was answered in the
             # terminal: health returns to read-only observation.
             asyncio.run(

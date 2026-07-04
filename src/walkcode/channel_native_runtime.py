@@ -2344,6 +2344,11 @@ class ChannelNativeRuntime:
         session.last_progress_event = f"external_tui.{hook_type}"
         if not text:
             return
+        # The permission-request hook already sent the orange notice card;
+        # Claude's follow-up Notification ("Claude needs your permission")
+        # would just repeat it.
+        if hook_type == "notification" and session.lifecycle_state == "WAITING_PERMISSION":
+            return
         # A user prompt / turn end breaks the tool burst; next tools open a new card.
         self.orchestrator._seal_tool_progress_burst(session)
         await self.orchestrator.refresh_session_status_card(session)
