@@ -2310,11 +2310,29 @@ class ChannelNativeRuntime:
         if tool_event is not None:
             session.last_event_seq += 1
             self.orchestrator._record_session_progress(session, tool_event)
+            # A TUI approval prompt must be loud: flip the health card to
+            # waiting_permission and drop a dedicated notice card instead of
+            # hiding behind one tool-progress line (it can only be answered in
+            # the terminal, so the reader needs to know to go there).
+            if hook_type == "permission-request":
+                session.lifecycle_state = "WAITING_PERMISSION"
+            elif session.lifecycle_state == "WAITING_PERMISSION":
+                session.lifecycle_state = "EXTERNAL_OBSERVED_READONLY"
             await self.orchestrator.refresh_session_status_card(session)
             view = self.orchestrator._event_to_view(session, tool_event)
             channel = self.channels.get(session.channel_binding.channel_kind) if session.channel_binding else None
             if channel is not None:
                 await self.orchestrator._upsert_tool_progress_view(session, channel, view)
+            if hook_type == "permission-request":
+                await self.orchestrator._send_session_view(
+                    session,
+                    {
+                        "type": "tui_permission_notice",
+                        "tool_name": str(tool_event.payload.get("tool_name", "") or ""),
+                        "summary": str(tool_event.payload.get("summary", "") or ""),
+                    },
+                    idempotency_key=f"external_tui:permission:{session.last_event_seq}",
+                )
             return
         text = _tui_hook_text(hook_type, payload)
         session.last_progress_at = self._now()

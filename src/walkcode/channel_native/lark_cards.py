@@ -404,6 +404,22 @@ _DECISION_LABELS = {
 }
 
 
+def _tui_permission_notice_card(view: dict[str, Any]) -> dict[str, Any]:
+    tool = str(view.get("tool_name", "") or "工具")
+    summary = str(view.get("summary", "") or "")
+    rows = [f"终端里的会话正在等你确认一个操作：**`{escape_lark_md(_inline(tool))}`**"]
+    if summary:
+        rows.append(escape_lark_md(_clip(_inline(summary), 300, "...")))
+    return _card_message(
+        "⏳ 终端在等你确认",
+        "orange",
+        [
+            _md_div("\n".join(rows)),
+            _note("这个确认只能在终端里按；如果人不在电脑前，可以对本会话发起 Take over 接管。"),
+        ],
+    )
+
+
 def _decision_result_card(view: dict[str, Any]) -> dict[str, Any]:
     action = str(view.get("action", "") or "")
     detail = str(view.get("detail", "") or "")
@@ -485,6 +501,7 @@ _CARD_RENDERERS = {
     "command_menu": _command_menu_card,
     "model_choice": _model_choice_card,
     "decision_result": _decision_result_card,
+    "tui_permission_notice": _tui_permission_notice_card,
 }
 
 

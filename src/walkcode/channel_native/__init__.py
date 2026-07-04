@@ -3685,6 +3685,14 @@ def render_view_text(view_model: dict[str, Any]) -> str:
     if view_type == "tui_user_input":
         value = str(view_model.get("input", "") or "").strip()
         return f"TUI input\n\n{value}" if value else "TUI input"
+    if view_type == "tui_permission_notice":
+        tool = str(view_model.get("tool_name", "") or "tool")
+        summary = str(view_model.get("summary", "") or "")
+        rows = [f"⏳ TUI is waiting for your approval: {tool}"]
+        if summary:
+            rows.append(summary)
+        rows.append("Answer in the terminal, or take over this session.")
+        return "\n".join(rows)
     if view_type == "tool_progress":
         def _status_label(value: str) -> str:
             return {

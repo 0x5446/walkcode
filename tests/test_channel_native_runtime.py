@@ -2236,6 +2236,75 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
             self.assertEqual(ledger["in_progress"], {})
             self.assertEqual(len(ledger["completed"]), 2)
 
+    def test_tui_permission_request_hook_sends_loud_notice_and_flips_health(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = str(Path(tmp) / "state.json")
+            cfg = ChannelNativeConfig.from_env(
+                {
+                    "WALKCODE_CHANNEL": "telegram",
+                    "TELEGRAM_BOT_TOKEN": "fake",
+                    "WALKCODE_AGENT": "claude",
+                    "TELEGRAM_ALLOWED_CHAT_IDS": "123",
+                    "WALKCODE_STATE_PATH": state_path,
+                    "WALKCODE_CWD": tmp,
+                }
+            )
+            api = _FakeTelegramApi()
+            runtime = ChannelNativeRuntime.from_config(
+                cfg,
+                telegram_api=api,
+                transports={"claude_headless": FakeAgentTransport("claude_headless", _transport_caps())},
+            )
+            asyncio.run(
+                runtime.process_tui_hook(
+                    hook_type="sync",
+                    agent="claude",
+                    payload={"session_id": "claude-session-1", "cwd": tmp},
+                )
+            )
+
+            result = asyncio.run(
+                runtime.process_tui_hook(
+                    hook_type="permission-request",
+                    agent="claude",
+                    payload={
+                        "session_id": "claude-session-1",
+                        "cwd": tmp,
+                        "tool_name": "Edit",
+                        "summary": "docs/design.md",
+                    },
+                )
+            )
+
+            self.assertTrue(result.accepted)
+            notices = [
+                payload
+                for method, payload in api.calls
+                if method == "sendMessage" and "waiting for your approval" in payload.get("text", "")
+            ]
+            self.assertEqual(len(notices), 1)
+            self.assertIn("Edit", notices[0]["text"])
+            snapshot = JsonFileStateStore(state_path).load()
+            session = snapshot.sessions.get(
+                snapshot.sessions.list_sessions(channel_kind="telegram")[0].session_id
+            )
+            self.assertEqual(session.lifecycle_state, "WAITING_PERMISSION")
+
+            # The next tool lifecycle hook means the prompt was answered in the
+            # terminal: health returns to read-only observation.
+            asyncio.run(
+                runtime.process_tui_hook(
+                    hook_type="post-tool",
+                    agent="claude",
+                    payload={"session_id": "claude-session-1", "cwd": tmp, "tool_name": "Edit"},
+                )
+            )
+            snapshot = JsonFileStateStore(state_path).load()
+            session = snapshot.sessions.get(
+                snapshot.sessions.list_sessions(channel_kind="telegram")[0].session_id
+            )
+            self.assertEqual(session.lifecycle_state, "EXTERNAL_OBSERVED_READONLY")
+
     def test_raw_stop_hook_name_is_normalized_before_processing(self):
         with tempfile.TemporaryDirectory() as tmp:
             state_path = str(Path(tmp) / "state.json")
