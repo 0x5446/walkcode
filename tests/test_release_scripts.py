@@ -10,7 +10,7 @@ scripts to assert their gates:
 * re-entrant publish: pushes a local-only tag to origin, non-empty notes (C)
 * publish aborts on a non-404 `gh release view` error (C)
 * version checks
-* upgrade requires the codex env file (F)
+* upgrade is V3-only and does not require legacy codex env/hooks
 * upgrade lock: active lock blocks, stale lock is reclaimed (H)
 
 Everything uses the local bare remote, so nothing touches the network.
@@ -26,6 +26,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 RELEASE_SH = REPO_ROOT / "release.sh"
+INSTALL_SH = REPO_ROOT / "install.sh"
 UPGRADE_SH = REPO_ROOT / "upgrade.sh"
 
 _GIT = shutil.which("git")
@@ -55,6 +56,9 @@ esac
 """
 
 FAKE_UV = """#!/usr/bin/env bash
+if [ -n "${FAKE_UV_LOG:-}" ]; then
+  printf '%s\n' "$*" >> "$FAKE_UV_LOG"
+fi
 exit 0
 """
 
@@ -63,11 +67,15 @@ case "${1:-}" in
   --version) echo "walkcode 0.10.0" ;;
   upgrade) echo "upgraded" ;;
   install-hooks) echo "hooks installed" ;;
+  native) echo "native doctor ok" ;;
   *) : ;;
 esac
 """
 
 FAKE_LAUNCHCTL = """#!/usr/bin/env bash
+if [ -n "${FAKE_LAUNCHCTL_LOG:-}" ]; then
+  printf '%s\n' "$*" >> "$FAKE_LAUNCHCTL_LOG"
+fi
 case "${1:-}" in
   list) echo '{ "PID" = 4242; };' ;;
   *) : ;;
@@ -88,7 +96,9 @@ class _ScriptGateBase(unittest.TestCase):
         self.origin = self.tmp / "origin.git"
         self.work = self.tmp / "work"
         self.fakebin = self.tmp / "bin"
+        self.home = self.tmp / "home"
         self.fakebin.mkdir()
+        self.home.mkdir()
         _write_exe(self.fakebin / "gh", FAKE_GH)
         _write_exe(self.fakebin / "uv", FAKE_UV)
         _write_exe(self.fakebin / "walkcode", FAKE_WALKCODE)
@@ -96,8 +106,12 @@ class _ScriptGateBase(unittest.TestCase):
 
         self.env = os.environ.copy()
         self.env["PATH"] = f"{self.fakebin}{os.pathsep}{self.env['PATH']}"
+        self.env["HOME"] = str(self.home)
         self.env["GIT_CONFIG_GLOBAL"] = "/dev/null"
         self.env["TMPDIR"] = str(self.tmp)
+        for key in list(self.env):
+            if key.startswith("FEISHU_"):
+                self.env.pop(key)
         self.env.update({
             "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
             "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t",
@@ -142,8 +156,6 @@ class _ScriptGateBase(unittest.TestCase):
 
     def _upgrade_env(self, **extra):
         env = {
-            "WALKCODE_LAUNCHD_LABEL": "fake",
-            "WALKCODE_LAUNCHD_LABEL_CODEX": "fake-codex",
             "LOG_CLAUDE": str(self.tmp / "c.log"),
             "LOG_CODEX": str(self.tmp / "x.log"),
             "TMPDIR": str(self.tmp),
@@ -153,6 +165,11 @@ class _ScriptGateBase(unittest.TestCase):
 
 
 class ReleaseGateTests(_ScriptGateBase):
+    def test_install_script_installs_claude_sdk_in_tool_env(self):
+        text = INSTALL_SH.read_text()
+        self.assertIn("--with claude-agent-sdk", text)
+        self.assertNotIn("walkcode[summary]", text)
+
     def test_wrong_account_rejected(self):
         r = self._run("release.sh", "prepare", "0.10.1",
                       extra_env={"FAKE_GH_ACCOUNT": "someone-else"})
@@ -238,18 +255,63 @@ class ReleaseGateTests(_ScriptGateBase):
 
 
 class UpgradeGateTests(_ScriptGateBase):
-    def test_missing_codex_env_fails(self):
+    def test_upgrade_does_not_require_legacy_codex_env_or_install_hooks(self):
+        uv_log = self.tmp / "uv.log"
         r = self._run("upgrade.sh", extra_env=self._upgrade_env(
-            WALKCODE_CODEX_ENV=str(self.tmp / "nope.env")))
+            WALKCODE_CODEX_ENV=str(self.tmp / "nope.env"),
+            FAKE_UV_LOG=str(uv_log),
+        ))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertNotIn("hooks installed", r.stdout + r.stderr)
+        self.assertIn("native doctor", r.stdout + r.stderr)
+        uv_invocation = uv_log.read_text()
+        self.assertIn("--with claude-agent-sdk", uv_invocation)
+        self.assertIn("--reinstall", uv_invocation)
+        self.assertIn("--refresh-package walkcode", uv_invocation)
+
+    def test_upgrade_allows_v3_pass_through_agent_wrappers(self):
+        wrappers = self.home / ".agent-control-plane"
+        wrappers.mkdir(parents=True)
+        (wrappers / "agent-wrappers.sh").write_text(
+            'claude() { command claude "$@"; }\n'
+            'codex() { command codex "$@"; }\n'
+        )
+        (self.home / ".zshrc").write_text("source ~/.agent-control-plane/agent-wrappers.sh")
+
+        r = self._run("upgrade.sh", extra_env=self._upgrade_env())
+
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertNotIn("legacy agent-wrappers", r.stdout + r.stderr)
+
+    def test_v3_launchd_labels_are_restarted_when_configured(self):
+        log = self.tmp / "launchctl.log"
+        r = self._run("upgrade.sh", extra_env=self._upgrade_env(
+            WALKCODE_V3_LAUNCHD_LABELS="com.walkcode.telegram-claude,com.walkcode.telegram-codex",
+            FAKE_LAUNCHCTL_LOG=str(log),
+        ))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        content = log.read_text()
+        self.assertIn("gui/", content)
+        self.assertIn("com.walkcode.telegram-claude", content)
+        self.assertIn("com.walkcode.telegram-codex", content)
+
+    def test_upgrade_blocks_legacy_remnants(self):
+        hooks = self.home / ".codex" / "hooks.json"
+        hooks.parent.mkdir(parents=True)
+        hooks.write_text('{"hooks": {"Stop": [{"hooks": [{"command": "walkcode hook stop"}]}]}}')
+
+        r = self._run("upgrade.sh", extra_env=self._upgrade_env())
+
         self.assertNotEqual(r.returncode, 0)
-        self.assertIn("codex env", (r.stdout + r.stderr).lower())
+        combined = r.stdout + r.stderr
+        self.assertIn("Legacy hook", combined)
+        self.assertIn("legacy remnants", combined)
 
     def test_active_lock_blocks(self):
         lock = self.tmp / "walkcode-upgrade.lock"
         lock.mkdir()
         (lock / "pid").write_text(str(os.getpid()))  # alive
-        r = self._run("upgrade.sh", extra_env=self._upgrade_env(
-            WALKCODE_CODEX_ENV=str(self.tmp / "codex.env")))
+        r = self._run("upgrade.sh", extra_env=self._upgrade_env())
         self.assertNotEqual(r.returncode, 0)
         self.assertRegex(r.stdout + r.stderr, r"another upgrade is running|已有升级在运行")
 
@@ -257,9 +319,7 @@ class UpgradeGateTests(_ScriptGateBase):
         lock = self.tmp / "walkcode-upgrade.lock"
         lock.mkdir()
         (lock / "pid").write_text("999999")  # dead pid
-        (self.tmp / "codex.env").write_text("X=1")
-        r = self._run("upgrade.sh", extra_env=self._upgrade_env(
-            WALKCODE_CODEX_ENV=str(self.tmp / "codex.env")))
+        r = self._run("upgrade.sh", extra_env=self._upgrade_env())
         self.assertNotRegex(r.stdout + r.stderr, r"another upgrade is running|已有升级在运行")
         self.assertRegex(r.stdout + r.stderr, r"stale|残留")
 

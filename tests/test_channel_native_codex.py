@@ -1,0 +1,870 @@
+import asyncio
+import base64
+import hashlib
+import json
+import os
+import unittest
+import uuid
+
+from walkcode.channel_native import (
+    ActorRef,
+    AgentEventType,
+    AuthorizationStore,
+    ChannelBinding,
+    ChannelCapabilities,
+    CodexAppServerTransport,
+    DurableOutbox,
+    FakeChannelAdapter,
+    InboundEvent,
+    InteractionStore,
+    LaunchSpec,
+    Orchestrator,
+    SessionRegistry,
+    TurnInput,
+)
+from walkcode.channel_native_runtime import (
+    CodexManagedAppServerClient,
+    CodexStdioAppServerClient,
+    _read_websocket_frame,
+    _websocket_frame,
+)
+
+
+class _FakeCodexClient:
+    def __init__(self):
+        self.requests = []
+        self.responses = []
+        self.event_batches = {}
+
+    async def request(self, method, params):
+        self.requests.append((method, params))
+        if method == "thread/start":
+            return {"thread": {"id": "thread-1"}}
+        if method == "thread/resume":
+            return {"thread": {"id": params["threadId"]}}
+        if method == "turn/start":
+            return {"turn": {"id": "turn-1"}}
+        return {}
+
+    async def events(self, thread_id):
+        return self.event_batches.pop(thread_id, [])
+
+    async def answer_request(self, request_id, result):
+        self.responses.append((request_id, result))
+
+
+class _IdleGapCodexStdioClient(CodexStdioAppServerClient):
+    def __init__(self):
+        super().__init__(request_timeout=1, event_timeout=1, event_idle_timeout=0.01)
+        self.messages = [
+            {"method": "turn/started", "params": {"threadId": "thread-1"}},
+            TimeoutError(),
+            {
+                "method": "item/agentMessage/delta",
+                "params": {"threadId": "thread-1", "delta": "OK"},
+            },
+            {"method": "turn/completed", "params": {"threadId": "thread-1"}},
+        ]
+
+    async def _ensure_started(self):
+        return None
+
+    async def _read_message(self, *, timeout):
+        message = self.messages.pop(0)
+        if isinstance(message, Exception):
+            raise message
+        return message
+
+
+class _EventMsgCodexStdioClient(CodexStdioAppServerClient):
+    def __init__(self):
+        super().__init__(request_timeout=1, event_timeout=0.05, event_idle_timeout=0.01)
+        self.messages = [
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "agent_message",
+                    "message": "walkcode-codex-ok",
+                    "phase": "final_answer",
+                },
+            },
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "task_complete",
+                    "turn_id": "turn-1",
+                    "last_agent_message": "walkcode-codex-ok",
+                },
+            },
+        ]
+
+    async def _ensure_started(self):
+        return None
+
+    async def _read_message(self, *, timeout):
+        if not self.messages:
+            raise TimeoutError()
+        return self.messages.pop(0)
+
+
+class _ServerRequestCodexStdioClient(CodexStdioAppServerClient):
+    def __init__(self):
+        super().__init__(request_timeout=1, event_timeout=1, event_idle_timeout=0.01)
+        self.messages = [
+            {
+                "id": "approval-1",
+                "method": "item/commandExecution/requestApproval",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "itemId": "cmd-1",
+                    "startedAtMs": 1,
+                    "environmentId": None,
+                    "command": "rm -rf build",
+                    "cwd": "/tmp/project",
+                    "availableDecisions": ["accept", "decline", "cancel"],
+                },
+            }
+        ]
+
+    async def _ensure_started(self):
+        return None
+
+    async def _read_message(self, *, timeout):
+        if not self.messages:
+            raise TimeoutError()
+        return self.messages.pop(0)
+
+
+class _ManagedClientNoProcess(CodexManagedAppServerClient):
+    def __init__(self):
+        super().__init__(socket_path="/tmp/codex.sock")
+        self.started = 0
+        self.sent = []
+
+    async def _start_daemon(self):
+        self.started += 1
+
+    async def _ensure_started(self):
+        if not self._daemon_checked:
+            await self._start_daemon()
+            self._daemon_checked = True
+
+    async def _send(self, message):
+        self.sent.append(message)
+
+    async def _read_response(self, request_id, *, timeout):
+        return {"id": request_id, "result": {"thread": {"id": "thread-managed"}}}
+
+
+class _ManagedClientFakeDaemon(CodexManagedAppServerClient):
+    def __init__(self, *, socket_path: str):
+        super().__init__(socket_path=socket_path, request_timeout=1, event_timeout=1, event_idle_timeout=0.01)
+        self.started = 0
+
+    async def _start_daemon(self):
+        self.started += 1
+
+
+async def _managed_websocket_smoke():
+    socket_path = f"/tmp/walkcode-codex-{uuid.uuid4().hex}.sock"
+    messages = []
+    handshakes = []
+
+    async def handle_client(reader, writer):
+        try:
+            request = (await reader.readuntil(b"\r\n\r\n")).decode("iso-8859-1", errors="replace")
+            handshakes.append(request)
+            key = ""
+            for line in request.splitlines():
+                if line.lower().startswith("sec-websocket-key:"):
+                    key = line.split(":", 1)[1].strip()
+                    break
+            accept = base64.b64encode(
+                hashlib.sha1((key + CodexManagedAppServerClient._WS_GUID).encode("ascii")).digest()
+            ).decode("ascii")
+            writer.write(
+                (
+                    "HTTP/1.1 101 Switching Protocols\r\n"
+                    "Upgrade: websocket\r\n"
+                    "Connection: Upgrade\r\n"
+                    f"Sec-WebSocket-Accept: {accept}\r\n"
+                    "\r\n"
+                ).encode("ascii")
+            )
+            await writer.drain()
+            while True:
+                opcode, payload = await _read_websocket_frame(reader)
+                if opcode == 0x8:
+                    break
+                if opcode != 0x1:
+                    continue
+                message = json.loads(payload.decode("utf-8"))
+                messages.append(message)
+                if message.get("method") == "initialize":
+                    response = {"id": message["id"], "result": {"userAgent": "codex-test", "codexHome": "/tmp"}}
+                    writer.write(_websocket_frame(0x1, json.dumps(response).encode("utf-8"), masked=False))
+                    await writer.drain()
+                elif message.get("method") == "thread/start":
+                    response = {"id": message["id"], "result": {"thread": {"id": "thread-ws"}}}
+                    writer.write(_websocket_frame(0x1, json.dumps(response).encode("utf-8"), masked=False))
+                    await writer.drain()
+                    break
+        except (asyncio.IncompleteReadError, ConnectionResetError):
+            pass
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
+
+    try:
+        server = await asyncio.start_unix_server(handle_client, path=socket_path)
+    except Exception:
+        if os.path.exists(socket_path):
+            os.unlink(socket_path)
+        raise
+    try:
+        client = _ManagedClientFakeDaemon(socket_path=socket_path)
+        result = await client.request("thread/start", {"cwd": "/tmp/project"})
+        client._close_websocket()
+        return result, client.started, handshakes, messages
+    finally:
+        server.close()
+        await server.wait_closed()
+        if os.path.exists(socket_path):
+            os.unlink(socket_path)
+
+
+def _actor(actor_id="owner"):
+    return ActorRef(channel_kind="telegram", actor_id=actor_id, display_name=actor_id.title())
+
+
+def _binding():
+    return ChannelBinding("telegram", "bot", "chat", "topic", "root")
+
+
+def _channel_caps():
+    return ChannelCapabilities(
+        thread_context=True,
+        editable_message=True,
+        interactive_message=True,
+        interactive_update=True,
+        private_callback_ack=True,
+        toast_or_ephemeral_notice=True,
+        force_reply=True,
+        attachment_download=True,
+        forum_or_topic=True,
+        max_text_chars=4096,
+        max_callback_payload_bytes=64,
+    )
+
+
+def _callback(token: str, *, actor_id: str = "owner") -> InboundEvent:
+    return InboundEvent(
+        event_id=f"cb-{actor_id}-{token[:4]}",
+        channel_kind="telegram",
+        account_id="bot",
+        chat_id="chat",
+        thread_id="topic",
+        message_id=f"m-{actor_id}",
+        root_message_id="root",
+        sender_id=actor_id,
+        sender_display=actor_id.title(),
+        text=f"cb:{token}",
+        callback={"token": token},
+    )
+
+
+def _token_for(view: dict, action: str) -> str:
+    return next(item["token"] for item in view["actions"] if item["action"] == action)
+
+
+class CodexAppServerTransportTests(unittest.TestCase):
+    def test_managed_client_starts_daemon_once(self):
+        client = _ManagedClientNoProcess()
+
+        first = asyncio.run(client.request("thread/start", {"cwd": "/tmp/project"}))
+        second = asyncio.run(client.request("thread/resume", {"threadId": "thread-managed"}))
+
+        self.assertEqual(client.socket_path, "/tmp/codex.sock")
+        self.assertEqual(client.started, 1)
+        self.assertEqual(first["thread"]["id"], "thread-managed")
+        self.assertEqual(second["thread"]["id"], "thread-managed")
+
+    def test_managed_client_talks_to_unix_websocket_control_socket(self):
+        result, started, handshakes, messages = asyncio.run(_managed_websocket_smoke())
+
+        self.assertEqual(result["thread"]["id"], "thread-ws")
+        self.assertEqual(started, 1)
+        self.assertEqual(len(handshakes), 1)
+        self.assertIn("Upgrade: websocket", handshakes[0])
+        self.assertEqual(
+            [message.get("method") for message in messages],
+            ["initialize", "initialized", "thread/start"],
+        )
+
+    def test_stdio_events_wait_through_idle_gap_until_turn_completed(self):
+        client = _IdleGapCodexStdioClient()
+
+        events = asyncio.run(client.events("thread-1"))
+
+        self.assertEqual([event["method"] for event in events], [
+            "turn/started",
+            "item/agentMessage/delta",
+            "turn/completed",
+        ])
+
+    def test_stdio_events_accept_event_msg_task_complete(self):
+        client = _EventMsgCodexStdioClient()
+
+        events = asyncio.run(client.events("thread-1"))
+
+        self.assertEqual([event["payload"]["type"] for event in events], [
+            "agent_message",
+            "task_complete",
+        ])
+
+    def test_stdio_events_return_hitl_server_request_without_waiting_for_turn_completed(self):
+        client = _ServerRequestCodexStdioClient()
+
+        events = asyncio.run(client.events("thread-1"))
+
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["id"], "approval-1")
+        self.assertEqual(events[0]["method"], "item/commandExecution/requestApproval")
+
+    def test_launch_and_submit_use_app_server_shapes(self):
+        client = _FakeCodexClient()
+        transport = CodexAppServerTransport(client=client)
+
+        handle = asyncio.run(transport.launch(LaunchSpec(cwd="/tmp/project", session_id="s1")))
+        asyncio.run(transport.submit_turn(handle, TurnInput(text="hello"), "idem-1"))
+
+        self.assertEqual(client.requests[0][0], "thread/start")
+        self.assertEqual(client.requests[0][1]["cwd"], "/tmp/project")
+        self.assertFalse(client.requests[0][1]["ephemeral"])
+        self.assertEqual(client.requests[1][0], "turn/start")
+        self.assertEqual(client.requests[1][1]["threadId"], "thread-1")
+        self.assertEqual(
+            client.requests[1][1]["input"],
+            [{"type": "text", "text": "hello", "text_elements": []}],
+        )
+        self.assertEqual(client.requests[1][1]["idempotencyKey"], "idem-1")
+
+    def test_events_convert_delta_and_completed(self):
+        client = _FakeCodexClient()
+        client.event_batches["thread-1"] = [
+            {"method": "mcpServer/startupStatus/updated", "params": {"threadId": "thread-1"}},
+            {
+                "method": "item/agentMessage/delta",
+                "params": {"threadId": "thread-1", "turnId": "turn-1", "itemId": "item-1", "delta": "hi"},
+            },
+            {"method": "thread/tokenUsage/updated", "params": {"threadId": "thread-1"}},
+            {"method": "turn/completed", "params": {"threadId": "thread-1", "turn": {"id": "turn-1"}}},
+        ]
+        transport = CodexAppServerTransport(client=client)
+        handle = asyncio.run(transport.launch(LaunchSpec(cwd="/tmp/project", session_id="s1")))
+
+        events = asyncio.run(transport.events(handle))
+
+        self.assertEqual(len(events), 2)
+        self.assertEqual(events[0].type, AgentEventType.TURN_DELTA)
+        self.assertEqual(events[0].payload["text"], "hi")
+        self.assertEqual(events[1].type, AgentEventType.TURN_COMPLETED)
+        self.assertEqual(events[1].payload["status"], "completed")
+
+    def test_events_convert_codex_event_msg_agent_message_and_task_complete(self):
+        client = _FakeCodexClient()
+        client.event_batches["thread-1"] = [
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "agent_message",
+                    "message": "walkcode-codex-ok",
+                    "phase": "final_answer",
+                },
+            },
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "task_complete",
+                    "turn_id": "turn-1",
+                    "last_agent_message": "walkcode-codex-ok",
+                    "duration_ms": 1234,
+                },
+            },
+        ]
+        transport = CodexAppServerTransport(client=client)
+        handle = asyncio.run(transport.launch(LaunchSpec(cwd="/tmp/project", session_id="s1")))
+
+        events = asyncio.run(transport.events(handle))
+
+        self.assertEqual(len(events), 2)
+        self.assertEqual(events[0].type, AgentEventType.TURN_DELTA)
+        self.assertEqual(events[0].payload["text"], "walkcode-codex-ok")
+        self.assertEqual(events[1].type, AgentEventType.TURN_COMPLETED)
+        self.assertEqual(events[1].payload["message"], "walkcode-codex-ok")
+        self.assertEqual(events[1].payload["status"], "completed")
+
+    def test_events_coalesce_codex_delta_fragments(self):
+        client = _FakeCodexClient()
+        client.event_batches["thread-1"] = [
+            {
+                "method": "item/agentMessage/delta",
+                "params": {"threadId": "thread-1", "delta": "walkcode"},
+            },
+            {
+                "method": "item/agentMessage/delta",
+                "params": {"threadId": "thread-1", "delta": "-ok"},
+            },
+            {"method": "turn/completed", "params": {"threadId": "thread-1"}},
+        ]
+        transport = CodexAppServerTransport(client=client)
+        handle = asyncio.run(transport.launch(LaunchSpec(cwd="/tmp/project", session_id="s1")))
+
+        events = asyncio.run(transport.events(handle))
+
+        self.assertEqual(len(events), 2)
+        self.assertEqual(events[0].type, AgentEventType.TURN_DELTA)
+        self.assertEqual(events[0].payload["text"], "walkcode-ok")
+        self.assertEqual(events[1].type, AgentEventType.TURN_COMPLETED)
+
+    def test_events_convert_tool_lifecycle_without_full_output(self):
+        client = _FakeCodexClient()
+        client.event_batches["thread-1"] = [
+            {
+                "method": "item/toolCall/started",
+                "params": {
+                    "threadId": "thread-1",
+                    "itemId": "tool-1",
+                    "toolName": "shell",
+                    "arguments": {"cmd": "ls -la"},
+                },
+            },
+            {
+                "method": "item/toolCall/completed",
+                "params": {
+                    "threadId": "thread-1",
+                    "itemId": "tool-1",
+                    "toolName": "shell",
+                    "output": "large output that should not be surfaced",
+                },
+            },
+            {"method": "turn/completed", "params": {"threadId": "thread-1"}},
+        ]
+        transport = CodexAppServerTransport(client=client)
+        handle = asyncio.run(transport.launch(LaunchSpec(cwd="/tmp/project", session_id="s1")))
+
+        events = asyncio.run(transport.events(handle))
+
+        self.assertEqual(events[0].type, AgentEventType.TOOL_STARTED)
+        self.assertEqual(events[0].payload["tool_name"], "shell")
+        self.assertEqual(events[1].type, AgentEventType.TOOL_COMPLETED)
+        self.assertNotIn("large output", events[1].payload["summary"])
+        self.assertEqual(events[2].type, AgentEventType.TURN_COMPLETED)
+
+    def test_events_convert_command_execution_items_without_full_output(self):
+        client = _FakeCodexClient()
+        client.event_batches["thread-1"] = [
+            {
+                "method": "item/started",
+                "params": {
+                    "threadId": "thread-1",
+                    "item": {
+                        "type": "commandExecution",
+                        "id": "cmd-1",
+                        "command": "ls -la",
+                    },
+                },
+            },
+            {
+                "method": "item/completed",
+                "params": {
+                    "threadId": "thread-1",
+                    "item": {
+                        "type": "commandExecution",
+                        "id": "cmd-1",
+                        "command": "ls -la",
+                        "output": "large output that should not be surfaced",
+                    },
+                },
+            },
+            {"method": "turn/completed", "params": {"threadId": "thread-1"}},
+        ]
+        transport = CodexAppServerTransport(client=client)
+        handle = asyncio.run(transport.launch(LaunchSpec(cwd="/tmp/project", session_id="s1")))
+
+        events = asyncio.run(transport.events(handle))
+
+        self.assertEqual(events[0].type, AgentEventType.TOOL_STARTED)
+        self.assertEqual(events[0].payload["tool_name"], "command")
+        self.assertIn("ls -la", events[0].payload["summary"])
+        self.assertEqual(events[1].type, AgentEventType.TOOL_COMPLETED)
+        self.assertNotIn("large output", events[1].payload["summary"])
+        self.assertEqual(events[2].type, AgentEventType.TURN_COMPLETED)
+
+    def test_events_convert_command_approval_request_and_answer_original_request_id(self):
+        client = _FakeCodexClient()
+        client.event_batches["thread-1"] = [
+            {
+                "id": "approval-1",
+                "method": "item/commandExecution/requestApproval",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "itemId": "cmd-1",
+                    "startedAtMs": 1,
+                    "environmentId": None,
+                    "reason": "network access",
+                    "command": "curl https://example.com",
+                    "cwd": "/tmp/project",
+                    "availableDecisions": ["accept", "acceptForSession", "decline", "cancel"],
+                },
+            }
+        ]
+        transport = CodexAppServerTransport(client=client)
+        handle = asyncio.run(transport.launch(LaunchSpec(cwd="/tmp/project", session_id="s1")))
+
+        events = asyncio.run(transport.events(handle))
+
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].type, AgentEventType.PERMISSION_REQUESTED)
+        self.assertEqual(events[0].payload["rid"], "approval-1")
+        self.assertEqual(events[0].payload["tool_name"], "Command")
+        self.assertEqual(events[0].payload["tool_input"]["command"], "curl https://example.com")
+        self.assertEqual(events[0].payload["actions"], ["accept", "acceptForSession", "decline", "cancel"])
+
+        asyncio.run(transport.approve_permission(handle, "approval-1", {"action": "acceptForSession"}))
+
+        self.assertEqual(
+            client.responses,
+            [("approval-1", {"decision": "acceptForSession"})],
+        )
+
+    def test_events_convert_file_change_approval_and_answer_original_request_id(self):
+        client = _FakeCodexClient()
+        client.event_batches["thread-1"] = [
+            {
+                "id": "file-approval-1",
+                "method": "item/fileChange/requestApproval",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "itemId": "file-1",
+                    "startedAtMs": 1,
+                    "grantRoot": "/tmp/project",
+                    "reason": "write generated file",
+                },
+            }
+        ]
+        transport = CodexAppServerTransport(client=client)
+        handle = asyncio.run(transport.launch(LaunchSpec(cwd="/tmp/project", session_id="s1")))
+
+        events = asyncio.run(transport.events(handle))
+
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].type, AgentEventType.PERMISSION_REQUESTED)
+        self.assertEqual(events[0].payload["rid"], "file-approval-1")
+        self.assertEqual(events[0].payload["tool_name"], "File change")
+        self.assertEqual(events[0].payload["tool_input"]["grant_root"], "/tmp/project")
+        self.assertEqual(events[0].payload["actions"], ["accept", "acceptForSession", "decline", "cancel"])
+
+        asyncio.run(transport.approve_permission(handle, "file-approval-1", {"action": "decline"}))
+
+        self.assertEqual(client.responses, [("file-approval-1", {"decision": "decline"})])
+
+    def test_events_convert_permission_profile_approval_and_answer_native_shape(self):
+        client = _FakeCodexClient()
+        client.event_batches["thread-1"] = [
+            {
+                "id": "permissions-1",
+                "method": "item/permissions/requestApproval",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "itemId": "perm-1",
+                    "startedAtMs": 1,
+                    "cwd": "/tmp/project",
+                    "reason": "needs network and write",
+                    "permissions": {
+                        "network": {"enabled": True},
+                        "fileSystem": {"write": ["/tmp/project"]},
+                    },
+                },
+            }
+        ]
+        transport = CodexAppServerTransport(client=client)
+        handle = asyncio.run(transport.launch(LaunchSpec(cwd="/tmp/project", session_id="s1")))
+
+        events = asyncio.run(transport.events(handle))
+
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].type, AgentEventType.PERMISSION_REQUESTED)
+        self.assertEqual(events[0].payload["rid"], "permissions-1")
+        self.assertEqual(events[0].payload["tool_name"], "Permission profile")
+        self.assertEqual(events[0].payload["tool_input"]["permissions"]["network"], {"enabled": True})
+
+        asyncio.run(transport.approve_permission(handle, "permissions-1", {"action": "acceptForSession"}))
+
+        self.assertEqual(
+            client.responses,
+            [
+                (
+                    "permissions-1",
+                    {
+                        "permissions": {
+                            "network": {"enabled": True},
+                            "fileSystem": {"write": ["/tmp/project"]},
+                        },
+                        "scope": "session",
+                    },
+                )
+            ],
+        )
+
+    def test_orchestrator_roundtrips_codex_command_approval_through_callback(self):
+        client = _FakeCodexClient()
+        client.event_batches["thread-1"] = [
+            {
+                "id": "approval-1",
+                "method": "item/commandExecution/requestApproval",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "itemId": "cmd-1",
+                    "startedAtMs": 1,
+                    "environmentId": None,
+                    "command": "ls -la",
+                    "cwd": "/tmp/project",
+                    "availableDecisions": ["accept", "decline"],
+                },
+            }
+        ]
+        transport = CodexAppServerTransport(client=client)
+        channel = FakeChannelAdapter("telegram", _channel_caps())
+        orchestrator = Orchestrator(
+            sessions=SessionRegistry(),
+            interactions=InteractionStore(),
+            outbox=DurableOutbox(),
+            channels={"telegram": channel},
+            transports={"codex_app_server": transport},
+            authz=AuthorizationStore(),
+        )
+        session = asyncio.run(
+            orchestrator.start_session(_binding(), "codex_app_server", "/tmp/project", _actor())
+        )
+
+        result = asyncio.run(
+            orchestrator.submit_user_input(
+                session.session_id,
+                TurnInput(text="run command"),
+                actor=_actor(),
+                generation=session.generation,
+            )
+        )
+
+        self.assertTrue(result.accepted)
+        prompt = channel.sent_views[-1]["view"]
+        self.assertEqual(prompt["type"], "permission_prompt")
+        pending = orchestrator.hitls.pending_for_session(session.session_id)
+        self.assertEqual(len(pending), 1)
+        self.assertEqual(pending[0].transport_request_id, "approval-1")
+        self.assertEqual(pending[0].native_method, "item/commandExecution/requestApproval")
+        callback = asyncio.run(
+            orchestrator.handle_inbound_event(
+                _callback(_token_for(prompt, "accept")),
+                agent_transport_kind="codex_app_server",
+                cwd="/tmp/project",
+            )
+        )
+
+        self.assertTrue(callback.accepted)
+        self.assertEqual(client.responses, [("approval-1", {"decision": "accept"})])
+        decided = orchestrator.hitls.get(pending[0].hitl_request_id)
+        self.assertEqual(decided.status, "decided")
+        self.assertEqual(
+            orchestrator.hitls.decision_for(pending[0].hitl_request_id).native_response["action"],
+            "accept",
+        )
+
+    def test_events_convert_tool_request_user_input_and_answer_by_question_id(self):
+        client = _FakeCodexClient()
+        client.event_batches["thread-1"] = [
+            {
+                "id": "ask-1",
+                "method": "item/tool/requestUserInput",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "itemId": "tool-1",
+                    "questions": [
+                        {
+                            "id": "choice",
+                            "header": "Mode",
+                            "question": "Pick a mode",
+                            "isOther": True,
+                            "isSecret": False,
+                            "options": [
+                                {"label": "Fast", "description": ""},
+                                {"label": "Careful", "description": ""},
+                            ],
+                        }
+                    ],
+                    "autoResolutionMs": None,
+                },
+            }
+        ]
+        transport = CodexAppServerTransport(client=client)
+        handle = asyncio.run(transport.launch(LaunchSpec(cwd="/tmp/project", session_id="s1")))
+
+        events = asyncio.run(transport.events(handle))
+
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].type, AgentEventType.ASK_USER_REQUESTED)
+        self.assertEqual(events[0].payload["rid"], "ask-1")
+        self.assertEqual(events[0].payload["questions"][0]["prompt"], "Pick a mode")
+        self.assertEqual(events[0].payload["questions"][0]["options"], ["Fast", "Careful"])
+        self.assertTrue(events[0].payload["questions"][0]["allow_other"])
+
+        asyncio.run(transport.answer_user_question(handle, "ask-1", {0: "Careful"}))
+
+        self.assertEqual(
+            client.responses,
+            [("ask-1", {"answers": {"choice": {"answers": ["Careful"]}}})],
+        )
+
+    def test_events_convert_mcp_elicitation_form_and_answer_content(self):
+        client = _FakeCodexClient()
+        client.event_batches["thread-1"] = [
+            {
+                "id": "mcp-1",
+                "method": "mcpServer/elicitation/request",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "serverName": "demo",
+                    "mode": "form",
+                    "message": "Need deployment options",
+                    "requestedSchema": {
+                        "required": ["environment", "dry_run"],
+                        "properties": {
+                            "environment": {
+                                "type": "string",
+                                "title": "Environment",
+                                "enum": ["staging", "prod"],
+                            },
+                            "dry_run": {
+                                "type": "boolean",
+                                "title": "Dry run",
+                            },
+                        },
+                    },
+                },
+            }
+        ]
+        transport = CodexAppServerTransport(client=client)
+        handle = asyncio.run(transport.launch(LaunchSpec(cwd="/tmp/project", session_id="s1")))
+
+        events = asyncio.run(transport.events(handle))
+
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].type, AgentEventType.ASK_USER_REQUESTED)
+        self.assertEqual(events[0].payload["rid"], "mcp-1")
+        self.assertEqual([q["id"] for q in events[0].payload["questions"]], ["environment", "dry_run"])
+        self.assertEqual(events[0].payload["questions"][0]["options"], ["staging", "prod"])
+        self.assertEqual(events[0].payload["questions"][1]["options"], ["true", "false"])
+
+        asyncio.run(transport.answer_user_question(handle, "mcp-1", {0: "prod", 1: "false"}))
+
+        self.assertEqual(
+            client.responses,
+            [
+                (
+                    "mcp-1",
+                    {
+                        "action": "accept",
+                        "content": {"environment": "prod", "dry_run": False},
+                        "_meta": None,
+                    },
+                )
+            ],
+        )
+
+    def test_codex_question_answer_can_rebuild_shape_from_persisted_question_metadata(self):
+        client = _FakeCodexClient()
+        transport = CodexAppServerTransport(client=client)
+
+        asyncio.run(
+            transport.answer_user_question(
+                None,
+                "ask-after-restart",
+                {
+                    0: "Careful",
+                    "_questions": [{"id": "choice", "prompt": "Pick", "options": ["Fast", "Careful"]}],
+                },
+            )
+        )
+
+        self.assertEqual(
+            client.responses,
+            [("ask-after-restart", {"answers": {"choice": {"answers": ["Careful"]}}})],
+        )
+
+    def test_codex_permission_answer_can_rebuild_permissions_response_from_persisted_metadata(self):
+        client = _FakeCodexClient()
+        transport = CodexAppServerTransport(client=client)
+
+        asyncio.run(
+            transport.approve_permission(
+                None,
+                "perm-after-restart",
+                {
+                    "action": "acceptForSession",
+                    "_tool_input": {
+                        "native_method": "item/permissions/requestApproval",
+                        "permissions": {
+                            "network": {"hosts": ["example.com"]},
+                            "fileSystem": {"writableRoots": ["/tmp/project"]},
+                        },
+                    },
+                },
+            )
+        )
+
+        self.assertEqual(
+            client.responses,
+            [
+                (
+                    "perm-after-restart",
+                    {
+                        "permissions": {
+                            "network": {"hosts": ["example.com"]},
+                            "fileSystem": {"writableRoots": ["/tmp/project"]},
+                        },
+                        "scope": "session",
+                    },
+                )
+            ],
+        )
+
+    def test_resume_requires_thread_id(self):
+        client = _FakeCodexClient()
+        transport = CodexAppServerTransport(client=client)
+
+        with self.assertRaises(ValueError):
+            asyncio.run(transport.resume_thread("", cwd="/tmp/project"))
+
+        handle = asyncio.run(transport.resume_thread("thread-2", cwd="/tmp/project"))
+        self.assertEqual(handle.ref["thread_id"], "thread-2")
+        self.assertEqual(client.requests[-1][0], "thread/resume")
+
+    def test_unverified_capabilities_are_disabled(self):
+        transport = CodexAppServerTransport(client=_FakeCodexClient())
+        caps = transport.capabilities()
+
+        self.assertTrue(caps.permission_callback)
+        self.assertTrue(caps.ask_user_question)
+        self.assertFalse(caps.multi_client_observe)
+        self.assertFalse(caps.resume_active_turn)

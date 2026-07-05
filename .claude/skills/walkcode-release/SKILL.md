@@ -2,10 +2,11 @@
 name: walkcode-release
 version: 1.0.0
 description: >
-  WalkCode 发布与本地升级编排（带门禁，全自动）。先 release 再 upgrade：release =
+  WalkCode V3 发布与本地升级编排（带门禁，全自动）。先 release 再 upgrade：release =
   bump 版本 + 跑测试 + deep-review skill 过关(无 Critical) + 合并 main + 打 tag + 建 GitHub
-  Release；upgrade = walkcode upgrade + 重启并验证两个 launchd 实例。触发：发版、
-  release、上线、ship、cut a release、升级 walkcode、部署 walkcode、bump 版本。
+  Release；upgrade = 安装最新 V3 CLI + 重启 WALKCODE_V3_LAUNCHD_LABELS 指定的 native runtime
+  + walkcode native doctor 验证。触发：发版、release、上线、ship、cut a release、升级
+  walkcode、部署 walkcode、bump 版本。
 metadata:
   scripts: ["release.sh", "upgrade.sh"]
 ---
@@ -21,7 +22,14 @@ metadata:
 - **门禁**：单测必须全绿、deep-review skill 必须过且**无 Critical**，才能合并 PR。
   Review 门禁由 deep-review skill 执行；不要用普通 `codex review` / `claude review` 替代。
 - **tag 打在合并后的 `main`**，不在分支上发版。
-- **两个 launchd 实例**（claude `com.walkcode` + codex `com.walkcode-codex`）都要升、都要验。
+- **V3 launchd 实例显式列出**：只重启 `WALKCODE_V3_LAUNCHD_LABELS` 中的
+  native runtime，例如 `com.walkcode.telegram-claude,com.walkcode.telegram-codex`。
+  不重启旧 `walkcode serve/start` daemon。
+- **旧版残留是阻断项**：旧 LaunchAgent、`walkcode hook`、shell wrapper source、
+  `FEISHU_*` env 存在时先清理；不要带着残留进入 upgrade 或真实 E2E。
+- **一个 runtime 一个身份**：一份 env 只能有一个 `WALKCODE_CHANNEL`、一个
+  `WALKCODE_AGENT`、一个 bot/app identity、一个 `WALKCODE_STATE_PATH`。Claude 和
+  Codex 必须拆成两份 env、两个 bot、两个 state。
 - 版本单一真源是 `pyproject.toml`（`__init__.py` 从安装元数据派生，不要手改）。
 - **prepare 前置**（脚本强制）：当前在 `main`、本地 `main` == `origin/main`、**无未跟踪文件**。本次要发的新文件先 `git add`，其余杂物清掉——否则 `git add -A` 会把别的东西卷进发布分支。**多个 agent 别共用一个 checkout**，并行任务各用独立 git worktree。
 
@@ -39,8 +47,15 @@ metadata:
    - 打 tag 前校验 `HEAD`==`origin/main`（防发未合并的本地提交）。在 `main` 打 `vX.Y.Z` tag、push、`gh release create --latest`（release notes 自动取上个 tag 到 HEAD 的 commit）。
    - **可重入**：若 tag 已在 HEAD 但 Release 没建成（如 `gh` 中途失败），重跑会跳过打 tag、续建 Release；tag 指向别处才报错。
 5. **本地升级**：`./upgrade.sh`
-   - `walkcode upgrade` + 用 `WALKCODE_ENV_FILE=~/.walkcode/codex.env` 补 codex hooks（缺该文件直接失败，可用 `WALKCODE_CODEX_ENV` 覆盖路径）+ kickstart 两个实例 + 验证（PID 稳定不 crash-loop + **重启后新日志**出现 Feishu 连接标记）。并发升级被目录锁挡住。
-6. **报告**：版本号、PR URL、Release URL、两个实例是否 healthy。
+   - 安装最新 Release。
+   - 不写 legacy `walkcode hook`，不安装 tmux wrapper。
+   - 发现旧 LaunchAgent、old hook、shell wrapper、`FEISHU_*` env 会直接失败。
+   - 只 kickstart `WALKCODE_V3_LAUNCHD_LABELS`。
+   - 运行 `walkcode native doctor`；真实验收继续跑模块 gate：
+     `config`、`runtime`、`state`、`outbox`、`agent`、`telegram`、必要时
+     `agent-smoke --live`。
+   - 并发升级被目录锁挡住。
+6. **报告**：版本号、PR URL、Release URL、每个 V3 runtime label 的 doctor/gate 状态。
 
 预演任意一步可加 `--dry-run`（打印将执行的动作，无副作用），例如 `./release.sh prepare --dry-run`。
 
@@ -49,9 +64,9 @@ metadata:
 `./upgrade.sh` 报实例异常时（或发版后线上不对）：
 
 ```
-uv tool install 'git+https://github.com/0x5446/walkcode@v<上个好版本>' --force
-launchctl kickstart -k gui/$(id -u)/com.walkcode
-launchctl kickstart -k gui/$(id -u)/com.walkcode-codex
+uv tool install 'git+https://github.com/0x5446/walkcode@v<上个好版本>' --force --reinstall --refresh-package walkcode
+launchctl kickstart -k gui/$(id -u)/com.walkcode.telegram-claude
+launchctl kickstart -k gui/$(id -u)/com.walkcode.telegram-codex
 ```
 
 ## 脚本速查
@@ -60,6 +75,6 @@ launchctl kickstart -k gui/$(id -u)/com.walkcode-codex
 |---|---|---|
 | `./release.sh prepare [VER] -m MSG` | bump + 测试 + 分支 + commit + push + PR | 改动写好后 |
 | `./release.sh publish [VER]` | main 打 tag + 建 GitHub Release | PR 合并进 main 后 |
-| `./upgrade.sh` | walkcode upgrade + 重启验证两个 launchd 实例 | Release 建好后 |
+| `./upgrade.sh` | 安装最新 V3 + 重启验证显式配置的 native launchd 实例 | Release 建好后 |
 
 合并（`gh pr merge`）刻意不在脚本里——它是 deep-review 门禁点，由本流程在第 3 步手动执行。

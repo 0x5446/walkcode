@@ -1,32 +1,33 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# WalkCode local deploy primitive: upgrade the installed code to the latest
-# GitHub Release and restart + verify the launchd instances.
+# WalkCode V3 upgrade primitive.
+# It upgrades the CLI package and restarts only explicitly configured V3
+# launchd labels. It does not install legacy hooks, tmux wrappers, or restart
+# old `walkcode serve/start` daemons.
 #
-# `walkcode upgrade` does NOT restart under launchd here (the plist runs
-# `walkcode serve` directly and writes no pid file, so its built-in pid-based
-# restart is skipped). So we kickstart both instances explicitly and verify they
-# came up and aren't crash-looping.
-#
+# Usage:
 #   ./upgrade.sh [--dry-run]
 #
-# Defaults match the launchd Labels documented in the README (com.walkcode /
-# com.walkcode-codex). If your plists use different Labels, override via env:
-#   WALKCODE_LAUNCHD_LABEL, WALKCODE_LAUNCHD_LABEL_CODEX, LOG_CLAUDE, LOG_CODEX
+# Optional env:
+#   WALKCODE_V3_LAUNCHD_LABELS="com.walkcode.telegram-claude,com.walkcode.telegram-codex"
+#   WALKCODE_ENV_FILE=~/.walkcode/telegram-claude.env
 
 DRY_RUN=false
 [ "${1:-}" = "--dry-run" ] && DRY_RUN=true
 
-LABEL_CLAUDE="${WALKCODE_LAUNCHD_LABEL:-com.walkcode}"
-LABEL_CODEX="${WALKCODE_LAUNCHD_LABEL_CODEX:-com.walkcode-codex}"
-LOG_CLAUDE="${LOG_CLAUDE:-$HOME/.walkcode/launchd.claude.err.log}"
-LOG_CODEX="${LOG_CODEX:-$HOME/.walkcode/launchd.codex.err.log}"
-CODEX_ENV="${WALKCODE_CODEX_ENV:-$HOME/.walkcode/codex.env}"
-READY_RE="Feishu WebSocket|WebSocket client started|connected|listening"
+REPO="0x5446/walkcode"
+GITHUB_URL="https://github.com/${REPO}.git"
+PYTHON_SPEC="${WALKCODE_PYTHON:-3.13}"
+ENV_FILE="${WALKCODE_ENV_FILE:-$HOME/.walkcode/telegram-claude.env}"
+LABELS_RAW="${WALKCODE_V3_LAUNCHD_LABELS:-}"
 UID_NUM="$(id -u)"
 
-RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m'
+
 info()  { echo -e "${GREEN}[upgrade]${NC} $*"; }
 warn()  { echo -e "${YELLOW}[upgrade]${NC} $*"; }
 error() { echo -e "${RED}[upgrade]${NC} $*" >&2; }
@@ -35,80 +36,29 @@ msg()   { if is_zh; then echo "$2"; else echo "$1"; fi; }
 die()   { error "$1"; exit 1; }
 run()   { if $DRY_RUN; then printf '  [dry-run] %s\n' "$*"; else "$@"; fi; }
 
-command -v walkcode >/dev/null 2>&1 || die "$(msg "walkcode not found in PATH" "PATH 中找不到 walkcode")"
 command -v uv >/dev/null 2>&1 || die "$(msg "uv not found in PATH" "PATH 中找不到 uv")"
 
-# Single-flight (issue #23 H): serialize concurrent upgrades so two runs don't
-# interleave kickstarts and mis-read each other's PID churn as a crash-loop. The
-# lock records its owner PID so a stale lock (script killed before EXIT) can be
-# reclaimed instead of wedging every future upgrade.
 LOCK_DIR="${TMPDIR:-/tmp}/walkcode-upgrade.lock"
 if ! $DRY_RUN; then
   if ! mkdir "$LOCK_DIR" 2>/dev/null; then
-    lock_owner=$(cat "$LOCK_DIR/pid" 2>/dev/null || true)
-    if [ -n "$lock_owner" ] && kill -0 "$lock_owner" 2>/dev/null; then
-      die "$(msg "another upgrade is running (pid $lock_owner, lock: $LOCK_DIR)" "已有升级在运行（pid ${lock_owner}，锁: ${LOCK_DIR}）")"
+    owner="$(cat "$LOCK_DIR/pid" 2>/dev/null || true)"
+    if [ -n "$owner" ] && kill -0 "$owner" 2>/dev/null; then
+      die "$(msg "another upgrade is running (pid $owner)" "已有升级在运行（pid ${owner}）")"
     fi
-    # Stale lock (owner gone). Claim it atomically: rename is atomic, so among
-    # concurrent reclaimers exactly one wins the mv; the losers bail. Only the
-    # winner clears the old dir and recreates the lock.
-    stale="$LOCK_DIR.stale.$$"
-    mv "$LOCK_DIR" "$stale" 2>/dev/null || die "$(msg "lost stale-lock reclaim race; another upgrade is running" "抢占残留锁失败；已有升级在运行")"
-    rm -rf "$stale"
-    warn "$(msg "reclaimed stale upgrade lock (owner ${lock_owner:-unknown} gone)" "已回收残留升级锁（owner ${lock_owner:-未知} 已退出）")"
-    mkdir "$LOCK_DIR" 2>/dev/null || die "$(msg "cannot acquire lock $LOCK_DIR" "无法获取锁 ${LOCK_DIR}")"
+    warn "$(msg "reclaiming stale upgrade lock" "清理残留升级锁")"
+    rm -rf "$LOCK_DIR"
+    mkdir "$LOCK_DIR" 2>/dev/null || die "$(msg "cannot acquire upgrade lock" "无法获取升级锁")"
   fi
   echo "$$" > "$LOCK_DIR/pid"
-  # Only remove the lock if we still own it (avoid deleting a lock another run
-  # legitimately acquired after a reclaim).
   trap 'if [ "$(cat "$LOCK_DIR/pid" 2>/dev/null)" = "$$" ]; then rm -rf "$LOCK_DIR" 2>/dev/null; fi' INT TERM HUP EXIT
 fi
 
-wc_version() {  # just the X.Y.Z (walkcode --version prints "walkcode X.Y.Z")
+current_version() {
   walkcode --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true
 }
 
-instance_pid() {  # echo the launchd-reported PID for a label, or empty
-  launchctl list "$1" 2>/dev/null | sed -n 's/.*"PID" = \([0-9]*\);.*/\1/p' | head -1
-}
-
-verify_instance() {  # label log offset -> 0 ok / 1 fail
-  local label="$1" log="$2" offset="${3:-0}"
-  if $DRY_RUN; then echo "  [dry-run] verify $label (PID stable) + grep ready in $log after byte $offset"; return 0; fi
-  local p1 p2
-  sleep 2
-  p1=$(instance_pid "$label")
-  [ -n "$p1" ] || { error "$(msg "$label not running" "$label 未运行")"; return 1; }
-  sleep 3
-  p2=$(instance_pid "$label")
-  if [ -z "$p2" ] || [ "$p1" != "$p2" ]; then
-    error "$(msg "$label is crash-looping (PID $p1 -> ${p2:-gone})" "$label 在 crash-loop（PID $p1 -> ${p2:-没了}）")"
-    return 1
-  fi
-  # Only scan log bytes written AFTER this run's restart (offset captured
-  # pre-kickstart), so a stale "connected" line from the old process can't make
-  # a freshly-restarted instance look healthy.
-  if tail -c "+$((offset + 1))" "$log" 2>/dev/null | grep -Eq "$READY_RE"; then
-    info "$(msg "$label up (PID $p2), Feishu connected" "$label 已起（PID ${p2}），飞书已连接")"
-    return 0
-  fi
-  warn "$(msg "$label PID stable ($p2) but no NEW ready marker in log yet — check $log" \
-              "$label PID 稳定（${p2}）但重启后日志暂无 ready 标记 — 看 $log")"
-  return 0  # PID stable is the hard signal; missing marker is a soft warning
-}
-
-old_ver=$(wc_version); old_ver=${old_ver:-unknown}
-info "$(msg "Current version: $old_ver" "当前版本: $old_ver")"
-
-# 1) install latest released code with the summary extra, then refresh claude hooks.
-# Do this directly instead of delegating to the currently installed `walkcode
-# upgrade`: during a self-upgrade that command is still the old version, which may
-# not know about newly-required extras.
-GITHUB_REPO="0x5446/walkcode"
-GITHUB_URL="https://github.com/${GITHUB_REPO}.git"
-PYTHON_SPEC="${WALKCODE_PYTHON:-3.13}"
-latest_tag=""
-latest_tag=$(python3 - "$GITHUB_REPO" <<'PY' || true
+latest_tag() {
+  python3 - "$REPO" <<'PY' 2>/dev/null || true
 import json
 import sys
 import urllib.request
@@ -121,56 +71,124 @@ req = urllib.request.Request(
 with urllib.request.urlopen(req, timeout=10) as resp:
     print(json.loads(resp.read()).get("tag_name", ""))
 PY
-)
-if [ -n "$latest_tag" ]; then
-  info "$(msg "Latest release: $latest_tag" "最新版本: ${latest_tag}")"
-  run uv tool install --python "$PYTHON_SPEC" "walkcode[summary] @ git+${GITHUB_URL}@${latest_tag}" --force
+}
+
+detect_legacy_remnants() {
+  local found=0
+  local wrapper_path="$HOME/.agent-control-plane/agent-wrappers.sh"
+  local wrapper_is_legacy=0
+
+  if ls "$HOME"/Library/LaunchAgents/com.walkcode*.plist >/dev/null 2>&1; then
+    for plist in "$HOME"/Library/LaunchAgents/com.walkcode*.plist; do
+      if grep -Eq 'walkcode([[:space:]]|</string>[[:space:]]*<string>)(serve|start)' "$plist" 2>/dev/null; then
+        warn "$(msg \
+          "Legacy LaunchAgent still points at walkcode serve/start: $plist" \
+          "仍有旧版 LaunchAgent 指向 walkcode serve/start: $plist")"
+        found=1
+      fi
+    done
+  fi
+
+  for hook_file in "$HOME/.claude/settings.json" "$HOME/.codex/hooks.json"; do
+    if [ -f "$hook_file" ] && grep -q 'walkcode hook' "$hook_file" 2>/dev/null; then
+      warn "$(msg \
+        "Legacy hook config still points at walkcode hook: $hook_file" \
+        "仍有旧版 hook 配置指向 walkcode hook: $hook_file")"
+      found=1
+    fi
+  done
+
+  if [ -f "$wrapper_path" ] && grep -Eq 'tmux|walkcode[[:space:]]+(hook|serve|start|status|test-inject)|WALKCODE_PORT|WALKCODE_INSTANCE|\.walkcode/codex\.env|FEISHU_' "$wrapper_path" 2>/dev/null; then
+    wrapper_is_legacy=1
+    warn "$(msg \
+      "Legacy shell wrapper behavior still exists: $wrapper_path" \
+      "仍有旧版 shell wrapper 行为: $wrapper_path")"
+    found=1
+  fi
+
+  for shell_rc in "$HOME/.zshrc" "$HOME/.zprofile" "$HOME/.bashrc"; do
+    if [ "$wrapper_is_legacy" -eq 1 ] && grep -q 'agent-wrappers.sh' "$shell_rc" 2>/dev/null; then
+      warn "$(msg \
+        "$shell_rc still sources a legacy agent-wrappers.sh" \
+        "$shell_rc 仍引用旧版 agent-wrappers.sh")"
+      found=1
+    fi
+  done
+
+  if [ -d "$HOME/.walkcode" ] && ls "$HOME/.walkcode"/*.env >/dev/null 2>&1; then
+    for env_path in "$HOME/.walkcode"/*.env; do
+      if grep -q 'FEISHU_' "$env_path" 2>/dev/null; then
+        warn "$(msg \
+          "Legacy FEISHU_* env still exists: $env_path" \
+          "仍有旧版 FEISHU_* env: $env_path")"
+        found=1
+      fi
+    done
+  fi
+
+  if env | grep -q '^FEISHU_'; then
+    warn "$(msg \
+      "Current shell exports FEISHU_* variables" \
+      "当前 shell 导出了 FEISHU_* 变量")"
+    found=1
+  fi
+
+  return "$found"
+}
+
+restart_v3_labels() {
+  if [ -z "$LABELS_RAW" ]; then
+    warn "$(msg \
+      "WALKCODE_V3_LAUNCHD_LABELS is empty; no runtime was restarted." \
+      "WALKCODE_V3_LAUNCHD_LABELS 为空；未重启任何 runtime。")"
+    return
+  fi
+
+  local label
+  IFS=',' read -r -a labels <<< "$LABELS_RAW"
+  for label in "${labels[@]}"; do
+    label="$(echo "$label" | xargs)"
+    [ -n "$label" ] || continue
+    run launchctl kickstart -k "gui/$UID_NUM/$label"
+  done
+}
+
+old_ver="$(current_version)"
+old_ver="${old_ver:-unknown}"
+info "$(msg "Current version: $old_ver" "当前版本: ${old_ver}")"
+
+if detect_legacy_remnants; then
+  :
 else
-  warn "$(msg "No release tag detected, installing from main" "未检测到 release tag，从 main 安装")"
-  run uv tool install --python "$PYTHON_SPEC" "walkcode[summary] @ git+${GITHUB_URL}" --force
-fi
-run walkcode install-hooks --agent claude
-# 2) codex hooks (step 1 refreshed only the default/claude agent's hooks).
-#    MUST carry WALKCODE_ENV_FILE=codex.env — otherwise install-hooks writes the
-#    codex hooks pointing at the default port (3001) and without the codex creds,
-#    wiring the codex instance back to the claude instance. Hard error, not warn.
-rc_hooks=0
-if $DRY_RUN; then
-  echo "  [dry-run] WALKCODE_ENV_FILE=$CODEX_ENV walkcode install-hooks --agent codex"
-elif [ ! -f "$CODEX_ENV" ]; then
-  error "$(msg "codex env file not found: $CODEX_ENV (set WALKCODE_CODEX_ENV)" "codex env 文件不存在: ${CODEX_ENV}（用 WALKCODE_CODEX_ENV 指定）")"
-  rc_hooks=1
-elif ! WALKCODE_ENV_FILE="$CODEX_ENV" walkcode install-hooks --agent codex; then
-  error "$(msg "codex install-hooks failed" "codex install-hooks 失败")"
-  rc_hooks=1
+  die "$(msg \
+    "legacy remnants must be cleaned before upgrading to the V3 runtime" \
+    "升级到 V3 runtime 前必须先清理旧版残留")"
 fi
 
-# 3) capture pre-restart log sizes so verify scans only this run's new output
-off_claude=0; off_codex=0
-if ! $DRY_RUN; then
-  [ -f "$LOG_CLAUDE" ] && off_claude=$(wc -c < "$LOG_CLAUDE" | tr -d ' ')
-  [ -f "$LOG_CODEX" ]  && off_codex=$(wc -c < "$LOG_CODEX" | tr -d ' ')
-fi
-
-# 4) restart both launchd instances cleanly
-run launchctl kickstart -k "gui/$UID_NUM/$LABEL_CLAUDE"
-run launchctl kickstart -k "gui/$UID_NUM/$LABEL_CODEX"
-
-# 5) verify both came up and are stable (codex hook failure already folded in)
-rc=$rc_hooks
-verify_instance "$LABEL_CLAUDE" "$LOG_CLAUDE" "$off_claude" || rc=1
-verify_instance "$LABEL_CODEX"  "$LOG_CODEX"  "$off_codex"  || rc=1
-
-if $DRY_RUN; then new_ver="$old_ver"; else new_ver=$(wc_version); new_ver=${new_ver:-unknown}; fi
-echo
-if [ "$rc" -eq 0 ]; then
-  info "$(msg "Upgrade complete: $old_ver -> $new_ver; both instances healthy." \
-              "升级完成: $old_ver -> ${new_ver}；两个实例均正常。")"
+tag="$(latest_tag)"
+if [ -n "$tag" ]; then
+  source="walkcode @ git+${GITHUB_URL}@${tag}"
+  info "$(msg "Latest release: $tag" "最新版本: ${tag}")"
 else
-  error "$(msg "Upgrade finished but an instance is unhealthy. Rollback:" \
-              "升级完成但有实例异常。回滚：")"
-  echo "    uv tool install 'git+https://github.com/0x5446/walkcode@v$old_ver' --force"
-  echo "    launchctl kickstart -k gui/$UID_NUM/$LABEL_CLAUDE"
-  echo "    launchctl kickstart -k gui/$UID_NUM/$LABEL_CODEX"
-  exit 1
+  source="walkcode @ git+${GITHUB_URL}"
+  warn "$(msg "No release tag detected; installing from main." "未检测到 release tag；从 main 安装。")"
 fi
+
+run uv tool install --python "$PYTHON_SPEC" --with claude-agent-sdk "$source" \
+  --force --reinstall --refresh-package walkcode
+
+restart_v3_labels
+
+if command -v walkcode >/dev/null 2>&1; then
+  if $DRY_RUN; then
+    echo "  [dry-run] WALKCODE_ENV_FILE=$ENV_FILE walkcode native doctor"
+  else
+    WALKCODE_ENV_FILE="$ENV_FILE" walkcode native doctor || warn "$(msg \
+      "native doctor failed; check $ENV_FILE before starting the runtime." \
+      "native doctor 失败；启动 runtime 前请检查 $ENV_FILE。")"
+  fi
+fi
+
+new_ver="$(current_version)"
+new_ver="${new_ver:-unknown}"
+info "$(msg "Upgrade complete: $old_ver -> $new_ver." "升级完成: ${old_ver} -> ${new_ver}。")"

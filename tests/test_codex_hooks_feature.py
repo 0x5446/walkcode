@@ -10,7 +10,7 @@ adding the feature flag. These tests pin that the installer writes the current
 flag and is not fooled by `[hooks.state]`.
 """
 
-import json
+import io
 import tomllib
 import unittest
 from pathlib import Path
@@ -129,7 +129,7 @@ class EnsureCodexHooksFeatureTests(unittest.TestCase):
 
 
 class InstallClaudeHooksTests(unittest.TestCase):
-    def test_installs_subagent_progress_hooks(self):
+    def test_legacy_installer_is_removed(self):
         with TemporaryDirectory() as d:
             home = Path(d)
             settings_path = home / ".claude" / "settings.json"
@@ -137,81 +137,29 @@ class InstallClaudeHooksTests(unittest.TestCase):
             settings_path.write_text("{}")
 
             with patch.object(m.Path, "home", return_value=home), \
-                 patch.dict("os.environ", {}, clear=True):
-                m._install_claude_hooks(None)
+                 patch.object(m.sys, "stderr", io.StringIO()) as err:
+                with self.assertRaises(SystemExit) as cm:
+                    m._install_claude_hooks(None)
 
-            hooks = json.loads(settings_path.read_text())["hooks"]
-            self.assertEqual(
-                hooks["SubagentStart"][0]["hooks"][0]["command"],
-                "walkcode hook subagent-start",
-            )
-            self.assertEqual(
-                hooks["SubagentStop"][0]["hooks"][0]["command"],
-                "walkcode hook subagent-stop",
-            )
-            self.assertEqual(
-                hooks["TaskCreated"][0]["hooks"][0]["command"],
-                "walkcode hook task-created",
-            )
-            self.assertEqual(
-                hooks["TaskCompleted"][0]["hooks"][0]["command"],
-                "walkcode hook task-completed",
-            )
-            self.assertEqual(
-                hooks["PermissionRequest"][0]["hooks"][0]["timeout"],
-                2_100_000,
-            )
-
-    def test_permission_hook_timeout_follows_stuck_threshold(self):
-        with TemporaryDirectory() as d:
-            home = Path(d)
-            settings_path = home / ".claude" / "settings.json"
-            settings_path.parent.mkdir()
-            settings_path.write_text("{}")
-
-            with patch.object(m.Path, "home", return_value=home), \
-                 patch.dict("os.environ", {"WALKCODE_STUCK_THRESHOLD": "60"}, clear=True):
-                m._install_claude_hooks(None)
-
-            hooks = json.loads(settings_path.read_text())["hooks"]
-            self.assertEqual(
-                hooks["PermissionRequest"][0]["hooks"][0]["timeout"],
-                360_000,
-            )
+            self.assertEqual(cm.exception.code, 2)
+            self.assertEqual(settings_path.read_text(), "{}")
+            self.assertIn("V3 runtime", err.getvalue())
 
 
 class InstallCodexHooksTests(unittest.TestCase):
-    def test_installs_subagent_progress_hooks(self):
+    def test_legacy_installer_is_removed(self):
         with TemporaryDirectory() as d:
             home = Path(d)
 
             with patch.object(m.Path, "home", return_value=home), \
-                 patch.dict("os.environ", {}, clear=True):
-                m._install_codex_hooks(None)
+                 patch.object(m.sys, "stderr", io.StringIO()) as err:
+                with self.assertRaises(SystemExit) as cm:
+                    m._install_codex_hooks(None)
 
-            hooks = json.loads((home / ".codex" / "hooks.json").read_text())["hooks"]
-            self.assertEqual(
-                hooks["SubagentStart"][0]["hooks"][0]["command"],
-                "WALKCODE_AGENT=codex WALKCODE_PORT=3001 walkcode hook subagent-start",
-            )
-            self.assertEqual(
-                hooks["SubagentStop"][0]["hooks"][0]["command"],
-                "WALKCODE_AGENT=codex WALKCODE_PORT=3001 walkcode hook subagent-stop",
-            )
-            self.assertEqual(hooks["PreToolUse"][0]["hooks"][0]["timeout"], 2100)
-
-    def test_permission_hook_timeout_follows_env_file(self):
-        with TemporaryDirectory() as d:
-            home = Path(d)
-            env_file = home / "codex.env"
-            env_file.write_text("WALKCODE_STUCK_THRESHOLD=90\n")
-
-            with patch.object(m.Path, "home", return_value=home), \
-                 patch.dict("os.environ", {"WALKCODE_ENV_FILE": str(env_file)}, clear=True):
-                m._install_codex_hooks(None)
-
-            hooks = json.loads((home / ".codex" / "hooks.json").read_text())["hooks"]
-            self.assertEqual(hooks["PreToolUse"][0]["hooks"][0]["timeout"], 390)
+            self.assertEqual(cm.exception.code, 2)
+            self.assertFalse((home / ".codex" / "hooks.json").exists())
+            self.assertFalse((home / ".codex" / "config.toml").exists())
+            self.assertIn("V3 runtime", err.getvalue())
 
 
 if __name__ == "__main__":
