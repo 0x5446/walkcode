@@ -21,6 +21,37 @@ ingress）、ADR 0045（/repo 工作目录）。
 work 可复用 V2 时代已配好的两个公司飞书 bot；personal 在 Lark 开发者后台新建
 两个。
 
+### 1.1 personal 的个人飞书 fallback bot（Lark 配额耗尽时）
+
+Lark 免费租户 API 额度为每月 10000 次调用，耗尽后（错误码 99991403）personal
+两实例的出站消息全部失败，且额度到次月 1 日才恢复。fallback 方案：在**个人
+飞书租户**（open.feishu.cn 个人版）再建一对同名 bot，随时可切：
+
+| 飞书个人版 app | App ID | 服务实例 |
+|---|---|---|
+| Claude Code | `cli_aac0e4cd5238dcc2` | personal-claude |
+| Codex | `cli_aac0da7b7df8dcdc` | personal-codex |
+
+app 配置与第 1 节清单完全一致（Bot 能力 + 4 scope + 长连接事件/回调 +
+发布版本；个人版租户发版免审核、即时生效）。
+
+**切到飞书 fallback**（2026-07-05 已执行）：
+
+1. 备份 Lark env：`cp personal-claude.env personal-claude.env.lark-backup`（codex 同理）；
+2. env 换成飞书 app 的 `LARK_APP_ID`/`LARK_APP_SECRET`，
+   `LARK_OPENAPI_DOMAIN=https://open.feishu.cn`，白名单清空（bootstrap）；
+3. `launchctl kickstart -k` 两实例，向新 bot 各发一条消息，从
+   `{profile}-state.json` 抓真实 `open_id`/`chat_id` 回填白名单，再 kickstart。
+
+**切回 Lark**（次月额度恢复后）：`cp personal-{claude,codex}.env.lark-backup`
+覆盖回 env，`launchctl kickstart -k` 两实例即可——Lark state 里的旧话题绑定
+未清除，切回后原话题继续可用。
+
+已知噪音：切换 bot 后，state 里绑定旧 bot 话题的存活会话（尤其还开着的
+TUI daemon 会话）发进度消息会报 `230002 Bot/User can NOT be out of the chat`
+并丢弃——属预期，旧会话结束后自然消失，不影响新会话。注意这些失败调用同样
+消耗当前 bot 的 API 额度，切换后尽快结束旧终端会话。
+
 ## 2. Agent Profile 配置目录（每 profile 一次）
 
 `~/.local/bin` 下有四个 profile wrapper（独立可执行脚本，任何 shell 上下文都生效）：
@@ -93,10 +124,14 @@ auto|off|ask_only`、`WALKCODE_CLAUDE_GATE_TIMEOUT`、`WALKCODE_CLAUDE_GATE_TOOL
 |---|---|---|---|---|
 | WALKCODE_PROFILE | work | work | personal | personal |
 | WALKCODE_AGENT | claude | codex | claude | codex |
-| LARK_APP_ID/SECRET | 公司 bot A | 公司 bot B | Lark bot C | Lark bot D |
-| LARK_OPENAPI_DOMAIN | open.feishu.cn | open.feishu.cn | open.larksuite.com | open.larksuite.com |
+| LARK_APP_ID/SECRET | 公司 bot A | 公司 bot B | Lark bot C¹ | Lark bot D¹ |
+| LARK_OPENAPI_DOMAIN | open.feishu.cn | open.feishu.cn | open.larksuite.com¹ | open.larksuite.com¹ |
 | WALKCODE_CLAUDE_CONFIG_DIR | ~/.claude-profiles/work | — | ~/.claude-profiles/personal | — |
 | WALKCODE_CODEX_HOME | — | ~/.codex-profiles/work | — | ~/.codex-profiles/personal |
+
+¹ Lark 额度耗尽期间 personal 两列切到个人飞书 fallback bot
+（open.feishu.cn，见 1.1 节）；Lark 原值备份在
+`personal-{claude,codex}.env.lark-backup`。
 
 共同项：`WALKCODE_CHANNEL=lark`、`LARK_ALLOWED_CHAT_IDS`/`LARK_ALLOWED_OPEN_IDS`
 白名单、`WALKCODE_CWD`、按需 `WALKCODE_WORKSPACE_ROOTS`（启用 `/repo`）。
