@@ -19,8 +19,46 @@ WalkCode V3 是 channel-native 的 Coding Agent runtime。它把 IM 当成一等
 - **Lark/飞书是首发部署渠道**：同一个 adapter 通过 `LARK_OPENAPI_DOMAIN` 同时支持公司飞书（open.feishu.cn）和 Lark（open.larksuite.com）；会话按话题 reply-chain 放置，卡片体系移植自 V2 已验证的飞书 UI（权限三按钮卡、AskUserQuestion 三模式、健康卡）。
 - Telegram 是架构验证通道（代码与测试保留，不再打磨 UX）；forum topic 会话放置逻辑仍然可用。
 
-标准本地部署是 4 个 Lark/飞书实例：{work, personal} × {claude, codex}，见
-[docs/lark-profile-deploy.md](docs/lark-profile-deploy.md)。
+标准本地部署是 {work, personal} × {claude, codex} 的实例矩阵（可为不同模型路由
+加更多 profile），见 [docs/lark-profile-deploy.md](docs/lark-profile-deploy.md)。
+
+## 双端同步：终端与 IM 共驾同一个 Claude 会话
+
+Claude 会话以 daemon-native 方式运行时（`claude --bg` 启动后 attach，或用
+[部署文档](docs/lark-profile-deploy.md)里的 profile wrapper 裸启动），终端 TUI
+和飞书/Lark **同时可读可写同一个会话**：
+
+- **IM 直写**：在会话话题里发消息，文字直接注入终端会话（等同终端敲入回车），
+  并收到「✅ 已发送到终端会话」回执；终端侧的输入与模型回答也实时同步回话题。
+- **权限审批在 IM 完成**：会触发权限确认的工具（Bash / Edit / Write 等，减去
+  你 allow 规则已覆盖的）渲染为飞书卡片——允许 / 始终允许 / 拒绝，点选即刻在
+  终端会话生效。实现是一个阻塞的 PreToolUse hook（"gate"），只用 Claude Code
+  的公开 hook 协议，不依赖私有 API。
+- **AskUserQuestion 在 IM 作答**：模型提问渲染为选项卡（单选 / 多选 / 自由
+  文本），提交后答案注入工具输入，终端不再弹对话框。
+- **状态同步**：运行中 / 等待确认 / 已结束的状态卡实时更新；在终端处理过的
+  确认也会回传话题。
+
+启用：把 claude profile `settings.json` 的 PreToolUse hook 换成 `--gate` 变体
+（必须放大 hook 超时，否则 60s 默认值会先杀掉等待中的 hook）：
+
+```json
+"PreToolUse": [{"matcher": "", "hooks": [{
+  "type": "command",
+  "command": "WALKCODE_ENV_FILE=$HOME/.walkcode/work-claude.env walkcode native hook PreToolUse --agent claude --gate",
+  "timeout": 1830
+}]}]
+```
+
+可调项：`WALKCODE_CLAUDE_GATE_MODE=auto|off|ask_only`、
+`WALKCODE_CLAUDE_GATE_TIMEOUT`（默认 1800s，超时按拒绝处理）、
+`WALKCODE_CLAUDE_GATE_TOOLS`（替换默认权限拦截工具集）。安全兜底：walkcode
+服务没在运行时 hook 自动弃权，终端原生权限提示照常工作；
+`WALKCODE_CLAUDE_DAEMON_MODE=off` 可整体回退到只读观察 + takeover 模式。
+
+设计与协议细节：[docs/design/claude-daemon-multi-ui-sync.md](docs/design/claude-daemon-multi-ui-sync.md)、
+[docs/design/daemon-appserver-protocol-reference.md](docs/design/daemon-appserver-protocol-reference.md)、
+[docs/adr/0046](docs/adr/0046-claude-daemon-reply-and-subscribe-sync.md)。
 
 ## 安装
 

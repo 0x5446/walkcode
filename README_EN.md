@@ -30,9 +30,55 @@ Each local runtime instance has one clear identity line:
 - Telegram remains the architecture-validation channel (code and tests stay;
   no further UX investment).
 
-The standard local deployment is four Lark/Feishu instances
-({work, personal} x {claude, codex}); see
+The standard local deployment is a {work, personal} x {claude, codex} instance
+matrix (add more profiles for extra model routes); see
 [docs/lark-profile-deploy.md](docs/lark-profile-deploy.md).
+
+## Dual-Drive: Terminal and IM Share One Claude Session
+
+When a Claude session runs daemon-native (`claude --bg` then attach, or a bare
+launch through the profile wrappers in the
+[deploy doc](docs/lark-profile-deploy.md)), the terminal TUI and Feishu/Lark
+**read and write the same session at the same time**:
+
+- **Direct write from IM**: a message in the session topic is injected into
+  the terminal session (as if typed there), acknowledged with a short receipt;
+  terminal-side input and model replies stream back into the topic.
+- **Permission approvals on IM**: tools that would prompt for permission
+  (Bash / Edit / Write, minus whatever your allow rules already cover) render
+  as cards — Allow / Always allow / Deny — and a click takes effect in the
+  terminal session immediately. The mechanism is a blocking PreToolUse hook
+  (the "gate") built entirely on Claude Code's public hook protocol; no
+  private APIs.
+- **AskUserQuestion on IM**: model questions render as option cards
+  (single / multi select / free text); submitted answers are injected into the
+  tool input, so the terminal never shows the dialog.
+- **State sync**: running / waiting-for-approval / ended status cards update
+  live; confirmations handled on the terminal side sync back to the topic.
+
+Enable it by switching the claude profile's PreToolUse hook to the `--gate`
+variant (the enlarged hook timeout is required — the 60s default would kill
+the waiting hook first):
+
+```json
+"PreToolUse": [{"matcher": "", "hooks": [{
+  "type": "command",
+  "command": "WALKCODE_ENV_FILE=$HOME/.walkcode/work-claude.env walkcode native hook PreToolUse --agent claude --gate",
+  "timeout": 1830
+}]}]
+```
+
+Tunables: `WALKCODE_CLAUDE_GATE_MODE=auto|off|ask_only`,
+`WALKCODE_CLAUDE_GATE_TIMEOUT` (default 1800s; timeout means deny),
+`WALKCODE_CLAUDE_GATE_TOOLS` (replace the default gated tool set). Fail-safe:
+when the walkcode service is not running the hook abstains and the native
+terminal prompt flow keeps working; `WALKCODE_CLAUDE_DAEMON_MODE=off` reverts
+to read-only observation + takeover entirely.
+
+Design and protocol notes:
+[docs/design/claude-daemon-multi-ui-sync.md](docs/design/claude-daemon-multi-ui-sync.md),
+[docs/design/daemon-appserver-protocol-reference.md](docs/design/daemon-appserver-protocol-reference.md),
+[ADR 0046](docs/adr/0046-claude-daemon-reply-and-subscribe-sync.md).
 
 ## Install
 

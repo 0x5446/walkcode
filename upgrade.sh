@@ -174,7 +174,7 @@ else
   warn "$(msg "No release tag detected; installing from main." "未检测到 release tag；从 main 安装。")"
 fi
 
-run uv tool install --python "$PYTHON_SPEC" --with claude-agent-sdk "$source" \
+run uv tool install --python "$PYTHON_SPEC" --with claude-agent-sdk --with lark-oapi "$source" \
   --force --reinstall --refresh-package walkcode
 
 restart_v3_labels
