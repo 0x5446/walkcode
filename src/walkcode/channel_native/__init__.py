@@ -6560,6 +6560,13 @@ class Orchestrator:
         # sender's own words repeated at them. In-memory on purpose: the
         # window is seconds, a restart in between just lets one echo through.
         self._daemon_reply_echoes: dict[str, tuple[str, float]] = {}
+        # Status-card dedup: fingerprint of the last successfully delivered
+        # card per session. Refresh calls are event-driven, but most events
+        # (tool started/completed churn, elapsed-time ticks) don't change what
+        # the card materially says — skipping identical sends is what keeps
+        # Lark's monthly API quota alive (a busy session used to emit
+        # thousands of no-op card patches per day).
+        self._status_card_fingerprints: dict[str, str] = {}
 
     async def start_session(
         self,
@@ -7073,6 +7080,29 @@ class Orchestrator:
             view_model=view,
         )
 
+    # Progress events that flip on every observed tool/message beat. They only
+    # add churn to the card's "进展" line; the tool-progress card is where that
+    # detail lives. Folding them keeps the fingerprint stable through a turn.
+    _STATUS_NOISE_PROGRESS = re.compile(
+        r"^external_tui\.(pre-tool|post-tool|post-tool-failure|post-tool-batch|"
+        r"message-display|notification|user-prompt-submit)$"
+    )
+
+    @classmethod
+    def _status_card_fingerprint(cls, view: dict[str, Any]) -> str:
+        data = {
+            key: value
+            for key, value in view.items()
+            # elapsed ticks on every render and last_event_seq on every event;
+            # neither is a material state change worth an API call.
+            if key not in {"elapsed", "last_event_seq"}
+        }
+        for key in ("last_progress_event", "reason"):
+            value = str(data.get(key, "") or "")
+            if cls._STATUS_NOISE_PROGRESS.match(value):
+                data[key] = "external_tui.activity"
+        return json.dumps(data, sort_keys=True, ensure_ascii=False)
+
     async def refresh_session_status_card(self, session: Session) -> None:
         binding = session.channel_binding
         if binding is None or not bool(binding.capabilities.get("status_card")):
@@ -7086,12 +7116,16 @@ class Orchestrator:
         message_id = str(binding.health_message_id or "")
         if message_id and bool(binding.capabilities.get("static_status_card")):
             return
+        fingerprint = self._status_card_fingerprint(view)
+        if message_id and self._status_card_fingerprints.get(session.session_id) == fingerprint:
+            return
         if message_id and channel.capabilities().editable_message:
             try:
                 edited = await channel.edit_view(binding, message_id, view)
             except Exception:
                 edited = False
             if edited:
+                self._status_card_fingerprints[session.session_id] = fingerprint
                 await self._sync_readonly_topic_state(session)
                 return
             binding.health_message_id = ""
@@ -7102,6 +7136,7 @@ class Orchestrator:
         if new_message_id:
             binding.health_message_id = str(new_message_id)
             binding.last_message_id = str(new_message_id)
+            self._status_card_fingerprints[session.session_id] = fingerprint
         await self._pin_status_card_if_requested(channel, binding)
         await self._sync_readonly_topic_state(session)
 

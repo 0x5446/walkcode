@@ -615,6 +615,44 @@ class DaemonStatePatchSemanticsTests(unittest.TestCase):
                 ]
             )
 
+    def test_status_card_refresh_skips_unchanged_state(self):
+        # Event-driven refreshes fire on every hook event, but only material
+        # state changes may spend a Lark API call (monthly-quota exhaustion
+        # was traced to no-op card patches).
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime, session, api = _runtime_with_observed_session(tmp)
+            orch = runtime.orchestrator
+            session.channel_binding.capabilities["status_card"] = True
+
+            def card_calls():
+                return sum(
+                    1
+                    for method, _payload in api.calls
+                    if method in {"sendMessage", "editMessageText", "sendRichMessage"}
+                )
+
+            session.last_progress_event = "external_tui.pre-tool"
+            asyncio.run(orch.refresh_session_status_card(session))
+            first = card_calls()
+            self.assertGreater(first, 0)
+            # Tool churn: progress flips and seq ticks, nothing material.
+            session.last_progress_event = "external_tui.post-tool"
+            asyncio.run(orch.refresh_session_status_card(session))
+            session.last_progress_event = "external_tui.pre-tool"
+            session.last_event_seq += 5
+            asyncio.run(orch.refresh_session_status_card(session))
+            self.assertEqual(card_calls(), first)
+            # Material change (lifecycle flip) must go out.
+            session.lifecycle_state = "WAITING_PERMISSION"
+            asyncio.run(orch.refresh_session_status_card(session))
+            self.assertGreater(card_calls(), first)
+            # gate.waiting progress is material (it is what the user watches).
+            session.lifecycle_state = "EXTERNAL_OBSERVED_READONLY"
+            session.last_progress_event = "gate.waiting:Write"
+            before = card_calls()
+            asyncio.run(orch.refresh_session_status_card(session))
+            self.assertGreater(card_calls(), before)
+
     def test_status_card_hides_takeover_while_daemon_live(self):
         with tempfile.TemporaryDirectory() as tmp:
             runtime, session, _api = _runtime_with_observed_session(tmp)
