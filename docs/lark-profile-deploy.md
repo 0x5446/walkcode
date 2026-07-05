@@ -213,12 +213,14 @@ ADR 0044）。
 - 卡片回调 3 秒窗口偶发超时：内联降级为"正在处理…" toast，终态由 outbox 的
   editCard patch 兜底；
 - `serve --once` 不支持 lark（WS 推送无拉取语义），预检用 doctor + debug lark。
-- **两个 Codex bot 的入站事件投递自 2026-07-02 起失效**（p2p 消息不再到达
-  runtime；WS 长连接建立正常、出站 token 正常、同机三个 claude bot 同代码
-  路径全天正常收发——已排除 walkcode 侧原因）。待办：到飞书/Lark 开发者
-  后台核查两个 Codex 应用的事件订阅（im.message.receive_v1 长连接模式）、
-  `im:message.p2p_msg:readonly` scope 是否仍在已发布版本、bot 是否被移出
-  白名单群（chats API 对白名单群返回 400）。参照本文 §1 的 ccp 建 bot 坑。
+- ~~两个 Codex bot 的入站事件投递自 2026-07-02 起失效~~ → **已定位并修复
+  （2026-07-05）**：根因是 §2 已记载的老坑再犯——两个 codex env 的
+  `LARK_ALLOWED_OPEN_IDS` 复用了同 profile claude bot 的 open_id（open_id
+  按应用隔离，跨 bot 无效），p2p 消息全部被 sender 白名单**静默**拒掉
+  （`UNAUTHORIZED`，无任何日志）。修复即本文的标准流程：临时放空
+  OPEN_IDS → 收首条消息从 state 抓真实 open_id → 回填 → 重启，双实例
+  收紧后复验通过。教训固化：改 env 后必须真机发一条消息回归；
+  白名单拒收零日志是排障黑洞，后续给 UNAUTHORIZED 拒收加 degrade 日志。
 - personal Lark 租户免费 API 月配额有限：高频 E2E（尤其状态卡每 5 秒
   refresh 的 editCard 调用）会耗尽当月配额（错误码 99991403），届时该 bot
   当月无法再发消息/卡片。后续优化项：状态卡刷新做变更检测跳发。
