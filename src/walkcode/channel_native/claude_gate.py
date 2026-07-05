@@ -31,9 +31,11 @@ import it (a dependency back into the package would cycle).
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -83,9 +85,29 @@ def heartbeat_path(state_path: Path | str) -> Path:
     return gate_root(state_path) / HEARTBEAT_FILE_NAME
 
 
+def trace(event: str, **fields: Any) -> None:
+    """One-line stderr trace for gate decision paths.
+
+    The gate is a cross-process rendezvous: every degrade branch (abstain,
+    timeout deny, pass) changes user-visible behavior, and without a trace the
+    failure mode is undiagnosable after the fact (review finding).
+    """
+    parts = [f"walkcode-gate {event}"]
+    parts.extend(f"{key}={value}" for key, value in fields.items())
+    print(" ".join(parts), file=sys.stderr, flush=True)
+
+
 def _safe_rid_filename(rid: str) -> str:
     cleaned = re.sub(r"[^A-Za-z0-9._-]", "_", str(rid or ""))[:120]
     return cleaned or "unknown"
+
+
+def _ensure_private_dir(path: Path) -> None:
+    """Create spool dirs owner-only: pendings carry tool inputs and answers."""
+    path.mkdir(parents=True, exist_ok=True)
+    for directory in (path, path.parent):
+        with contextlib.suppress(OSError):
+            os.chmod(directory, 0o700)
 
 
 def pending_path(state_path: Path | str, rid: str) -> Path:
@@ -96,10 +118,16 @@ def decision_path(state_path: Path | str, rid: str) -> Path:
     return decisions_dir(state_path) / f"{_safe_rid_filename(rid)}.json"
 
 
+def _write_private_file(path: Path, content: str) -> None:
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(content)
+
+
 def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    _ensure_private_dir(path.parent)
     tmp = path.parent / f".{path.name}.{os.getpid()}.tmp"
-    tmp.write_text(json.dumps(payload, ensure_ascii=False, sort_keys=True), encoding="utf-8")
+    _write_private_file(tmp, json.dumps(payload, ensure_ascii=False, sort_keys=True))
     os.replace(tmp, path)
 
 
@@ -113,7 +141,7 @@ def _read_json(path: Path) -> dict[str, Any] | None:
 
 def touch_heartbeat(state_path: Path | str) -> None:
     path = heartbeat_path(state_path)
-    path.parent.mkdir(parents=True, exist_ok=True)
+    _ensure_private_dir(path.parent)
     path.touch()
 
 
@@ -145,7 +173,12 @@ def list_pending(state_path: Path | str) -> list[dict[str, Any]]:
 
 
 def read_pending(state_path: Path | str, rid: str) -> dict[str, Any] | None:
-    return _read_json(pending_path(state_path, rid))
+    data = _read_json(pending_path(state_path, rid))
+    # Filename derivation is lossy (sanitize + truncate): reject a file whose
+    # embedded rid differs, so colliding rids cannot share a rendezvous.
+    if data is not None and str(data.get("rid", rid)) != str(rid):
+        return None
+    return data
 
 
 def remove_pending(state_path: Path | str, rid: str) -> None:
@@ -158,12 +191,12 @@ def remove_pending(state_path: Path | str, rid: str) -> None:
 def write_decision(state_path: Path | str, rid: str, decision: dict[str, Any]) -> bool:
     """Write-once: only the first decision for an rid lands; later ones no-op."""
     path = decision_path(state_path, rid)
-    path.parent.mkdir(parents=True, exist_ok=True)
+    _ensure_private_dir(path.parent)
     payload = dict(decision)
     payload.setdefault("rid", str(rid))
     payload.setdefault("decided_at", time.time())
     tmp = path.parent / f".{path.name}.{os.getpid()}.tmp"
-    tmp.write_text(json.dumps(payload, ensure_ascii=False, sort_keys=True), encoding="utf-8")
+    _write_private_file(tmp, json.dumps(payload, ensure_ascii=False, sort_keys=True))
     try:
         os.link(tmp, path)  # atomic create-if-absent (write-once)
     except FileExistsError:
@@ -184,7 +217,33 @@ def write_decision(state_path: Path | str, rid: str, decision: dict[str, Any]) -
 
 
 def read_decision(state_path: Path | str, rid: str) -> dict[str, Any] | None:
-    return _read_json(decision_path(state_path, rid))
+    data = _read_json(decision_path(state_path, rid))
+    if data is not None and str(data.get("rid", rid)) != str(rid):
+        return None
+    return data
+
+
+def list_orphan_decision_paths(state_path: Path | str, *, min_age: float = 600.0) -> list[Path]:
+    """Decision files with no pending counterpart (nobody will consume them).
+
+    Left behind when a card is clicked after the hook already gave up; the
+    drain loop reaps them (documented contract).
+    """
+    directory = decisions_dir(state_path)
+    if not directory.exists():
+        return []
+    cutoff = time.time() - max(0.0, min_age)
+    pending = pending_dir(state_path)
+    orphans: list[Path] = []
+    for path in directory.glob("*.json"):
+        try:
+            if path.stat().st_mtime > cutoff:
+                continue
+        except OSError:
+            continue
+        if not (pending / path.name).exists():
+            orphans.append(path)
+    return orphans
 
 
 def remove_decision(state_path: Path | str, rid: str) -> None:

@@ -295,6 +295,7 @@ class DaemonTransportGateTests(unittest.TestCase):
             seen = []
             transport.on_gate_decision = lambda rid, decision: seen.append((rid, decision["action"]))
             handle = TransportHandle(handle_id="h", transport_kind="claude_daemon", ref={})
+            claude_gate.write_pending(state, {"rid": "toolu_1", "tool_name": "Edit"})
             asyncio.run(
                 transport.approve_permission(handle, "toolu_1", {"action": "deny", "reason": "no"})
             )
@@ -309,6 +310,7 @@ class DaemonTransportGateTests(unittest.TestCase):
             state = Path(tmp) / "state.json"
             transport = ClaudeDaemonTransport(config_dir="/tmp/profile", gate_state_path=state)
             handle = TransportHandle(handle_id="h", transport_kind="claude_daemon", ref={})
+            claude_gate.write_pending(state, {"rid": "toolu_2", "tool_name": "AskUserQuestion"})
             asyncio.run(
                 transport.answer_user_question(
                     handle, "toolu_2", {0: "蓝", "_questions": [{"q": "x"}]}
@@ -317,6 +319,34 @@ class DaemonTransportGateTests(unittest.TestCase):
             decision = claude_gate.read_decision(state, "toolu_2")
             self.assertEqual(decision["action"], "answers")
             self.assertEqual(decision["answers"], {"0": "蓝"})
+
+    def test_stale_card_decision_without_pending_is_dropped(self):
+        # Hook timed out and cleaned its pending: a late card click must not
+        # leave an orphan decision file nor feed the always_allow observer.
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp) / "state.json"
+            transport = ClaudeDaemonTransport(config_dir="/tmp/profile", gate_state_path=state)
+            seen = []
+            transport.on_gate_decision = lambda rid, decision: seen.append(rid)
+            handle = TransportHandle(handle_id="h", transport_kind="claude_daemon", ref={})
+            asyncio.run(
+                transport.approve_permission(handle, "toolu_gone", {"action": "always_allow"})
+            )
+            self.assertIsNone(claude_gate.read_decision(state, "toolu_gone"))
+            self.assertEqual(seen, [])
+
+    def test_lost_write_once_race_does_not_notify(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp) / "state.json"
+            transport = ClaudeDaemonTransport(config_dir="/tmp/profile", gate_state_path=state)
+            seen = []
+            transport.on_gate_decision = lambda rid, decision: seen.append(rid)
+            handle = TransportHandle(handle_id="h", transport_kind="claude_daemon", ref={})
+            claude_gate.write_pending(state, {"rid": "toolu_3", "tool_name": "Edit"})
+            claude_gate.write_decision(state, "toolu_3", {"action": "deny"})
+            asyncio.run(transport.approve_permission(handle, "toolu_3", {"action": "allow"}))
+            self.assertEqual(claude_gate.read_decision(state, "toolu_3")["action"], "deny")
+            self.assertEqual(seen, [])
 
     def test_gate_calls_without_spool_raise_capability_unsupported(self):
         transport = ClaudeDaemonTransport(config_dir="/tmp/profile")
@@ -494,6 +524,47 @@ class GateDrainTests(unittest.TestCase):
             self.assertIn((session.session_id, "Edit"), runtime._gate_always_allow)
             runtime._record_gate_decision("toolu_edit_1", {"action": "allow"})
             self.assertEqual(len(runtime._gate_always_allow), 1)
+
+    def test_drain_reaps_orphan_decisions(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime, _session, _api = _runtime_with_observed_session(tmp)
+            state = runtime.state_store.path
+            claude_gate.write_decision(state, "toolu_orphaned", {"action": "allow"})
+            path = claude_gate.decision_path(state, "toolu_orphaned")
+            import os
+
+            old = time.time() - 3600
+            os.utime(path, (old, old))
+            asyncio.run(runtime.drain_claude_gate_requests())
+            self.assertIsNone(claude_gate.read_decision(state, "toolu_orphaned"))
+
+    def test_gate_prompt_interaction_outlives_default_token_ttl(self):
+        # The blocking hook waits up to 30 min; the card must stay decidable
+        # for that whole window, not the 10-min token default.
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime, _session, _api = _runtime_with_observed_session(tmp)
+            request = {
+                "rid": "toolu_ttl",
+                "kind": "permission",
+                "transport_kind": "claude_headless",
+                "session_id": AGENT_SESSION_ID,
+                "resume_ref": {"agent_session_id": AGENT_SESSION_ID},
+                "tool_name": "Edit",
+                "tool_input": {},
+                "created_at": time.time(),
+                "deadline": time.time() + 1800,
+            }
+            posted = asyncio.run(
+                runtime.orchestrator.post_claude_gate_prompt("observed-1", request)
+            )
+            self.assertTrue(posted)
+            interactions = runtime.orchestrator.interactions
+            ctx = next(
+                ctx
+                for ctx in interactions._interactions.values()
+                if ctx.transport_request_id == "toolu_ttl"
+            )
+            self.assertGreater(ctx.expires_at - ctx.created_at, 600)
 
 
 class DaemonStatePatchSemanticsTests(unittest.TestCase):

@@ -2004,6 +2004,7 @@ class InteractionStore:
         transport_request_id: str = "",
         high_risk: bool = False,
         hitl_request_id: str = "",
+        ttl: float | None = None,
     ) -> InteractionContext:
         interaction_id = f"int-{uuid.uuid4().hex}"
         now = self._now()
@@ -2012,7 +2013,9 @@ class InteractionStore:
             session_id=session_id,
             generation=generation,
             created_at=now,
-            expires_at=now + self._token_ttl,
+            # ttl override: gate prompts must stay decidable for the whole
+            # hook wait window (default 30 min), not the 10-min card default.
+            expires_at=now + (ttl if ttl and ttl > 0 else self._token_ttl),
             tool_name=tool_name,
             tool_input=dict(tool_input),
             actions=list(actions),
@@ -2031,6 +2034,7 @@ class InteractionStore:
         questions: list[dict[str, Any]],
         transport_request_id: str = "",
         hitl_request_id: str = "",
+        ttl: float | None = None,
     ) -> InteractionContext:
         interaction_id = f"int-{uuid.uuid4().hex}"
         now = self._now()
@@ -2039,7 +2043,7 @@ class InteractionStore:
             session_id=session_id,
             generation=generation,
             created_at=now,
-            expires_at=now + self._token_ttl,
+            expires_at=now + (ttl if ttl and ttl > 0 else self._token_ttl),
             tool_name="",
             tool_input={},
             actions=[],
@@ -2108,12 +2112,18 @@ class InteractionStore:
 
     def create_callback_token(self, interaction_id: str, action: str, *, generation: int) -> str:
         token = uuid.uuid4().hex[:20]
+        expires_at = self._now() + self._token_ttl
+        ctx = self._interactions.get(interaction_id)
+        if ctx is not None:
+            # Tokens must not die before their interaction: gate prompts carry
+            # an extended TTL matched to the blocking hook's wait window.
+            expires_at = max(expires_at, ctx.expires_at)
         self._tokens[token] = CallbackToken(
             token=token,
             interaction_id=interaction_id,
             action=action,
             generation=generation,
-            expires_at=self._now() + self._token_ttl,
+            expires_at=expires_at,
         )
         return token
 
@@ -6667,9 +6677,11 @@ class Orchestrator:
 
         Returns a SubmitResult when the daemon accepted the reply, or None to
         fall back to the takeover prompt. Writer ownership is intentionally
-        left with the external TUI: the hook pipeline keeps rendering content
-        (the injected input echoes back as ``tui_user_input``), and the TUI
-        process stays alive — that is the whole point of ADR 0046.
+        left with the external TUI: the hook pipeline keeps rendering content,
+        and the TUI process stays alive — that is the whole point of ADR 0046.
+        The injected input does echo back as a user-prompt-submit hook, but
+        the runtime consumes it via the echo record below (the sender sees a
+        short ack instead of their own words repeated).
         """
         transport = self.transports.get("claude_daemon")
         if transport is None:
@@ -8156,6 +8168,11 @@ class Orchestrator:
         tool_input = request.get("tool_input")
         if not isinstance(tool_input, dict):
             tool_input = {}
+        # Keep the card decidable for the whole hook wait window: the token
+        # default (10 min) is shorter than the gate timeout (30 min), and a
+        # click on a valid-looking card must not silently do nothing.
+        deadline = float(request.get("deadline", 0) or 0)
+        interaction_ttl = max(60.0, deadline - self._now()) if deadline else 0
         if str(request.get("kind", "")) == claude_gate.KIND_ASK_USER:
             event = AgentEvent(
                 AgentEventType.ASK_USER_REQUESTED,
@@ -8163,6 +8180,7 @@ class Orchestrator:
                     "rid": rid,
                     "questions": _ClaudePermissionBridge._map_ask_questions(tool_input),
                     "native_method": "pre_tool_use_hook",
+                    "interaction_ttl": interaction_ttl,
                 },
             )
         else:
@@ -8175,6 +8193,7 @@ class Orchestrator:
                     "actions": ["allow", "always_allow", "deny"],
                     "high_risk": _claude_tool_is_high_risk(tool_name),
                     "native_method": "pre_tool_use_hook",
+                    "interaction_ttl": interaction_ttl,
                 },
             )
         view = self._event_to_view(session, event)
@@ -8435,6 +8454,7 @@ class Orchestrator:
                 transport_request_id=transport_request_id,
                 high_risk=bool(event.payload.get("high_risk", False)),
                 hitl_request_id=hitl_request.hitl_request_id if hitl_request else "",
+                ttl=float(event.payload.get("interaction_ttl", 0) or 0) or None,
             )
             if hitl_request is not None:
                 self.hitls.attach_interaction(hitl_request.hitl_request_id, ctx.interaction_id)
@@ -8469,6 +8489,7 @@ class Orchestrator:
                 questions=valid_questions,
                 transport_request_id=transport_request_id,
                 hitl_request_id=hitl_request.hitl_request_id if hitl_request else "",
+                ttl=float(event.payload.get("interaction_ttl", 0) or 0) or None,
             )
             if hitl_request is not None:
                 self.hitls.attach_interaction(hitl_request.hitl_request_id, ctx.interaction_id)

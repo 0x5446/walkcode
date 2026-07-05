@@ -2046,9 +2046,18 @@ class ChannelNativeRuntime:
         if not short:
             return False
         try:
-            return await transport.client.job_ready(short)
+            alive = await transport.client.job_alive(short)
         except Exception:
-            return False
+            alive = None
+        if alive is None:
+            # Probe failure means "unknown", not "dead": a socket blip or a
+            # restarting daemon must not let stop paths end a live session.
+            # Fall back to the last observed state (settled clears the flag).
+            return bool(
+                isinstance(session.transport_ref, dict)
+                and session.transport_ref.get("daemon_live")
+            )
+        return alive
 
     # -- PreToolUse gate (ADR 0046 v2) ---------------------------------------
     #
@@ -2109,6 +2118,7 @@ class ChannelNativeRuntime:
         if not claude_gate.heartbeat_fresh(state_path):
             # No serve loop draining the spool: abstain so the native terminal
             # prompt flow keeps working without the walkcode service.
+            claude_gate.trace("abstain_heartbeat_stale", rid=rid, tool=tool_name)
             return None
         timeout = float(options.get("gate_timeout", 0) or claude_gate.DEFAULT_WAIT_TIMEOUT_SECONDS)
         now = time.time()
@@ -2130,12 +2140,26 @@ class ChannelNativeRuntime:
                 "hook_pid": os.getpid(),
             },
         )
+        claude_gate.trace("gate_open", rid=rid, kind=kind, tool=tool_name, timeout=int(timeout))
+        started = time.monotonic()
         try:
             decision = claude_gate.wait_for_decision(state_path, rid, timeout=timeout)
         finally:
             claude_gate.cleanup_gate_files(state_path, rid)
         if decision is None:
             decision = claude_gate.timeout_decision(kind)
+            claude_gate.trace(
+                "gate_timeout_deny", rid=rid, tool=tool_name, elapsed=int(time.monotonic() - started)
+            )
+        else:
+            claude_gate.trace(
+                "gate_decision",
+                rid=rid,
+                tool=tool_name,
+                action=decision.get("action"),
+                reason=decision.get("reason", ""),
+                elapsed=int(time.monotonic() - started),
+            )
         return claude_gate.pre_tool_use_output(kind, decision, tool_input)
 
     async def _drain_claude_gate_requests_forever(
@@ -2166,6 +2190,7 @@ class ChannelNativeRuntime:
             deadline = float(request.get("deadline", 0) or 0)
             if deadline and now > deadline + CLAUDE_GATE_REAP_SLACK_SECONDS:
                 # The hook process is gone (denied on timeout or was killed).
+                claude_gate.trace("reap_expired_pending", rid=rid)
                 claude_gate.cleanup_gate_files(state_path, rid)
                 self._gate_dispatched.pop(rid, None)
                 continue
@@ -2175,6 +2200,7 @@ class ChannelNativeRuntime:
             created_at = float(request.get("created_at", now) or now)
             if not session_id:
                 if now - created_at > CLAUDE_GATE_UNROUTABLE_GRACE_SECONDS:
+                    claude_gate.trace("pass_session_not_observed", rid=rid)
                     claude_gate.write_decision(
                         state_path, rid, {"action": "pass", "reason": "session_not_observed"}
                     )
@@ -2185,6 +2211,7 @@ class ChannelNativeRuntime:
                 str(request.get("kind", "")) == claude_gate.KIND_PERMISSION
                 and (session_id, tool_name) in self._gate_always_allow
             ):
+                claude_gate.trace("auto_allow_session", rid=rid, tool=tool_name)
                 claude_gate.write_decision(
                     state_path, rid, {"action": "allow", "reason": "always_allow(session)"}
                 )
@@ -2198,6 +2225,7 @@ class ChannelNativeRuntime:
                 processed += 1
                 self.save_state()
             elif now - created_at > CLAUDE_GATE_UNROUTABLE_GRACE_SECONDS:
+                claude_gate.trace("pass_card_not_delivered", rid=rid)
                 claude_gate.write_decision(
                     state_path, rid, {"action": "pass", "reason": "card_not_delivered"}
                 )
@@ -2205,6 +2233,14 @@ class ChannelNativeRuntime:
         for rid in list(self._gate_dispatched):
             if rid not in live_rids:
                 self._gate_dispatched.pop(rid, None)
+        # Documented contract: decision files whose pending is gone (stale card
+        # clicked after the hook gave up) are reaped here.
+        for orphan in claude_gate.list_orphan_decision_paths(state_path):
+            claude_gate.trace("reap_orphan_decision", file=orphan.name)
+            try:
+                orphan.unlink()
+            except OSError:
+                pass
         return processed
 
     def _claude_gate_session_id(self, request: dict[str, Any]) -> str | None:

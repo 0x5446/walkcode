@@ -4,8 +4,9 @@ Date: 2026-07-04
 
 Status: Accepted; v1 implemented 2026-07-04 — reply 写路径、subscribe 状态
 watcher、takeover 回落、`WALKCODE_CLAUDE_DAEMON_MODE` 门禁（细节与验证记录见
-`docs/design/claude-daemon-multi-ui-sync.md`）。permission-response 闭环、
-list 兜底建会话、Codex 持久订阅仍为后续步骤。
+`docs/design/claude-daemon-multi-ui-sync.md`）；v2 implemented 2026-07-05 —
+权限/AskUserQuestion 闭环改走 PreToolUse gate（`permission-response` 实测为
+空壳、已弃用，见文末 v2 段）。list 兜底建会话、Codex 持久订阅仍为后续步骤。
 
 ## Context
 
@@ -51,7 +52,7 @@ kill TUI 进程后用 headless SDK resume。该机制与 daemon worker 进程模
 - 协议 experimental：版本升级可能破坏；`ping` 门禁 + hooks 回落是安全网。
 - 每 profile 一个 daemon，与 5-wrapper/5-instance/5-bot 矩阵一一对应，无共享
   socket 的跨 profile 风险。
-- 后续演进：`permission-response` 闭环审批、list 兜底建会话、Codex 持久订阅。
+- 后续演进：list 兜底建会话、Codex 持久订阅（审批闭环已由 v2 的 PreToolUse gate 落地；`permission-response` 已弃用）。
 
 ## v2: PreToolUse gate 权限/AskUserQuestion 闭环（2026-07-05）
 

@@ -157,6 +157,19 @@ class ClaudeDaemonClient:
             return False
         return bool(status.get("alive")) and bool(status.get("present")) and bool(status.get("ready"))
 
+    async def job_alive(self, short: str) -> bool | None:
+        """Existence probe for stop guards: True/False definitive, None unknown.
+
+        Unlike ``job_ready`` this does not require ``ready`` (a worker still
+        starting up is alive) and does not fold probe failures into "dead" —
+        a socket blip must not let stop paths end a running session.
+        """
+        try:
+            status = await self.has(short)
+        except (TransportUnavailable, ClaudeDaemonError):
+            return None
+        return bool(status.get("alive")) and bool(status.get("present"))
+
     async def reply(self, short: str, text: str) -> dict[str, Any]:
         return await self._request(
             {
@@ -368,8 +381,7 @@ class ClaudeDaemonTransport:
         reason = str((decision or {}).get("reason", "") or "")
         if reason:
             payload["reason"] = reason
-        claude_gate.write_decision(self.gate_state_path, rid, payload)
-        self._notify_gate_decision(rid, payload)
+        self._deliver_gate_decision(rid, payload)
 
     async def answer_user_question(
         self,
@@ -388,7 +400,19 @@ class ClaudeDaemonTransport:
                 if not str(key).startswith("_")
             },
         }
-        claude_gate.write_decision(self.gate_state_path, rid, payload)
+        self._deliver_gate_decision(rid, payload)
+
+    def _deliver_gate_decision(self, rid: str, payload: dict[str, Any]) -> None:
+        # A decision only counts when a hook is still waiting for it AND the
+        # write-once actually landed. A stale card click (hook timed out and
+        # cleaned its pending) or a lost race must not leave orphan decision
+        # files, and must not feed always_allow via the observer.
+        if claude_gate.read_pending(self.gate_state_path, rid) is None:
+            claude_gate.trace("decision_dropped_no_pending", rid=rid, action=payload.get("action"))
+            return
+        if not claude_gate.write_decision(self.gate_state_path, rid, payload):
+            claude_gate.trace("decision_dropped_already_decided", rid=rid, action=payload.get("action"))
+            return
         self._notify_gate_decision(rid, payload)
 
     def _notify_gate_decision(self, rid: str, decision: dict[str, Any]) -> None:

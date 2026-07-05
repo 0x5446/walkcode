@@ -80,8 +80,9 @@ TUI 会话仍由 hooks 创建为 `external_tui` + `EXTERNAL_OBSERVED_READONLY`�
    `EXTERNAL_TUI_READONLY` 时，先尝试 daemon 直写——会话 resume_ref 能映射到
    存活 daemon job（`has` alive+ready）就 `reply` 注入并直接成功返回；
    daemon 不可用（老版本 Claude / proto 不符 / job 已死）才回落原 takeover 流程。
-   写入成功后不做 writer 所有权变更：TUI 继续持有会话，hooks 会把注入的输入
-   以 `tui_user_input` 卡片回显（作为注入成功的确认）。
+   写入成功后不做 writer 所有权变更：TUI 继续持有会话。注入的输入会以
+   user-prompt-submit hook 回流，但 v2 起由回显去重消费掉——发送者看到的
+   是"✅ 已发送到终端会话"回执，而不是自己的话被复读。
 2. **状态同步**（subscribe watcher）：state patch 驱动会话生命周期与健康卡：
    - `tempo=active` → ACTIVE；`tempo=idle` → EXTERNAL_OBSERVED_READONLY（可写，
      命名沿用但语义已是"外部 TUI 会话"）；
