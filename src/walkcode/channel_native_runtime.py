@@ -62,12 +62,30 @@ from .channel_native import (
     ViewModelFactory,
     WriterOwner,
     _agent_to_transport_kind,
+    _external_claude_resume_ref,
     _session_is_external_tui_takeover_candidate,
+)
+from .channel_native import claude_gate
+from .channel_native.claude_daemon import (
+    ClaudeDaemonTransport,
+    claude_daemon_short_from_resume_ref,
+    claude_daemon_short_id,
 )
 from .channel_native.lark_live import AckRegistry, LarkIngressBridge, build_lark_live_api
 
 
 TELEGRAM_FORUM_TOPIC_ICON_COLORS = (0x6FB9F0, 0xFFD67E, 0xCB86DB, 0x8EEE98, 0xFF93B2, 0xFB6F5F)
+CLAUDE_DAEMON_WATCH_INTERVAL_SECONDS = 5.0
+CLAUDE_DAEMON_UNAVAILABLE_RETRY_SECONDS = 30.0
+CLAUDE_GATE_DRAIN_INTERVAL_SECONDS = 1.0
+# A pending gate request that cannot be routed to an observed session (or
+# whose card cannot be delivered) is answered "pass" after this grace, so the
+# blocking hook falls back to the native terminal flow instead of waiting out
+# the full deny timeout.
+CLAUDE_GATE_UNROUTABLE_GRACE_SECONDS = 10.0
+# Pending files whose hook process must be gone (deadline long past) get
+# reaped by the drain loop.
+CLAUDE_GATE_REAP_SLACK_SECONDS = 60.0
 TUI_HOOK_DRAIN_TIMEOUT_SECONDS = 30.0
 TUI_HOOK_DRAIN_BATCH_SIZE = 25
 TUI_HOOK_RECENT_PRIORITY_WINDOW_SECONDS = 300.0
@@ -631,6 +649,15 @@ class ChannelNativeRuntime:
         self._ingress_lock = asyncio.Lock()
         self._drain_lock = asyncio.Lock()
         self._loaded_tui_observed_bindings_refreshed = False
+        # PreToolUse gate bookkeeping (ADR 0046 v2): rid -> dispatch time for
+        # pending requests already turned into cards, and per-session tools
+        # the user chose "always allow" for (in-memory: hooks cannot persist
+        # permission rules, so the scope is this runtime process).
+        self._gate_dispatched: dict[str, float] = {}
+        self._gate_always_allow: set[tuple[str, str]] = set()
+        daemon_transport = self._claude_daemon_transport()
+        if daemon_transport is not None:
+            daemon_transport.on_gate_decision = self._record_gate_decision
 
     @classmethod
     def from_env(
@@ -711,9 +738,25 @@ class ChannelNativeRuntime:
             "agent_status": agent_status,
             "runtime_status": self._describe_runtime_status(),
             "tui_hook_status": _describe_tui_hook_status(self.config.agent, codex_home),
+            "claude_daemon": self._describe_claude_daemon(),
             "state_path": self.config.state_path,
             "cwd": self.config.cwd,
             "e2e_gates": self.e2e_gates,
+        }
+
+    def _describe_claude_daemon(self) -> dict[str, Any]:
+        transport = self._claude_daemon_transport()
+        if transport is None:
+            return {
+                "enabled": False,
+                "reason": "daemon_mode is off or the agent is not claude",
+            }
+        socket_path = transport.client.socket_path
+        return {
+            "enabled": True,
+            "socket_path": socket_path,
+            "socket_present": os.path.exists(socket_path),
+            "config_dir": transport.config_dir,
         }
 
     def _describe_runtime_status(self) -> dict[str, Any]:
@@ -1709,6 +1752,20 @@ class ChannelNativeRuntime:
                 ),
                 name="walkcode-tui-binding-refresh",
             ),
+            *(
+                [
+                    asyncio.create_task(
+                        self._watch_claude_daemon_forever(),
+                        name="walkcode-claude-daemon-watch",
+                    ),
+                    asyncio.create_task(
+                        self._drain_claude_gate_requests_forever(),
+                        name="walkcode-claude-gate-drain",
+                    ),
+                ]
+                if self._claude_daemon_transport() is not None
+                else []
+            ),
         ]
 
     @staticmethod
@@ -1833,7 +1890,14 @@ class ChannelNativeRuntime:
                 self.state.inbound_ledger.fail(event_id)
             raise
         if session.status != "stopped" and _tui_hook_stops_session(hook_type):
-            self._mark_tui_session_stopped(session, hook_type=hook_type)
+            if await self._claude_daemon_session_alive(session):
+                # Daemon-native session: the TUI process exiting is a detach
+                # (the worker keeps running); the session ends on the daemon's
+                # settled event, not here.
+                session.last_progress_at = self._now()
+                session.last_progress_event = "external_tui.tui_detached_daemon_alive"
+            else:
+                self._mark_tui_session_stopped(session, hook_type=hook_type)
             await self.orchestrator.refresh_session_status_card(session)
         if ledger_started:
             self.state.inbound_ledger.complete(event_id)
@@ -1960,6 +2024,415 @@ class ChannelNativeRuntime:
         while True:
             await self._best_effort_drain_deferred_tui_hooks()
             await asyncio.sleep(interval)
+
+    def _claude_daemon_transport(self) -> ClaudeDaemonTransport | None:
+        transport = self.transports.get("claude_daemon")
+        return transport if isinstance(transport, ClaudeDaemonTransport) else None
+
+    async def _claude_daemon_session_alive(self, session) -> bool:
+        """Is the daemon worker behind this TUI-observed session still running?
+
+        Daemon-native sessions outlive their attach TUI (``/exit`` detaches).
+        Stop paths keyed on the TUI process must not end the session while the
+        worker is alive; the daemon's ``settled`` event is the authority.
+        """
+        transport = self._claude_daemon_transport()
+        if transport is None:
+            return False
+        resume_ref = _external_claude_resume_ref(session)
+        if not resume_ref:
+            return False
+        short = claude_daemon_short_from_resume_ref(resume_ref)
+        if not short:
+            return False
+        try:
+            return await transport.client.job_ready(short)
+        except Exception:
+            return False
+
+    # -- PreToolUse gate (ADR 0046 v2) ---------------------------------------
+    #
+    # Headless sessions close the permission / AskUserQuestion loop in-process
+    # (SDK can_use_tool -> Future -> card -> resolve). TUI/daemon sessions run
+    # the PreToolUse hook in a separate process, so the same loop runs over
+    # the gate spool: the blocking hook (gate_tui_hook, hook-process side)
+    # writes pending/<rid>.json and polls decisions/<rid>.json; the serve loop
+    # (drain_claude_gate_requests) turns pendings into cards, and the card
+    # callback writes the decision file via ClaudeDaemonTransport.
+
+    def gate_tui_hook(
+        self,
+        *,
+        hook_type: str,
+        payload: dict[str, Any],
+        agent: str = "",
+    ) -> dict[str, Any] | None:
+        """Blocking PreToolUse gate; returns hookSpecificOutput or None (abstain).
+
+        Always spools the observation copy first (same as ``--defer``) so tool
+        progress keeps flowing while the gate holds the tool call.
+        """
+        self.defer_tui_hook(hook_type=hook_type, payload=payload, agent=agent)
+        normalized = _normalize_tui_hook_type(hook_type or _payload_hook_event_name(payload))
+        if normalized != "pre-tool":
+            return None
+        agent_name = _normalize_tui_agent(agent or str(payload.get("agent", "") or ""))
+        if (agent_name or self.config.agent) != "claude":
+            return None
+        if _tui_hook_is_walkcode_headless_transport("claude_headless", payload):
+            # walkcode's own headless sessions gate in-process via can_use_tool;
+            # gating here would double-prompt every tool.
+            return None
+        rid = str(payload.get("tool_use_id", "") or "")
+        tool_name = str(payload.get("tool_name", "") or "")
+        tool_input = payload.get("tool_input")
+        if not isinstance(tool_input, dict):
+            tool_input = {}
+        if not rid or not tool_name:
+            return None
+        options = self.config.agent_options.get("claude", {})
+        if str(options.get("daemon_mode", "") or "auto") == "off":
+            return None
+        config_dir = str(options.get("config_dir", "") or os.environ.get("CLAUDE_CONFIG_DIR", ""))
+        gate_tools = options.get("gate_tools")
+        kind = claude_gate.should_gate(
+            tool_name=tool_name,
+            tool_input=tool_input,
+            permission_mode=str(payload.get("permission_mode", "") or ""),
+            allow_rules=claude_gate.profile_allow_rules(config_dir),
+            gate_mode=str(options.get("gate_mode", "") or "auto"),
+            gate_tools=gate_tools if isinstance(gate_tools, list) else None,
+        )
+        if not kind:
+            return None
+        state_path = self.state_store.path
+        if not claude_gate.heartbeat_fresh(state_path):
+            # No serve loop draining the spool: abstain so the native terminal
+            # prompt flow keeps working without the walkcode service.
+            return None
+        timeout = float(options.get("gate_timeout", 0) or claude_gate.DEFAULT_WAIT_TIMEOUT_SECONDS)
+        now = time.time()
+        claude_gate.write_pending(
+            state_path,
+            {
+                "rid": rid,
+                "kind": kind,
+                "agent": "claude",
+                "transport_kind": "claude_headless",
+                "session_id": str(payload.get("session_id", "") or ""),
+                "resume_ref": _tui_resume_ref("claude_headless", payload),
+                "tool_name": tool_name,
+                "tool_input": tool_input,
+                "permission_mode": str(payload.get("permission_mode", "") or ""),
+                "cwd": str(payload.get("cwd", "") or ""),
+                "created_at": now,
+                "deadline": now + timeout,
+                "hook_pid": os.getpid(),
+            },
+        )
+        try:
+            decision = claude_gate.wait_for_decision(state_path, rid, timeout=timeout)
+        finally:
+            claude_gate.cleanup_gate_files(state_path, rid)
+        if decision is None:
+            decision = claude_gate.timeout_decision(kind)
+        return claude_gate.pre_tool_use_output(kind, decision, tool_input)
+
+    async def _drain_claude_gate_requests_forever(
+        self,
+        *,
+        interval: float = CLAUDE_GATE_DRAIN_INTERVAL_SECONDS,
+    ) -> None:
+        while True:
+            try:
+                claude_gate.touch_heartbeat(self.state_store.path)
+                await self.drain_claude_gate_requests()
+            except Exception as exc:
+                print(
+                    f"claude gate drain transient error: {type(exc).__name__}: {exc}",
+                    file=sys.stderr,
+                )
+            await asyncio.sleep(interval)
+
+    async def drain_claude_gate_requests(self) -> int:
+        state_path = self.state_store.path
+        requests = claude_gate.list_pending(state_path)
+        live_rids: set[str] = set()
+        processed = 0
+        now = time.time()
+        for request in requests:
+            rid = str(request.get("rid", "") or "")
+            live_rids.add(rid)
+            deadline = float(request.get("deadline", 0) or 0)
+            if deadline and now > deadline + CLAUDE_GATE_REAP_SLACK_SECONDS:
+                # The hook process is gone (denied on timeout or was killed).
+                claude_gate.cleanup_gate_files(state_path, rid)
+                self._gate_dispatched.pop(rid, None)
+                continue
+            if rid in self._gate_dispatched:
+                continue
+            session_id = self._claude_gate_session_id(request)
+            created_at = float(request.get("created_at", now) or now)
+            if not session_id:
+                if now - created_at > CLAUDE_GATE_UNROUTABLE_GRACE_SECONDS:
+                    claude_gate.write_decision(
+                        state_path, rid, {"action": "pass", "reason": "session_not_observed"}
+                    )
+                    self._gate_dispatched[rid] = now
+                continue
+            tool_name = str(request.get("tool_name", "") or "")
+            if (
+                str(request.get("kind", "")) == claude_gate.KIND_PERMISSION
+                and (session_id, tool_name) in self._gate_always_allow
+            ):
+                claude_gate.write_decision(
+                    state_path, rid, {"action": "allow", "reason": "always_allow(session)"}
+                )
+                self._gate_dispatched[rid] = now
+                processed += 1
+                continue
+            async with self._ingress_lock:
+                posted = await self.orchestrator.post_claude_gate_prompt(session_id, request)
+            if posted:
+                self._gate_dispatched[rid] = now
+                processed += 1
+                self.save_state()
+            elif now - created_at > CLAUDE_GATE_UNROUTABLE_GRACE_SECONDS:
+                claude_gate.write_decision(
+                    state_path, rid, {"action": "pass", "reason": "card_not_delivered"}
+                )
+                self._gate_dispatched[rid] = now
+        for rid in list(self._gate_dispatched):
+            if rid not in live_rids:
+                self._gate_dispatched.pop(rid, None)
+        return processed
+
+    def _claude_gate_session_id(self, request: dict[str, Any]) -> str | None:
+        resume_ref = request.get("resume_ref")
+        if isinstance(resume_ref, dict) and resume_ref:
+            session_id = self.state.sessions.find_by_resume_ref(
+                transport_kind=str(request.get("transport_kind", "") or "claude_headless"),
+                resume_ref=resume_ref,
+            )
+            if session_id:
+                return session_id
+        sid = str(request.get("session_id", "") or "")
+        if sid:
+            return self.state.sessions.find_by_resume_ref(
+                transport_kind="claude_headless",
+                resume_ref={"agent_session_id": sid},
+            )
+        return None
+
+    def _record_gate_decision(self, rid: str, decision: dict[str, Any]) -> None:
+        if str(decision.get("action", "") or "") != "always_allow":
+            return
+        request = claude_gate.read_pending(self.state_store.path, rid)
+        if not request:
+            return
+        tool_name = str(request.get("tool_name", "") or "")
+        session_id = self._claude_gate_session_id(request)
+        if session_id and tool_name:
+            self._gate_always_allow.add((session_id, tool_name))
+
+    async def _watch_claude_daemon_forever(
+        self,
+        *,
+        interval: float = CLAUDE_DAEMON_WATCH_INTERVAL_SECONDS,
+    ) -> None:
+        """Maintain one subscribe watcher per live TUI-owned Claude daemon job.
+
+        Read half of ADR 0046: ``list`` discovers which known sessions have a
+        live worker; each gets a long-lived ``subscribe`` connection whose
+        ``state`` patches drive lifecycle + health cards. Content still comes
+        from hooks, so this loop touches no message rendering.
+        """
+        transport = self._claude_daemon_transport()
+        if transport is None:
+            return
+        watchers: dict[str, asyncio.Task[None]] = {}
+        try:
+            while True:
+                delay = interval
+                try:
+                    await self._sync_claude_daemon_watchers(transport, watchers)
+                except TransportUnavailable:
+                    # No daemon for this profile right now (old Claude version,
+                    # daemon not started, proto drift). Cheap to re-probe later.
+                    delay = CLAUDE_DAEMON_UNAVAILABLE_RETRY_SECONDS
+                except Exception as exc:
+                    print(
+                        f"claude daemon watch transient error: {type(exc).__name__}: {exc}",
+                        file=sys.stderr,
+                    )
+                await asyncio.sleep(delay)
+        finally:
+            for task in watchers.values():
+                task.cancel()
+            if watchers:
+                await asyncio.gather(*watchers.values(), return_exceptions=True)
+
+    async def _sync_claude_daemon_watchers(
+        self,
+        transport: ClaudeDaemonTransport,
+        watchers: dict[str, asyncio.Task[None]],
+    ) -> None:
+        for short, task in list(watchers.items()):
+            if task.done():
+                watchers.pop(short, None)
+        jobs = await transport.client.list_jobs()
+        for job in jobs:
+            if job.get("dying") or job.get("outcome"):
+                continue
+            short = claude_daemon_short_id(job.get("short") or job.get("sessionId"))
+            if not short or short in watchers:
+                continue
+            session_id = self.state.sessions.find_by_resume_ref(
+                transport_kind="claude_headless",
+                resume_ref={"agent_session_id": str(job.get("sessionId", "") or "")},
+            )
+            if not session_id:
+                # Unknown to walkcode (no hook observed it yet, or it is a
+                # walkcode-owned headless worker). Hooks stay the creation
+                # channel; list-based session bootstrap is a follow-up step.
+                continue
+            session = self.state.sessions.get(session_id)
+            if session.status == "stopped":
+                continue
+            if not (session.writer_owner and session.writer_owner.kind == "external_tui"):
+                continue
+            watchers[short] = asyncio.create_task(
+                self._watch_claude_daemon_job(session_id, short, transport),
+                name=f"walkcode-claude-daemon-sub-{short}",
+            )
+
+    async def _watch_claude_daemon_job(
+        self,
+        session_id: str,
+        short: str,
+        transport: ClaudeDaemonTransport,
+    ) -> None:
+        last_needs = ""
+        try:
+            async for event in transport.client.subscribe(short):
+                event_type = str(event.get("type", "") or "")
+                if event_type == "state":
+                    patch = event.get("patch")
+                    if not isinstance(patch, dict):
+                        continue
+                    async with self._ingress_lock:
+                        last_needs = await self._apply_claude_daemon_state_patch(
+                            session_id, patch, last_needs
+                        )
+                        self.save_state()
+                elif event_type == "settled":
+                    async with self._ingress_lock:
+                        await self._settle_claude_daemon_session(
+                            session_id,
+                            outcome=str(event.get("outcome", "") or ""),
+                        )
+                        self.save_state()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # The watcher is re-created by the discovery loop while the job is
+            # alive, so a dropped subscribe connection self-heals.
+            print(
+                f"claude daemon subscribe ended ({short}): {type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+
+    async def _apply_claude_daemon_state_patch(
+        self,
+        session_id: str,
+        patch: dict[str, Any],
+        last_needs: str,
+    ) -> str:
+        try:
+            session = self.state.sessions.get(session_id)
+        except KeyError:
+            return last_needs
+        if session.status == "stopped":
+            return last_needs
+        if not (session.writer_owner and session.writer_owner.kind == "external_tui"):
+            # Session was taken over meanwhile; the structured transport owns
+            # state now and daemon patches are no longer authoritative.
+            return last_needs
+        session.last_progress_at = self._now()
+        # A state patch only arrives from a live daemon worker: remember that
+        # so stop paths (TUI detach, stale-pid sweep) and the status card can
+        # tell "TUI closed" apart from "session over" (ADR 0046 v2).
+        session.transport_ref["daemon_live"] = True
+        tempo = str(patch.get("tempo", "") or "")
+        detail = str(patch.get("detail", "") or "").strip()
+        if tempo:
+            session.last_progress_event = f"external_tui.daemon_{tempo}" + (
+                f":{detail}" if detail else ""
+            )
+        changed = False
+        needs = patch.get("needs")
+        needs_text = str(needs or "").strip()
+        # needs carries two unrelated meanings (live-verified): a real tool
+        # permission gate is tempo=blocked / "approve <Tool>: <detail>", but
+        # an idle worker also reports needs like "send a prompt to start".
+        # Only the approve form may flip the session into WAITING_PERMISSION —
+        # treating every non-empty needs as a gate is the false-orange-card
+        # bug from the daemon-native rollout.
+        blocking_needs = needs_text if needs_text and (
+            needs_text.lower().startswith("approve ") or tempo == "blocked"
+        ) else ""
+        if blocking_needs:
+            already_waiting = session.lifecycle_state == "WAITING_PERMISSION"
+            if not already_waiting:
+                session.lifecycle_state = "WAITING_PERMISSION"
+                changed = True
+            # The permission-request hook may have raced ahead with its own
+            # notice card; only send ours on a fresh daemon-observed need.
+            if blocking_needs != last_needs and not already_waiting:
+                session.last_event_seq += 1
+                match = re.match(r"^approve\s+([A-Za-z0-9_-]+)", blocking_needs, re.IGNORECASE)
+                await self.orchestrator._send_session_view(
+                    session,
+                    {
+                        "type": "tui_permission_notice",
+                        "tool_name": match.group(1) if match else "",
+                        "summary": blocking_needs,
+                    },
+                    idempotency_key=f"external_tui:daemon_needs:{session.last_event_seq}",
+                )
+            last_needs = blocking_needs
+        elif needs is not None or needs_text:
+            was_waiting = session.lifecycle_state == "WAITING_PERMISSION"
+            if was_waiting:
+                session.lifecycle_state = "EXTERNAL_OBSERVED_READONLY"
+                changed = True
+                # Sync the terminal-side decision back to the channel: the
+                # orange notice card above would otherwise look pending forever.
+                if last_needs:
+                    session.last_event_seq += 1
+                    await self.orchestrator._send_session_view(
+                        session,
+                        {"type": "text", "text": f"✅ 已在终端处理：{last_needs}"},
+                        idempotency_key=f"external_tui:daemon_needs_cleared:{session.last_event_seq}",
+                    )
+            last_needs = ""
+        if tempo or changed:
+            await self.orchestrator.refresh_session_status_card(session)
+        return last_needs
+
+    async def _settle_claude_daemon_session(self, session_id: str, *, outcome: str) -> None:
+        try:
+            session = self.state.sessions.get(session_id)
+        except KeyError:
+            return
+        if session.status == "stopped":
+            return
+        if not (session.writer_owner and session.writer_owner.kind == "external_tui"):
+            return
+        self._mark_tui_session_stopped(
+            session, hook_type=f"daemon_settled_{outcome or 'unknown'}"
+        )
+        await self.orchestrator.refresh_session_status_card(session)
 
     def _archive_bad_tui_hook(self, path: Path) -> None:
         try:
@@ -2109,7 +2582,7 @@ class ChannelNativeRuntime:
                 # Detached sessions need this too — importing them requires an
                 # authorized actor just like takeover does.
                 self._grant_tui_channel_owners(session.session_id, session.channel_binding)
-            if self._mark_stale_tui_process_detached_if_needed(session):
+            if await self._maybe_mark_stale_tui_process_detached(session):
                 changed = True
                 await self.orchestrator.refresh_session_status_card(session)
                 continue
@@ -2121,6 +2594,20 @@ class ChannelNativeRuntime:
         self._loaded_tui_observed_bindings_refreshed = True
         if changed:
             self.save_state()
+
+    async def _maybe_mark_stale_tui_process_detached(self, session) -> bool:
+        process_ref = _external_tui_process_ref(session)
+        if not process_ref or _process_ref_is_running(process_ref):
+            return False
+        if await self._claude_daemon_session_alive(session):
+            # Attach TUI is gone but the daemon worker lives on: this is a
+            # detach, not an end. Keep the session writable via daemon reply.
+            if session.last_progress_event != "external_tui.tui_detached_daemon_alive":
+                session.last_progress_event = "external_tui.tui_detached_daemon_alive"
+                session.last_progress_at = self._now()
+                return True
+            return False
+        return self._mark_stale_tui_process_detached_if_needed(session)
 
     def _mark_stale_tui_process_detached_if_needed(self, session) -> bool:
         process_ref = _external_tui_process_ref(session)
@@ -2349,9 +2836,20 @@ class ChannelNativeRuntime:
         # would just repeat it.
         if hook_type == "notification" and session.lifecycle_state == "WAITING_PERMISSION":
             return
+        # Idle noise ("Claude is waiting for your input") adds nothing on the
+        # channel: the status card already shows the session is idle.
+        if hook_type == "notification" and _is_idle_notification_text(text):
+            return
         # A user prompt / turn end breaks the tool burst; next tools open a new card.
         self.orchestrator._seal_tool_progress_burst(session)
         await self.orchestrator.refresh_session_status_card(session)
+        # A prompt injected from the channel via daemon reply echoes back as a
+        # user-prompt-submit hook; re-posting it would repeat the sender's own
+        # message ("TUI input" echo bug from the daemon-native rollout).
+        if hook_type == "user-prompt-submit" and self.orchestrator.consume_daemon_reply_echo(
+            session.session_id, text
+        ):
+            return
         session.last_event_seq += 1
         view = (
             {"type": "tui_user_input", "input": text}
@@ -2371,6 +2869,8 @@ class ChannelNativeRuntime:
         session.stop_reason = f"external_tui_{hook_type}"
         session.writer_lease = None
         session.writer_owner = WriterOwner(kind="none")
+        if isinstance(session.transport_ref, dict):
+            session.transport_ref.pop("daemon_live", None)
 
     def save_state(self) -> None:
         self.state_store.save(
@@ -2837,6 +3337,15 @@ def run_native_cli(args) -> None:
         payload.setdefault("_walkcode_hook_process_tree_entries", _process_tree_entries(parent_pid, max_depth=4))
         payload.setdefault("_walkcode_hook_process_tree", _process_tree_commands(parent_pid, max_depth=4))
         payload.setdefault("_walkcode_infer_tui_pid", True)
+        if getattr(args, "gate", False):
+            output = runtime.gate_tui_hook(
+                hook_type=args.hook_type,
+                payload=payload,
+                agent=getattr(args, "agent", "") or "",
+            )
+            if output is not None:
+                print(json.dumps(output, ensure_ascii=False))
+            raise SystemExit(0)
         if getattr(args, "defer", False):
             queued = runtime.defer_tui_hook(
                 hook_type=args.hook_type,
@@ -2945,6 +3454,17 @@ def _build_transports(config: ChannelNativeConfig) -> dict[str, AgentTransport]:
             config_dir=claude_options.get("config_dir"),
             permission_mode=claude_options.get("permission_mode"),
         )
+        # Multi-UI sync (ADR 0046): the daemon transport rides alongside the
+        # headless one — reply/subscribe against TUI-owned daemon workers.
+        # "auto" registers it unconditionally; every op degrades to
+        # TransportUnavailable when the per-profile daemon is not running.
+        if str(claude_options.get("daemon_mode", "") or "auto") != "off":
+            transports["claude_daemon"] = ClaudeDaemonTransport(
+                config_dir=str(claude_options.get("config_dir", "") or ""),
+                # Enables the PreToolUse gate decision path: card callbacks
+                # write decisions/<rid>.json under this state's hook spool.
+                gate_state_path=config.state_path,
+            )
     elif kind == "codex_app_server":
         if shutil.which("codex"):
             transports[kind] = CodexAppServerTransport(client=_build_codex_app_server_client(config))
@@ -4017,6 +4537,20 @@ def _tui_visible_text_from_content_blocks(blocks: list[Any]) -> str:
 
 def _tui_hook_stops_session(hook_type: str) -> bool:
     return str(hook_type or "").strip().lower() in {"process-exit", "process-exited"}
+
+
+def _is_idle_notification_text(text: str) -> bool:
+    lowered = str(text or "").strip().lower()
+    if not lowered:
+        return True
+    return any(
+        marker in lowered
+        for marker in (
+            "waiting for your input",
+            "waiting for input",
+            "awaiting your input",
+        )
+    )
 
 
 def _tui_hook_is_tool_lifecycle(hook_type: str) -> bool:

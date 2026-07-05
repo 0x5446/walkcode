@@ -1028,10 +1028,10 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
                 try:
                     for _ in range(50):
                         sent = [payload for method, payload in api.calls if method == "sendMessage"]
-                        if any(payload.get("text") == "TUI input\n\nmirror while polling is stuck" for payload in sent):
+                        if any(payload.get("text") == "⌨️ 终端输入\n\nmirror while polling is stuck" for payload in sent):
                             return
                         await asyncio.sleep(0.01)
-                    self.fail("TUI input was not mirrored while getUpdates was hanging")
+                    self.fail("terminal input was not mirrored while getUpdates was hanging")
                 finally:
                     task.cancel()
                     await asyncio.gather(task, return_exceptions=True)
@@ -2690,7 +2690,7 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
             send_messages = [payload for method, payload in api.calls if method == "sendMessage"]
             self.assertEqual(len(send_messages), 2)
             self.assertIn("WalkCode session: claude: TUI claude-session-early", send_messages[0]["text"])
-            self.assertEqual(send_messages[1]["text"], "TUI input\n\nhello from TUI")
+            self.assertEqual(send_messages[1]["text"], "⌨️ 终端输入\n\nhello from TUI")
             self.assertEqual(runtime.transports["claude_headless"].submitted_turns, [])
             snapshot = JsonFileStateStore(state_path).load()
             summaries = snapshot.sessions.list_sessions(channel_kind="telegram")
@@ -2742,7 +2742,7 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
 
             self.assertTrue(result.accepted)
             send_messages = [payload for method, payload in api.calls if method == "sendMessage"]
-            self.assertEqual(send_messages[-1]["text"], "TUI input\n\nplease inspect the branch")
+            self.assertEqual(send_messages[-1]["text"], "⌨️ 终端输入\n\nplease inspect the branch")
             self.assertEqual(transport.submitted_turns, [])
             session = runtime.state.sessions.get(runtime.state.sessions.list_sessions(channel_kind="telegram")[0].session_id)
             self.assertEqual(session.writer_owner.kind, "external_tui")

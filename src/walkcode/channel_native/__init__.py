@@ -27,6 +27,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal, Protocol
 
+from . import claude_gate
+
 
 BindingKey = tuple[str, str, str, str, str]
 
@@ -429,6 +431,36 @@ def _configured_agent_options(source: Any) -> dict[str, dict[str, Any]]:
                 f"use one of {', '.join(sorted(allowed_modes))}"
             )
         claude["permission_mode"] = claude_permission_mode
+    claude_daemon_mode = str(source.get("WALKCODE_CLAUDE_DAEMON_MODE") or "").strip().lower()
+    if claude_daemon_mode:
+        if claude_daemon_mode not in {"auto", "off"}:
+            raise ChannelConfigError(
+                f"invalid WALKCODE_CLAUDE_DAEMON_MODE: {claude_daemon_mode}; use auto or off"
+            )
+        claude["daemon_mode"] = claude_daemon_mode
+    claude_gate_mode = str(source.get("WALKCODE_CLAUDE_GATE_MODE") or "").strip().lower()
+    if claude_gate_mode:
+        if claude_gate_mode not in {"auto", "off", "ask_only"}:
+            raise ChannelConfigError(
+                f"invalid WALKCODE_CLAUDE_GATE_MODE: {claude_gate_mode}; use auto, off, or ask_only"
+            )
+        claude["gate_mode"] = claude_gate_mode
+    claude_gate_timeout = str(source.get("WALKCODE_CLAUDE_GATE_TIMEOUT") or "").strip()
+    if claude_gate_timeout:
+        try:
+            timeout_value = float(claude_gate_timeout)
+        except ValueError:
+            timeout_value = 0.0
+        if timeout_value <= 0:
+            raise ChannelConfigError(
+                f"invalid WALKCODE_CLAUDE_GATE_TIMEOUT: {claude_gate_timeout}; use seconds > 0"
+            )
+        claude["gate_timeout"] = timeout_value
+    claude_gate_tools = str(source.get("WALKCODE_CLAUDE_GATE_TOOLS") or "").strip()
+    if claude_gate_tools:
+        claude["gate_tools"] = [
+            tool.strip() for tool in claude_gate_tools.split(",") if tool.strip()
+        ]
     codex: dict[str, Any] = {}
     codex_home = str(source.get("WALKCODE_CODEX_HOME") or "").strip()
     if codex_home:
@@ -739,6 +771,25 @@ def _session_is_external_tui_takeover_candidate(session: Session) -> bool:
     if session.writer_owner is not None and isinstance(session.writer_owner.external_ref, dict):
         refs.append(session.writer_owner.external_ref)
     return any(str(ref.get("source", "")) == "native_tui_hook" for ref in refs)
+
+
+def _external_claude_resume_ref(session: Session) -> dict[str, Any]:
+    """The Claude-native resume_ref of a TUI-observed session, if any.
+
+    TUI hooks store it nested as ``transport_ref["resume_ref"]`` with a
+    ``transport_kind`` discriminator; only claude sessions can be driven
+    through the Claude daemon.
+    """
+    refs: list[dict[str, Any]] = []
+    if isinstance(session.transport_ref, dict):
+        refs.append(session.transport_ref)
+    if session.writer_owner is not None and isinstance(session.writer_owner.external_ref, dict):
+        refs.append(session.writer_owner.external_ref)
+    for ref in refs:
+        nested = ref.get("resume_ref")
+        if isinstance(nested, dict) and str(nested.get("transport_kind", "")) == "claude_headless":
+            return dict(nested)
+    return {}
 
 
 def _estimate_context_tokens(usage: dict[str, Any]) -> int:
@@ -2800,6 +2851,7 @@ class ViewModelFactory:
         model: str = "",
         context_used: int = 0,
         context_limit: int = 0,
+        direct_write: bool = False,
     ) -> dict[str, Any]:
         return {
             "type": "health",
@@ -2818,6 +2870,9 @@ class ViewModelFactory:
             "model": model,
             "context_used": context_used,
             "context_limit": context_limit,
+            # TUI-observed session with live daemon direct-write: channel input
+            # reaches the terminal session without takeover (ADR 0046 v2).
+            "direct_write": direct_write,
         }
 
     @staticmethod
@@ -3732,8 +3787,10 @@ def render_view_text(view_model: dict[str, Any]) -> str:
             return "请选择：" + " / ".join(t for t in titles if t)
         return str(view_model.get("prompt", "请选择"))
     if view_type == "tui_user_input":
+        # Terminal-side keystrokes mirrored to the channel (channel-originated
+        # input is deduped upstream and never rendered as an echo).
         value = str(view_model.get("input", "") or "").strip()
-        return f"TUI input\n\n{value}" if value else "TUI input"
+        return f"⌨️ 终端输入\n\n{value}" if value else "⌨️ 终端输入"
     if view_type == "tui_permission_notice":
         tool = str(view_model.get("tool_name", "") or "tool")
         summary = str(view_model.get("summary", "") or "")
@@ -4804,27 +4861,9 @@ class _ClaudePermissionBridge:
         return deny_cls(message=message or "Denied via WalkCode", interrupt=False)
 
     def _build_ask_updated_input(self, entry: dict[str, Any], answers: dict[Any, Any]) -> dict[str, Any]:
-        questions = entry.get("tool_input", {}).get("questions", [])
-        if not isinstance(questions, list):
-            questions = []
-        answers_map: dict[str, str] = {}
-        for index, question in enumerate(questions):
-            if not isinstance(question, dict):
-                continue
-            question_text = str(
-                question.get("question") or question.get("header") or question.get("prompt") or ""
-            )
-            if not question_text:
-                continue
-            value = answers.get(index)
-            if value is None:
-                value = answers.get(str(index))
-            if value is None:
-                continue
-            if isinstance(value, (list, tuple)):
-                value = ",".join(str(item) for item in value)
-            answers_map[question_text] = str(value)
-        return {"questions": questions, "answers": answers_map}
+        # Shared with the cross-process PreToolUse gate (claude_gate): the
+        # hook builds the same updatedInput payload from its decision file.
+        return claude_gate.ask_updated_input(entry.get("tool_input", {}) or {}, answers)
 
     def _always_allow_updates(self, entry: dict[str, Any]) -> list[Any]:
         suggestions = list(getattr(entry.get("ctx"), "suggestions", []) or [])
@@ -6505,6 +6544,12 @@ class Orchestrator:
         self.on_state_changed = on_state_changed
         self._background_event_drains: set[asyncio.Task] = set()
         self._now = now
+        # Echo dedup for daemon replies (ADR 0046 v2): a channel message
+        # injected via daemon reply comes back as a user-prompt-submit hook;
+        # without this record it would be re-posted as "TUI input" — the
+        # sender's own words repeated at them. In-memory on purpose: the
+        # window is seconds, a restart in between just lets one echo through.
+        self._daemon_reply_echoes: dict[str, tuple[str, float]] = {}
 
     async def start_session(
         self,
@@ -6555,6 +6600,16 @@ class Orchestrator:
                 return ready
         validation = self.sessions.validate_submit(session_id, generation)
         if not validation.accepted:
+            if validation.reason == BlockedReason.EXTERNAL_TUI_READONLY and (
+                _session_is_external_tui_takeover_candidate(session)
+            ):
+                # Multi-UI write path (ADR 0046): a live daemon worker accepts
+                # the message directly (as if typed in the TUI), so no takeover
+                # is needed and the terminal stays attached. Falls through to
+                # the takeover prompt when the daemon or the job is gone.
+                daemon_result = await self._try_external_daemon_reply(session, turn)
+                if daemon_result is not None:
+                    return daemon_result
             if validation.reason in {BlockedReason.EXTERNAL_TUI_READONLY, BlockedReason.SESSION_STOPPED} and (
                 _session_is_external_tui_takeover_candidate(session)
             ):
@@ -6602,6 +6657,79 @@ class Orchestrator:
         await self._drain_events(session, transport, handle)
         await self.refresh_session_status_card(session)
         return SubmitResult(True)
+
+    async def _try_external_daemon_reply(
+        self,
+        session: Session,
+        turn: TurnInput,
+    ) -> SubmitResult | None:
+        """Inject a message into a TUI-owned Claude session via the daemon.
+
+        Returns a SubmitResult when the daemon accepted the reply, or None to
+        fall back to the takeover prompt. Writer ownership is intentionally
+        left with the external TUI: the hook pipeline keeps rendering content
+        (the injected input echoes back as ``tui_user_input``), and the TUI
+        process stays alive — that is the whole point of ADR 0046.
+        """
+        transport = self.transports.get("claude_daemon")
+        if transport is None:
+            return None
+        resume_ref = _external_claude_resume_ref(session)
+        if not resume_ref:
+            return None
+        try:
+            handle = await transport.resume(
+                ResumeSpec(
+                    cwd=session.cwd,
+                    session_id=session.session_id,
+                    resume_ref=resume_ref,
+                )
+            )
+            await transport.submit_turn(
+                handle,
+                turn,
+                idempotency_key=f"{session.session_id}:{session.generation}:daemon-reply:{turn.text}",
+            )
+        except Exception as exc:
+            # Any failure here (dead socket, ENOJOB, ENOREPLY mid-turn, proto
+            # drift) degrades to the takeover prompt, which remains fully
+            # functional; the reply path must never hard-fail the inbound.
+            _log_degrade(
+                "claude_daemon_reply_failed",
+                session_id=session.session_id,
+                error=exc,
+                fallback="takeover_prompt",
+            )
+            return None
+        composed = ClaudeHeadlessTransport._compose_turn_text(turn)
+        self._daemon_reply_echoes[session.session_id] = (composed.strip(), self._now())
+        session.last_progress_at = self._now()
+        session.last_progress_event = "external_tui.daemon_reply"
+        session.last_event_seq += 1
+        await self._send_session_view(
+            session,
+            {"type": "text", "text": "✅ 已发送到终端会话"},
+            idempotency_key=f"daemon_reply_ack:{session.last_event_seq}",
+        )
+        await self.refresh_session_status_card(session)
+        self._notify_state_changed()
+        return SubmitResult(True, "daemon_reply")
+
+    def consume_daemon_reply_echo(
+        self, session_id: str, text: str, *, max_age: float = 180.0
+    ) -> bool:
+        """True (and consumed) when this TUI prompt echo came from a daemon reply."""
+        record = self._daemon_reply_echoes.get(session_id)
+        if not record:
+            return False
+        recorded_text, recorded_at = record
+        if self._now() - recorded_at > max_age:
+            self._daemon_reply_echoes.pop(session_id, None)
+            return False
+        if str(text or "").strip() != recorded_text:
+            return False
+        self._daemon_reply_echoes.pop(session_id, None)
+        return True
 
     def _start_background_event_drain(
         self,
@@ -6907,6 +7035,11 @@ class Orchestrator:
             last_event_seq=session.last_event_seq,
             readonly=bool(session.writer_owner and session.writer_owner.kind == "external_tui"),
             model=session.model,
+            direct_write=bool(
+                session.status != "stopped"
+                and isinstance(session.transport_ref, dict)
+                and session.transport_ref.get("daemon_live")
+            ),
             context_used=_estimate_context_tokens(session.last_usage),
             context_limit=_context_window_limit(
                 session.model, _estimate_context_tokens(session.last_usage)
@@ -6962,9 +7095,13 @@ class Orchestrator:
 
     @staticmethod
     def _status_card_actions(session: Session) -> list[dict[str, Any]]:
-        if _session_is_external_tui_takeover_candidate(session):
-            return [{"action": "request_takeover", "label": "Take over"}]
-        return []
+        if not _session_is_external_tui_takeover_candidate(session):
+            return []
+        if session.status != "stopped" and session.transport_ref.get("daemon_live"):
+            # Daemon direct-write is live: channel input already reaches the
+            # session via reply, so a takeover button would only mislead.
+            return []
+        return [{"action": "request_takeover", "label": "Take over"}]
 
     async def _pin_status_card_if_requested(self, channel: ChannelAdapter, binding: ChannelBinding) -> None:
         if not binding.health_message_id or not bool(binding.capabilities.get("pin_status_card")):
@@ -6999,6 +7136,20 @@ class Orchestrator:
             ref=dict(session.transport_ref),
         )
 
+    def _interaction_transport(self, session: Session) -> AgentTransport | None:
+        """Transport that carries HITL decisions for this session.
+
+        TUI-observed sessions have ``transport_kind == "external_tui"`` which
+        has no transport of its own; their permission / AskUserQuestion
+        decisions ride the Claude daemon transport's gate spool (ADR 0046 v2).
+        """
+        transport = self.transports.get(session.transport_kind)
+        if transport is not None:
+            return transport
+        if _session_is_external_tui_takeover_candidate(session) and _external_claude_resume_ref(session):
+            return self.transports.get("claude_daemon")
+        return None
+
     async def handle_inbound_event(
         self,
         inbound: InboundEvent,
@@ -7029,8 +7180,10 @@ class Orchestrator:
                             if not authz_result.allowed:
                                 result = SubmitResult(False, authz_result.reason)
                         if result is None:
-                            transport = self.transports[session.transport_kind]
-                        if result is None and not transport.capabilities().ask_user_question:
+                            transport = self._interaction_transport(session)
+                        if result is None and (
+                            transport is None or not transport.capabilities().ask_user_question
+                        ):
                             result = SubmitResult(False, BlockedReason.CAPABILITY_DISABLED)
                         if result is None:
                             decision = self.interactions.answer_awaiting_other(
@@ -7242,7 +7395,7 @@ class Orchestrator:
             return SubmitResult(False, BlockedReason.NOT_FOUND)
         actor = ActorRef(inbound.channel_kind, inbound.sender_id, inbound.sender_display)
         if ctx.kind == "permission":
-            transport = self.transports[session.transport_kind]
+            transport = self._interaction_transport(session)
             if self.authz is not None:
                 authz_result = self.authz.can_decide_permission(
                     ctx.session_id,
@@ -7251,15 +7404,15 @@ class Orchestrator:
                 )
                 if not authz_result.allowed:
                     return SubmitResult(False, authz_result.reason)
-            if not transport.capabilities().permission_callback:
+            if transport is None or not transport.capabilities().permission_callback:
                 return SubmitResult(False, BlockedReason.CAPABILITY_DISABLED)
         elif ctx.kind == "ask_user_question":
-            transport = self.transports[session.transport_kind]
+            transport = self._interaction_transport(session)
             if self.authz is not None:
                 authz_result = self.authz.can_submit(ctx.session_id, actor)
                 if not authz_result.allowed:
                     return SubmitResult(False, authz_result.reason)
-            if not transport.capabilities().ask_user_question:
+            if transport is None or not transport.capabilities().ask_user_question:
                 return SubmitResult(False, BlockedReason.CAPABILITY_DISABLED)
         elif ctx.kind == "takeover":
             if self.authz is not None:
@@ -7269,12 +7422,12 @@ class Orchestrator:
             if ctx.generation != session.generation:
                 return SubmitResult(False, BlockedReason.STALE_GENERATION)
         elif ctx.kind == "model_choice":
-            transport = self.transports[session.transport_kind]
+            transport = self._interaction_transport(session)
             if self.authz is not None:
                 authz_result = self.authz.can_submit(ctx.session_id, actor)
                 if not authz_result.allowed:
                     return SubmitResult(False, authz_result.reason)
-            if not transport.capabilities().set_model:
+            if transport is None or not transport.capabilities().set_model:
                 return SubmitResult(False, BlockedReason.CAPABILITY_DISABLED)
         # Lark form cards submit every field in one callback: fold the form
         # values into the pending answers before the submit token is decided.
@@ -7290,7 +7443,9 @@ class Orchestrator:
             binding_key=inbound.binding_key(),
         )
         if decision.accepted and ctx.kind == "permission":
-            transport = self.transports[session.transport_kind]
+            transport = self._interaction_transport(session)
+            if transport is None:
+                return SubmitResult(False, BlockedReason.CAPABILITY_DISABLED)
             approval_decision = dict(decision.decision or {})
             if session.transport_kind == "codex_app_server":
                 approval_decision["_tool_input"] = dict(ctx.tool_input)
@@ -7876,7 +8031,9 @@ class Orchestrator:
         payload = decision.decision or {}
         action = payload.get("action")
         if action == "answers":
-            transport = self.transports[session.transport_kind]
+            transport = self._interaction_transport(session)
+            if transport is None:
+                return
             answers = payload.get("answers", {})
             if not isinstance(answers, dict):
                 answers = {}
@@ -7976,6 +8133,57 @@ class Orchestrator:
             idempotency_key=f"{session.session_id}:{session.generation}:{idempotency_key}",
         )
         await self._flush_outbox()
+
+    async def post_claude_gate_prompt(self, session_id: str, request: dict[str, Any]) -> bool:
+        """Post a permission / AskUserQuestion card for a PreToolUse gate request.
+
+        Reuses the headless event pipeline end to end: the synthesized
+        ``AgentEvent`` flows through ``_event_to_view`` (HITL + interaction
+        registration with ``transport_request_id = rid``), so the card
+        callback resolves through ``_handle_callback_event`` unchanged and the
+        decision lands in the gate spool via the daemon transport.
+        """
+        try:
+            session = self.sessions.get(session_id)
+        except KeyError:
+            return False
+        if session.channel_binding is None:
+            return False
+        rid = str(request.get("rid", "") or "")
+        if not rid:
+            return False
+        tool_name = str(request.get("tool_name", "") or "")
+        tool_input = request.get("tool_input")
+        if not isinstance(tool_input, dict):
+            tool_input = {}
+        if str(request.get("kind", "")) == claude_gate.KIND_ASK_USER:
+            event = AgentEvent(
+                AgentEventType.ASK_USER_REQUESTED,
+                {
+                    "rid": rid,
+                    "questions": _ClaudePermissionBridge._map_ask_questions(tool_input),
+                    "native_method": "pre_tool_use_hook",
+                },
+            )
+        else:
+            event = AgentEvent(
+                AgentEventType.PERMISSION_REQUESTED,
+                {
+                    "rid": rid,
+                    "tool_name": tool_name,
+                    "tool_input": tool_input,
+                    "actions": ["allow", "always_allow", "deny"],
+                    "high_risk": _claude_tool_is_high_risk(tool_name),
+                    "native_method": "pre_tool_use_hook",
+                },
+            )
+        view = self._event_to_view(session, event)
+        session.last_event_seq += 1
+        session.last_progress_at = self._now()
+        session.last_progress_event = f"gate.waiting:{tool_name or 'ask_user_question'}"
+        await self._send_session_view(session, view, idempotency_key=f"gate:{rid}")
+        await self.refresh_session_status_card(session)
+        return True
 
     async def _drain_events(
         self,

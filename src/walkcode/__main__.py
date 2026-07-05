@@ -263,6 +263,15 @@ def main() -> None:
         action="store_true",
         help="Persist the hook locally and let the running native service process Telegram side effects",
     )
+    nh.add_argument(
+        "--gate",
+        action="store_true",
+        help=(
+            "Blocking PreToolUse gate: spool the observation copy (implies --defer), then "
+            "hold the tool call until a channel-side permission/AskUserQuestion decision "
+            "lands; requires a larger Claude hook timeout (e.g. 1830)"
+        ),
+    )
     nh.add_argument("--json", action="store_true", help="Print machine-readable JSON")
 
     args = parser.parse_args()

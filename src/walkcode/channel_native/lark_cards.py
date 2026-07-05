@@ -92,7 +92,11 @@ def _card_message(title: str, template: str, elements: list[dict[str, Any]]) -> 
     return {
         "msg_type": "interactive",
         "content": {
-            "config": {"wide_screen_mode": True},
+            # update_multi makes the card "shared": required by the message
+            # PATCH endpoint that flips decided prompts into result cards —
+            # patching a private (default) card is rejected by Lark, which
+            # left settled permission/ask cards showing live buttons.
+            "config": {"wide_screen_mode": True, "update_multi": True},
             "header": {
                 "title": {"tag": "plain_text", "content": _clip(_inline(title), 120, "...")},
                 "template": template,
@@ -288,7 +292,9 @@ def _health_card(view: dict[str, Any]) -> dict[str, Any]:
         detail_bits.append(f"**进展**: {escape_lark_md(_inline(str(view['last_progress_event'])))}")
     if detail_bits:
         elements.append({"tag": "markdown", "content": "　".join(detail_bits)})
-    if view.get("readonly"):
+    if view.get("direct_write"):
+        elements.append(_md_div("🔁 双端同步中：这里发消息会直达终端会话。"))
+    elif view.get("readonly"):
         elements.append(_md_div("👀 只读观察中：接管后才能从这里发消息。"))
     reason = str(view.get("reason", "") or "")
     if status in {"error", "stale"} and reason:
@@ -415,7 +421,12 @@ def _tui_permission_notice_card(view: dict[str, Any]) -> dict[str, Any]:
         "orange",
         [
             _md_div("\n".join(rows)),
-            _note("这个确认只能在终端里按；如果人不在电脑前，可以对本会话发起 Take over 接管。"),
+            # Post-gate this card only appears for confirmations that did NOT
+            # route to a Feishu approval card (tool outside the gate set, gate
+            # off/ask_only, or the gate abstained) — so the terminal is the
+            # only place to answer. No takeover pitch: daemon-native sessions
+            # are already dual-writable.
+            _note("这个确认未走飞书审批通道，需要在终端里处理。"),
         ],
     )
 

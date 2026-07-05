@@ -68,6 +68,23 @@ TUI hook 归属锚定：把 walkcode hook 命令写进各 profile 的
 WALKCODE_ENV_FILE=$HOME/.walkcode/work-claude.env walkcode native hook <type> --agent claude --defer
 ```
 
+claude 的 **PreToolUse 例外**：daemon 多端闭环（ADR 0046 v2）要求它用阻塞
+gate 变体，且必须放大 Claude 侧 hook 超时（默认 60s 会先杀掉 hook、静默退
+回终端原生提示）：
+
+```json
+"PreToolUse": [{"matcher": "", "hooks": [{
+  "type": "command",
+  "command": "WALKCODE_ENV_FILE=$HOME/.walkcode/work-claude.env walkcode native hook PreToolUse --agent claude --gate",
+  "timeout": 1830
+}]}]
+```
+
+gate 行为：AskUserQuestion 与会原生弹权限的工具（Bash/Edit/Write 等，减去
+allow 规则命中）转到飞书卡片点选，决策同步回终端会话；walkcode 服务没在跑
+时 hook 自动弃权、终端原生提示照旧。调参：`WALKCODE_CLAUDE_GATE_MODE=
+auto|off|ask_only`、`WALKCODE_CLAUDE_GATE_TIMEOUT`、`WALKCODE_CLAUDE_GATE_TOOLS`。
+
 ## 3. Env 文件（×4）
 
 `~/.walkcode/{profile}-{agent}.env`，模板见 `.env.example`。关键差异项：
@@ -84,6 +101,15 @@ WALKCODE_ENV_FILE=$HOME/.walkcode/work-claude.env walkcode native hook <type> --
 共同项：`WALKCODE_CHANNEL=lark`、`LARK_ALLOWED_CHAT_IDS`/`LARK_ALLOWED_OPEN_IDS`
 白名单、`WALKCODE_CWD`、按需 `WALKCODE_WORKSPACE_ROOTS`（启用 `/repo`）。
 状态路径和 codex socket 不用写，按 profile 自动推导。
+
+claude 实例默认启用 daemon 多端同步（ADR 0046）：TUI 会话飞书直写走 daemon
+`reply`，socket 路径由 `WALKCODE_CLAUDE_CONFIG_DIR` 自动推导。要禁用（回到
+纯 hooks + takeover）设 `WALKCODE_CLAUDE_DAEMON_MODE=off`。
+
+三个 claude wrapper 已是 daemon-native：裸启动 = `claude --bg` + attach，
+会话生而为 daemon worker，飞书直写不再需要 takeover。逃生口：
+`WALKCODE_NO_BG=1 claude-personal` 回到普通 TUI；带任意参数的调用不受影响。
+注意 attach 模式下 `/exit` = detach（会话保活），结束用 `claude stop <short>`。
 
 ## 4. launchd（×4）
 
@@ -152,6 +178,18 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.walkcode.work-claude
 - 发图片/文件 → agent 收到本地附件；
 - `/status`、`/sessions`、`/model`；
 - TUI 起会话 → 话题只读观察 → 接管提示 → 接管后可写。
+
+daemon-native 会话（wrapper 裸启动）另验（ADR 0046 v2）：
+
+- 飞书发消息 → 终端实时出现该输入，飞书**无 "TUI input" 回显**、有
+  "✅ 已发送到终端会话" 回执；
+- 会话内触发 AskUserQuestion → 飞书出选项卡，点选/提交后终端不弹 dialog、
+  模型按所选答案继续；
+- 会话内触发权限工具（如 Edit）→ 飞书出权限卡，点允许/拒绝真放行/拦截；
+  "始终允许"本会话内同工具不再发卡（重启 walkcode 后失效属预期）；
+- 空闲会话不弹权限橙卡；无 "waiting for your input" 英文透传；
+- 终端 `/exit`（detach）→ 状态卡不标已结束、无 Take over 按钮；
+  `claude stop <short>` 后状态卡才转已结束。
 
 部署顺序：work-claude → work-codex（验证 CODEX_HOME 双 daemon 隔离）→
 personal-claude / personal-codex（验证 larksuite 域名差异）。
