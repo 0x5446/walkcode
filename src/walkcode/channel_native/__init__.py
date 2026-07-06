@@ -21,6 +21,7 @@ import re
 import sys
 import tempfile
 import urllib.error
+import urllib.parse
 import urllib.request
 import random
 
@@ -424,6 +425,26 @@ def _configured_agent_options(source: Any) -> dict[str, dict[str, Any]]:
     claude_config_dir = str(source.get("WALKCODE_CLAUDE_CONFIG_DIR") or "").strip()
     if claude_config_dir:
         claude["config_dir"] = str(Path(claude_config_dir).expanduser())
+    claude_anthropic_base_url = str(source.get("WALKCODE_CLAUDE_ANTHROPIC_BASE_URL") or "").strip()
+    if claude_anthropic_base_url:
+        parsed_base_url = urllib.parse.urlsplit(claude_anthropic_base_url)
+        if parsed_base_url.scheme not in {"http", "https"} or not parsed_base_url.hostname:
+            raise ChannelConfigError(
+                f"invalid WALKCODE_CLAUDE_ANTHROPIC_BASE_URL: {claude_anthropic_base_url}; "
+                "must be a full http:// or https:// URL with a host"
+            )
+        if claude.get("settings"):
+            # _option_kwargs() passes this override as a standalone --settings
+            # payload rather than merging WALKCODE_CLAUDE_SETTINGS' own file
+            # content into it (merging would mean re-serializing that file's
+            # content — possibly including secrets like ANTHROPIC_API_KEY —
+            # into this process' argv, and silently dropping it on any
+            # read/parse failure). Combining the two is not supported.
+            raise ChannelConfigError(
+                "WALKCODE_CLAUDE_ANTHROPIC_BASE_URL cannot be combined with "
+                "WALKCODE_CLAUDE_SETTINGS on the same profile; unset one of them"
+            )
+        claude["anthropic_base_url"] = claude_anthropic_base_url
     claude_permission_mode = str(source.get("WALKCODE_CLAUDE_PERMISSION_MODE") or "").strip()
     if claude_permission_mode:
         allowed_modes = {"default", "acceptEdits", "plan", "bypassPermissions", "dontAsk", "auto"}
@@ -4925,6 +4946,7 @@ class ClaudeHeadlessTransport:
         settings: str | None = None,
         cli_path: str | None = None,
         config_dir: str | None = None,
+        anthropic_base_url: str | None = None,
         permission_mode: str | None = None,
         permission_timeout: float = 1800.0,
     ):
@@ -4933,6 +4955,7 @@ class ClaudeHeadlessTransport:
         self.settings = settings
         self.cli_path = cli_path
         self.config_dir = config_dir
+        self.anthropic_base_url = anthropic_base_url
         self.permission_mode = permission_mode
         self.permission_timeout = permission_timeout
         self._clients: dict[str, Any] = {}
@@ -5236,7 +5259,28 @@ class ClaudeHeadlessTransport:
 
     def _option_kwargs(self, spec: LaunchSpec, *, resume_id: str = "") -> dict[str, Any]:
         option_kwargs: dict[str, Any] = {"cwd": spec.cwd}
-        if self.settings:
+        if self.anthropic_base_url:
+            # Confirmed live against a real Vertex-routed profile: plain
+            # options.env is merged into the subprocess env (verified via
+            # CLAUDE_CONFIG_DIR, which relies on exactly that), but Claude
+            # Code still applies this profile's own settings.json (loaded
+            # from CLAUDE_CONFIG_DIR) env block with *higher* priority than
+            # inherited process env for ANTHROPIC_BASE_URL/ANTHROPIC_VERTEX_
+            # BASE_URL specifically — env-only overrides silently never hit
+            # a local proxy. --settings is the layer Claude Code actually
+            # honors here (the same fix claude-tap's own inject_settings_env
+            # applies when it launches the "claude" client itself).
+            #
+            # Deliberately minimal and self-contained (no merging of
+            # self.settings' own file/JSON content): an earlier version read
+            # and re-serialized WALKCODE_CLAUDE_SETTINGS' content inline,
+            # which (a) leaked any embedded secrets (e.g. ANTHROPIC_API_KEY)
+            # into this process' argv/`ps` output, and (b) silently dropped
+            # the whole settings payload on any read/parse hiccup. Combining
+            # WALKCODE_CLAUDE_SETTINGS with this override is rejected at
+            # config-parse time instead (_configured_agent_options).
+            option_kwargs["settings"] = self._anthropic_base_url_settings_override()
+        elif self.settings:
             option_kwargs["settings"] = self.settings
         if self.cli_path:
             option_kwargs["cli_path"] = self.cli_path
@@ -5254,6 +5298,14 @@ class ClaudeHeadlessTransport:
         if resume_id:
             option_kwargs["resume"] = resume_id
         return option_kwargs
+
+    def _anthropic_base_url_settings_override(self) -> str:
+        env_obj: dict[str, str] = {"ANTHROPIC_BASE_URL": self.anthropic_base_url}
+        if _env_bool(os.environ.get("CLAUDE_CODE_USE_VERTEX")):
+            # Claude Code reads ANTHROPIC_VERTEX_BASE_URL instead of
+            # ANTHROPIC_BASE_URL when Vertex routing is active.
+            env_obj["ANTHROPIC_VERTEX_BASE_URL"] = self.anthropic_base_url
+        return json.dumps({"env": env_obj})
 
     def _create_client(self, spec: LaunchSpec, *, resume_id: str = ""):
         if self._client_factory is not None:
