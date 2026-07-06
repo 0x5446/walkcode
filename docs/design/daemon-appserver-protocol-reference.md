@@ -322,6 +322,22 @@ simultaneously. Each gets the full terminal stream. The last attacher's
 terminal dimensions win for resize purposes. The `attachers` map on the
 job tracks all connected clients.
 
+**Keystroke injection via second attacher（2026-07-06 实测）:** 第二个
+attacher（自定义 `attachId`）在握手成功、短暂 settle（~0.8s）后写入的
+原始字节会进入 worker 的终端输入处理器，与真人键盘输入等价——**能直接
+驱动原生对话框**（AskUserQuestion 单选实测三次：注入 `b"N"` 一击选中即
+确认、无需回车，subscribe 观测 blocked→idle/resolved）。注入发生在 raw
+PTY 字节层，不区分对话框类型。相关事实：
+
+- 原生对话框（AskUserQuestion / 权限提示）**无自动超时**，无限等待键盘输入；
+- 无任何 attacher 时对话框仍在 job 的 PTY 内渲染，`state` patch 的 `needs`
+  照常出现（ask 形如 `answer: <question> (<label1> · <label2> ...)`，
+  选项按序号 1 起排列；permission 形如 `approve <Tool>: <detail>`）；
+- 已有 attacher（如用户终端）不影响第二连接注入，双方输入互不互斥。
+
+WalkCode v3 真双端方案（`claude-daemon-multi-ui-sync.md`「交互闭环 v3」）
+基于此机制。
+
 #### 1.6.7 `dispatch` (auth required)
 
 Create and start a new session (job) via the daemon.

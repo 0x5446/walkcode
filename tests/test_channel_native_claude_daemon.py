@@ -38,6 +38,8 @@ from walkcode.channel_native.claude_daemon import (
     claude_daemon_short_from_resume_ref,
     claude_daemon_short_id,
     claude_daemon_socket_path,
+    keys_for_ask_answer,
+    keys_for_permission,
 )
 from walkcode.channel_native_runtime import ChannelNativeRuntime, _build_transports
 
@@ -68,6 +70,10 @@ class _FakeDaemonServer:
         self.replies: list[tuple[str, str]] = []
         self.reply_error_code = ""
         self.subscribe_events: list[dict] = []
+        # attach op: each record is {"request", "bytes", "done"(asyncio.Event)};
+        # attach_stream is raw PTY output pushed right after the handshake.
+        self.attaches: list[dict] = []
+        self.attach_stream = b""
         self._server = None
 
     async def __aenter__(self):
@@ -103,6 +109,22 @@ class _FakeDaemonServer:
                 else:
                     self.replies.append((str(request.get("short", "")), str(request.get("text", ""))))
                     await self._send(writer, {"ok": True, "op": "reply"})
+            elif op == "attach":
+                if request.get("auth") != self.key:
+                    await self._send(writer, {"ok": False, "code": "EAUTH", "error": "control key mismatch"})
+                else:
+                    record = {"request": request, "bytes": b"", "done": asyncio.Event()}
+                    self.attaches.append(record)
+                    await self._send(writer, {"ok": True, "op": "attach", "tempo": "blocked"})
+                    if self.attach_stream:
+                        writer.write(self.attach_stream)
+                        await writer.drain()
+                    while True:
+                        chunk = await reader.read(65536)
+                        if not chunk:
+                            break
+                        record["bytes"] += chunk
+                    record["done"].set()
             elif op == "subscribe":
                 for event in self.subscribe_events:
                     await self._send(writer, event)
@@ -243,6 +265,170 @@ class ClaudeDaemonClientTests(unittest.IsolatedAsyncioTestCase):
                 client = _client_for(server, tmp)
                 self.assertTrue(await client.job_ready(SHORT))
                 self.assertFalse(await client.job_ready("deadbeef"))
+
+
+def _key_bytes(frames) -> list[bytes]:
+    return [data for data, _delay in frames]
+
+
+class KeystrokeMappingTests(unittest.TestCase):
+    """v3 keystroke mapping (live-verified table, design doc "交互闭环 v3")."""
+
+    # -- permission dialog ----------------------------------------------------
+
+    def test_permission_allow_and_always_allow_press_1(self):
+        for action in ("allow", "allow_once", "accept", "acceptForSession", "always_allow"):
+            self.assertEqual(_key_bytes(keys_for_permission(action)), [b"1"], action)
+
+    def test_permission_deny_is_position_independent_esc(self):
+        self.assertEqual(_key_bytes(keys_for_permission("deny")), [b"\x1b"])
+
+    def test_permission_unknown_action_is_not_injectable(self):
+        self.assertIsNone(keys_for_permission("frobnicate"))
+        self.assertIsNone(keys_for_permission(""))
+
+    # -- ask: single question, single-select ----------------------------------
+
+    def _single(self, options, **extra):
+        return {"questions": [{"question": "Which fruit?", "options": options, **extra}]}
+
+    def test_single_select_digit_confirms_in_one_press(self):
+        frames = keys_for_ask_answer(self._single(["apple", "banana", "cherry"]), {0: "banana"})
+        self.assertEqual(_key_bytes(frames), [b"2"])
+
+    def test_single_select_accepts_dict_options_and_str_answer_key(self):
+        options = [{"label": "apple", "value": "a"}, {"label": "banana", "value": "b"}]
+        frames = keys_for_ask_answer(self._single(options), {"0": "banana"})
+        self.assertEqual(_key_bytes(frames), [b"2"])
+
+    def test_single_select_free_text_goes_through_other_slot(self):
+        frames = keys_for_ask_answer(self._single(["apple", "banana", "cherry"]), {0: "mango"})
+        # Locate "Type something." (slot 4), type inline, then Enter confirms.
+        self.assertEqual(_key_bytes(frames), [b"4", b"mango", b"\r"])
+
+    def test_other_free_text_sanitizes_control_bytes_and_newlines(self):
+        frames = keys_for_ask_answer(
+            self._single(["apple"]), {0: "line one\nline\ttwo\x1b\x7f"}
+        )
+        self.assertEqual(_key_bytes(frames), [b"2", b"line one line two", b"\r"])
+
+    def test_other_empty_text_would_cancel_the_dialog_so_not_injectable(self):
+        self.assertIsNone(keys_for_ask_answer(self._single(["apple"]), {0: "   \n "}))
+
+    def test_missing_answer_is_not_injectable(self):
+        self.assertIsNone(keys_for_ask_answer(self._single(["apple"]), {}))
+
+    def test_empty_or_malformed_questions_are_not_injectable(self):
+        self.assertIsNone(keys_for_ask_answer({}, {0: "x"}))
+        self.assertIsNone(keys_for_ask_answer({"questions": []}, {0: "x"}))
+        self.assertIsNone(keys_for_ask_answer({"questions": ["not-a-dict"]}, {0: "x"}))
+
+    # -- ask: single question, multiSelect ------------------------------------
+
+    def test_multi_select_toggles_then_right_arrow_then_submit(self):
+        question = self._single(["python", "go", "rust"], multiSelect=True)
+        frames = keys_for_ask_answer(question, {0: ["python", "rust"]})
+        self.assertEqual(_key_bytes(frames), [b"1", b"3", b"\x1b[C", b"1"])
+
+    def test_multi_select_single_string_answer_is_wrapped(self):
+        question = self._single(["python", "go"], allow_multiple=True)
+        frames = keys_for_ask_answer(question, {0: "go"})
+        self.assertEqual(_key_bytes(frames), [b"2", b"\x1b[C", b"1"])
+
+    def test_multi_select_duplicate_pick_does_not_toggle_back_off(self):
+        question = self._single(["python", "go"], multiSelect=True)
+        frames = keys_for_ask_answer(question, {0: ["go", "go"]})
+        self.assertEqual(_key_bytes(frames), [b"2", b"\x1b[C", b"1"])
+
+    def test_multi_select_free_text_is_not_injectable(self):
+        question = self._single(["python", "go"], multiSelect=True)
+        self.assertIsNone(keys_for_ask_answer(question, {0: ["python", "zig"]}))
+        self.assertIsNone(keys_for_ask_answer(question, {0: []}))
+
+    # -- ask: multi-question ---------------------------------------------------
+
+    def test_multi_question_digits_auto_advance_then_submit(self):
+        tool_input = {
+            "questions": [
+                {"question": "Fruit?", "options": ["apple", "banana"]},
+                {"question": "Color?", "options": ["red", "blue", "green"]},
+            ]
+        }
+        frames = keys_for_ask_answer(tool_input, {0: "apple", "1": "blue"})
+        self.assertEqual(_key_bytes(frames), [b"1", b"2", b"1"])
+
+    def test_multi_question_with_multi_select_is_not_injectable(self):
+        tool_input = {
+            "questions": [
+                {"question": "Fruit?", "options": ["apple"]},
+                {"question": "Langs?", "options": ["python", "go"], "multiSelect": True},
+            ]
+        }
+        self.assertIsNone(keys_for_ask_answer(tool_input, {0: "apple", 1: ["go"]}))
+
+    def test_multi_question_with_free_text_is_not_injectable(self):
+        tool_input = {
+            "questions": [
+                {"question": "Fruit?", "options": ["apple"]},
+                {"question": "Color?", "options": ["red"]},
+            ]
+        }
+        self.assertIsNone(keys_for_ask_answer(tool_input, {0: "apple", 1: "purple"}))
+
+    def test_option_slot_past_digit_9_is_not_injectable(self):
+        many = [f"opt{i}" for i in range(9)]  # Other would land on slot 10
+        self.assertIsNone(keys_for_ask_answer(self._single(many), {0: "free text"}))
+
+
+class AttachSendKeysTests(unittest.IsolatedAsyncioTestCase):
+    async def test_frames_injected_in_order_over_single_attach_connection(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            async with _FakeDaemonServer(str(Path(tmp) / "control.sock")) as server:
+                # PTY replay after the handshake must be drained, not choke the writer.
+                server.attach_stream = b"\x1b[2J\x1b[H? Which fruit?\r\n> 1. apple\r\n"
+                client = _client_for(server, tmp)
+                await client.attach_send_keys(
+                    SHORT,
+                    [(b"2", 0.0), (b"\x1b[C", 0.0), (b"1", 0.0)],
+                    settle=0.0,
+                )
+                record = server.attaches[0]
+                await asyncio.wait_for(record["done"].wait(), timeout=2.0)
+                self.assertEqual(record["bytes"], b"2\x1b[C1")
+                request = record["request"]
+                self.assertEqual(request["short"], SHORT)
+                self.assertEqual(request["auth"], server.key)
+                self.assertEqual(request["attachId"], "walkcode-injector")
+                self.assertEqual((request["cols"], request["rows"]), (120, 40))
+
+    async def test_wrong_control_key_raises_eauth(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            async with _FakeDaemonServer(str(Path(tmp) / "control.sock")) as server:
+                client = _client_for(server, tmp, key="b" * 32)
+                with self.assertRaises(ClaudeDaemonError) as caught:
+                    await client.attach_send_keys(SHORT, [(b"1", 0.0)], settle=0.0)
+                self.assertEqual(caught.exception.code, "EAUTH")
+                self.assertEqual(server.attaches, [])
+
+    async def test_missing_socket_degrades_to_transport_unavailable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            key_path = Path(tmp) / "control.key"
+            key_path.write_text("a" * 32, encoding="utf-8")
+            client = ClaudeDaemonClient(
+                socket_path=str(Path(tmp) / "missing.sock"),
+                control_key_path=str(key_path),
+                request_timeout=1.0,
+            )
+            with self.assertRaises(TransportUnavailable):
+                await client.attach_send_keys(SHORT, [(b"1", 0.0)], settle=0.0)
+
+    async def test_empty_frames_are_a_noop_without_connecting(self):
+        client = ClaudeDaemonClient(
+            socket_path="/nonexistent/control.sock",
+            control_key_path="/nonexistent/control.key",
+        )
+        await client.attach_send_keys(SHORT, [], settle=0.0)
+        await client.attach_send_keys(SHORT, [(b"", 0.0)], settle=0.0)
 
 
 class ClaudeDaemonTransportTests(unittest.IsolatedAsyncioTestCase):

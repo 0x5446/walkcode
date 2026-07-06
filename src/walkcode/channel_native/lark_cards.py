@@ -160,7 +160,15 @@ def _permission_card(view: dict[str, Any]) -> dict[str, Any]:
     elements: list[dict[str, Any]] = [_md_div(content)]
     if buttons:
         elements.append(_action_row(buttons))
+    if view.get("dual_surface"):
+        elements.append(_dual_surface_note())
     return _card_message(title, template, elements)
+
+
+def _dual_surface_note() -> dict[str, Any]:
+    # v3 true dual-surface (ADR 0046 v3): the native terminal dialog renders
+    # at the same time as this card; whichever side answers first wins.
+    return _note("💡 终端与飞书均可回答，先答先生效。")
 
 
 def _ask_user_question_card(view: dict[str, Any]) -> dict[str, Any]:
@@ -169,8 +177,12 @@ def _ask_user_question_card(view: dict[str, Any]) -> dict[str, Any]:
         return _card_message("选择一个选项", "blue", [_md_div("⚠️ 无可用问题。")])
     submit = view.get("submit")
     if isinstance(submit, dict) and submit.get("token"):
-        return _ask_user_form_card(questions, submit)
-    return _ask_user_button_card(questions)
+        card = _ask_user_form_card(questions, submit)
+    else:
+        card = _ask_user_button_card(questions)
+    if view.get("dual_surface"):
+        card["content"]["elements"].append(_dual_surface_note())
+    return card
 
 
 def _ask_user_button_card(questions: list[Any]) -> dict[str, Any]:
@@ -439,6 +451,13 @@ def _decision_result_card(view: dict[str, Any]) -> dict[str, Any]:
         # runtime restarted and the in-flight prompt died with it).
         body = escape_lark_md(_inline(detail)) if detail else "会话进程已重启，这张卡片已失效。"
         return _card_message("⚠️ 卡片已失效", "orange", [_md_div(body)])
+    if action == "degraded":
+        # v3 keystroke injection missed; the native dialog is still waiting.
+        body = escape_lark_md(_inline(detail)) if detail else "注入未生效，请在终端操作。"
+        return _card_message("⚠️ 请在终端操作", "orange", [_md_div(body)])
+    if action == "terminal":
+        body = escape_lark_md(_inline(detail)) if detail else "已在终端处理。"
+        return _card_message("✅ 已在终端处理", "green", [_md_div(body)])
     if str(view.get("kind", "")) == "model_choice":
         body = f"✅ {escape_lark_md(_inline(detail))}" if detail else "✅ 模型已切换"
         return _card_message("🧠 模型已切换", "green", [_md_div(body)])

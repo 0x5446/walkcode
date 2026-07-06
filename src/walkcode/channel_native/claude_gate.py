@@ -11,6 +11,16 @@ rendezvous under the instance's TUI hook spool:
     <state>.tui-hooks.d/gate/decisions/<rid>.json   runtime -> hook (write-once)
     <state>.tui-hooks.d/gate/serve.heartbeat        runtime drain liveness
 
+Pendings carry a ``mode`` (ADR 0046 v3):
+
+    block   v2 semantics (default for files without the field): the hook
+            blocks polling decisions/<rid>.json until decision or timeout.
+    notify  v3 true dual-surface: the hook captures the structured tool_input
+            and abstains immediately, letting the native dialog render; the
+            runtime turns the pending into a card and delivers the answer via
+            daemon attach keystroke injection instead of a decision file. No
+            hook is waiting, so the runtime owns pending cleanup.
+
 Decision mapping mirrors ``_ClaudePermissionBridge._result_from_decision``:
 
     allow / always_allow      -> {"permissionDecision": "allow"}
@@ -19,10 +29,11 @@ Decision mapping mirrors ``_ClaudePermissionBridge._result_from_decision``:
                                   "updatedInput": {questions, answers}}
     pass                      -> no output (native permission flow takes over)
 
-Fail-safe posture matches the headless bridge: no decision inside the wait
-budget -> deny. But when the runtime is not draining (stale heartbeat) the
-hook *abstains* instead of denying blind, so a TUI without its walkcode
-service keeps the native terminal prompt flow.
+Fail-safe posture: no decision inside the wait budget -> the hook ABSTAINS
+(returns no output) and Claude Code falls back to its native terminal prompt
+— see ``timeout_decision``. Likewise when the runtime is not draining (stale
+heartbeat) the hook abstains up front, so a TUI without its walkcode service
+keeps the native terminal prompt flow. Nothing here denies blind.
 
 This module must stay stdlib-only: the blocking hook path has to be
 import-light, and both ``channel_native/__init__`` and ``claude_daemon``
@@ -66,6 +77,56 @@ _EDIT_TOOLS = frozenset({"Edit", "Write", "MultiEdit", "NotebookEdit"})
 
 KIND_PERMISSION = "permission"
 KIND_ASK_USER = "ask_user_question"
+
+MODE_BLOCK = "block"
+MODE_NOTIFY = "notify"
+
+
+def pending_mode(request: dict[str, Any] | None) -> str:
+    """Rendezvous mode of a pending request; unknown/missing -> block (v2)."""
+    mode = str((request or {}).get("mode", "") or "").strip().lower()
+    return MODE_NOTIFY if mode == MODE_NOTIFY else MODE_BLOCK
+
+
+class GateInjectionFailed(RuntimeError):
+    """A notify-mode card decision could not be keystroke-injected.
+
+    Lives here (stdlib module) so both ``claude_daemon`` (raises) and the
+    orchestrator in ``channel_native/__init__`` (catches, flips the card to a
+    "answer in the terminal" notice) can import it without a cycle.
+
+    reasons: ``dialog_mismatch`` (needs/tempo no longer match this request —
+    typically the terminal answered first or another dialog replaced it),
+    ``not_injectable`` (answer shape outside the verified keystroke matrix),
+    ``inject_failed`` (attach write failed), ``not_cleared`` (keys sent but
+    the dialog did not resolve within the verify window),
+    ``already_resolved`` (this gate was settled on the terminal side earlier).
+    """
+
+    def __init__(self, reason: str, message: str = ""):
+        super().__init__(message or reason)
+        self.reason = str(reason or "unknown")
+
+
+def ask_form_injectable(tool_input: dict[str, Any]) -> bool:
+    """Is this AskUserQuestion *form* inside the verified injection matrix?
+
+    Answer-independent companion to ``claude_daemon.keys_for_ask_answer`` (the
+    two must stay in sync): used at card-post time to degrade unsupported
+    forms to a "answer in the terminal" notice instead of offering buttons
+    that could never be delivered. Free-text (Other) support still depends on
+    the eventual answers and is checked at injection time.
+    """
+    questions = tool_input.get("questions", []) if isinstance(tool_input, dict) else []
+    if not isinstance(questions, list) or not questions:
+        return False
+    if not all(isinstance(question, dict) for question in questions):
+        return False
+    if len(questions) == 1:
+        return True
+    return not any(
+        question.get("multiSelect") or question.get("allow_multiple") for question in questions
+    )
 
 
 def gate_root(state_path: Path | str) -> Path:
@@ -264,7 +325,8 @@ def wait_for_decision(
 
     Returns the decision dict, ``{"action": "pass", ...}`` when the runtime
     stops draining mid-wait (stale heartbeat -> abstain to the native flow),
-    or ``None`` on timeout (caller emits a deny).
+    or ``None`` on timeout (caller abstains to the native prompt via
+    ``timeout_decision``).
     """
     deadline = time.monotonic() + max(1.0, float(timeout))
     while time.monotonic() < deadline:

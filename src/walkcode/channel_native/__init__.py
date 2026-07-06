@@ -484,6 +484,13 @@ def _configured_agent_options(source: Any) -> dict[str, dict[str, Any]]:
         claude["gate_tools"] = [
             tool.strip() for tool in claude_gate_tools.split(",") if tool.strip()
         ]
+    claude_gate_style = str(source.get("WALKCODE_CLAUDE_GATE_STYLE") or "").strip().lower()
+    if claude_gate_style:
+        if claude_gate_style not in {"dual", "block"}:
+            raise ChannelConfigError(
+                f"invalid WALKCODE_CLAUDE_GATE_STYLE: {claude_gate_style}; use dual or block"
+            )
+        claude["gate_style"] = claude_gate_style
     codex: dict[str, Any] = {}
     codex_home = str(source.get("WALKCODE_CODEX_HOME") or "").strip()
     if codex_home:
@@ -3913,7 +3920,9 @@ def render_view_text(view_model: dict[str, Any]) -> str:
     if view_type == "model_choice":
         return "Choose a model"
     if view_type == "decision_result":
-        return f"{view_model.get('action', 'decided')}: {view_model.get('tool_name', '')}".strip()
+        base = f"{view_model.get('action', 'decided')}: {view_model.get('tool_name', '')}".strip()
+        detail = str(view_model.get("detail", "") or "")
+        return f"{base.rstrip(':')} — {detail}" if detail else base
     if view_type == "session_chooser":
         rows = [
             "Multiple active sessions match this chat.",
@@ -7631,6 +7640,39 @@ class Orchestrator:
             detail="会话进程已重启，这张卡片已失效。",
         )
 
+    async def _notify_gate_injection_failure(
+        self,
+        inbound: InboundEvent,
+        session: Session,
+        ctx: InteractionContext,
+        exc: "claude_gate.GateInjectionFailed",
+    ) -> None:
+        # v3 injection is best-effort by design: every miss leaves the native
+        # dialog on screen, so the honest degrade is "answer in the terminal"
+        # (ADR 0046 v3 — failure mode is single-surface usable, never blind).
+        _log_degrade(
+            "gate_injection_failed",
+            kind=ctx.kind,
+            session_id=ctx.session_id,
+            reason=exc.reason,
+            error=str(exc),
+        )
+        if exc.reason in {"dialog_mismatch", "already_resolved"}:
+            action, detail = "terminal", "已在终端处理（或对话框已变化），本卡片未生效。"
+        elif exc.reason == "stale_gate":
+            action, detail = "stale", "这个请求已经结束或服务重启过，这张卡片已失效；如终端仍在等待，请直接在终端处理。"
+        elif exc.reason == "not_injectable":
+            action, detail = "degraded", "该回答形态暂不支持从飞书注入，请在终端完成选择。"
+        else:
+            action, detail = "degraded", "注入未生效，请直接在终端操作（对话框仍在等待）。"
+        await self._flip_decided_card(
+            inbound,
+            kind=ctx.kind,
+            tool_name=ctx.tool_name,
+            action=action,
+            detail=detail,
+        )
+
     async def _handle_callback_event(self, inbound: InboundEvent) -> SubmitResult:
         token = str((inbound.callback or {}).get("token", ""))
         data = str((inbound.callback or {}).get("data", "") or token)
@@ -7707,6 +7749,12 @@ class Orchestrator:
                     ctx.transport_request_id or ctx.interaction_id,
                     approval_decision,
                 )
+            except claude_gate.GateInjectionFailed as exc:
+                # v3 keystroke injection missed: the native dialog is still on
+                # screen and the terminal fully usable — tell the truth on the
+                # card instead of pretending the click took effect.
+                await self._notify_gate_injection_failure(inbound, session, ctx, exc)
+                return SubmitResult(False, BlockedReason.NOT_FOUND)
             except TransportUnavailable as exc:
                 # Only the stale-worker path (runtime restarted, worker gone)
                 # retires the card. Any other failure must keep propagating so
@@ -7738,6 +7786,9 @@ class Orchestrator:
                     idempotency_key=f"{inbound.event_id}:ask_user_view",
                     edit_card=inbound,
                 )
+            except claude_gate.GateInjectionFailed as exc:
+                await self._notify_gate_injection_failure(inbound, session, ctx, exc)
+                return SubmitResult(False, BlockedReason.NOT_FOUND)
             except TransportUnavailable as exc:
                 # Same narrowing as the permission branch: only worker-gone is
                 # stale. Local prompt sends (incomplete/awaiting_other/update
@@ -8428,6 +8479,28 @@ class Orchestrator:
         # click on a valid-looking card must not silently do nothing.
         deadline = float(request.get("deadline", 0) or 0)
         interaction_ttl = max(60.0, deadline - self._now()) if deadline else 0
+        if claude_gate.pending_mode(request) == claude_gate.MODE_NOTIFY:
+            # Notify mode mirrors a dialog that never times out: the card
+            # stays decidable until someone answers on either surface.
+            interaction_ttl = 86400.0
+            if str(request.get("kind", "")) == claude_gate.KIND_ASK_USER and (
+                not claude_gate.ask_form_injectable(tool_input)
+            ):
+                # Outside the verified keystroke matrix: offering buttons that
+                # can never be delivered is worse than saying so up front.
+                question_count = len(tool_input.get("questions", []) or [])
+                await self._send_session_view(
+                    session,
+                    {
+                        "type": "text",
+                        "text": (
+                            f"❓ Claude 提了 {question_count} 个问题（含多选的多题形态），"
+                            "这类形态暂不支持从飞书作答，请在终端选择。"
+                        ),
+                    },
+                    idempotency_key=f"gate:{rid}",
+                )
+                return True
         if str(request.get("kind", "")) == claude_gate.KIND_ASK_USER:
             event = AgentEvent(
                 AgentEventType.ASK_USER_REQUESTED,
@@ -8452,6 +8525,10 @@ class Orchestrator:
                 },
             )
         view = self._event_to_view(session, event)
+        if claude_gate.pending_mode(request) == claude_gate.MODE_NOTIFY:
+            # v3 dual-surface: the native dialog is rendering in the terminal
+            # at the same time — say so on the card (first answer wins).
+            view["dual_surface"] = True
         session.last_event_seq += 1
         session.last_progress_at = self._now()
         session.last_progress_event = f"gate.waiting:{tool_name or 'ask_user_question'}"

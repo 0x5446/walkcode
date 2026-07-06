@@ -87,6 +87,16 @@ CLAUDE_GATE_UNROUTABLE_GRACE_SECONDS = 10.0
 # Pending files whose hook process must be gone (deadline long past) get
 # reaped by the drain loop.
 CLAUDE_GATE_REAP_SLACK_SECONDS = 60.0
+# Hot-path budget for the gate hook's "is this session a daemon job?" probe:
+# one `has` round trip on the local unix socket. Anything slower degrades to
+# the blocking (v2) path, so a daemon blip costs UX, never correctness.
+CLAUDE_GATE_DAEMON_PROBE_TIMEOUT_SECONDS = 0.5
+# A notify pending only becomes a card once the native dialog actually shows
+# (needs match). Auto-approved calls (safe read-only Bash etc.) never render
+# one — after this grace the pending is dropped silently instead of leaving a
+# dangling live card (live-E2E finding). Sized for dialog render latency
+# behind model thinking (live-observed up to ~9s).
+CLAUDE_GATE_NOTIFY_DIALOG_GRACE_SECONDS = 30.0
 TUI_HOOK_DRAIN_TIMEOUT_SECONDS = 30.0
 TUI_HOOK_DRAIN_BATCH_SIZE = 25
 TUI_HOOK_RECENT_PRIORITY_WINDOW_SECONDS = 300.0
@@ -2179,11 +2189,12 @@ class ChannelNativeRuntime:
         if str(options.get("daemon_mode", "") or "auto") == "off":
             return None
         config_dir = str(options.get("config_dir", "") or os.environ.get("CLAUDE_CONFIG_DIR", ""))
+        permission_mode = str(payload.get("permission_mode", "") or "")
         gate_tools = options.get("gate_tools")
         kind = claude_gate.should_gate(
             tool_name=tool_name,
             tool_input=tool_input,
-            permission_mode=str(payload.get("permission_mode", "") or ""),
+            permission_mode=permission_mode,
             allow_rules=claude_gate.profile_allow_rules(config_dir),
             gate_mode=str(options.get("gate_mode", "") or "auto"),
             gate_tools=gate_tools if isinstance(gate_tools, list) else None,
@@ -2196,26 +2207,42 @@ class ChannelNativeRuntime:
             # prompt flow keeps working without the walkcode service.
             claude_gate.trace("abstain_heartbeat_stale", rid=rid, tool=tool_name)
             return None
-        timeout = float(options.get("gate_timeout", 0) or claude_gate.DEFAULT_WAIT_TIMEOUT_SECONDS)
         now = time.time()
-        claude_gate.write_pending(
-            state_path,
-            {
-                "rid": rid,
-                "kind": kind,
-                "agent": "claude",
-                "transport_kind": "claude_headless",
-                "session_id": str(payload.get("session_id", "") or ""),
-                "resume_ref": _tui_resume_ref("claude_headless", payload),
-                "tool_name": tool_name,
-                "tool_input": tool_input,
-                "permission_mode": str(payload.get("permission_mode", "") or ""),
-                "cwd": str(payload.get("cwd", "") or ""),
-                "created_at": now,
-                "deadline": now + timeout,
-                "hook_pid": os.getpid(),
-            },
-        )
+        request = {
+            "rid": rid,
+            "kind": kind,
+            "agent": "claude",
+            "transport_kind": "claude_headless",
+            "session_id": str(payload.get("session_id", "") or ""),
+            "resume_ref": _tui_resume_ref("claude_headless", payload),
+            "tool_name": tool_name,
+            "tool_input": tool_input,
+            "permission_mode": permission_mode,
+            "cwd": str(payload.get("cwd", "") or ""),
+            "created_at": now,
+            "hook_pid": os.getpid(),
+        }
+        # v3 routing (ADR 0046 v3): daemon jobs get the dual-surface path —
+        # capture the structured tool_input, then abstain immediately so the
+        # native dialog renders and both surfaces can answer. dontAsk stays on
+        # the blocking path (abstain there means auto-deny: no dialog exists
+        # to inject into), as do non-daemon TUI sessions (no attach plane) and
+        # everything when gate_style=block (escape hatch).
+        gate_style = str(options.get("gate_style", "") or "dual").strip().lower()
+        if gate_style != "block" and permission_mode != "dontAsk":
+            daemon_short = self._probe_claude_daemon_short(str(payload.get("session_id", "") or ""))
+            if daemon_short:
+                request["mode"] = claude_gate.MODE_NOTIFY
+                request["daemon_short"] = daemon_short
+                claude_gate.write_pending(state_path, request)
+                claude_gate.trace(
+                    "gate_notify", rid=rid, kind=kind, tool=tool_name, short=daemon_short
+                )
+                return None
+        timeout = float(options.get("gate_timeout", 0) or claude_gate.DEFAULT_WAIT_TIMEOUT_SECONDS)
+        request["mode"] = claude_gate.MODE_BLOCK
+        request["deadline"] = now + timeout
+        claude_gate.write_pending(state_path, request)
         claude_gate.trace("gate_open", rid=rid, kind=kind, tool=tool_name, timeout=int(timeout))
         started = time.monotonic()
         try:
@@ -2225,7 +2252,10 @@ class ChannelNativeRuntime:
         if decision is None:
             decision = claude_gate.timeout_decision(kind)
             claude_gate.trace(
-                "gate_timeout_deny", rid=rid, tool=tool_name, elapsed=int(time.monotonic() - started)
+                "gate_timeout_abstain",
+                rid=rid,
+                tool=tool_name,
+                elapsed=int(time.monotonic() - started),
             )
         else:
             claude_gate.trace(
@@ -2263,6 +2293,7 @@ class ChannelNativeRuntime:
         for request in requests:
             rid = str(request.get("rid", "") or "")
             live_rids.add(rid)
+            mode = claude_gate.pending_mode(request)
             deadline = float(request.get("deadline", 0) or 0)
             if deadline and now > deadline + CLAUDE_GATE_REAP_SLACK_SECONDS:
                 # The hook process is gone (denied on timeout or was killed).
@@ -2272,40 +2303,94 @@ class ChannelNativeRuntime:
                 continue
             if rid in self._gate_dispatched:
                 continue
-            session_id = self._claude_gate_session_id(request)
             created_at = float(request.get("created_at", now) or now)
+            if mode == claude_gate.MODE_NOTIFY:
+                # The card mirrors a real dialog. Auto-approved tool calls
+                # (safe read-only Bash etc.) never render one — wait for the
+                # dialog, then give up silently instead of posting a card
+                # with buttons that could never be delivered.
+                transport = self._claude_daemon_transport()
+                waiting = False
+                if transport is not None:
+                    try:
+                        waiting = await transport.notify_dialog_waiting(request)
+                    except Exception as exc:
+                        claude_gate.trace(
+                            "notify_dialog_probe_failed",
+                            rid=rid,
+                            error=f"{type(exc).__name__}: {exc}",
+                        )
+                        waiting = False
+                if not waiting:
+                    if now - created_at > CLAUDE_GATE_NOTIFY_DIALOG_GRACE_SECONDS:
+                        claude_gate.trace("notify_dialog_never_rendered", rid=rid)
+                        claude_gate.remove_pending(state_path, rid)
+                    continue
+            session_id = self._claude_gate_session_id(request)
             if not session_id:
                 if now - created_at > CLAUDE_GATE_UNROUTABLE_GRACE_SECONDS:
-                    claude_gate.trace("pass_session_not_observed", rid=rid)
-                    claude_gate.write_decision(
-                        state_path, rid, {"action": "pass", "reason": "session_not_observed"}
-                    )
-                    self._gate_dispatched[rid] = now
+                    claude_gate.trace("pass_session_not_observed", rid=rid, mode=mode)
+                    if mode == claude_gate.MODE_NOTIFY:
+                        # No hook is waiting: the native dialog is the surface.
+                        claude_gate.remove_pending(state_path, rid)
+                    else:
+                        claude_gate.write_decision(
+                            state_path, rid, {"action": "pass", "reason": "session_not_observed"}
+                        )
+                        self._gate_dispatched[rid] = now
                 continue
             tool_name = str(request.get("tool_name", "") or "")
             if (
                 str(request.get("kind", "")) == claude_gate.KIND_PERMISSION
                 and (session_id, tool_name) in self._gate_always_allow
             ):
-                claude_gate.trace("auto_allow_session", rid=rid, tool=tool_name)
-                claude_gate.write_decision(
-                    state_path, rid, {"action": "allow", "reason": "always_allow(session)"}
-                )
-                self._gate_dispatched[rid] = now
-                processed += 1
-                continue
+                if mode == claude_gate.MODE_NOTIFY:
+                    # Single attempt, never a timed retry: a failed injection
+                    # may already have written keys, and a second automatic
+                    # press could confirm the WRONG dialog (review finding).
+                    outcome = await self._auto_inject_gate_allow(rid, request, session_id)
+                    if outcome in {"ok", "skip"}:
+                        claude_gate.remove_pending(state_path, rid)
+                        self._gate_dispatched[rid] = now
+                        if outcome == "ok":
+                            processed += 1
+                        continue
+                    # outcome == "card": fall through to a human card — clicks
+                    # re-run the pre-injection dialog check, so they stay safe.
+                else:
+                    claude_gate.trace("auto_allow_session", rid=rid, tool=tool_name)
+                    claude_gate.write_decision(
+                        state_path, rid, {"action": "allow", "reason": "always_allow(session)"}
+                    )
+                    self._gate_dispatched[rid] = now
+                    processed += 1
+                    continue
             async with self._ingress_lock:
                 posted = await self.orchestrator.post_claude_gate_prompt(session_id, request)
             if posted:
+                if mode == claude_gate.MODE_NOTIFY:
+                    # Card (or degraded notice) is up: the runtime owns the
+                    # pending from here on (the hook abstained long ago).
+                    # Degraded ask forms register too — the entry suppresses
+                    # the duplicate needs notice and is reaped by the watcher
+                    # when the terminal answers; unmappable answers are still
+                    # rejected at injection time (keys_for_ask_answer -> None).
+                    transport = self._claude_daemon_transport()
+                    if transport is not None:
+                        transport.register_notify_gate(rid, request, session_id=session_id)
+                    claude_gate.remove_pending(state_path, rid)
                 self._gate_dispatched[rid] = now
                 processed += 1
                 self.save_state()
             elif now - created_at > CLAUDE_GATE_UNROUTABLE_GRACE_SECONDS:
-                claude_gate.trace("pass_card_not_delivered", rid=rid)
-                claude_gate.write_decision(
-                    state_path, rid, {"action": "pass", "reason": "card_not_delivered"}
-                )
-                self._gate_dispatched[rid] = now
+                claude_gate.trace("pass_card_not_delivered", rid=rid, mode=mode)
+                if mode == claude_gate.MODE_NOTIFY:
+                    claude_gate.remove_pending(state_path, rid)
+                else:
+                    claude_gate.write_decision(
+                        state_path, rid, {"action": "pass", "reason": "card_not_delivered"}
+                    )
+                    self._gate_dispatched[rid] = now
         for rid in list(self._gate_dispatched):
             if rid not in live_rids:
                 self._gate_dispatched.pop(rid, None)
@@ -2336,16 +2421,91 @@ class ChannelNativeRuntime:
             )
         return None
 
+    async def _auto_inject_gate_allow(
+        self, rid: str, request: dict[str, Any], session_id: str
+    ) -> str:
+        """Session-scoped always_allow, v3 shape: press "1" on the dialog.
+
+        The v2 memory wrote an allow decision file; with notify mode nobody
+        reads decisions, so the same memory auto-injects allow-once instead.
+
+        Returns "ok" (injected), "skip" (the terminal settled it first —
+        drop the pending quietly), or "card" (injection could not be
+        confirmed — hand over to a human card, never auto-retry: the keys
+        may already have been written).
+        """
+        transport = self._claude_daemon_transport()
+        if transport is None:
+            return "card"
+        transport.register_notify_gate(rid, request, session_id=session_id)
+        handle = TransportHandle(
+            handle_id=f"claude-daemon-{request.get('daemon_short', '')}",
+            transport_kind="claude_daemon",
+            ref={"short": str(request.get("daemon_short", "") or "")},
+        )
+        try:
+            await transport.approve_permission(
+                handle, rid, {"action": "allow", "reason": "always_allow(session)"}
+            )
+        except claude_gate.GateInjectionFailed as exc:
+            claude_gate.trace("auto_allow_inject_missed", rid=rid, reason=exc.reason)
+            if exc.reason in {"dialog_mismatch", "already_resolved", "stale_gate"}:
+                return "skip"
+            return "card"
+        except Exception as exc:
+            claude_gate.trace(
+                "auto_allow_inject_error", rid=rid, error=f"{type(exc).__name__}: {exc}"
+            )
+            return "card"
+        claude_gate.trace(
+            "auto_allow_session", rid=rid, tool=request.get("tool_name", ""), mode="notify"
+        )
+        return "ok"
+
     def _record_gate_decision(self, rid: str, decision: dict[str, Any]) -> None:
         if str(decision.get("action", "") or "") != "always_allow":
             return
-        request = claude_gate.read_pending(self.state_store.path, rid)
-        if not request:
-            return
-        tool_name = str(request.get("tool_name", "") or "")
-        session_id = self._claude_gate_session_id(request)
+        # v3 notify gates embed routing info in the decision (their pending
+        # file is gone by decision time); v2 block gates still read it back
+        # from the pending spool.
+        tool_name = str(decision.get("tool_name", "") or "")
+        session_id = str(decision.get("session_id", "") or "")
+        if not (session_id and tool_name):
+            request = claude_gate.read_pending(self.state_store.path, rid)
+            if not request:
+                return
+            tool_name = tool_name or str(request.get("tool_name", "") or "")
+            session_id = session_id or (self._claude_gate_session_id(request) or "")
         if session_id and tool_name:
             self._gate_always_allow.add((session_id, tool_name))
+
+    def _probe_claude_daemon_short(self, session_id: str) -> str:
+        """8-hex daemon short id when this session is a live daemon job, else "".
+
+        Runs on the gate hook's hot path in the hook process: one bounded
+        ``has`` round trip through the registered daemon transport's client
+        (absent transport = daemon_mode off = not a daemon route). Any
+        failure or timeout returns "" and the caller stays on the blocking
+        (v2) path — a daemon blip can only degrade UX, never the gate.
+        """
+        short = claude_daemon_short_id(session_id)
+        if not short:
+            return ""
+        transport = self._claude_daemon_transport()
+        if transport is None:
+            return ""
+
+        async def _probe() -> bool:
+            return await asyncio.wait_for(
+                transport.client.job_ready(short),
+                timeout=CLAUDE_GATE_DAEMON_PROBE_TIMEOUT_SECONDS,
+            )
+
+        try:
+            ready = asyncio.run(_probe())
+        except Exception:
+            return ""
+        return short if ready else ""
 
     async def _watch_claude_daemon_forever(
         self,
@@ -2434,7 +2594,7 @@ class ChannelNativeRuntime:
                         continue
                     async with self._ingress_lock:
                         last_needs = await self._apply_claude_daemon_state_patch(
-                            session_id, patch, last_needs
+                            session_id, patch, last_needs, short=short
                         )
                         self.save_state()
                 elif event_type == "settled":
@@ -2442,6 +2602,7 @@ class ChannelNativeRuntime:
                         await self._settle_claude_daemon_session(
                             session_id,
                             outcome=str(event.get("outcome", "") or ""),
+                            short=short,
                         )
                         self.save_state()
         except asyncio.CancelledError:
@@ -2459,6 +2620,8 @@ class ChannelNativeRuntime:
         session_id: str,
         patch: dict[str, Any],
         last_needs: str,
+        *,
+        short: str = "",
     ) -> str:
         try:
             session = self.state.sessions.get(session_id)
@@ -2500,7 +2663,13 @@ class ChannelNativeRuntime:
                 changed = True
             # The permission-request hook may have raced ahead with its own
             # notice card; only send ours on a fresh daemon-observed need.
-            if blocking_needs != last_needs and not already_waiting:
+            # v3 notify gates already produce a rich interactive card from the
+            # gate drain — a second orange notice would be pure noise.
+            if (
+                blocking_needs != last_needs
+                and not already_waiting
+                and not (short and self._has_open_notify_gate(short))
+            ):
                 session.last_event_seq += 1
                 match = re.match(r"^approve\s+([A-Za-z0-9_-]+)", blocking_needs, re.IGNORECASE)
                 await self.orchestrator._send_session_view(
@@ -2514,13 +2683,26 @@ class ChannelNativeRuntime:
                 )
             last_needs = blocking_needs
         elif needs is not None or needs_text:
+            transport = self._claude_daemon_transport()
+            injected = bool(
+                short and transport is not None and transport.recently_injected(short)
+            )
+            if short and transport is not None:
+                # Whoever answered, this job's open notify gates are done:
+                # tombstone them so a late card click flips honestly. This
+                # must NOT depend on lifecycle_state — a tool event can flip
+                # WAITING_PERMISSION away before this patch arrives (review
+                # finding + live-E2E observation).
+                transport.resolve_notify_gates_for_short(short)
             was_waiting = session.lifecycle_state == "WAITING_PERMISSION"
             if was_waiting:
                 session.lifecycle_state = "EXTERNAL_OBSERVED_READONLY"
                 changed = True
-                # Sync the terminal-side decision back to the channel: the
-                # orange notice card above would otherwise look pending forever.
-                if last_needs:
+                # Sync the terminal-side decision back to the channel (the
+                # notice/card would otherwise look pending forever) — unless
+                # the clearing was our own injection: the clicked card already
+                # flipped to the decision result.
+                if last_needs and not injected:
                     session.last_event_seq += 1
                     await self.orchestrator._send_session_view(
                         session,
@@ -2532,7 +2714,13 @@ class ChannelNativeRuntime:
             await self.orchestrator.refresh_session_status_card(session)
         return last_needs
 
-    async def _settle_claude_daemon_session(self, session_id: str, *, outcome: str) -> None:
+    async def _settle_claude_daemon_session(
+        self, session_id: str, *, outcome: str, short: str = ""
+    ) -> None:
+        transport = self._claude_daemon_transport()
+        if short and transport is not None:
+            # Job is gone, so are its dialogs: retire any open notify gates.
+            transport.resolve_notify_gates_for_short(short)
         try:
             session = self.state.sessions.get(session_id)
         except KeyError:
@@ -2545,6 +2733,26 @@ class ChannelNativeRuntime:
             session, hook_type=f"daemon_settled_{outcome or 'unknown'}"
         )
         await self.orchestrator.refresh_session_status_card(session)
+
+    def _has_open_notify_gate(self, short: str, *, tool_name: str = "") -> bool:
+        """Is a v3 dual-surface card open (or about to open) for this job?
+
+        With ``tool_name`` the match narrows to that tool, so a notice for an
+        unrelated native prompt is not swallowed by a gate on another tool.
+        """
+        transport = self._claude_daemon_transport()
+        if transport is not None and transport.has_notify_gate_for_short(
+            short, tool_name=tool_name
+        ):
+            return True
+        for request in claude_gate.list_pending(self.state_store.path):
+            if (
+                claude_gate.pending_mode(request) == claude_gate.MODE_NOTIFY
+                and str(request.get("daemon_short", "") or "") == short
+                and (not tool_name or str(request.get("tool_name", "") or "") == tool_name)
+            ):
+                return True
+        return False
 
     def _archive_bad_tui_hook(self, path: Path) -> None:
         try:
@@ -2928,15 +3136,22 @@ class ChannelNativeRuntime:
             if channel is not None:
                 await self.orchestrator._upsert_tool_progress_view(session, channel, view)
             if hook_type == "permission-request":
-                await self.orchestrator._send_session_view(
-                    session,
-                    {
-                        "type": "tui_permission_notice",
-                        "tool_name": str(tool_event.payload.get("tool_name", "") or ""),
-                        "summary": str(tool_event.payload.get("summary", "") or ""),
-                    },
-                    idempotency_key=f"external_tui:permission:{session.last_event_seq}",
-                )
+                # v3 dual-surface: when this dialog already has an interactive
+                # gate card (open notify gate for the same tool), the old
+                # "answer in the terminal" notice is both redundant and wrong.
+                notice_tool = str(tool_event.payload.get("tool_name", "") or "")
+                resume_ref = _external_claude_resume_ref(session)
+                short = claude_daemon_short_from_resume_ref(resume_ref) if resume_ref else ""
+                if not (short and self._has_open_notify_gate(short, tool_name=notice_tool)):
+                    await self.orchestrator._send_session_view(
+                        session,
+                        {
+                            "type": "tui_permission_notice",
+                            "tool_name": notice_tool,
+                            "summary": str(tool_event.payload.get("summary", "") or ""),
+                        },
+                        idempotency_key=f"external_tui:permission:{session.last_event_seq}",
+                    )
             return
         text = _tui_hook_text(hook_type, payload)
         session.last_progress_at = self._now()
@@ -2948,6 +3163,13 @@ class ChannelNativeRuntime:
         # would just repeat it.
         if hook_type == "notification" and session.lifecycle_state == "WAITING_PERMISSION":
             return
+        # Same dedup for the v3 path: an open notify gate means a rich card is
+        # already (or about to be) up for this dialog.
+        if hook_type == "notification" and "permission" in text.lower():
+            resume_ref = _external_claude_resume_ref(session)
+            short = claude_daemon_short_from_resume_ref(resume_ref) if resume_ref else ""
+            if short and self._has_open_notify_gate(short):
+                return
         # Idle noise ("Claude is waiting for your input") adds nothing on the
         # channel: the status card already shows the session is idle.
         if hook_type == "notification" and _is_idle_notification_text(text):
