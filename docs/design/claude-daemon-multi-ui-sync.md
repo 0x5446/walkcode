@@ -1,7 +1,7 @@
 # Claude Daemon 多端同步读写方案（1 daemon / 多 UI 订阅读写）
 
-Date: 2026-07-04（v2: 2026-07-05）
-Status: v1 已实现（reply 写路径 + subscribe 状态同步）；v2 已实现（PreToolUse gate 权限/AskUserQuestion 飞书闭环 + 状态卡/回显整改，见文末「交互闭环 v2」）
+Date: 2026-07-04（v2: 2026-07-05；v3 方案: 2026-07-06）
+Status: v1 已实现（reply 写路径 + subscribe 状态同步）；v2 已实现（PreToolUse gate 权限/AskUserQuestion 飞书闭环 + 状态卡/回显整改，见「交互闭环 v2」）；v3 **已实现并通过 Live E2E**（2026-07-06，attach 按键注入实现真双端，Step 0–5 完成、单测 621 绿、work 实例 Playwright 点卡全场景验收——推翻 v2「双端同时可答不可行」结论，见文末「交互闭环 v3」）
 Protocol grounding: `docs/design/daemon-appserver-protocol-reference.md`（2026-07-04 实测，Claude Code v2.1.201, proto 1）
 
 ## 目标
@@ -385,12 +385,15 @@ hook 配置必须放大 Claude 侧超时（否则 60s 默认值先杀掉 hook、
 - **被 gate 的工具审批以飞书为主**：hook 阻塞在权限引擎之前，终端此时只见
   spinner、无法按原生提示（esc 打断 turn 是终端侧唯一逃生口）。"双端任一侧
   审批"留作后续增强；终端优先的用户可 `WALKCODE_CLAUDE_GATE_MODE=off` 或
-  `ask_only`。
+  `ask_only`。**（2026-07-06 更新：该增强已有可行机制，见「交互闭环 v3」。）**
 - 非 gate 集合内的工具若仍触发原生提示，行为同 v1：橙卡提示"终端确认"+
   等待态，终端处理后回传（needs 清空）。
 - hook 超时改为**弃权**（2026-07-06 起）：飞书卡在超时窗口内优先，超时后
-  hook 返回无决策、终端原生弹窗接管——"飞书优先、超时落回终端"。真正的
-  双端同时可答仍不可行（阻塞 hook 挡在原生 UI 之前是协议约束）。超时后的
+  hook 返回无决策、终端原生弹窗接管——"飞书优先、超时落回终端"。~~真正的
+  双端同时可答仍不可行（阻塞 hook 挡在原生 UI 之前是协议约束）~~
+  **（此结论已被同日 attach 注入实测推翻，见「交互闭环 v3」；
+  `docs/review/2026-07-06-v0.10.57-*.md` §追加变更中的同句一并作废，
+  历史报告不改，以本节为准）**。超时后的
   旧卡再点选会写入决策文件但无人消费（drain 清理孤儿决策）。
 - ~~决策卡翻面在真机未生效~~ → **已定位并修复（2026-07-05）**：根因是
   Lark 卡片 `config` 缺 `update_multi: true`——应用发的交互卡默认为
@@ -477,3 +480,278 @@ Telegram 不走该池——其 runtime 已对每条入站消息预贴 ✅，二�
   idle 通知过滤
 - `src/walkcode/__main__.py` — `native hook --gate` 参数
 - `tests/test_channel_native_claude_gate.py` — 全部新增用例
+
+## 交互闭环 v3：attach 按键注入实现真双端（2026-07-06，已实现）
+
+### 背景：v2 的核心取舍被新事实推翻
+
+v2 的形态是"单端活"：阻塞 gate 期间飞书可答、终端只见 spinner；超时弃权后
+终端原生对话框接管、飞书旧卡失效。当时结论是"双端同时可答不可行——阻塞
+hook 挡在原生 UI 之前是 hook 协议约束"。这个结论只看了 hook 面，漏了
+daemon 控制面的第三条路：**`attach` op 支持多路接入（协议文档 §1.6.6
+Multi-attach），第二个 attacher 写入的原始 PTY 字节能直接驱动原生对话框**，
+与真人在终端敲键盘完全等价。
+
+### 实测依据（2026-07-06，真机三组实验）
+
+1. **带 gate 的 personal bg 会话**：AskUserQuestion 原生对话框弹出后，以
+   `attachId=injector` 的第二连接注入 `b"2"` → 对话框立即选中并推进
+   （subscribe 观测 blocked→idle）。
+2. **无 gate 的 `~/.claude` bg 会话**：对话框 +8.6s 渲染（纯模型延迟、无任何
+   人为等待），subscribe `needs` 给出
+   `answer: Which fruit? (apple · banana · cherry)`（问题 + 有序选项标签），
+   注入 `b"3"` → 立即 resolved。
+3. **注入层级**：直接发原始字节（`b"1"`/`b"2"`/`b"3"`），经 attach 握手后的
+   raw PTY 通道进入 worker 的终端输入处理器——这一层不区分对话框类型，权限框
+   走同一键盘通道（该 profile 为 auto 模式自动放行、未能现场逼出权限框，
+   键位映射留待 Step 0 实测对齐）。
+4. **原生对话框无自动超时**：无限等待键盘输入（v2 里"等几分钟没反应"是
+   阻塞 gate 在挡，不是对话框超时）。对话框在无人 attach 时也照常在 job 的
+   PTY 内渲染，`needs` 照常出现——注入不依赖终端是否有人挂着。
+
+单选对话框的关键性质：**数字键一击即选中并确认，无需回车**（三次实测一致）。
+
+### 目标形态（闭环）
+
+```
+PreToolUse gate hook ──捕获完整 tool_input 落 pending(mode=notify)──► 立即弃权退出
+        │                                                    │
+        ▼                                                    ▼
+原生对话框正常渲染（终端键盘可答）              runtime drain → 飞书富卡片
+        │                                     "终端与飞书均可回答，先答先生效"
+        │                                                    │
+        │                            飞书点卡 → callback → 选项映射按键序列
+        │                                     → attach 第二连接注入 ◄──┘
+        ▼
+任一侧答完 → subscribe needs 清空 / tempo 离开 blocked
+        → 未答一侧卡片翻面（"✅ 已在终端回答" / "✅ 已在飞书回答"）
+```
+
+飞书卡片**不需要第二个超时**：它是"无限等"对话框的镜像，谁答了就翻牌，
+没人答就一直挂着（可选加提醒，不加硬超时）。
+
+### 按键映射表（Step 0 全部实测于 Claude Code 2.1.201）
+
+| 对话框形态 | 按键序列 | 状态 |
+|---|---|---|
+| 权限框 允许一次 | `b"1"` | ✅ 实测：blocked→active，命令执行 |
+| 权限框 拒绝（模型继续） | `b"3"` | ✅ 实测：命令不执行、tempo 转 idle/active。**实现未采用**：No 项数字位随布局变（2 项/3 项框），见下「拒绝键位落定」 |
+| 权限框 取消整轮 | `b"\x1b"`（ESC） | ✅ 实测：turn 取消，回 idle。**实现采用为 deny 键位** |
+| 权限框 总是允许 | 见下「权限框首版简化」 | ⚠️ 位置随文案变，首版降级为 allow |
+| Ask 单选 | `b"N"`（一击选中即确认） | ✅ 实测（含旧会话共 4 次） |
+| Ask 单选 Other 自由输入 | `b"<other_idx>"` + 文本字节 + `b"\r"` | ✅ 实测：`4`+`mango`+Enter → "you prefer mango" |
+| Ask 多选（multiSelect） | 各选中项 `b"N"`(toggle) + `b"\x1b[C"`(→Submit 页) + `b"1"`(Submit answers) | ✅ 实测：勾 python/go → 提交 |
+| Ask 多问题（questions>1） | 逐题 `b"N"`（答完自动前进下一题/Submit 页）+ 末尾 `b"1"`(Submit answers) | ✅ 实测：apple+blue 两题提交 |
+
+**Step 0 关键行为（决定映射函数写法，非直觉，必须遵守）**：
+
+- **数字键语义随对话框类型变**：单选/多问题的普通选项——数字键**一击选中即
+  确认**（多问题下还自动前进到下一题）；多选选项——数字键是 **toggle**（勾/取消），
+  不推进。
+- **Enter 语义随光标上下文变，禁止盲发 Enter**：单选选项上=确认；多选选项上=
+  toggle 当前项（实测把已勾项又取消了）；Other 项**空文本**上=取消整个对话框
+  （回 idle、不提交）；Other 项**有文本**上=确认。因此 Enter 只在两处发：
+  Other 自由输入文本之后、以及多步序列不需要它（Submit 页用数字键 `1`）。
+- **Other 必须先定位再打字**：数字键先把光标移到 "Type something." 项（此时**不**
+  确认），随后**直接输入文本**（内联编辑，选项文字变为输入内容），最后 Enter 确认。
+  顺序不可换——先 Enter 会以空文本取消。
+- **多选/多问题都以 Submit 页收尾**：Submit 页恒为 `1. Submit answers / 2. Cancel`，
+  注入 `b"1"` 提交。多选需先 `b"\x1b[C"` 从选项页横向切到 Submit 页；多问题答完
+  最后一题会自动落到 Submit 页。
+- **序列完全由捕获的 `tool_input` 构造，不依赖 `needs` 解析**：gate 捕获完整
+  `questions` 数组（含 options 顺序、multiSelect 标志），飞书答案（选项标签或
+  自由文本）→ 映射为选项序号或 Other 分支 → 拼字节序列。`needs` 仅用于注入
+  前/后的 blocked 校验。
+
+**权限框「总是允许」首版简化**：权限框选项文案含动态范围
+（`2. Yes, and always allow access to ws/ from this project`），项数与文案随
+工具/上下文变化（可能没有 always 项、或范围不同）。首版**不按渲染定位 always
+项**——飞书「总是允许」注入 `b"1"`（allow once），持久化仍由 runtime 层的会话级
+`always_allow` 记忆承担（沿用 v2 语义：runtime 记住 (session, tool)，后续同工具
+pending 直接放行——v3 下的"放行"= 自动注入 `b"1"`，不再写决策文件）。这样既拿到
+"这次放行"，又拿到"本会话后续不再问"，且不依赖脆弱的文案定位。
+
+**拒绝键位落定（实现决策）**：deny 注入 **ESC**，不用 `b"3"`。原因：No 项的
+数字位随对话框布局变（2 项框里是 `2`、3 项框里是 `3`，且项数无法从捕获的
+tool_input 推导），而 ESC 在权限框上绑定的就是 No 项（选项行自带 `(esc)` 注记），
+位置无关、任何布局都成立。语义差异：终端回 idle 等新输入，deny reason 无法像
+v2 那样经 hook 送回模型——飞书侧拒绝理由目前只记录在交互台账，如需给模型
+补指示可直接在话题里发消息（daemon reply 直写）。
+
+Step 0 未覆盖 / 未来版本改布局的形态**不注入**：卡片降级为"请在终端回答"提示卡
+（仍优于 v2——终端此时是可答的，不是被 gate 挡死的 spinner）。
+不做 CLI 版本硬白名单（patch 版本频繁），安全性主要靠注入前/后校验
+（见下）+ `block` 风格逃生口；映射表在代码内带"实测于 2.1.201"注记。
+
+### 路由决策：哪些会话走哪条路
+
+| 场景 | 路径 | 原因 |
+|---|---|---|
+| daemon bg 会话 + 常规 permission_mode | **v3 真双端**（capture → abstain → inject） | 对话框会渲染，attach 可注入 |
+| `permission_mode=dontAsk` | 保留 v2 阻塞 gate | dontAsk 原生兜底是自动拒绝：弃权 = 工具直接被 deny，**没有对话框可注入**；飞书卡仍是唯一放行通道 |
+| 非 daemon 的普通 TUI 会话 | 保留 v2 阻塞 gate | 不是 daemon job、无 attach 面；v2 行为保住飞书可答 |
+| walkcode 自身 headless worker | 不拦（不变） | SDK can_use_tool 已进程内闭环 |
+
+hook 侧判定"是否 daemon job"：session_id 规范化为 8-hex short id
+（`claude_daemon_short_id`），对该 profile 的 daemon socket 发一次 `has`
+（约 200ms 预算，失败/超时一律按非 daemon 处理 → 走阻塞路径）。探测放在
+`gate_tui_hook`（runtime 层，可 import claude_daemon）；`claude_gate.py`
+保持纯 stdlib，不产生循环依赖。
+
+### 注入前/后校验与竞态防护
+
+- **注入前**：取 subscribe 最新 state 快照，要求 `tempo=blocked` 且 `needs`
+  与本 interaction 匹配（ask：问题文本前缀比对；permission：
+  `approve <Tool>` 工具名比对）。不匹配 → 不注入，卡片翻
+  "已在终端处理 / 对话框已变化"。这同时防住"第一个对话框被终端答掉、
+  第二个已弹出"时的错注。
+- **注入后**：3s 内 `needs` 未清 → 判定注入未生效：卡片提示
+  "注入未生效，请在终端操作"，**不盲目重试**（重试可能双击）。trace 记录。
+- **双端同刻竞态**：终端刚按下、注入字节紧随而至 → 多余字符落进下一个输入框
+  （composer 里多一个数字，不会自动提交）。概率极低、危害小，接受并记录。
+
+### gate spool 协议演进（v2 → v3 兼容）
+
+pending 增加 `mode` 字段：
+
+- `block`（v2 语义，缺省值向后兼容）：hook 阻塞轮询 decisions。
+- `notify`（v3）：hook 落盘后已弃权退出，decisions 目录对该 rid **无消费者**；
+  runtime 回调不写决策文件，改调 transport 注入。
+
+配套调整：
+
+- `WALKCODE_CLAUDE_GATE_TIMEOUT` 只对 block 模式有意义；personal 上的 30s
+  试验值随本版清理、恢复缺省。
+- interaction 的关闭改由 **watcher needs 清空**驱动（v2 由 decision 写入驱动）。
+- pending 清理责任转移：notify 模式下 hook 立即退出、不再负责清理，改由
+  runtime 在发卡后删除 pending（幂等由 in-memory 已发卡 rid 集保证）；
+  interaction 存活于注册表直至 resolve。runtime 重启丢失注册表时，终端对话框
+  仍在，subscribe 快照的 `needs` 会按既有路径重新标 WAITING_PERMISSION 并弹
+  提醒卡——即"重启后降级为 v1 式提醒"，不丢安全性。
+
+### transport 与代码落点
+
+- `ClaudeDaemonClient.attach_send_keys(short, keys, *, cols, rows, attach_id)`：
+  一次性连接——attach 握手 → 短暂 settle（POC 用 0.8s，Step 0 调参）→ 写入
+  字节 → flush 读净 → 关闭。
+- 键位映射函数（`keys_for_ask_answer(tool_input, answers)` /
+  `keys_for_permission(action, variant)`）与 tool_input 解析同放
+  `claude_daemon.py`，独立单测。
+- `ClaudeDaemonTransport.approve_permission / answer_user_question`：按
+  pending 的 `mode` 分流——notify 走注入、block 维持写决策文件。**签名不变，
+  `_handle_callback_event` 及以上全部零改动。**
+- 卡片文案：v3 卡标注"终端与飞书均可回答，先答先生效"；翻面新增
+  "已在终端回答"形态（复用 `decision_result` 渲染）。
+
+### 配置
+
+- 新增 `WALKCODE_CLAUDE_GATE_STYLE=dual|block`（默认 `dual`）。dual 下对
+  dontAsk / 非 daemon 会话自动降级 block（路由表）；设 `block` 整体恢复 v2
+  行为（逃生口）。
+- 现有 `WALKCODE_CLAUDE_GATE_MODE=auto|off|ask_only`、
+  `WALKCODE_CLAUDE_GATE_TOOLS` 语义不变。
+
+### 风险表
+
+| 风险 | 影响 | 缓解 |
+|---|---|---|
+| 键位映射脆弱（CLI 升级改键位/对话框布局） | 注入静默失效 | 注入后 needs 校验 + 失败提示走终端（终端始终可答，无安全损失）；`block` 逃生口；映射表带版本注记 |
+| attach 是逆向协议 | 升级可能破坏 | 与 v1/v2 相同 experimental 姿态：probe 门禁 + hooks/block 回落 |
+| 双端同刻竞态 | composer 落入多余字符 | 注入前校验收窄窗口；接受残余风险 |
+| 多选/多问题/Other 序列复杂 | 部分形态不可注入 | Step 0 实测定支持面；不支持者卡片降级"请去终端"（终端可答） |
+| dontAsk 误走 abstain | 工具被自动拒绝 | 路由表显式保留 block；单测覆盖该分支 |
+| runtime 重启丢 interaction | 卡片无法注入 | 降级为 needs 提醒卡（v1 路径）；终端不受影响 |
+
+对比 v2 的一个本质改善：v2 里 gate 失效的后果是"终端被挡死等超时"；v3 里
+注入失效的后果只是"回到纯终端作答"——**失败模式从两端皆盲降级为单端可用**。
+
+### 实施步骤
+
+| # | 步骤 | 说明 |
+|---|------|------|
+| 0 | 键位对齐 POC | 一次性 profile（`defaultMode=default` 强制权限框）实测：权限框各变体（Bash/Edit/mcp）、多选、多问题、Other 自由输入；产出映射表定支持面 |
+| 1 | `claude_daemon.py`：`attach_send_keys` + 键位映射 | 假 daemon 桩扩展 attach op（录制注入字节），单测映射函数与注入流程 |
+| 2 | `claude_gate.py`：pending `mode` 字段 + notify 捕获路径 | `gate_tui_hook` 增加 daemon-job `has` 探测；dontAsk / 非 daemon 走 block；30s 试验值清理 |
+| 3 | runtime：notify drain + 回调注入 + needs 清空翻卡 | 复用 `_event_to_view` / `_handle_callback_event`；pending 清理责任转移；注入前/后校验 |
+| 4 | 配置 + 文档 + 单测全绿 | `GATE_STYLE`、README / 本文档 / ADR 0046 / 协议参考同步 |
+| 5 | Live E2E | 终端答一次、飞书答一次、注入失败路径、双端竞态观察；Playwright 点卡验收（对齐 v2 E2E 规格） |
+
+每步保持可独立回退；Step 0 结论若推翻映射假设（如权限框不吃数字键），
+方案回到本节评审重议，不带伤上线。
+
+### 实现记录（2026-07-06，Step 0–4）
+
+代码落点（与设计一致处不赘述，只记决策与偏差）：
+
+- `claude_daemon.py`：`ClaudeDaemonClient.attach_send_keys(short, frames)`
+  单连接分帧注入（帧间默认 0.15s，attach 后 settle 0.8s，握手后的 PTY 回放流
+  后台排干丢弃）；`keys_for_permission` / `keys_for_ask_answer` 键位映射
+  （deny=ESC，见「拒绝键位落定」；不可映射返回 None）。**生产代码真机复验**：
+  多选序列 `1`→`3`→`→`→`1` 经 `attach_send_keys` 分帧注入，Review 页显示
+  "→ Python, Rust"、提交成功、模型按答案继续（与 POC 单次写入等价成立）。
+- transport notify 注册表：`register_notify_gate` 由 runtime drain 在发卡后
+  调用（同时删除 pending，清理责任转移完成）；注入前 `list_jobs` 校验
+  tempo=blocked + needs 匹配（permission 按工具名、ask 按问题文本前 40 字符
+  前缀，容忍 daemon 截断）；注入后 3s 窗口轮询 needs 清空/变化。任何一步失败
+  抛 `GateInjectionFailed(reason)`（定义在 `claude_gate.py`，避免
+  `__init__` ↔ `claude_daemon` 循环依赖），卡片按 reason 如实翻面：
+  `dialog_mismatch`/`already_resolved` → "已在终端处理"；`not_injectable` →
+  "该形态请在终端选择"；其余 → "注入未生效，请在终端操作"。不盲重试。
+- 终端先答的收敛：watcher needs 清空时 `resolve_notify_gates_for_short`
+  弹掉该 job 的开放 gate 并留墓碑（bounded 256），迟到的卡片点击翻
+  "已在终端处理" 而非假装生效；飞书注入成功走 `recently_injected` 窗口
+  （10s）抑制 "✅ 已在终端处理" 的误播报。
+- 重复卡抑制（v3 特有）：notify 下对话框真的渲染，daemon needs 会出现——
+  watcher 检测到该 short 有开放 notify gate（注册表或 pending 里）时不再发
+  v1 式橙色提醒卡，避免与富卡片双报。
+- 卡片：v3 卡带注记「终端与飞书均可回答，先答先生效」（`dual_surface`）；
+  notify 交互 TTL 放大到 24h（镜像无超时对话框）；多问题含多选的形态发卡前
+  降级为"请在终端回答"提示（`ask_form_injectable`，与映射函数支持面同步）。
+- 会话级 always_allow 的 v3 形态：drain 命中记忆时自动注入 `b"1"`
+  （对话框未渲染完成时按 grace 重试 ~10s，仍失败则回落正常发卡）。
+- 路由探测：hook 进程内 `has` 探测 job 存活（预算 0.5s，走已注册 transport
+  的 client），失败/超时一律回落 v2 阻塞路径。
+
+单测：621 全绿（对比 v3 开工前基线 570，净增 51 例：键位映射、attach 注入、
+hook 双端路由、transport 注入与墓碑、drain notify 分流与对话框预检、
+watcher 抑制/收敛、卡片渲染回归）。
+
+### v3 验证记录（Live E2E，work 全自动 Playwright 点卡，2026-07-06）
+
+规格对齐 v2 E2E：停 launchd 用 repo 新代码 serve work-claude、work profile
+settings 临时切 `defaultMode=default` + hook 指 repo（测后全部还原、实例复检
+健康），`claude --bg` 起真会话，Playwright 驱动飞书 web 点卡。全场景通过：
+
+1. **Ask 单选，飞书答**：终端对话框与飞书卡（带「终端与飞书均可回答，先答
+   先生效」注记）同时在场 → 卡上选 blue 提交 → 注入 `2` → 对话框解除、卡翻
+   「✅ Color: blue」、工具行翻 ✅、模型按答案继续（"你选了 blue"）。
+2. **权限 Allow**：`touch`（写命令）弹框 → 飞书 Allow → 注入 `1` → 命令执行、
+   卡翻「✅ 已允许」。
+3. **终端先答 + 迟点击**：`rm` 弹框由终端按 `1` 答掉 → 飞书卡迟点击 →
+   pre-check dialog_mismatch → 卡诚实翻「✅ 已在终端处理（或对话框已变化），
+   本卡片未生效」，未假装生效。
+4. **Deny**：注入 ESC → 命令未执行、turn 取消回 idle、会话存活可继续（随后
+   飞书直写下一条指令成功，带表情回执、无 TUI input 回显）。
+5. **Always allow 链**：点卡注入 `1` + 会话记忆 → 下一次同工具（`rm`）
+   **零卡片自动注入放行**（serve 日志：`auto_allow_session ... mode=notify`
+   + `inject_ok`）。
+6. 抑制项全部生效：v3 卡在场时无旧橙色提醒卡、无 "Claude needs your
+   permission" 英文透传。
+
+E2E 抓出并当场修复两个缺陷（各补回归单测）：
+
+- **Lark 卡片信封 KeyError**：`dual_surface` 注记误写 `card["card"]`（实际键
+  是 `content`），首张 ask 卡投递 5 次全败进死信——outbox 死信里的
+  `last_error: "'card'"` 定位。修复 + 渲染回归用例。
+- **auto-approve 悬卡**：CLI 对安全只读命令（实测 `date`）自动放行、原生对话
+  框根本不渲染，而 gate 卡照发 → 永久悬挂的活按钮卡。修复为**发卡前 needs
+  预检**：对话框真的在等才发卡（`notify_dialog_waiting`，宽限 30s 未见对话框
+  则静默丢弃 pending）——卡片严格是对话框的镜像。
+
+已知遗留（不阻塞，记录待后续）：
+
+- runtime 重启后 idle 的 daemon 会话可能被误标 STOPPED，直写降级为接管提示
+  （重启语义既有问题，非 v3 引入）。
+- 终端先答瞬间若有工具事件把 lifecycle 拨出 WAITING，watcher 的「✅ 已在终端
+  处理」文本可能漏发；迟点击墓碑兜底，无正确性损失。
+- 新会话首张状态卡在 daemon_live 到达前短暂显示「只读观察 + Take over」。

@@ -15,6 +15,7 @@ from walkcode.channel_native import (
     TransportHandle,
 )
 from walkcode.channel_native import claude_gate
+from walkcode.channel_native import claude_daemon as claude_daemon_mod
 from walkcode.channel_native.claude_daemon import ClaudeDaemonTransport
 from walkcode.channel_native_runtime import ChannelNativeRuntime
 
@@ -38,6 +39,21 @@ class _FakeTelegramApi:
         return {"ok": True, "result": {}}
 
 
+class _StubDaemonClient:
+    """gate_tui_hook's daemon-job probe seam: hermetic job_ready control."""
+
+    def __init__(self, *, ready: bool = False, error: Exception | None = None):
+        self.ready = ready
+        self.error = error
+        self.probes: list[str] = []
+
+    async def job_ready(self, short: str) -> bool:
+        self.probes.append(short)
+        if self.error is not None:
+            raise self.error
+        return self.ready
+
+
 def _runtime_with_observed_session(tmp: str, *, extra_env: dict | None = None):
     cfg = ChannelNativeConfig.from_env(
         {
@@ -51,6 +67,10 @@ def _runtime_with_observed_session(tmp: str, *, extra_env: dict | None = None):
     )
     api = _FakeTelegramApi()
     runtime = ChannelNativeRuntime.from_config(cfg, telegram_api=api)
+    # Keep the gate hook's daemon probe off the machine's real control socket.
+    daemon_transport = runtime.transports.get("claude_daemon")
+    if daemon_transport is not None:
+        daemon_transport.client = _StubDaemonClient()
     session = runtime.state.sessions.create_observed_session(
         session_id="observed-1",
         binding=ChannelBinding("telegram", "bot", "chat", "topic", "root"),
@@ -119,6 +139,13 @@ class DecisionSpoolTests(unittest.TestCase):
             decision = claude_gate.wait_for_decision(state, "toolu_y", timeout=5)
             thread.join()
             self.assertEqual(decision["action"], "deny")
+
+    def test_pending_mode_defaults_to_block_for_v2_files_and_unknown_values(self):
+        self.assertEqual(claude_gate.pending_mode(None), claude_gate.MODE_BLOCK)
+        self.assertEqual(claude_gate.pending_mode({}), claude_gate.MODE_BLOCK)
+        self.assertEqual(claude_gate.pending_mode({"mode": "weird"}), claude_gate.MODE_BLOCK)
+        self.assertEqual(claude_gate.pending_mode({"mode": "notify"}), claude_gate.MODE_NOTIFY)
+        self.assertEqual(claude_gate.pending_mode({"mode": " NOTIFY "}), claude_gate.MODE_NOTIFY)
 
     def test_wait_times_out_to_none(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -452,6 +479,136 @@ class GateTuiHookTests(unittest.TestCase):
             self.assertIsNone(output)
 
 
+class GateNotifyRoutingTests(unittest.TestCase):
+    """v3 dual-surface routing (ADR 0046 v3): daemon jobs -> capture then
+    abstain (mode=notify); dontAsk / non-daemon / style=block stay on v2."""
+
+    def _stub(self, runtime, **kwargs) -> _StubDaemonClient:
+        client = _StubDaemonClient(**kwargs)
+        runtime.transports["claude_daemon"].client = client
+        return client
+
+    def test_daemon_job_captures_notify_pending_and_abstains(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime, _session, _api = _runtime_with_observed_session(tmp)
+            state = runtime.state_store.path
+            claude_gate.touch_heartbeat(state)
+            stub = self._stub(runtime, ready=True)
+            payload = _pre_tool_payload("Edit", {"file_path": "/tmp/x"})
+            output = runtime.gate_tui_hook(hook_type="PreToolUse", payload=payload, agent="claude")
+            self.assertIsNone(output)
+            self.assertEqual(stub.probes, [AGENT_SESSION_ID.split("-")[0]])
+            pending = claude_gate.read_pending(state, payload["tool_use_id"])
+            self.assertEqual(claude_gate.pending_mode(pending), claude_gate.MODE_NOTIFY)
+            self.assertEqual(pending["daemon_short"], AGENT_SESSION_ID.split("-")[0])
+            self.assertEqual(pending["tool_input"], {"file_path": "/tmp/x"})
+            # No hook is blocking on a decision, so notify pendings carry no
+            # reap deadline: the runtime owns their cleanup after card post.
+            self.assertNotIn("deadline", pending)
+
+    def test_ask_user_question_also_routes_to_notify(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime, _session, _api = _runtime_with_observed_session(tmp)
+            state = runtime.state_store.path
+            claude_gate.touch_heartbeat(state)
+            self._stub(runtime, ready=True)
+            payload = _pre_tool_payload(
+                "AskUserQuestion",
+                {"questions": [{"question": "颜色?", "options": [{"label": "红"}]}]},
+            )
+            output = runtime.gate_tui_hook(hook_type="PreToolUse", payload=payload, agent="claude")
+            self.assertIsNone(output)
+            pending = claude_gate.read_pending(state, payload["tool_use_id"])
+            self.assertEqual(claude_gate.pending_mode(pending), claude_gate.MODE_NOTIFY)
+            self.assertEqual(pending["kind"], claude_gate.KIND_ASK_USER)
+
+    def test_dont_ask_stays_on_blocking_gate_without_probing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime, _session, _api = _runtime_with_observed_session(tmp)
+            state = runtime.state_store.path
+            claude_gate.touch_heartbeat(state)
+            stub = self._stub(runtime, ready=True)
+            payload = _pre_tool_payload(
+                "Edit", {"file_path": "/tmp/x"}, permission_mode="dontAsk"
+            )
+            claude_gate.write_decision(state, payload["tool_use_id"], {"action": "allow"})
+            output = runtime.gate_tui_hook(hook_type="PreToolUse", payload=payload, agent="claude")
+            self.assertEqual(output["hookSpecificOutput"]["permissionDecision"], "allow")
+            self.assertEqual(stub.probes, [])
+
+    def test_non_daemon_session_stays_on_blocking_gate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime, _session, _api = _runtime_with_observed_session(tmp)
+            state = runtime.state_store.path
+            claude_gate.touch_heartbeat(state)
+            stub = self._stub(runtime, ready=False)
+            payload = _pre_tool_payload("Edit", {"file_path": "/tmp/x"})
+            claude_gate.write_decision(state, payload["tool_use_id"], {"action": "allow"})
+            output = runtime.gate_tui_hook(hook_type="PreToolUse", payload=payload, agent="claude")
+            self.assertEqual(output["hookSpecificOutput"]["permissionDecision"], "allow")
+            self.assertEqual(stub.probes, [AGENT_SESSION_ID.split("-")[0]])
+
+    def test_probe_failure_degrades_to_blocking_gate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime, _session, _api = _runtime_with_observed_session(tmp)
+            state = runtime.state_store.path
+            claude_gate.touch_heartbeat(state)
+            self._stub(runtime, error=OSError("socket gone"))
+            payload = _pre_tool_payload("Edit", {"file_path": "/tmp/x"})
+            claude_gate.write_decision(state, payload["tool_use_id"], {"action": "allow"})
+            output = runtime.gate_tui_hook(hook_type="PreToolUse", payload=payload, agent="claude")
+            self.assertEqual(output["hookSpecificOutput"]["permissionDecision"], "allow")
+
+    def test_gate_style_block_env_forces_v2_without_probing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime, _session, _api = _runtime_with_observed_session(
+                tmp, extra_env={"WALKCODE_CLAUDE_GATE_STYLE": "block"}
+            )
+            state = runtime.state_store.path
+            claude_gate.touch_heartbeat(state)
+            stub = self._stub(runtime, ready=True)
+            payload = _pre_tool_payload("Edit", {"file_path": "/tmp/x"})
+            claude_gate.write_decision(state, payload["tool_use_id"], {"action": "allow"})
+            output = runtime.gate_tui_hook(hook_type="PreToolUse", payload=payload, agent="claude")
+            self.assertEqual(output["hookSpecificOutput"]["permissionDecision"], "allow")
+            self.assertEqual(stub.probes, [])
+
+    def test_invalid_gate_style_is_rejected(self):
+        with self.assertRaises(Exception) as caught:
+            ChannelNativeConfig.from_env(
+                {
+                    "WALKCODE_CHANNEL": "telegram",
+                    "TELEGRAM_BOT_TOKEN": "fake",
+                    "WALKCODE_AGENT": "claude",
+                    "WALKCODE_CLAUDE_GATE_STYLE": "yolo",
+                }
+            )
+        self.assertIn("WALKCODE_CLAUDE_GATE_STYLE", str(caught.exception))
+
+    def test_block_pending_records_mode_and_deadline(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime, _session, _api = _runtime_with_observed_session(tmp)
+            state = runtime.state_store.path
+            claude_gate.touch_heartbeat(state)
+            self._stub(runtime, ready=False)
+            payload = _pre_tool_payload("Edit", {"file_path": "/tmp/x"})
+
+            captured = {}
+            original_wait = claude_gate.wait_for_decision
+
+            def _capture_then_allow(state_path, rid, **kwargs):
+                captured.update(claude_gate.read_pending(state_path, rid) or {})
+                return {"action": "allow"}
+
+            claude_gate.wait_for_decision = _capture_then_allow
+            try:
+                runtime.gate_tui_hook(hook_type="PreToolUse", payload=payload, agent="claude")
+            finally:
+                claude_gate.wait_for_decision = original_wait
+            self.assertEqual(claude_gate.pending_mode(captured), claude_gate.MODE_BLOCK)
+            self.assertGreater(float(captured.get("deadline", 0)), 0)
+
+
 class GateDrainTests(unittest.TestCase):
     def _pending_for_session(self, rid: str = "toolu_edit_1") -> dict:
         return {
@@ -569,6 +726,431 @@ class GateDrainTests(unittest.TestCase):
             self.assertGreater(ctx.expires_at - ctx.created_at, 600)
 
 
+class _InjectStubClient:
+    """Transport-level injection seam: list_jobs snapshots + attach recorder."""
+
+    def __init__(self, *, jobs: list | None = None):
+        self.jobs = jobs if jobs is not None else []
+        self.injections: list[tuple[str, list[bytes]]] = []
+        self.clear_after_inject = True
+
+    async def job_ready(self, short: str) -> bool:
+        return True
+
+    async def list_jobs(self):
+        return [dict(job) for job in self.jobs]
+
+    async def attach_send_keys(self, short, frames, **kwargs):
+        self.injections.append((short, [bytes(data) for data, _delay in frames]))
+        if self.clear_after_inject:
+            for job in self.jobs:
+                if job.get("short") == short:
+                    job["needs"] = ""
+                    job["tempo"] = "idle"
+
+
+SHORT = AGENT_SESSION_ID.split("-")[0]
+
+
+def _blocked_job(needs: str) -> dict:
+    return {"short": SHORT, "sessionId": AGENT_SESSION_ID, "tempo": "blocked", "needs": needs}
+
+
+def _notify_request(rid: str = "toolu_edit_1", **overrides) -> dict:
+    request = {
+        "rid": rid,
+        "kind": "permission",
+        "mode": "notify",
+        "daemon_short": SHORT,
+        "agent": "claude",
+        "transport_kind": "claude_headless",
+        "session_id": AGENT_SESSION_ID,
+        "resume_ref": {"agent_session_id": AGENT_SESSION_ID},
+        "tool_name": "Edit",
+        "tool_input": {"file_path": "/tmp/x"},
+        "created_at": time.time(),
+    }
+    request.update(overrides)
+    return request
+
+
+class NotifyGateInjectionTests(unittest.TestCase):
+    """v3 keystroke delivery on the daemon transport (ADR 0046 v3)."""
+
+    def setUp(self):
+        self._verify_timeout = claude_daemon_mod.GATE_INJECT_VERIFY_TIMEOUT_SECONDS
+        self._verify_poll = claude_daemon_mod.GATE_INJECT_VERIFY_POLL_SECONDS
+        claude_daemon_mod.GATE_INJECT_VERIFY_TIMEOUT_SECONDS = 0.1
+        claude_daemon_mod.GATE_INJECT_VERIFY_POLL_SECONDS = 0.01
+
+    def tearDown(self):
+        claude_daemon_mod.GATE_INJECT_VERIFY_TIMEOUT_SECONDS = self._verify_timeout
+        claude_daemon_mod.GATE_INJECT_VERIFY_POLL_SECONDS = self._verify_poll
+
+    def _transport(self, tmp: str, client: _InjectStubClient) -> ClaudeDaemonTransport:
+        transport = ClaudeDaemonTransport(
+            client=client, gate_state_path=Path(tmp) / "state.json"
+        )
+        return transport
+
+    def _handle(self) -> TransportHandle:
+        return TransportHandle(
+            handle_id=f"claude-daemon-{SHORT}",
+            transport_kind="claude_daemon",
+            ref={"short": SHORT},
+        )
+
+    def test_permission_allow_injects_key_1_without_decision_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            client = _InjectStubClient(jobs=[_blocked_job("approve Edit: /tmp/x")])
+            transport = self._transport(tmp, client)
+            observed = []
+            transport.on_gate_decision = lambda rid, decision: observed.append((rid, decision))
+            transport.register_notify_gate("rid-1", _notify_request(), session_id="observed-1")
+            asyncio.run(
+                transport.approve_permission(self._handle(), "rid-1", {"action": "allow"})
+            )
+            self.assertEqual(client.injections, [(SHORT, [b"1"])])
+            self.assertIsNone(claude_gate.read_decision(transport.gate_state_path, "rid-1"))
+            self.assertIsNone(transport.notify_gate("rid-1"))
+            self.assertTrue(transport.recently_injected(SHORT))
+            self.assertEqual(observed[0][0], "rid-1")
+            self.assertEqual(observed[0][1]["tool_name"], "Edit")
+            self.assertEqual(observed[0][1]["session_id"], "observed-1")
+
+    def test_permission_deny_injects_esc(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            client = _InjectStubClient(jobs=[_blocked_job("approve Edit: /tmp/x")])
+            transport = self._transport(tmp, client)
+            transport.register_notify_gate("rid-1", _notify_request())
+            asyncio.run(
+                transport.approve_permission(self._handle(), "rid-1", {"action": "deny"})
+            )
+            self.assertEqual(client.injections, [(SHORT, [b"\x1b"])])
+
+    def test_ask_answers_inject_mapped_frames(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            client = _InjectStubClient(jobs=[_blocked_job("answer: 颜色? (红 · 蓝)")])
+            transport = self._transport(tmp, client)
+            request = _notify_request(
+                kind="ask_user_question",
+                tool_name="AskUserQuestion",
+                tool_input={"questions": [{"question": "颜色?", "options": ["红", "蓝"]}]},
+            )
+            transport.register_notify_gate("rid-ask", request)
+            asyncio.run(
+                transport.answer_user_question(self._handle(), "rid-ask", {"0": "蓝"})
+            )
+            self.assertEqual(client.injections, [(SHORT, [b"2"])])
+
+    def test_dialog_mismatch_raises_and_tombstones(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            client = _InjectStubClient(jobs=[_blocked_job("approve Bash: rm -rf /tmp/y")])
+            transport = self._transport(tmp, client)
+            transport.register_notify_gate("rid-1", _notify_request())  # tool Edit
+            with self.assertRaises(claude_gate.GateInjectionFailed) as caught:
+                asyncio.run(
+                    transport.approve_permission(self._handle(), "rid-1", {"action": "allow"})
+                )
+            self.assertEqual(caught.exception.reason, "dialog_mismatch")
+            self.assertEqual(client.injections, [])
+            # A second click on the retired gate is told the truth.
+            with self.assertRaises(claude_gate.GateInjectionFailed) as second:
+                asyncio.run(
+                    transport.approve_permission(self._handle(), "rid-1", {"action": "allow"})
+                )
+            self.assertEqual(second.exception.reason, "already_resolved")
+
+    def test_unmappable_answers_raise_not_injectable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            client = _InjectStubClient(jobs=[_blocked_job("answer: 颜色? (红)")])
+            transport = self._transport(tmp, client)
+            request = _notify_request(
+                kind="ask_user_question",
+                tool_name="AskUserQuestion",
+                tool_input={"questions": [{"question": "颜色?", "options": ["红"]}]},
+            )
+            transport.register_notify_gate("rid-ask", request)
+            with self.assertRaises(claude_gate.GateInjectionFailed) as caught:
+                asyncio.run(
+                    transport.answer_user_question(self._handle(), "rid-ask", {"0": "   "})
+                )
+            self.assertEqual(caught.exception.reason, "not_injectable")
+            self.assertEqual(client.injections, [])
+
+    def test_dialog_not_clearing_raises_not_cleared(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            client = _InjectStubClient(jobs=[_blocked_job("approve Edit: /tmp/x")])
+            client.clear_after_inject = False
+            transport = self._transport(tmp, client)
+            transport.register_notify_gate("rid-1", _notify_request())
+            with self.assertRaises(claude_gate.GateInjectionFailed) as caught:
+                asyncio.run(
+                    transport.approve_permission(self._handle(), "rid-1", {"action": "allow"})
+                )
+            self.assertEqual(caught.exception.reason, "not_cleared")
+            self.assertEqual(len(client.injections), 1)
+            self.assertFalse(transport.recently_injected(SHORT))
+
+    def test_terminal_resolution_tombstones_open_gates(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            transport = self._transport(tmp, _InjectStubClient())
+            transport.register_notify_gate("rid-1", _notify_request())
+            resolved = transport.resolve_notify_gates_for_short(SHORT)
+            self.assertEqual(resolved, ["rid-1"])
+            self.assertIsNone(transport.notify_gate("rid-1"))
+            with self.assertRaises(claude_gate.GateInjectionFailed) as caught:
+                asyncio.run(
+                    transport.approve_permission(self._handle(), "rid-1", {"action": "allow"})
+                )
+            self.assertEqual(caught.exception.reason, "already_resolved")
+
+
+class NotifyGateDrainTests(unittest.TestCase):
+    def test_notify_pending_posts_card_registers_gate_and_removes_pending(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime, _session, api = _runtime_with_observed_session(tmp)
+            state = runtime.state_store.path
+            runtime.transports["claude_daemon"].client = _InjectStubClient(
+                jobs=[_blocked_job("approve Edit: /tmp/x")]
+            )
+            claude_gate.write_pending(state, _notify_request())
+            processed = asyncio.run(runtime.drain_claude_gate_requests())
+            self.assertEqual(processed, 1)
+            self.assertTrue(
+                [
+                    payload
+                    for method, payload in api.calls
+                    if method == "sendMessage" and "Edit" in str(payload.get("text", ""))
+                ]
+            )
+            self.assertIsNone(claude_gate.read_pending(state, "toolu_edit_1"))
+            self.assertIsNone(claude_gate.read_decision(state, "toolu_edit_1"))
+            gate = runtime.transports["claude_daemon"].notify_gate("toolu_edit_1")
+            self.assertIsNotNone(gate)
+            self.assertEqual(gate["session_id"], "observed-1")
+            self.assertEqual(gate["short"], SHORT)
+
+    def test_notify_unroutable_pending_removed_without_decision(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime, _session, _api = _runtime_with_observed_session(tmp)
+            state = runtime.state_store.path
+            request = _notify_request(rid="toolu_orphan")
+            request["session_id"] = "99999999-9999-9999-9999-999999999999"
+            request["resume_ref"] = {"agent_session_id": request["session_id"]}
+            request["created_at"] = time.time() - 60
+            claude_gate.write_pending(state, request)
+            asyncio.run(runtime.drain_claude_gate_requests())
+            self.assertIsNone(claude_gate.read_pending(state, "toolu_orphan"))
+            self.assertIsNone(claude_gate.read_decision(state, "toolu_orphan"))
+
+    def test_notify_always_allow_auto_injects_without_card(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime, session, api = _runtime_with_observed_session(tmp)
+            state = runtime.state_store.path
+            client = _InjectStubClient(jobs=[_blocked_job("approve Edit: /tmp/x")])
+            runtime.transports["claude_daemon"].client = client
+            runtime._gate_always_allow.add((session.session_id, "Edit"))
+            claude_gate.write_pending(state, _notify_request())
+            old_poll = claude_daemon_mod.GATE_INJECT_VERIFY_POLL_SECONDS
+            claude_daemon_mod.GATE_INJECT_VERIFY_POLL_SECONDS = 0.01
+            try:
+                asyncio.run(runtime.drain_claude_gate_requests())
+            finally:
+                claude_daemon_mod.GATE_INJECT_VERIFY_POLL_SECONDS = old_poll
+            self.assertEqual(client.injections, [(SHORT, [b"1"])])
+            self.assertIsNone(claude_gate.read_pending(state, "toolu_edit_1"))
+            self.assertFalse(
+                [
+                    payload
+                    for method, payload in api.calls
+                    if method == "sendMessage" and "Edit" in str(payload.get("text", ""))
+                ]
+            )
+
+    def test_notify_uninjectable_ask_form_degrades_to_notice(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime, _session, api = _runtime_with_observed_session(tmp)
+            state = runtime.state_store.path
+            runtime.transports["claude_daemon"].client = _InjectStubClient(
+                jobs=[_blocked_job("answer: A? (x)")]
+            )
+            request = _notify_request(
+                rid="toolu_ask",
+                kind="ask_user_question",
+                tool_name="AskUserQuestion",
+                tool_input={
+                    "questions": [
+                        {"question": "A?", "options": ["x"]},
+                        {"question": "B?", "options": ["y", "z"], "multiSelect": True},
+                    ]
+                },
+            )
+            claude_gate.write_pending(state, request)
+            asyncio.run(runtime.drain_claude_gate_requests())
+            self.assertTrue(
+                [
+                    payload
+                    for method, payload in api.calls
+                    if method == "sendMessage" and "请在终端" in str(payload.get("text", ""))
+                ]
+            )
+            self.assertIsNone(claude_gate.read_pending(state, "toolu_ask"))
+            self.assertIsNone(runtime.transports["claude_daemon"].notify_gate("toolu_ask"))
+
+    def test_notify_card_waits_for_dialog_and_drops_when_never_rendered(self):
+        # Auto-approved tool calls never render a dialog: no dialog, no card
+        # (live-E2E: `date` was auto-approved and the card dangled forever).
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime, _session, api = _runtime_with_observed_session(tmp)
+            state = runtime.state_store.path
+            runtime.transports["claude_daemon"].client = _InjectStubClient(jobs=[])
+            claude_gate.write_pending(state, _notify_request())
+            asyncio.run(runtime.drain_claude_gate_requests())
+            # Dialog not up yet: card held back, pending kept for retry.
+            self.assertIsNotNone(claude_gate.read_pending(state, "toolu_edit_1"))
+            self.assertFalse(
+                [
+                    p
+                    for m, p in api.calls
+                    if m == "sendMessage" and "Edit" in str(p.get("text", ""))
+                ]
+            )
+            # Past the dialog grace with still no dialog: dropped silently.
+            stale = _notify_request()
+            stale["created_at"] = time.time() - 60
+            claude_gate.write_pending(state, stale)
+            asyncio.run(runtime.drain_claude_gate_requests())
+            self.assertIsNone(claude_gate.read_pending(state, "toolu_edit_1"))
+            self.assertIsNone(runtime.transports["claude_daemon"].notify_gate("toolu_edit_1"))
+
+    def test_permission_request_notice_suppressed_while_notify_gate_open(self):
+        # v3: the dialog renders natively, so the PermissionRequest hook fires
+        # even though a rich gate card exists — the old "answer in the
+        # terminal" notice must not double-post for the same tool.
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime, session, api = _runtime_with_observed_session(tmp)
+            runtime.transports["claude_daemon"].register_notify_gate(
+                "rid-1",
+                _notify_request(kind="ask_user_question", tool_name="AskUserQuestion"),
+            )
+            payload = {
+                "hook_event_name": "PermissionRequest",
+                "session_id": AGENT_SESSION_ID,
+                "tool_name": "AskUserQuestion",
+                "tool_input": {"questions": [{"question": "Pick", "options": ["a"]}]},
+            }
+            asyncio.run(
+                runtime._send_tui_hook_output(
+                    session, hook_type="permission-request", payload=payload
+                )
+            )
+            self.assertFalse(
+                [
+                    p
+                    for m, p in api.calls
+                    if m == "sendMessage" and "waiting for your approval" in str(p.get("text", ""))
+                ]
+            )
+            # A different tool's native prompt still gets the notice.
+            other = dict(payload, tool_name="WebFetch", tool_input={"url": "https://x"})
+            asyncio.run(
+                runtime._send_tui_hook_output(
+                    session, hook_type="permission-request", payload=other
+                )
+            )
+            self.assertTrue(
+                [
+                    p
+                    for m, p in api.calls
+                    if m == "sendMessage" and "waiting for your approval" in str(p.get("text", ""))
+                ]
+            )
+
+    def test_record_gate_decision_uses_embedded_notify_fields(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime, session, _api = _runtime_with_observed_session(tmp)
+            runtime._record_gate_decision(
+                "rid-x",
+                {
+                    "action": "always_allow",
+                    "tool_name": "Bash",
+                    "session_id": session.session_id,
+                },
+            )
+            self.assertIn((session.session_id, "Bash"), runtime._gate_always_allow)
+
+
+class DualSurfaceCardRenderTests(unittest.TestCase):
+    """Regression: live E2E caught a KeyError('card') when appending the
+    dual-surface note — the Lark message envelope key is ``content``."""
+
+    def test_permission_card_renders_dual_surface_note(self):
+        from walkcode.channel_native.lark_cards import render_lark_message
+
+        view = {
+            "type": "permission_prompt",
+            "tool_name": "Bash",
+            "tool_input": {"command": "date"},
+            "actions": [{"action": "allow", "label": "允许", "token": "t1"}],
+            "dual_surface": True,
+        }
+        message = render_lark_message(view)
+        notes = [
+            element
+            for element in message["content"]["elements"]
+            if element.get("tag") == "note"
+        ]
+        self.assertTrue(any("先答先生效" in str(note) for note in notes))
+
+    def test_ask_button_and_form_cards_render_dual_surface_note(self):
+        from walkcode.channel_native.lark_cards import render_lark_message
+
+        button_view = {
+            "type": "ask_user_question",
+            "questions": [
+                {
+                    "prompt": "Pick a color",
+                    "options": [{"action": "answer:0:0", "label": "red", "token": "t1"}],
+                }
+            ],
+            "dual_surface": True,
+        }
+        form_view = {
+            "type": "ask_user_question",
+            "questions": [
+                {
+                    "prompt": "Pick a color",
+                    "options": [{"label": "red"}],
+                    "other": {"action": "other:0", "token": "t2"},
+                }
+            ],
+            "submit": {"action": "submit_all", "token": "t3"},
+            "dual_surface": True,
+        }
+        for view in (button_view, form_view):
+            message = render_lark_message(view)
+            self.assertTrue(
+                any(
+                    element.get("tag") == "note" and "先答先生效" in str(element)
+                    for element in message["content"]["elements"]
+                ),
+                view["questions"][0],
+            )
+
+    def test_degraded_and_terminal_decision_results_render(self):
+        from walkcode.channel_native.lark_cards import render_lark_message
+
+        degraded = render_lark_message(
+            {"type": "decision_result", "kind": "permission", "action": "degraded", "detail": "x"}
+        )
+        self.assertIn("请在终端操作", str(degraded))
+        terminal = render_lark_message(
+            {"type": "decision_result", "kind": "ask_user_question", "action": "terminal"}
+        )
+        self.assertIn("已在终端处理", str(terminal))
+
+
 class DaemonStatePatchSemanticsTests(unittest.TestCase):
     def test_idle_needs_does_not_flip_waiting_permission(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -616,6 +1198,86 @@ class DaemonStatePatchSemanticsTests(unittest.TestCase):
                     if method == "sendMessage" and "已在终端处理" in str(payload.get("text", ""))
                 ]
             )
+
+    def test_notice_suppressed_while_notify_gate_open(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime, session, api = _runtime_with_observed_session(tmp)
+            runtime.transports["claude_daemon"].register_notify_gate(
+                "rid-1", _notify_request(), session_id=session.session_id
+            )
+            asyncio.run(
+                runtime._apply_claude_daemon_state_patch(
+                    session.session_id,
+                    {"tempo": "blocked", "needs": "approve Edit: /tmp/x"},
+                    "",
+                    short=SHORT,
+                )
+            )
+            self.assertEqual(session.lifecycle_state, "WAITING_PERMISSION")
+            # The v3 rich card came from the gate drain; no duplicate orange
+            # notice for the same dialog.
+            self.assertFalse(
+                [
+                    payload
+                    for method, payload in api.calls
+                    if method == "sendMessage" and "approve Edit" in str(payload.get("text", ""))
+                ]
+            )
+
+    def test_cleared_needs_after_injection_skips_terminal_sync_text(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime, session, api = _runtime_with_observed_session(tmp)
+            transport = runtime.transports["claude_daemon"]
+            transport.register_notify_gate("rid-1", _notify_request())
+            last = asyncio.run(
+                runtime._apply_claude_daemon_state_patch(
+                    session.session_id,
+                    {"tempo": "blocked", "needs": "approve Edit: /tmp/x"},
+                    "",
+                    short=SHORT,
+                )
+            )
+            transport._recent_injections[SHORT] = time.time()
+            asyncio.run(
+                runtime._apply_claude_daemon_state_patch(
+                    session.session_id, {"tempo": "active", "needs": ""}, last, short=SHORT
+                )
+            )
+            self.assertFalse(
+                [
+                    payload
+                    for method, payload in api.calls
+                    if method == "sendMessage" and "已在终端处理" in str(payload.get("text", ""))
+                ]
+            )
+            self.assertIsNone(transport.notify_gate("rid-1"))
+
+    def test_cleared_needs_terminal_answer_retires_notify_gate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime, session, api = _runtime_with_observed_session(tmp)
+            transport = runtime.transports["claude_daemon"]
+            transport.register_notify_gate("rid-1", _notify_request())
+            last = asyncio.run(
+                runtime._apply_claude_daemon_state_patch(
+                    session.session_id,
+                    {"tempo": "blocked", "needs": "approve Edit: /tmp/x"},
+                    "",
+                    short=SHORT,
+                )
+            )
+            asyncio.run(
+                runtime._apply_claude_daemon_state_patch(
+                    session.session_id, {"tempo": "active", "needs": ""}, last, short=SHORT
+                )
+            )
+            self.assertTrue(
+                [
+                    payload
+                    for method, payload in api.calls
+                    if method == "sendMessage" and "已在终端处理" in str(payload.get("text", ""))
+                ]
+            )
+            self.assertIsNone(transport.notify_gate("rid-1"))
 
     def test_status_card_refresh_skips_unchanged_state(self):
         # Event-driven refreshes fire on every hook event, but only material

@@ -31,14 +31,17 @@ Claude 会话以 daemon-native 方式运行时（`claude --bg` 启动后 attach�
 - **IM 直写**：在会话话题里发消息，文字直接注入终端会话（等同终端敲入回车），
   机器人给你的消息贴一个表情作为回执（表情不可用时回退文本「✅ 已发送到终端
   会话」）；终端侧的输入与模型回答也实时同步回话题。
-- **权限审批在 IM 完成**：会触发权限确认的工具（Bash / Edit / Write 等，减去
-  你 allow 规则已覆盖的）渲染为飞书卡片——允许 / 始终允许 / 拒绝，点选即刻在
-  终端会话生效。实现是一个阻塞的 PreToolUse hook（"gate"），只用 Claude Code
-  的公开 hook 协议，不依赖私有 API。
-- **AskUserQuestion 在 IM 作答**：模型提问渲染为选项卡（单选 / 多选 / 自由
-  文本），提交后答案注入工具输入，终端不再弹对话框。
+- **权限审批与提问，双端同时可答（v3）**：会触发权限确认的工具（Bash / Edit /
+  Write 等，减去你 allow 规则已覆盖的）和 AskUserQuestion 提问，终端渲染原生
+  对话框的**同时**飞书收到交互卡片——先答先生效。终端直接按键；飞书点卡后
+  答案通过 daemon attach 以按键注入驱动原生对话框（等同真人敲键盘）。注入前后
+  都有校验，失败时卡片如实翻面「请在终端操作」，终端始终可答。
 - **状态同步**：运行中 / 等待确认 / 已结束的状态卡实时更新；在终端处理过的
-  确认也会回传话题。
+  确认也会回传话题（飞书答的则由卡片翻面呈现，不重复播报）。
+
+双端路由的保守面：`permission_mode=dontAsk`（原生兜底是自动拒绝，没有对话框
+可注入）与非 daemon 的普通 TUI 会话仍走 v2 阻塞 gate（飞书为主、终端等待）；
+walkcode 自己的 headless 会话不经过 gate。
 
 启用：把 claude profile `settings.json` 的 PreToolUse hook 换成 `--gate` 变体
 （必须放大 hook 超时，否则 60s 默认值会先杀掉等待中的 hook）：
@@ -51,10 +54,11 @@ Claude 会话以 daemon-native 方式运行时（`claude --bg` 启动后 attach�
 }]}]
 ```
 
-可调项：`WALKCODE_CLAUDE_GATE_MODE=auto|off|ask_only`、
-`WALKCODE_CLAUDE_GATE_TIMEOUT`（默认 1800s，超时后弃权回落终端原生弹窗）、
-`WALKCODE_CLAUDE_GATE_TOOLS`（替换默认权限拦截工具集）。安全兜底：walkcode
-服务没在运行时 hook 自动弃权，终端原生权限提示照常工作；
+可调项：`WALKCODE_CLAUDE_GATE_STYLE=dual|block`（默认 `dual` 真双端；`block`
+整体退回 v2 阻塞式，作为逃生口）、`WALKCODE_CLAUDE_GATE_MODE=auto|off|ask_only`、
+`WALKCODE_CLAUDE_GATE_TIMEOUT`（仅对 block 路径有意义，默认 1800s，超时后弃权
+回落终端原生弹窗）、`WALKCODE_CLAUDE_GATE_TOOLS`（替换默认权限拦截工具集）。
+安全兜底：walkcode 服务没在运行时 hook 自动弃权，终端原生权限提示照常工作；
 `WALKCODE_CLAUDE_DAEMON_MODE=off` 可整体回退到只读观察 + takeover 模式。
 
 设计与协议细节：[docs/design/claude-daemon-multi-ui-sync.md](docs/design/claude-daemon-multi-ui-sync.md)、

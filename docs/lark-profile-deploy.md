@@ -99,8 +99,9 @@ TUI hook 归属锚定：把 walkcode hook 命令写进各 profile 的
 WALKCODE_ENV_FILE=$HOME/.walkcode/work-claude.env walkcode native hook <type> --agent claude --defer
 ```
 
-claude 的 **PreToolUse 例外**：daemon 多端闭环（ADR 0046 v2）要求它用阻塞
-gate 变体，且必须放大 Claude 侧 hook 超时（默认 60s 会先杀掉 hook、静默退
+claude 的 **PreToolUse 例外**：daemon 多端闭环（ADR 0046 v2/v3）要求它用
+gate 变体，且必须放大 Claude 侧 hook 超时（v3 对 daemon 会话捕获后立即弃权，
+但 dontAsk / 非 daemon 会话仍走阻塞路径，默认 60s 会先杀掉 hook、静默退
 回终端原生提示）：
 
 ```json
@@ -111,10 +112,13 @@ gate 变体，且必须放大 Claude 侧 hook 超时（默认 60s 会先杀掉 h
 }]}]
 ```
 
-gate 行为：AskUserQuestion 与会原生弹权限的工具（Bash/Edit/Write 等，减去
-allow 规则命中）转到飞书卡片点选，决策同步回终端会话；walkcode 服务没在跑
-时 hook 自动弃权、终端原生提示照旧。调参：`WALKCODE_CLAUDE_GATE_MODE=
-auto|off|ask_only`、`WALKCODE_CLAUDE_GATE_TIMEOUT`、`WALKCODE_CLAUDE_GATE_TOOLS`。
+gate 行为（v3 真双端）：AskUserQuestion 与会原生弹权限的工具（Bash/Edit/Write
+等，减去 allow 规则命中）在 daemon 会话上**终端对话框与飞书卡片同时可答，先答
+先生效**——飞书点卡经 attach 按键注入驱动原生对话框；dontAsk / 非 daemon 会话
+保留 v2 阻塞式（飞书为主）。walkcode 服务没在跑时 hook 自动弃权、终端原生提示
+照旧。调参：`WALKCODE_CLAUDE_GATE_STYLE=dual|block`（block 整体退回 v2）、
+`WALKCODE_CLAUDE_GATE_MODE=auto|off|ask_only`、`WALKCODE_CLAUDE_GATE_TIMEOUT`
+（仅 block 路径）、`WALKCODE_CLAUDE_GATE_TOOLS`。
 
 ## 3. Env 文件（×4）
 
