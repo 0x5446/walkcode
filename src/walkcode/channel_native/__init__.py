@@ -5300,12 +5300,21 @@ class ClaudeHeadlessTransport:
         return option_kwargs
 
     def _anthropic_base_url_settings_override(self) -> str:
-        env_obj: dict[str, str] = {"ANTHROPIC_BASE_URL": self.anthropic_base_url}
-        if _env_bool(os.environ.get("CLAUDE_CODE_USE_VERTEX")):
-            # Claude Code reads ANTHROPIC_VERTEX_BASE_URL instead of
-            # ANTHROPIC_BASE_URL when Vertex routing is active.
-            env_obj["ANTHROPIC_VERTEX_BASE_URL"] = self.anthropic_base_url
-        return json.dumps({"env": env_obj})
+        # Claude Code reads ANTHROPIC_VERTEX_BASE_URL instead of
+        # ANTHROPIC_BASE_URL when Vertex routing is active — and the Vertex
+        # switch may live only in the profile's own settings.json, invisible
+        # to this runtime's process env (a launchd-run serve has neither;
+        # confirmed live: the gated variant silently bypassed the proxy for
+        # Vertex-routed profiles). Set both unconditionally: whichever
+        # routing mode is active picks up its variable, the other is ignored.
+        return json.dumps(
+            {
+                "env": {
+                    "ANTHROPIC_BASE_URL": self.anthropic_base_url,
+                    "ANTHROPIC_VERTEX_BASE_URL": self.anthropic_base_url,
+                }
+            }
+        )
 
     def _create_client(self, spec: LaunchSpec, *, resume_id: str = ""):
         if self._client_factory is not None:
