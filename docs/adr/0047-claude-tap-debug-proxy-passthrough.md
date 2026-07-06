@@ -106,6 +106,19 @@ launchd job），WalkCode 只做只读透传，不感知、不依赖 claude-tap 
   `settings.json` 里，导致 Vertex profile 的流量静默绕过代理）。两个变量都指向同
   一个代理地址，非 Vertex 模式下多出来的 `ANTHROPIC_VERTEX_BASE_URL` 会被 Claude
   Code 忽略，无副作用。
+- **v0.10.60：覆盖必须携带合并后的 profile env，且经 0600 文件传递。** 真机部署
+  验证（launchd 等价的"干净"进程环境）发现：`--settings` 的 `env` 映射会**整体替
+  换**掉 profile `settings.json` 的 `env` 映射，不是按 key 合并——只带两个 base
+  URL 的覆盖会把 profile 自己的 `ANTHROPIC_API_KEY` 等认证变量一起顶掉，每一轮都
+  报 "Not logged in"（v0.10.58/59 的真机验证之所以通过，是因为验证会话的进程环境
+  里恰好继承了这些认证变量做了兜底）。对照实验：同样干净环境下，不带覆盖认证正
+  常；覆盖 env 换成 profile env + base URL 合并结果后，认证成功且流量过代理。所
+  以 `_anthropic_base_url_settings_override()` 现在读取
+  `{config_dir}/settings.json` 的 `env` 块合并进覆盖。合并结果可能含密钥，绝不上
+  argv（deep-review 安全结论）：写进 `{config_dir}/walkcode-tap-override-settings.json`
+  （0600，与 settings.json 同目录同属主同威胁模型），`--settings` 只传路径。
+  settings.json 存在但解析失败时抛 `TransportUnavailable` 响亮失败（不静默降级、
+  不带着错误认证继续跑）；文件不存在（OAuth 型 profile）则覆盖只含两个 base URL。
 - 非标准 Vertex 网关（路径没有 `/v1` 前缀）需要额外的 `--tap-allow-path`，这是
   claude-tap 自身路径白名单的限制，文档里已注明排查方法（看 sidecar 日志里的
   `Blocked non-API path`）。
