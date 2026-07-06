@@ -3861,3 +3861,73 @@ class ClaudeModelChoiceInventoryTests(unittest.TestCase):
             )
             inv = runtime_module._local_model_inventory(cfg, "claude_headless")
             self.assertEqual([m["slug"] for m in inv["models"]], ["opus", "haiku"])
+
+
+class TranscriptModelBackfillTests(unittest.TestCase):
+    def test_reads_latest_assistant_model_from_transcript_tail(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            transcript = Path(tmp) / "t.jsonl"
+            transcript.write_text(
+                "\n".join(
+                    [
+                        json.dumps({"type": "user", "message": {"role": "user"}}),
+                        json.dumps({"type": "assistant", "message": {"model": "claude-sonnet-5[1m]"}}),
+                        json.dumps({"type": "assistant", "message": {"model": "<synthetic>"}}),
+                        json.dumps({"type": "progress"}),
+                        "not json",
+                    ]
+                )
+            )
+            self.assertEqual(
+                runtime_module._transcript_model_from_payload({"transcript_path": str(transcript)}),
+                "claude-sonnet-5[1m]",
+            )
+
+    def test_missing_or_absent_transcript_returns_empty(self):
+        self.assertEqual(runtime_module._transcript_model_from_payload({}), "")
+        self.assertEqual(
+            runtime_module._transcript_model_from_payload({"transcript_path": "/nonexistent/x.jsonl"}),
+            "",
+        )
+
+
+class OrphanHeadlessSweepTests(unittest.TestCase):
+    def test_sweep_settles_orchestrator_owned_headless_sessions_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = str(Path(tmp) / "state.json")
+            cfg = ChannelNativeConfig.from_env(
+                {
+                    "WALKCODE_CHANNEL": "telegram",
+                    "TELEGRAM_BOT_TOKEN": "fake",
+                    "WALKCODE_AGENT": "claude",
+                    "WALKCODE_STATE_PATH": state_path,
+                    "WALKCODE_CWD": tmp,
+                }
+            )
+            api = _FakeTelegramApi()
+            transport = FakeAgentTransport(
+                "claude_headless",
+                _transport_caps(),
+                scripted_events=[AgentEvent(AgentEventType.TURN_COMPLETED, {"message": "done"})],
+            )
+            runtime = ChannelNativeRuntime.from_config(
+                cfg,
+                telegram_api=api,
+                transports={"claude_headless": transport},
+            )
+            result = asyncio.run(runtime.process_telegram_update(_telegram_update()))
+            self.assertTrue(result.accepted)
+            session = next(runtime.state.sessions.iter_sessions())
+            self.assertEqual(session.status, "running")
+
+            # A TUI-owned session must survive the sweep untouched.
+            session.writer_owner = runtime_module.WriterOwner(kind="external_tui")
+            asyncio.run(runtime._settle_orphan_headless_sessions_once())
+            self.assertEqual(session.status, "running")
+
+            # An orchestrator-owned headless session is a zombie after restart.
+            session.writer_owner = runtime_module.WriterOwner(kind="orchestrator")
+            asyncio.run(runtime._settle_orphan_headless_sessions_once())
+            self.assertEqual(session.status, "stopped")
+            self.assertEqual(session.stop_reason, "runtime_restart")
+            self.assertEqual(session.lifecycle_state, "STOPPED")

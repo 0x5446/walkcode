@@ -434,6 +434,11 @@ def _tui_permission_notice_card(view: dict[str, Any]) -> dict[str, Any]:
 def _decision_result_card(view: dict[str, Any]) -> dict[str, Any]:
     action = str(view.get("action", "") or "")
     detail = str(view.get("detail", "") or "")
+    if action == "stale":
+        # Decision was recorded but could not reach the worker (e.g. the
+        # runtime restarted and the in-flight prompt died with it).
+        body = escape_lark_md(_inline(detail)) if detail else "会话进程已重启，这张卡片已失效。"
+        return _card_message("⚠️ 卡片已失效", "orange", [_md_div(body)])
     if str(view.get("kind", "")) == "model_choice":
         body = f"✅ {escape_lark_md(_inline(detail))}" if detail else "✅ 模型已切换"
         return _card_message("🧠 模型已切换", "green", [_md_div(body)])

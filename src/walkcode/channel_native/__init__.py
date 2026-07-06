@@ -22,7 +22,7 @@ import sys
 import tempfile
 import urllib.error
 import urllib.request
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal, Protocol
@@ -1298,6 +1298,9 @@ class SessionRegistry:
 
     def get(self, session_id: str) -> Session:
         return self._sessions[session_id]
+
+    def iter_sessions(self) -> Iterator[Session]:
+        yield from self._sessions.values()
 
     def resolve_binding(self, key: BindingKey) -> str | None:
         return self._binding_to_session.get(key)
@@ -5126,7 +5129,13 @@ class ClaudeHeadlessTransport:
             # awaiting. Write-once is enforced inside the bridge.
             bridge.resolve(rid, dict(decision))
             return
-        client = self._clients[handle.handle_id]
+        client = self._clients.get(handle.handle_id)
+        if client is None:
+            # The worker (and its in-flight can_use_tool Future) lived in a
+            # previous runtime process; a card clicked after a restart lands
+            # here. Raise instead of KeyError so the callback path can tell
+            # the user the card is stale rather than dying silently.
+            raise TransportUnavailable("claude headless worker is gone (runtime restarted)")
         approve = getattr(client, "approve_permission", None)
         if approve is None:
             raise CapabilityUnsupported("Claude headless permission approval is not available")
@@ -5142,7 +5151,9 @@ class ClaudeHeadlessTransport:
         if bridge is not None and bridge.has_pending(rid):
             bridge.resolve(rid, {"action": "answers", "answers": dict(answers)})
             return
-        client = self._clients[handle.handle_id]
+        client = self._clients.get(handle.handle_id)
+        if client is None:
+            raise TransportUnavailable("claude headless worker is gone (runtime restarted)")
         answer = getattr(client, "answer_user_question", None)
         if answer is None:
             raise CapabilityUnsupported("Claude headless AskUserQuestion answers are not available")
@@ -5259,10 +5270,10 @@ class ClaudeHeadlessTransport:
 
     def _permission_bridging_supported(self, sdk: Any) -> bool:
         # Only wire can_use_tool when the SDK exposes the PermissionResult types
-        # the bridge returns, and only when the mode isn't blanket-bypass. A
-        # bypass mode auto-approves everything, so there is nothing to card.
-        if str(self.permission_mode or "") == "bypassPermissions":
-            return False
+        # the bridge returns. bypassPermissions still keeps the bridge: the CLI
+        # auto-approves regular tools without consulting can_use_tool, but it
+        # DOES invoke the callback for AskUserQuestion (live-verified 2026-07),
+        # and dropping the bridge there would silently kill the IM answer loop.
         return (
             getattr(sdk, "PermissionResultAllow", None) is not None
             and getattr(sdk, "PermissionResultDeny", None) is not None
@@ -7426,6 +7437,47 @@ class Orchestrator:
             error=f"{type(last_exc).__name__}: {last_exc}" if last_exc else "unknown",
         )
 
+    async def _notify_interaction_delivery_failure(
+        self,
+        inbound: InboundEvent,
+        session: Session,
+        ctx: InteractionContext,
+        exc: Exception,
+    ) -> None:
+        # The decision is on record but never reached the worker (typically:
+        # the runtime restarted and the in-flight prompt died with the old
+        # process). Silence here reads as "I clicked and nothing happened" —
+        # tell the user and retire the card instead.
+        _log_degrade(
+            "interaction_decision_delivery_failed",
+            kind=ctx.kind,
+            session_id=ctx.session_id,
+            error=f"{type(exc).__name__}: {exc}",
+        )
+        binding = session.channel_binding
+        channel = self.channels.get(binding.channel_kind) if binding is not None else None
+        if channel is not None and binding is not None:
+            try:
+                await channel.send_view(
+                    binding,
+                    {
+                        "type": "text",
+                        "text": (
+                            "⚠️ 选择已记录，但这张卡片对应的会话进程已经不在了"
+                            "（服务重启过）。请在话题里重新发消息，等会话重新提问后再选。"
+                        ),
+                    },
+                )
+            except Exception:
+                pass
+        await self._flip_decided_card(
+            inbound,
+            kind=ctx.kind,
+            tool_name=ctx.tool_name,
+            action="stale",
+            detail="会话进程已重启，这张卡片已失效。",
+        )
+
     async def _handle_callback_event(self, inbound: InboundEvent) -> SubmitResult:
         token = str((inbound.callback or {}).get("token", ""))
         data = str((inbound.callback or {}).get("data", "") or token)
@@ -7496,11 +7548,15 @@ class Orchestrator:
             approval_decision = dict(decision.decision or {})
             if session.transport_kind == "codex_app_server":
                 approval_decision["_tool_input"] = dict(ctx.tool_input)
-            await transport.approve_permission(
-                self._handle_for_session(session),
-                ctx.transport_request_id or ctx.interaction_id,
-                approval_decision,
-            )
+            try:
+                await transport.approve_permission(
+                    self._handle_for_session(session),
+                    ctx.transport_request_id or ctx.interaction_id,
+                    approval_decision,
+                )
+            except Exception as exc:
+                await self._notify_interaction_delivery_failure(inbound, session, ctx, exc)
+                return SubmitResult(False, BlockedReason.NOT_FOUND)
             if ctx.hitl_request_id:
                 self.hitls.mark_decided(
                     ctx.hitl_request_id,
@@ -7516,14 +7572,18 @@ class Orchestrator:
                 action=str(approval_decision.get("action", "")),
             )
         if decision.accepted and ctx.kind == "ask_user_question":
-            await self._handle_ask_user_decision(
-                session,
-                ctx,
-                decision,
-                actor=actor,
-                idempotency_key=f"{inbound.event_id}:ask_user_view",
-                edit_card=inbound,
-            )
+            try:
+                await self._handle_ask_user_decision(
+                    session,
+                    ctx,
+                    decision,
+                    actor=actor,
+                    idempotency_key=f"{inbound.event_id}:ask_user_view",
+                    edit_card=inbound,
+                )
+            except Exception as exc:
+                await self._notify_interaction_delivery_failure(inbound, session, ctx, exc)
+                return SubmitResult(False, BlockedReason.NOT_FOUND)
             # Final answer (all questions done) → flip the clicked card to a
             # result; toggle/next-question keep the card interactive.
             if str((decision.decision or {}).get("action", "")) == "answers":

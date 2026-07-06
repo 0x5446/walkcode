@@ -404,6 +404,28 @@ hook 配置必须放大 Claude 侧超时（否则 60s 默认值先杀掉 hook、
 - 决策文件与 pending 由 hook 退出时清理；hook 被杀（超时/断电）遗留的
   pending 由 drain 按 deadline+60s 收尾。
 
+### 运行时重启语义（2026-07-06 补）
+
+claude_headless 的 worker（SDK client + CLI 子进程 + in-flight can_use_tool
+Future）都活在 runtime 进程内，**runtime 重启即全灭**。真机踩到的后果：重启
+前发出的 ask/permission 卡还留在飞书上，点提交只落决策账、注入时 KeyError
+被 WS 层吞掉——用户看到 toast 但卡片不翻、答案不生效、会话装作 running。
+三项修复：
+
+- transport 注入路径在 worker 缺失时抛 `TransportUnavailable`（不再裸
+  KeyError）；callback 层捕获后发提示文本并把卡片翻成"⚠️ 卡片已失效"
+  （`decision_result` 的 `action="stale"` 渲染）。
+- runtime 启动时一次性 sweep：orchestrator 拥有的 claude_headless 会话若
+  仍标 running，settle 为 `stop_reason=runtime_restart`（TUI 观察会话不受
+  影响——daemon worker 独立于 runtime 存活）。
+- `bypassPermissions` 不再摘掉 can_use_tool 桥：CLI 在 bypass 下对常规工具
+  自动放行（不调回调），但对 AskUserQuestion 仍会调（真机实测），摘桥会
+  顺带杀死飞书答题闭环。
+
+另：TUI 观察会话的状态卡模型此前恒为"—"（daemon job/state patch 无 model
+字段，实测确认），现从 hook payload 的 `transcript_path` 尾读最近一条
+assistant 记录的 model 回填（model 为空或 stop 事件时读，避免每事件 IO）。
+
 ### v2 验证记录（2026-07-05）
 
 - POC（一次性 profile + 阻塞 hook 脚本，/tmp/wc_poc）：deny 拦截 bg worker

@@ -596,5 +596,83 @@ class PermissionBridgeOrchestratorTests(unittest.TestCase):
         self.assertEqual(client.permission_results[0].updated_input["answers"], {"Pick": "A"})
 
 
+class BridgeBypassAndStaleWorkerTests(PermissionBridgeOrchestratorTests):
+    """bypassPermissions keeps the ask bridge; stale-worker clicks get feedback."""
+
+    def test_bridge_supported_under_bypass_permissions(self):
+        # bypass auto-approves regular tools CLI-side, but the CLI still
+        # consults can_use_tool for AskUserQuestion — dropping the bridge
+        # there would kill the IM answer loop.
+        sdk = _make_sdk(_client_class())
+        transport = ClaudeHeadlessTransport(
+            sdk_loader=lambda: sdk, permission_mode="bypassPermissions"
+        )
+        self.assertTrue(transport._permission_bridging_supported(sdk))
+
+    def test_answer_user_question_without_worker_raises_transport_unavailable(self):
+        from walkcode.channel_native import TransportHandle, TransportUnavailable
+
+        transport = ClaudeHeadlessTransport(sdk_loader=lambda: _make_sdk(_client_class()))
+        handle = TransportHandle(handle_id="gone", transport_kind="claude_headless")
+        with self.assertRaises(TransportUnavailable):
+            asyncio.run(transport.answer_user_question(handle, "rid-1", {"0": "A"}))
+        with self.assertRaises(TransportUnavailable):
+            asyncio.run(transport.approve_permission(handle, "rid-1", {"action": "allow"}))
+
+    def test_stale_worker_submit_flips_card_and_notifies(self):
+        # A card clicked after a runtime restart: the decision records but the
+        # worker (and its Future) died with the old process. The user must see
+        # a stale-card flip + a text notice instead of silence.
+        client_cls = _client_class(
+            tool_name="AskUserQuestion",
+            tool_input={"questions": [{"question": "Pick", "options": [{"label": "A"}, {"label": "B"}]}]},
+            tool_use_id="ask-stale",
+        )
+
+        async def scenario():
+            transport, channel, orch = self._build(client_cls)
+            owner = ActorRef("telegram", "owner", "Owner")
+            binding = ChannelBinding("telegram", "bot", "chat", "topic", "root")
+            session = await orch.start_session(binding, "claude_headless", "/tmp/project", owner)
+            await orch.submit_user_input(
+                session.session_id, TurnInput(text="run"), actor=owner, generation=session.generation
+            )
+            card = None
+            for _ in range(4000):
+                card = self._find_view(channel, "ask_user_question")
+                if card is not None:
+                    break
+                await asyncio.sleep(0)
+            self.assertIsNotNone(card, "ask_user card never floated")
+            set_token = next(a["token"] for a in card["actions"] if a["action"] == "set:0:0")
+            await orch.handle_inbound_event(
+                self._callback(set_token), agent_transport_kind="claude_headless", cwd="/tmp/project"
+            )
+            # Simulate a runtime restart: in-process worker state is gone.
+            transport._bridges.clear()
+            transport._clients.clear()
+            submit_token = card["submit"]["token"]
+            result = await orch.handle_inbound_event(
+                self._callback(submit_token), agent_transport_kind="claude_headless", cwd="/tmp/project"
+            )
+            return channel, result
+
+        channel, result = asyncio.run(scenario())
+        self.assertFalse(result.accepted)
+        stale_flip = None
+        notice = None
+        for item in channel.sent_views:
+            view = item.get("view", {})
+            if view.get("type") == "decision_result" and view.get("action") == "stale":
+                stale_flip = item
+            if view.get("type") == "text" and "已失效" in str(view.get("text", "")) or (
+                view.get("type") == "text" and "重启" in str(view.get("text", ""))
+            ):
+                notice = view
+        self.assertIsNotNone(stale_flip, "stale decision_result flip was not sent")
+        self.assertTrue(stale_flip.get("edited"), "stale flip must edit the clicked card")
+        self.assertIsNotNone(notice, "user-facing restart notice was not sent")
+
+
 if __name__ == "__main__":
     unittest.main()

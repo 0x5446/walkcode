@@ -1739,6 +1739,10 @@ class ChannelNativeRuntime:
     def _start_telegram_maintenance_tasks(self) -> list[asyncio.Task[None]]:
         return [
             asyncio.create_task(
+                self._settle_orphan_headless_sessions_once(),
+                name="walkcode-orphan-headless-sweep",
+            ),
+            asyncio.create_task(
                 self._flush_outbox_forever(interval=OUTBOX_FLUSH_INTERVAL_SECONDS),
                 name="walkcode-outbox-flush",
             ),
@@ -1774,6 +1778,47 @@ class ChannelNativeRuntime:
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _settle_orphan_headless_sessions_once(self) -> None:
+        # claude_headless workers are child processes of THIS runtime: the SDK
+        # client, its CLI subprocess, and any in-flight can_use_tool prompt all
+        # died with the previous process. A session still marked running after
+        # a restart is a zombie — its cards look live but clicks can never
+        # reach a worker. Settle them so the topic shows the truth and stale
+        # cards get retired by the callback-failure path instead of hanging.
+        try:
+            async with self._ingress_lock:
+                settled = 0
+                for session in self.state.sessions.iter_sessions():
+                    if session.transport_kind != "claude_headless":
+                        continue
+                    if session.status == "stopped":
+                        continue
+                    if not (session.writer_owner and session.writer_owner.kind == "orchestrator"):
+                        continue
+                    session.status = "stopped"
+                    session.lifecycle_state = "STOPPED"
+                    session.stop_reason = "runtime_restart"
+                    session.writer_lease = None
+                    session.writer_owner = WriterOwner(kind="none")
+                    session.last_progress_at = self._now()
+                    session.last_progress_event = "orchestrator.runtime_restart_settled"
+                    settled += 1
+                    try:
+                        await self.orchestrator.refresh_session_status_card(session)
+                    except Exception:
+                        pass
+                if settled:
+                    self.save_state()
+                    print(
+                        f"settled {settled} orphan claude_headless session(s) from a previous runtime",
+                        file=sys.stderr,
+                    )
+        except Exception as exc:
+            print(
+                f"orphan headless sweep failed: {type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
 
     async def _best_effort_flush_outbox(self) -> None:
         try:
@@ -1884,6 +1929,13 @@ class ChannelNativeRuntime:
                 self.save_state()
                 return SubmitResult(True, "unobserved_tui_hook")
             if session.status != "stopped":
+                # Backfill the model for TUI-observed sessions (status card
+                # shows "—" otherwise); re-read on stop so a mid-session
+                # /model switch lands eventually without per-event file IO.
+                if not session.model or _tui_hook_stops_session(hook_type):
+                    transcript_model = _transcript_model_from_payload(payload)
+                    if transcript_model and transcript_model != session.model:
+                        session.model = transcript_model
                 await self._send_tui_hook_output(session, hook_type=hook_type, payload=payload)
         except Exception:
             if ledger_started:
@@ -4035,6 +4087,43 @@ def _payload_hook_event_name(payload: dict[str, Any]) -> str:
         or payload.get("eventName")
         or ""
     )
+
+
+def _transcript_model_from_payload(payload: dict[str, Any]) -> str:
+    """Read the live model slug from the transcript a hook payload points at.
+
+    TUI-observed sessions have no other model source: the daemon's job record
+    and state patches carry tempo/detail/needs but no model (live-verified
+    2026-07), and hook payloads themselves don't include one. The transcript's
+    latest assistant record does. Tail-read keeps it cheap on long sessions.
+    """
+    path = str(payload.get("transcript_path", "") or "")
+    if not path:
+        return ""
+    try:
+        transcript = Path(path).expanduser()
+        size = transcript.stat().st_size
+        with transcript.open("rb") as fh:
+            if size > 65536:
+                fh.seek(-65536, os.SEEK_END)
+            tail = fh.read().decode("utf-8", "replace")
+    except OSError:
+        return ""
+    for line in reversed(tail.splitlines()):
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        message = record.get("message")
+        if isinstance(message, dict):
+            model = str(message.get("model", "") or "")
+            # "<synthetic>" marks CLI-generated filler messages, not the model.
+            if model and not model.startswith("<"):
+                return model
+    return ""
 
 
 def _normalize_tui_hook_type(value: str) -> str:
