@@ -2,9 +2,11 @@ import asyncio
 import io
 import json
 import os
+import tempfile
 import urllib.error
 import urllib.request
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from walkcode.channel_native import (
@@ -591,27 +593,73 @@ class ClaudeHeadlessTransportTests(unittest.TestCase):
         self.assertEqual(kwargs["resume"], "r1")
 
     def test_option_kwargs_config_dir_and_anthropic_base_url_combine(self):
-        transport = ClaudeHeadlessTransport(
-            config_dir="/tmp/claude-profiles/work",
-            anthropic_base_url="http://127.0.0.1:18899",
-        )
+        # With a config_dir, the override merges the profile settings.json env
+        # (confirmed live: the --settings env map REPLACES the profile env map
+        # wholesale, so an override without the profile's ANTHROPIC_API_KEY
+        # fails "Not logged in") and goes through a 0600 file so secrets never
+        # reach argv.
+        with tempfile.TemporaryDirectory() as config_dir:
+            (Path(config_dir) / "settings.json").write_text(
+                json.dumps({"env": {"ANTHROPIC_API_KEY": "sk-test", "CLAUDE_CODE_USE_VERTEX": "1"}, "model": "opus"}),
+                encoding="utf-8",
+            )
+            transport = ClaudeHeadlessTransport(
+                config_dir=config_dir,
+                anthropic_base_url="http://127.0.0.1:18899",
+            )
 
-        kwargs = transport._option_kwargs(LaunchSpec(cwd="/tmp/project", session_id="s1"))
+            kwargs = transport._option_kwargs(LaunchSpec(cwd="/tmp/project", session_id="s1"))
 
-        # CLAUDE_CONFIG_DIR still goes through plain env (needed pre-spawn to
-        # locate settings/credentials); the base URL override goes through
-        # --settings (see test_option_kwargs_anthropic_base_url_only for why
-        # plain env alone is not reliably honored here).
-        self.assertEqual(kwargs["env"], {"CLAUDE_CONFIG_DIR": "/tmp/claude-profiles/work"})
-        self.assertEqual(
-            json.loads(kwargs["settings"]),
-            {
-                "env": {
-                    "ANTHROPIC_BASE_URL": "http://127.0.0.1:18899",
-                    "ANTHROPIC_VERTEX_BASE_URL": "http://127.0.0.1:18899",
-                }
-            },
-        )
+            self.assertEqual(kwargs["env"], {"CLAUDE_CONFIG_DIR": config_dir})
+            override_path = Path(kwargs["settings"])
+            self.assertEqual(override_path, Path(config_dir) / "walkcode-tap-override-settings.json")
+            self.assertEqual(override_path.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(
+                json.loads(override_path.read_text(encoding="utf-8")),
+                {
+                    "env": {
+                        "ANTHROPIC_API_KEY": "sk-test",
+                        "CLAUDE_CODE_USE_VERTEX": "1",
+                        "ANTHROPIC_BASE_URL": "http://127.0.0.1:18899",
+                        "ANTHROPIC_VERTEX_BASE_URL": "http://127.0.0.1:18899",
+                    }
+                },
+            )
+
+    def test_option_kwargs_config_dir_without_settings_json_writes_override_file(self):
+        # OAuth-style profiles have no settings.json env; the override file
+        # then carries only the base URLs.
+        with tempfile.TemporaryDirectory() as config_dir:
+            transport = ClaudeHeadlessTransport(
+                config_dir=config_dir,
+                anthropic_base_url="http://127.0.0.1:18899",
+            )
+
+            kwargs = transport._option_kwargs(LaunchSpec(cwd="/tmp/project", session_id="s1"))
+
+            self.assertEqual(
+                json.loads(Path(kwargs["settings"]).read_text(encoding="utf-8")),
+                {
+                    "env": {
+                        "ANTHROPIC_BASE_URL": "http://127.0.0.1:18899",
+                        "ANTHROPIC_VERTEX_BASE_URL": "http://127.0.0.1:18899",
+                    }
+                },
+            )
+
+    def test_option_kwargs_corrupt_profile_settings_fails_loud(self):
+        # A profile whose settings.json cannot be parsed must not silently run
+        # with a partial env override (that would drop its auth and every turn
+        # would fail with a misleading "Not logged in").
+        with tempfile.TemporaryDirectory() as config_dir:
+            (Path(config_dir) / "settings.json").write_text("{not json", encoding="utf-8")
+            transport = ClaudeHeadlessTransport(
+                config_dir=config_dir,
+                anthropic_base_url="http://127.0.0.1:18899",
+            )
+
+            with self.assertRaisesRegex(TransportUnavailable, "unreadable or invalid JSON"):
+                transport._option_kwargs(LaunchSpec(cwd="/tmp/project", session_id="s1"))
 
     def test_option_kwargs_anthropic_base_url_only(self):
         # Plain options.env is confirmed (via CLAUDE_CONFIG_DIR) to reach the

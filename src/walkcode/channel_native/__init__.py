@@ -5268,17 +5268,11 @@ class ClaudeHeadlessTransport:
             # inherited process env for ANTHROPIC_BASE_URL/ANTHROPIC_VERTEX_
             # BASE_URL specifically — env-only overrides silently never hit
             # a local proxy. --settings is the layer Claude Code actually
-            # honors here (the same fix claude-tap's own inject_settings_env
-            # applies when it launches the "claude" client itself).
+            # honors here.
             #
-            # Deliberately minimal and self-contained (no merging of
-            # self.settings' own file/JSON content): an earlier version read
-            # and re-serialized WALKCODE_CLAUDE_SETTINGS' content inline,
-            # which (a) leaked any embedded secrets (e.g. ANTHROPIC_API_KEY)
-            # into this process' argv/`ps` output, and (b) silently dropped
-            # the whole settings payload on any read/parse hiccup. Combining
-            # WALKCODE_CLAUDE_SETTINGS with this override is rejected at
-            # config-parse time instead (_configured_agent_options).
+            # Note self.settings (WALKCODE_CLAUDE_SETTINGS) is NOT consulted:
+            # combining it with this override is rejected at config-parse
+            # time (_configured_agent_options).
             option_kwargs["settings"] = self._anthropic_base_url_settings_override()
         elif self.settings:
             option_kwargs["settings"] = self.settings
@@ -5300,21 +5294,64 @@ class ClaudeHeadlessTransport:
         return option_kwargs
 
     def _anthropic_base_url_settings_override(self) -> str:
-        # Claude Code reads ANTHROPIC_VERTEX_BASE_URL instead of
-        # ANTHROPIC_BASE_URL when Vertex routing is active — and the Vertex
-        # switch may live only in the profile's own settings.json, invisible
-        # to this runtime's process env (a launchd-run serve has neither;
-        # confirmed live: the gated variant silently bypassed the proxy for
-        # Vertex-routed profiles). Set both unconditionally: whichever
-        # routing mode is active picks up its variable, the other is ignored.
-        return json.dumps(
-            {
-                "env": {
-                    "ANTHROPIC_BASE_URL": self.anthropic_base_url,
-                    "ANTHROPIC_VERTEX_BASE_URL": self.anthropic_base_url,
-                }
-            }
+        """Build the --settings payload routing this profile through the debug proxy.
+
+        Two facts, both confirmed live against real profiles, shape this:
+
+        - Claude Code reads ANTHROPIC_VERTEX_BASE_URL (not ANTHROPIC_BASE_URL)
+          when Vertex routing is active, and the Vertex switch may live only in
+          the profile's settings.json — invisible to this runtime's process env
+          (a launchd-run serve has neither). So both variables are always set;
+          the inactive one is ignored.
+        - The --settings env map REPLACES the profile settings.json env map
+          wholesale rather than merging per key. An override carrying only the
+          base URLs therefore drops the profile's own env — including
+          ANTHROPIC_API_KEY — and every turn fails "Not logged in" on profiles
+          that authenticate via settings.json env. The override must re-supply
+          the profile env, merged with the base-URL rewrite.
+
+        The merged env can contain secrets, so it is never passed inline on the
+        CLI (argv is world-readable via ps); it is written to a 0600 file under
+        the profile's own config dir — same directory, same owner, same threat
+        model as the settings.json those values came from — and the *path* is
+        returned. A corrupt settings.json raises instead of silently degrading.
+        """
+        env_obj: dict[str, Any] = {}
+        settings_path: Path | None = None
+        if self.config_dir:
+            settings_path = Path(self.config_dir) / "settings.json"
+            if settings_path.is_file():
+                try:
+                    profile_settings = json.loads(settings_path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError) as exc:
+                    raise TransportUnavailable(
+                        f"cannot apply WALKCODE_CLAUDE_ANTHROPIC_BASE_URL: unreadable or invalid "
+                        f"JSON in {settings_path}: {exc}"
+                    ) from exc
+                if isinstance(profile_settings, dict) and isinstance(profile_settings.get("env"), dict):
+                    env_obj.update(profile_settings["env"])
+        env_obj["ANTHROPIC_BASE_URL"] = self.anthropic_base_url
+        env_obj["ANTHROPIC_VERTEX_BASE_URL"] = self.anthropic_base_url
+        payload = json.dumps({"env": env_obj})
+        if settings_path is None:
+            # No config dir → no profile env consulted, nothing sensitive in
+            # the payload; inline JSON is fine and leaves no file behind.
+            return payload
+        override_path = Path(self.config_dir) / "walkcode-tap-override-settings.json"
+        fd = os.open(
+            str(override_path),
+            os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+            0o600,
         )
+        try:
+            os.fchmod(fd, 0o600)  # tighten pre-existing files created with wider modes
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(payload)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.close(fd)
+            raise
+        return str(override_path)
 
     def _create_client(self, spec: LaunchSpec, *, resume_id: str = ""):
         if self._client_factory is not None:
