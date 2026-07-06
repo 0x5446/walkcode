@@ -3564,6 +3564,7 @@ def _build_transports(config: ChannelNativeConfig) -> dict[str, AgentTransport]:
             settings=claude_options.get("settings"),
             cli_path=claude_options.get("cli_path"),
             config_dir=claude_options.get("config_dir"),
+            anthropic_base_url=claude_options.get("anthropic_base_url"),
             permission_mode=claude_options.get("permission_mode"),
         )
         # Multi-UI sync (ADR 0046): the daemon transport rides alongside the

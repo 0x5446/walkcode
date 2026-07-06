@@ -1959,6 +1959,20 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
         self.assertEqual(transports["claude_headless"].cli_path, "/tmp/claude")
         self.assertEqual(transports["claude_headless"].config_dir, "/tmp/claude-profiles/work")
 
+    def test_build_transports_passes_claude_anthropic_base_url(self):
+        cfg = ChannelNativeConfig.from_env(
+            {
+                "WALKCODE_CHANNEL": "telegram",
+                "TELEGRAM_BOT_TOKEN": "fake",
+                "WALKCODE_AGENT": "claude",
+                "WALKCODE_CLAUDE_ANTHROPIC_BASE_URL": "http://127.0.0.1:18899",
+            }
+        )
+
+        transports = runtime_module._build_transports(cfg)
+
+        self.assertEqual(transports["claude_headless"].anthropic_base_url, "http://127.0.0.1:18899")
+
     def test_unknown_codex_app_server_mode_fails_instead_of_dropping_socket(self):
         cfg = ChannelNativeConfig.from_env(
             {

@@ -120,6 +120,47 @@ matrix and launchd templates live in
 [docs/lark-profile-deploy.md](docs/lark-profile-deploy.md); all variables are
 documented in [.env.example](.env.example).
 
+### Optional: debug proxy (claude-tap)
+
+To see the actual system prompt / tool calls / token usage a profile sends
+upstream, point that profile's Claude base URL at a local reverse proxy:
+
+```bash
+WALKCODE_CLAUDE_ANTHROPIC_BASE_URL=http://127.0.0.1:18899
+```
+
+WalkCode wraps this value into a standalone `--settings` override
+(`{"env": {"ANTHROPIC_BASE_URL": ...}}`) for the Claude Agent SDK — it does not
+install, launch, or supervise any proxy process, so it never competes with
+WalkCode's own Claude-session launch path. (Confirmed live: a plain
+process-env override alone does not take effect, because Claude Code
+re-applies the `env` block from this profile's own
+`CLAUDE_CONFIG_DIR/settings.json` on top of it; `--settings` is the layer that
+actually wins, same as what claude-tap itself uses when it launches the
+`claude` client directly.) This override does not read or merge whatever
+`WALKCODE_CLAUDE_SETTINGS` already points to — configuring both on the same
+profile is rejected at startup, so pick one (see
+[ADR 0047](docs/adr/0047-claude-tap-debug-proxy-passthrough.md) for why). You
+run the proxy yourself, e.g. with
+[claude-tap](https://github.com/liaohch3/claude-tap) (`uv tool install
+claude-tap`), started with this profile's own upstream env in no-launch mode:
+
+```bash
+claude-tap --tap-no-launch --tap-client claude --tap-port 18899 --tap-no-open
+```
+
+claude-tap detects its upstream target from **its own process environment**
+(`ANTHROPIC_VERTEX_BASE_URL` / `CLAUDE_CODE_USE_VERTEX` / `ANTHROPIC_BASE_URL`,
+etc.), so launch it with the same set this profile already uses — otherwise it
+falls back to the default `api.anthropic.com`.
+
+If your upstream is a non-Google Vertex gateway whose path shape isn't the
+standard `/v1/projects/.../publishers/anthropic/models/...:rawPredict` (e.g. an
+internal gateway that drops the `/v1` prefix), claude-tap's default path
+allowlist blocks it (look for `Blocked non-API path` in the sidecar log) —
+add `--tap-allow-path /projects` (or whatever prefix your gateway actually
+uses).
+
 ## Run Locally
 
 Check config, credentials, and agent capability first:

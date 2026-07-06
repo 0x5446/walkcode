@@ -217,6 +217,94 @@ class ChannelNativeConfigTests(unittest.TestCase):
             [".claude-profiles", "work"],
         )
 
+    def test_claude_anthropic_base_url_is_agent_option(self):
+        cfg = ChannelNativeConfig.from_env(
+            {
+                "WALKCODE_CHANNEL": "telegram",
+                "TELEGRAM_BOT_TOKEN": "tg-token",
+                "WALKCODE_AGENT": "claude",
+                "WALKCODE_CLAUDE_ANTHROPIC_BASE_URL": "http://127.0.0.1:18899",
+            }
+        )
+
+        self.assertEqual(
+            cfg.agent_options["claude"]["anthropic_base_url"], "http://127.0.0.1:18899"
+        )
+
+    def test_claude_anthropic_base_url_absent_by_default(self):
+        cfg = ChannelNativeConfig.from_env(
+            {
+                "WALKCODE_CHANNEL": "telegram",
+                "TELEGRAM_BOT_TOKEN": "tg-token",
+                "WALKCODE_AGENT": "claude",
+            }
+        )
+
+        self.assertNotIn("anthropic_base_url", cfg.agent_options["claude"])
+
+    def test_invalid_claude_anthropic_base_url_is_rejected(self):
+        with self.assertRaisesRegex(ChannelConfigError, "invalid WALKCODE_CLAUDE_ANTHROPIC_BASE_URL"):
+            ChannelNativeConfig.from_env(
+                {
+                    "WALKCODE_CHANNEL": "telegram",
+                    "TELEGRAM_BOT_TOKEN": "tg-token",
+                    "WALKCODE_AGENT": "claude",
+                    "WALKCODE_CLAUDE_ANTHROPIC_BASE_URL": "127.0.0.1:18899",
+                }
+            )
+
+    def test_claude_anthropic_base_url_without_host_is_rejected(self):
+        with self.assertRaisesRegex(ChannelConfigError, "invalid WALKCODE_CLAUDE_ANTHROPIC_BASE_URL"):
+            ChannelNativeConfig.from_env(
+                {
+                    "WALKCODE_CHANNEL": "telegram",
+                    "TELEGRAM_BOT_TOKEN": "tg-token",
+                    "WALKCODE_AGENT": "claude",
+                    "WALKCODE_CLAUDE_ANTHROPIC_BASE_URL": "http://",
+                }
+            )
+
+    def test_claude_anthropic_base_url_empty_host_with_port_is_rejected(self):
+        # urlsplit gives a non-empty netloc (":18899") but no hostname here —
+        # checking netloc alone would wrongly accept this.
+        with self.assertRaisesRegex(ChannelConfigError, "invalid WALKCODE_CLAUDE_ANTHROPIC_BASE_URL"):
+            ChannelNativeConfig.from_env(
+                {
+                    "WALKCODE_CHANNEL": "telegram",
+                    "TELEGRAM_BOT_TOKEN": "tg-token",
+                    "WALKCODE_AGENT": "claude",
+                    "WALKCODE_CLAUDE_ANTHROPIC_BASE_URL": "http://:18899",
+                }
+            )
+
+    def test_claude_anthropic_base_url_accepts_uppercase_scheme(self):
+        cfg = ChannelNativeConfig.from_env(
+            {
+                "WALKCODE_CHANNEL": "telegram",
+                "TELEGRAM_BOT_TOKEN": "tg-token",
+                "WALKCODE_AGENT": "claude",
+                "WALKCODE_CLAUDE_ANTHROPIC_BASE_URL": "HTTP://127.0.0.1:18899",
+            }
+        )
+
+        self.assertEqual(
+            cfg.agent_options["claude"]["anthropic_base_url"], "HTTP://127.0.0.1:18899"
+        )
+
+    def test_claude_anthropic_base_url_rejects_combination_with_settings(self):
+        with self.assertRaisesRegex(
+            ChannelConfigError, "cannot be combined with WALKCODE_CLAUDE_SETTINGS"
+        ):
+            ChannelNativeConfig.from_env(
+                {
+                    "WALKCODE_CHANNEL": "telegram",
+                    "TELEGRAM_BOT_TOKEN": "tg-token",
+                    "WALKCODE_AGENT": "claude",
+                    "WALKCODE_CLAUDE_SETTINGS": "/tmp/vertex.json",
+                    "WALKCODE_CLAUDE_ANTHROPIC_BASE_URL": "http://127.0.0.1:18899",
+                }
+            )
+
     def test_codex_home_is_agent_option(self):
         cfg = ChannelNativeConfig.from_env(
             {
