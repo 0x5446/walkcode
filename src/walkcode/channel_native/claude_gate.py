@@ -427,6 +427,10 @@ def pre_tool_use_output(
 
 
 def timeout_decision(kind: str) -> dict[str, Any]:
-    if kind == KIND_ASK_USER:
-        return {"action": "deny", "reason": "WalkCode 审批超时（未收到回答）"}
-    return {"action": "deny", "reason": "WalkCode 审批超时"}
+    # Timing out ABSTAINS instead of denying: the hook returns no decision, so
+    # Claude Code falls back to its native prompt and the user answers in the
+    # terminal. Deny-on-timeout meant nobody could answer anywhere once the IM
+    # card went unnoticed — "IM first, terminal after timeout" keeps both
+    # surfaces usable (a later click on the stale card is reaped as an orphan
+    # decision by the drain loop).
+    return {"action": "pass", "reason": "gate_timeout_fallback_to_native"}

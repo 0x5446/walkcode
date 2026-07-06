@@ -1830,6 +1830,9 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
             )
             runtime.state.authz.grant(session.session_id, ActorRef("telegram", "456", "Ada"), SessionRole.OWNER)
             clock.now += 31.0
+            # This test guards the lease-expiry hold-back semantics; treat the
+            # session as created by this process so the startup sweep skips it.
+            runtime._orphan_sweep_done = True
 
             processed = asyncio.run(runtime.poll_telegram_once(timeout=0, limit=5))
 
@@ -3963,7 +3966,16 @@ class OrphanHeadlessSweepTests(unittest.TestCase):
             asyncio.run(runtime._settle_orphan_headless_sessions_once())
             self.assertEqual(session.status, "running")
 
-            # An orchestrator-owned headless session is a zombie after restart.
+            # An IDLE session must also survive: the resume path revives it.
+            runtime._orphan_sweep_done = False
+            session.writer_owner = runtime_module.WriterOwner(kind="orchestrator")
+            session.lifecycle_state = "IDLE"
+            asyncio.run(runtime._settle_orphan_headless_sessions_once())
+            self.assertEqual(session.status, "running")
+
+            # An in-flight orchestrator-owned session is a true zombie.
+            runtime._orphan_sweep_done = False
+            session.lifecycle_state = "WAITING_USER"
             session.writer_owner = runtime_module.WriterOwner(kind="orchestrator")
             asyncio.run(runtime._settle_orphan_headless_sessions_once())
             self.assertEqual(session.status, "stopped")

@@ -765,6 +765,9 @@ class BridgeBypassAndStaleWorkerTests(PermissionBridgeOrchestratorTests):
     def test_headless_submit_reacts_on_user_message(self):
         async def scenario():
             transport, channel, orch = self._build(_client_class())
+            # Telegram is pre-acked by its runtime, so the orchestrator pool
+            # excludes it; inject a test pool for the fake telegram channel.
+            orch._ACK_REACTIONS = {**Orchestrator._ACK_REACTIONS, "telegram": ("👍",)}
             owner = ActorRef("telegram", "owner", "Owner")
             binding = ChannelBinding("telegram", "bot", "chat", "topic", "root")
             session = await orch.start_session(binding, "claude_headless", "/tmp/project", owner)
@@ -780,7 +783,7 @@ class BridgeBypassAndStaleWorkerTests(PermissionBridgeOrchestratorTests):
         channel = asyncio.run(scenario())
         self.assertTrue(channel.reactions, "submit must react on the user message")
         self.assertEqual(channel.reactions[0]["message_id"], "m-user-1")
-        self.assertIn(channel.reactions[0]["emoji"], Orchestrator._ACK_REACTIONS["telegram"])
+        self.assertEqual(channel.reactions[0]["emoji"], "👍")
 
 
 if __name__ == "__main__":

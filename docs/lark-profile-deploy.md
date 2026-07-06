@@ -216,8 +216,8 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.walkcode.work-claude
 
 daemon-native 会话（wrapper 裸启动）另验（ADR 0046 v2）：
 
-- 飞书发消息 → 终端实时出现该输入，飞书**无 "TUI input" 回显**、有
-  "✅ 已发送到终端会话" 回执；
+- 飞书发消息 → 终端实时出现该输入，飞书**无 "TUI input" 回显**、用户消息
+  被贴表情回执（reaction 失败时回退 "✅ 已发送到终端会话" 文本）；
 - 会话内触发 AskUserQuestion → 飞书出选项卡，点选/提交后终端不弹 dialog、
   模型按所选答案继续；
 - 会话内触发权限工具（如 Edit）→ 飞书出权限卡，点允许/拒绝真放行/拦截；

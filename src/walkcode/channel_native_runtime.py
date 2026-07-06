@@ -1680,6 +1680,8 @@ class ChannelNativeRuntime:
         channel = self.channels.get("telegram")
         if not isinstance(channel, TelegramChannelAdapter):
             raise ChannelConfigError("Telegram channel is not configured for channel-native runtime")
+        # Startup barrier for the --once path too (idempotent per process).
+        await self._settle_orphan_headless_sessions_once()
         if not self.config.channel.options.get("polling", True):
             raise ChannelConfigError("Telegram polling is disabled; webhook ingress is not wired yet")
         payload: dict[str, Any] = {
@@ -1790,6 +1792,12 @@ class ChannelNativeRuntime:
         # a restart is a zombie — its cards look live but clicks can never
         # reach a worker. Settle them so the topic shows the truth and stale
         # cards get retired by the callback-failure path instead of hanging.
+        # Guarded to one run per process so every ingress entry point (lark
+        # ws, telegram polling, --once) can call it without re-sweeping
+        # sessions this process created.
+        if getattr(self, "_orphan_sweep_done", False):
+            return
+        self._orphan_sweep_done = True
         try:
             async with self._ingress_lock:
                 settled = 0
@@ -1799,6 +1807,18 @@ class ChannelNativeRuntime:
                     if session.status == "stopped":
                         continue
                     if not (session.writer_owner and session.writer_owner.kind == "orchestrator"):
+                        continue
+                    # Only in-flight sessions are unrecoverable: their turn and
+                    # any blocked can_use_tool Future died with the previous
+                    # process, and active turns can't be resumed. IDLE (and
+                    # error-recoverable) sessions stay — the resume path
+                    # revives them on the next inbound message.
+                    if session.lifecycle_state not in {
+                        "ACTIVE",
+                        "WAITING_PERMISSION",
+                        "WAITING_USER",
+                        "INTERRUPTED",
+                    }:
                         continue
                     session.status = "stopped"
                     session.lifecycle_state = "STOPPED"

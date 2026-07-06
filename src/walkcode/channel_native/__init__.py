@@ -6622,11 +6622,12 @@ class Orchestrator:
             self.authz.grant(session.session_id, owner, SessionRole.OWNER)
         return session
 
-    # Per-channel reaction pools for lightweight acks. Lark values are
-    # emoji_type keys; Telegram values must come from its allowed reaction set.
+    # Per-channel reaction pools for lightweight acks (Lark values are
+    # emoji_type keys). Telegram is deliberately absent: its runtime already
+    # pre-acks every inbound message with ✅ (_ack_telegram_received), and a
+    # second setMessageReaction would overwrite that receipt.
     _ACK_REACTIONS: dict[str, tuple[str, ...]] = {
         "lark": ("DONE", "OK", "THUMBSUP", "MUSCLE", "APPLAUSE"),
-        "telegram": ("👌", "👍", "🔥", "🫡", "⚡"),
     }
 
     async def _react_ack(self, session: Session, message_id: str) -> bool:

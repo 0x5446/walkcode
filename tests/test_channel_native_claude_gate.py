@@ -268,12 +268,14 @@ class PreToolUseOutputTests(unittest.TestCase):
             out["hookSpecificOutput"]["updatedInput"]["answers"], {"颜色?": "红,蓝"}
         )
 
-    def test_ask_timeout_denies_with_reason(self):
-        out = claude_gate.pre_tool_use_output(
-            "ask_user_question", claude_gate.timeout_decision("ask_user_question"), {}
-        )
-        self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny")
-        self.assertTrue(out["hookSpecificOutput"]["permissionDecisionReason"])
+    def test_timeout_abstains_to_native_prompt(self):
+        # Timeout must NOT deny: the hook abstains (None output) so Claude
+        # Code falls back to its native dialog and the terminal can answer.
+        for kind in ("ask_user_question", "permission"):
+            out = claude_gate.pre_tool_use_output(
+                kind, claude_gate.timeout_decision(kind), {}
+            )
+            self.assertIsNone(out)
 
 
 class DaemonTransportGateTests(unittest.TestCase):
