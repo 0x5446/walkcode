@@ -674,5 +674,114 @@ class BridgeBypassAndStaleWorkerTests(PermissionBridgeOrchestratorTests):
         self.assertIsNotNone(notice, "user-facing restart notice was not sent")
 
 
+
+    def test_stale_worker_permission_click_flips_card(self):
+        client_cls = _client_class(tool_name="Bash", tool_input={"command": "ls"}, tool_use_id="perm-stale")
+
+        async def scenario():
+            transport, channel, orch = self._build(client_cls)
+            owner = ActorRef("telegram", "owner", "Owner")
+            binding = ChannelBinding("telegram", "bot", "chat", "topic", "root")
+            session = await orch.start_session(binding, "claude_headless", "/tmp/project", owner)
+            await orch.submit_user_input(
+                session.session_id, TurnInput(text="run"), actor=owner, generation=session.generation
+            )
+            card = None
+            for _ in range(4000):
+                card = self._find_view(channel, "permission_prompt")
+                if card is not None:
+                    break
+                await asyncio.sleep(0)
+            self.assertIsNotNone(card, "permission card never floated")
+            transport._bridges.clear()
+            transport._clients.clear()
+            token = next(a["token"] for a in card["actions"] if a["action"] == "allow")
+            result = await orch.handle_inbound_event(
+                self._callback(token), agent_transport_kind="claude_headless", cwd="/tmp/project"
+            )
+            return channel, result
+
+        channel, result = asyncio.run(scenario())
+        self.assertFalse(result.accepted)
+        stale = [
+            item for item in channel.sent_views
+            if item.get("view", {}).get("type") == "decision_result"
+            and item.get("view", {}).get("action") == "stale"
+        ]
+        self.assertTrue(stale and stale[0].get("edited"), "permission stale flip missing")
+
+    def test_non_transport_unavailable_failure_does_not_flip_stale(self):
+        # A transient injection failure must stay retryable: no stale flip,
+        # and the exception keeps propagating (inbound ledger marks failed).
+        client_cls = _client_class(
+            tool_name="AskUserQuestion",
+            tool_input={"questions": [{"question": "Pick", "options": [{"label": "A"}, {"label": "B"}]}]},
+            tool_use_id="ask-transient",
+        )
+
+        async def scenario():
+            transport, channel, orch = self._build(client_cls)
+            owner = ActorRef("telegram", "owner", "Owner")
+            binding = ChannelBinding("telegram", "bot", "chat", "topic", "root")
+            session = await orch.start_session(binding, "claude_headless", "/tmp/project", owner)
+            await orch.submit_user_input(
+                session.session_id, TurnInput(text="run"), actor=owner, generation=session.generation
+            )
+            card = None
+            for _ in range(4000):
+                card = self._find_view(channel, "ask_user_question")
+                if card is not None:
+                    break
+                await asyncio.sleep(0)
+            self.assertIsNotNone(card)
+            set_token = next(a["token"] for a in card["actions"] if a["action"] == "set:0:0")
+            await orch.handle_inbound_event(
+                self._callback(set_token), agent_transport_kind="claude_headless", cwd="/tmp/project"
+            )
+
+            async def boom(handle, rid, answers):
+                raise RuntimeError("transient injection failure")
+
+            transport.answer_user_question = boom
+            submit_token = card["submit"]["token"]
+            raised = False
+            try:
+                await orch.handle_inbound_event(
+                    self._callback(submit_token), agent_transport_kind="claude_headless", cwd="/tmp/project"
+                )
+            except RuntimeError:
+                raised = True
+            return channel, raised
+
+        channel, raised = asyncio.run(scenario())
+        self.assertTrue(raised, "transient failure must propagate, not be swallowed")
+        stale = [
+            item for item in channel.sent_views
+            if item.get("view", {}).get("type") == "decision_result"
+            and item.get("view", {}).get("action") == "stale"
+        ]
+        self.assertEqual(stale, [], "transient failure must not retire the card as stale")
+
+    def test_headless_submit_reacts_on_user_message(self):
+        async def scenario():
+            transport, channel, orch = self._build(_client_class())
+            owner = ActorRef("telegram", "owner", "Owner")
+            binding = ChannelBinding("telegram", "bot", "chat", "topic", "root")
+            session = await orch.start_session(binding, "claude_headless", "/tmp/project", owner)
+            await orch.submit_user_input(
+                session.session_id,
+                TurnInput(text="run"),
+                actor=owner,
+                generation=session.generation,
+                ack_message_id="m-user-1",
+            )
+            return channel
+
+        channel = asyncio.run(scenario())
+        self.assertTrue(channel.reactions, "submit must react on the user message")
+        self.assertEqual(channel.reactions[0]["message_id"], "m-user-1")
+        self.assertIn(channel.reactions[0]["emoji"], Orchestrator._ACK_REACTIONS["telegram"])
+
+
 if __name__ == "__main__":
     unittest.main()

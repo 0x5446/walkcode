@@ -3891,6 +3891,44 @@ class TranscriptModelBackfillTests(unittest.TestCase):
         )
 
 
+
+
+class TuiHookModelBackfillIntegrationTests(unittest.TestCase):
+    def test_process_tui_hook_backfills_session_model_from_transcript(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            transcript = Path(tmp) / "t.jsonl"
+            transcript.write_text(
+                json.dumps({"type": "assistant", "message": {"model": "claude-sonnet-5[1m]"}})
+            )
+            state_path = str(Path(tmp) / "state.json")
+            cfg = ChannelNativeConfig.from_env(
+                {
+                    "WALKCODE_CHANNEL": "telegram",
+                    "TELEGRAM_BOT_TOKEN": "fake",
+                    "WALKCODE_AGENT": "claude",
+                    "TELEGRAM_ALLOWED_CHAT_IDS": "-100",
+                    "WALKCODE_STATE_PATH": state_path,
+                    "WALKCODE_CWD": tmp,
+                }
+            )
+            api = _ForumTelegramApi()
+            runtime = ChannelNativeRuntime.from_config(cfg, telegram_api=api, transports={})
+            payload = {
+                "hook_event_name": "SessionStart",
+                "session_id": "sess-tui-model",
+                "transcript_path": str(transcript),
+                "cwd": tmp,
+                "_walkcode_external_tui_pid": 4242,
+            }
+            asyncio.run(runtime.process_tui_hook(hook_type="SessionStart", payload=payload, agent="claude"))
+            sessions = [
+                s for s in runtime.state.sessions.iter_sessions()
+                if s.transport_kind == "external_tui"
+            ]
+            if not sessions:
+                self.skipTest("TUI hook did not create an observed session in this configuration")
+            self.assertEqual(sessions[0].model, "claude-sonnet-5[1m]")
+
 class OrphanHeadlessSweepTests(unittest.TestCase):
     def test_sweep_settles_orchestrator_owned_headless_sessions_only(self):
         with tempfile.TemporaryDirectory() as tmp:

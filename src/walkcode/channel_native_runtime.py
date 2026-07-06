@@ -7,6 +7,7 @@ import base64
 import hashlib
 import json
 import os
+import stat
 import random
 import re
 import shlex
@@ -1467,6 +1468,10 @@ class ChannelNativeRuntime:
             )
         else:
             bridge = bridge_factory(loop=loop, queue=queue, ack_registry=ack_registry)
+        # Settle zombies from the previous process BEFORE ingress starts: the
+        # first inbound message must not race the sweep into a dead worker
+        # handle, and the sweep must never see sessions this process created.
+        await self._settle_orphan_headless_sessions_once()
         bridge.start()
         previous_defer_event_drain = self.orchestrator.defer_event_drain
         self.orchestrator.defer_event_drain = True
@@ -1713,6 +1718,9 @@ class ChannelNativeRuntime:
         max_iterations: int | None = None,
     ) -> None:
         iterations = 0
+        # Same startup barrier as serve_lark_ws: settle previous-process
+        # zombies before any polling can route messages into dead handles.
+        await self._settle_orphan_headless_sessions_once()
         previous_defer_event_drain = self.orchestrator.defer_event_drain
         self.orchestrator.defer_event_drain = True
         maintenance_tasks = self._start_telegram_maintenance_tasks()
@@ -1738,10 +1746,6 @@ class ChannelNativeRuntime:
 
     def _start_telegram_maintenance_tasks(self) -> list[asyncio.Task[None]]:
         return [
-            asyncio.create_task(
-                self._settle_orphan_headless_sessions_once(),
-                name="walkcode-orphan-headless-sweep",
-            ),
             asyncio.create_task(
                 self._flush_outbox_forever(interval=OUTBOX_FLUSH_INTERVAL_SECONDS),
                 name="walkcode-outbox-flush",
@@ -1930,9 +1934,9 @@ class ChannelNativeRuntime:
                 return SubmitResult(True, "unobserved_tui_hook")
             if session.status != "stopped":
                 # Backfill the model for TUI-observed sessions (status card
-                # shows "—" otherwise); re-read on stop so a mid-session
+                # shows "—" otherwise); re-read on turn stop so a mid-session
                 # /model switch lands eventually without per-event file IO.
-                if not session.model or _tui_hook_stops_session(hook_type):
+                if not session.model or hook_type == "stop" or _tui_hook_stops_session(hook_type):
                     transcript_model = _transcript_model_from_payload(payload)
                     if transcript_model and transcript_model != session.model:
                         session.model = transcript_model
@@ -4102,11 +4106,16 @@ def _transcript_model_from_payload(payload: dict[str, Any]) -> str:
         return ""
     try:
         transcript = Path(path).expanduser()
-        size = transcript.stat().st_size
+        # The path comes from an (unauthenticated) hook payload: refuse
+        # non-regular files (pipes, devices) and cap the read so a hostile
+        # path can't block the event loop or read unboundedly.
+        info = transcript.stat()
+        if not stat.S_ISREG(info.st_mode):
+            return ""
         with transcript.open("rb") as fh:
-            if size > 65536:
+            if info.st_size > 65536:
                 fh.seek(-65536, os.SEEK_END)
-            tail = fh.read().decode("utf-8", "replace")
+            tail = fh.read(65536).decode("utf-8", "replace")
     except OSError:
         return ""
     for line in reversed(tail.splitlines()):

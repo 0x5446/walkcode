@@ -86,6 +86,12 @@ def build_operation(method: str, payload: dict[str, Any]) -> dict[str, Any]:
             "message_id": str(payload.get("message_id", "") or ""),
             "content": json.dumps(message["content"], ensure_ascii=False),
         }
+    if method == "reactMessage":
+        return {
+            "kind": "reaction",
+            "message_id": str(payload.get("message_id", "") or ""),
+            "emoji_type": str(payload.get("emoji_type", "") or "DONE"),
+        }
     if method == "downloadResource":
         return {
             "kind": "download",
@@ -192,6 +198,8 @@ class SdkTransport:
                 return self._reply(operation)
             if kind == "patch":
                 return self._patch(operation)
+            if kind == "reaction":
+                return self._reaction(operation)
             if kind == "download":
                 return self._download(operation)
         except (TransientDeliveryError, PermanentDeliveryError):
@@ -258,6 +266,19 @@ class SdkTransport:
             .build()
         )
         self._check(self._ensure_client().im.v1.message.patch(request), "Lark patch")
+        return {"ok": True}
+
+    def _reaction(self, operation: dict[str, Any]) -> dict[str, Any]:
+        _, im_v1 = self._sdk()
+        emoji = im_v1.Emoji.builder().emoji_type(operation["emoji_type"]).build()
+        body = im_v1.CreateMessageReactionRequestBody.builder().reaction_type(emoji).build()
+        request = (
+            im_v1.CreateMessageReactionRequest.builder()
+            .message_id(operation["message_id"])
+            .request_body(body)
+            .build()
+        )
+        self._check(self._ensure_client().im.v1.message_reaction.create(request), "Lark reaction")
         return {"ok": True}
 
     def _download(self, operation: dict[str, Any]) -> dict[str, Any]:

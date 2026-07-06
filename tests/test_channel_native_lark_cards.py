@@ -341,6 +341,23 @@ class OtherViewTests(unittest.TestCase):
         rendered = json.dumps(content, ensure_ascii=False)
         self.assertIn("claude-fable-5", rendered)
 
+    def test_stale_decision_result_renders_orange_expired_card(self):
+        message = render_lark_message(
+            {
+                "type": "decision_result",
+                "kind": "ask_user_question",
+                "action": "stale",
+                "detail": "会话进程已重启，这张卡片已失效。",
+            }
+        )
+
+        content = message["content"]
+        self.assertEqual(content["header"]["template"], "orange")
+        rendered = json.dumps(content, ensure_ascii=False)
+        self.assertIn("已失效", rendered)
+        # stale must win over the ask_user_question green "已回答" branch
+        self.assertNotIn("已回答", rendered)
+
     def test_unknown_view_falls_back_to_text(self):
         message = render_lark_message(
             {"type": "some_new_view"}, fallback_text="fallback body"
