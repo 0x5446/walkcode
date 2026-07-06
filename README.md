@@ -100,39 +100,32 @@ launchd 模板见 [docs/lark-profile-deploy.md](docs/lark-profile-deploy.md)，�
 
 ### 可选：调试代理（claude-tap）
 
-想看某个 profile 实际发给 Claude Code 上游的 system prompt / 工具调用 / token
-用量，可以在该 profile 的 env 里加一行，把这个 profile 的上游 base URL 指向本地
-反向代理：
+想看各 profile 实际发给 Claude Code 上游的 system prompt / 工具调用 / token
+用量，可以给每个 claude profile 挂一个本地
+[claude-tap](https://github.com/liaohch3/claude-tap) 反向代理（launchd 常驻、
+开机自启、崩溃自动拉起），所有 trace 汇总在 http://127.0.0.1:19527 一个看板里：
 
 ```bash
-WALKCODE_CLAUDE_ANTHROPIC_BASE_URL=http://127.0.0.1:18899
+uv tool install claude-tap
+./scripts/claude-tap-setup.sh init      # 生成 ~/.walkcode/claude-tap/taps.conf 模板
+vi ~/.walkcode/claude-tap/taps.conf     # 按注释给每个 profile 填端口/上游
+./scripts/claude-tap-setup.sh apply     # 起 tap、写 profile env、重启实例（幂等）
+./scripts/claude-tap-setup.sh remove    # 一键全部关掉、恢复直连
 ```
 
-WalkCode 把这个值包成一个独立的 `--settings` 覆盖（`{"env": {"ANTHROPIC_BASE_URL":
-...}}`）传给 Claude Agent SDK，不会安装、拉起或看护任何代理进程——避免和 WalkCode
-自己拉起 Claude 会话的机制打架。（实测过：单纯覆盖进程 env 对这个变量不生效，因
-为 Claude Code 会用 `CLAUDE_CONFIG_DIR` 下 `settings.json` 自带的 `env` 块覆盖
-回去；走 `--settings` 才是真正生效的层级，和 claude-tap 自己转发 `claude` 客户
-端时用的机制一致。）这个覆盖不会读取或合并 `WALKCODE_CLAUDE_SETTINGS` 指向的已
-有 settings 文件内容——两者同时配置在同一个 profile 上会在启动时直接报错，需要
-二选一（详见 [ADR 0047](docs/adr/0047-claude-tap-debug-proxy-passthrough.md)）。
-代理本身仍由你自己起（比如用 [claude-tap](https://github.com/liaohch3/claude-tap)，
-`uv tool install claude-tap` 装好后，用这个 profile 本来的上游 env 起一个纯代理
-模式实例）：
+WalkCode 侧的开关是每个 profile env 里的一行
+`WALKCODE_CLAUDE_ANTHROPIC_BASE_URL=http://127.0.0.1:<port>`（由 setup 脚本自动
+管理）。实现上 WalkCode 会把该 profile `settings.json` 的 `env` 与代理地址合并，
+经 0600 文件以 `--settings` 传给 Claude Agent SDK——不会安装、拉起或看护任何代理
+进程，也不会把密钥暴露到命令行参数。为什么必须这么做（纯 env 覆盖不生效、
+`--settings` 的 env 会整体替换 profile env）踩坑记录见
+[ADR 0047](docs/adr/0047-claude-tap-debug-proxy-passthrough.md)；部署细节、三种
+上游形态（OAuth / Vertex 网关 / 真 Google Vertex）的填法与排障见
+[docs/claude-tap-deploy.md](docs/claude-tap-deploy.md)。
 
-```bash
-claude-tap --tap-no-launch --tap-client claude --tap-port 18899 --tap-no-open
-```
-
-注意 claude-tap 是从**它自己进程的环境变量**（`ANTHROPIC_VERTEX_BASE_URL` /
-`CLAUDE_CODE_USE_VERTEX` / `ANTHROPIC_BASE_URL` 等）探测上游目标的，起它时要带上这
-个 profile 原本会用的那一套，否则它会探测成默认的 `api.anthropic.com`。
-
-如果上游是非 Google 原生的 Vertex 网关（路径不是标准的
-`/v1/projects/.../publishers/anthropic/models/...:rawPredict`，比如公司内部网关
-省掉了 `/v1` 前缀），claude-tap 默认的路径白名单会把请求当非法路径拦掉（sidecar
-日志里能看到 `Blocked non-API path`），这时候要加
-`--tap-allow-path /projects`（或你网关实际的路径前缀）放行。
+注意：`WALKCODE_CLAUDE_SETTINGS` 与该开关不能同时配置在同一个 profile（启动时
+报错）；配置生效后该 profile 的新 headless 会话硬依赖本地 tap，长期不用建议
+`remove` 解除依赖。
 
 ## 本地运行
 

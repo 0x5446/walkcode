@@ -122,44 +122,36 @@ documented in [.env.example](.env.example).
 
 ### Optional: debug proxy (claude-tap)
 
-To see the actual system prompt / tool calls / token usage a profile sends
-upstream, point that profile's Claude base URL at a local reverse proxy:
+To see the actual system prompt / tool calls / token usage each profile sends
+upstream, attach a local [claude-tap](https://github.com/liaohch3/claude-tap)
+reverse proxy to each claude profile (launchd-resident, starts at login,
+auto-respawns on crash), with all traces aggregated in one dashboard at
+http://127.0.0.1:19527:
 
 ```bash
-WALKCODE_CLAUDE_ANTHROPIC_BASE_URL=http://127.0.0.1:18899
+uv tool install claude-tap
+./scripts/claude-tap-setup.sh init      # scaffold ~/.walkcode/claude-tap/taps.conf
+vi ~/.walkcode/claude-tap/taps.conf     # fill in port/upstream per profile
+./scripts/claude-tap-setup.sh apply     # start taps, wire profile envs, restart instances (idempotent)
+./scripts/claude-tap-setup.sh remove    # tear everything down, restore direct connection
 ```
 
-WalkCode wraps this value into a standalone `--settings` override
-(`{"env": {"ANTHROPIC_BASE_URL": ...}}`) for the Claude Agent SDK — it does not
-install, launch, or supervise any proxy process, so it never competes with
-WalkCode's own Claude-session launch path. (Confirmed live: a plain
-process-env override alone does not take effect, because Claude Code
-re-applies the `env` block from this profile's own
-`CLAUDE_CONFIG_DIR/settings.json` on top of it; `--settings` is the layer that
-actually wins, same as what claude-tap itself uses when it launches the
-`claude` client directly.) This override does not read or merge whatever
-`WALKCODE_CLAUDE_SETTINGS` already points to — configuring both on the same
-profile is rejected at startup, so pick one (see
-[ADR 0047](docs/adr/0047-claude-tap-debug-proxy-passthrough.md) for why). You
-run the proxy yourself, e.g. with
-[claude-tap](https://github.com/liaohch3/claude-tap) (`uv tool install
-claude-tap`), started with this profile's own upstream env in no-launch mode:
+The WalkCode-side switch is one line per profile env —
+`WALKCODE_CLAUDE_ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` — managed by the
+setup script. Under the hood WalkCode merges the profile's `settings.json` env
+with the proxy address and passes it to the Claude Agent SDK via `--settings`
+as a 0600 file: it does not install, launch, or supervise any proxy process,
+and secrets never reach argv. Why it must work this way (plain env overrides
+don't take effect; a `--settings` env map replaces the profile env wholesale)
+is recorded in [ADR 0047](docs/adr/0047-claude-tap-debug-proxy-passthrough.md);
+deployment details, the three upstream shapes (OAuth / Vertex gateway / native
+Google Vertex), and troubleshooting live in
+[docs/claude-tap-deploy.md](docs/claude-tap-deploy.md).
 
-```bash
-claude-tap --tap-no-launch --tap-client claude --tap-port 18899 --tap-no-open
-```
-
-claude-tap detects its upstream target from **its own process environment**
-(`ANTHROPIC_VERTEX_BASE_URL` / `CLAUDE_CODE_USE_VERTEX` / `ANTHROPIC_BASE_URL`,
-etc.), so launch it with the same set this profile already uses — otherwise it
-falls back to the default `api.anthropic.com`.
-
-If your upstream is a non-Google Vertex gateway whose path shape isn't the
-standard `/v1/projects/.../publishers/anthropic/models/...:rawPredict` (e.g. an
-internal gateway that drops the `/v1` prefix), claude-tap's default path
-allowlist blocks it (look for `Blocked non-API path` in the sidecar log) —
-add `--tap-allow-path /projects` (or whatever prefix your gateway actually
-uses).
+Note: `WALKCODE_CLAUDE_SETTINGS` cannot be combined with this switch on the
+same profile (rejected at startup); once enabled, the profile's new headless
+sessions hard-depend on the local tap — run `remove` to decouple when not
+actively debugging.
 
 ## Run Locally
 
