@@ -126,7 +126,7 @@ WalkCode 侧的开关是每个 profile env 里的一行
 注意：`WALKCODE_CLAUDE_SETTINGS` 与该开关不能同时配置在同一个 profile（启动时
 报错）；配置生效后该 profile 的新 headless 会话硬依赖本地 tap，长期不用建议
 `remove` 解除依赖。终端里自己开的 TUI 会话默认不走代理，想一并进 dashboard
-见部署文档的「可选：终端 TUI 会话接入」一节（软依赖，tap 没起自动直连）。
+见部署文档的「可选：终端 TUI 会话接入」一节（启动时软依赖，tap 没起则直连）。
 
 ## 本地运行
 
