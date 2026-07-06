@@ -7,6 +7,7 @@ import base64
 import hashlib
 import json
 import os
+import stat
 import random
 import re
 import shlex
@@ -1467,6 +1468,10 @@ class ChannelNativeRuntime:
             )
         else:
             bridge = bridge_factory(loop=loop, queue=queue, ack_registry=ack_registry)
+        # Settle zombies from the previous process BEFORE ingress starts: the
+        # first inbound message must not race the sweep into a dead worker
+        # handle, and the sweep must never see sessions this process created.
+        await self._settle_orphan_headless_sessions_once()
         bridge.start()
         previous_defer_event_drain = self.orchestrator.defer_event_drain
         self.orchestrator.defer_event_drain = True
@@ -1675,6 +1680,8 @@ class ChannelNativeRuntime:
         channel = self.channels.get("telegram")
         if not isinstance(channel, TelegramChannelAdapter):
             raise ChannelConfigError("Telegram channel is not configured for channel-native runtime")
+        # Startup barrier for the --once path too (idempotent per process).
+        await self._settle_orphan_headless_sessions_once()
         if not self.config.channel.options.get("polling", True):
             raise ChannelConfigError("Telegram polling is disabled; webhook ingress is not wired yet")
         payload: dict[str, Any] = {
@@ -1713,6 +1720,9 @@ class ChannelNativeRuntime:
         max_iterations: int | None = None,
     ) -> None:
         iterations = 0
+        # Same startup barrier as serve_lark_ws: settle previous-process
+        # zombies before any polling can route messages into dead handles.
+        await self._settle_orphan_headless_sessions_once()
         previous_defer_event_drain = self.orchestrator.defer_event_drain
         self.orchestrator.defer_event_drain = True
         maintenance_tasks = self._start_telegram_maintenance_tasks()
@@ -1774,6 +1784,65 @@ class ChannelNativeRuntime:
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _settle_orphan_headless_sessions_once(self) -> None:
+        # claude_headless workers are child processes of THIS runtime: the SDK
+        # client, its CLI subprocess, and any in-flight can_use_tool prompt all
+        # died with the previous process. A session still marked running after
+        # a restart is a zombie — its cards look live but clicks can never
+        # reach a worker. Settle them so the topic shows the truth and stale
+        # cards get retired by the callback-failure path instead of hanging.
+        # Guarded to one run per process so every ingress entry point (lark
+        # ws, telegram polling, --once) can call it without re-sweeping
+        # sessions this process created.
+        if getattr(self, "_orphan_sweep_done", False):
+            return
+        self._orphan_sweep_done = True
+        try:
+            async with self._ingress_lock:
+                settled = 0
+                for session in self.state.sessions.iter_sessions():
+                    if session.transport_kind != "claude_headless":
+                        continue
+                    if session.status == "stopped":
+                        continue
+                    if not (session.writer_owner and session.writer_owner.kind == "orchestrator"):
+                        continue
+                    # Only in-flight sessions are unrecoverable: their turn and
+                    # any blocked can_use_tool Future died with the previous
+                    # process, and active turns can't be resumed. IDLE (and
+                    # error-recoverable) sessions stay — the resume path
+                    # revives them on the next inbound message.
+                    if session.lifecycle_state not in {
+                        "ACTIVE",
+                        "WAITING_PERMISSION",
+                        "WAITING_USER",
+                        "INTERRUPTED",
+                    }:
+                        continue
+                    session.status = "stopped"
+                    session.lifecycle_state = "STOPPED"
+                    session.stop_reason = "runtime_restart"
+                    session.writer_lease = None
+                    session.writer_owner = WriterOwner(kind="none")
+                    session.last_progress_at = self._now()
+                    session.last_progress_event = "orchestrator.runtime_restart_settled"
+                    settled += 1
+                    try:
+                        await self.orchestrator.refresh_session_status_card(session)
+                    except Exception:
+                        pass
+                if settled:
+                    self.save_state()
+                    print(
+                        f"settled {settled} orphan claude_headless session(s) from a previous runtime",
+                        file=sys.stderr,
+                    )
+        except Exception as exc:
+            print(
+                f"orphan headless sweep failed: {type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
 
     async def _best_effort_flush_outbox(self) -> None:
         try:
@@ -1884,6 +1953,13 @@ class ChannelNativeRuntime:
                 self.save_state()
                 return SubmitResult(True, "unobserved_tui_hook")
             if session.status != "stopped":
+                # Backfill the model for TUI-observed sessions (status card
+                # shows "—" otherwise); re-read on turn stop so a mid-session
+                # /model switch lands eventually without per-event file IO.
+                if not session.model or hook_type == "stop" or _tui_hook_stops_session(hook_type):
+                    transcript_model = _transcript_model_from_payload(payload)
+                    if transcript_model and transcript_model != session.model:
+                        session.model = transcript_model
                 await self._send_tui_hook_output(session, hook_type=hook_type, payload=payload)
         except Exception:
             if ledger_started:
@@ -4035,6 +4111,48 @@ def _payload_hook_event_name(payload: dict[str, Any]) -> str:
         or payload.get("eventName")
         or ""
     )
+
+
+def _transcript_model_from_payload(payload: dict[str, Any]) -> str:
+    """Read the live model slug from the transcript a hook payload points at.
+
+    TUI-observed sessions have no other model source: the daemon's job record
+    and state patches carry tempo/detail/needs but no model (live-verified
+    2026-07), and hook payloads themselves don't include one. The transcript's
+    latest assistant record does. Tail-read keeps it cheap on long sessions.
+    """
+    path = str(payload.get("transcript_path", "") or "")
+    if not path:
+        return ""
+    try:
+        transcript = Path(path).expanduser()
+        # The path comes from an (unauthenticated) hook payload: refuse
+        # non-regular files (pipes, devices) and cap the read so a hostile
+        # path can't block the event loop or read unboundedly.
+        info = transcript.stat()
+        if not stat.S_ISREG(info.st_mode):
+            return ""
+        with transcript.open("rb") as fh:
+            if info.st_size > 65536:
+                fh.seek(-65536, os.SEEK_END)
+            tail = fh.read(65536).decode("utf-8", "replace")
+    except OSError:
+        return ""
+    for line in reversed(tail.splitlines()):
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        message = record.get("message")
+        if isinstance(message, dict):
+            model = str(message.get("model", "") or "")
+            # "<synthetic>" marks CLI-generated filler messages, not the model.
+            if model and not model.startswith("<"):
+                return model
+    return ""
 
 
 def _normalize_tui_hook_type(value: str) -> str:

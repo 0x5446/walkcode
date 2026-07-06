@@ -388,9 +388,10 @@ hook 配置必须放大 Claude 侧超时（否则 60s 默认值先杀掉 hook、
   `ask_only`。
 - 非 gate 集合内的工具若仍触发原生提示，行为同 v1：橙卡提示"终端确认"+
   等待态，终端处理后回传（needs 清空）。
-- hook 超时 deny 后卡片仍在：此时再点选会写入决策文件但无人消费（drain 会
-  清理孤儿决策）；卡片翻面显示的结果与实际 deny 存在错位，属 30 分钟级
-  边缘场景，不做额外机制。
+- hook 超时改为**弃权**（2026-07-06 起）：飞书卡在超时窗口内优先，超时后
+  hook 返回无决策、终端原生弹窗接管——"飞书优先、超时落回终端"。真正的
+  双端同时可答仍不可行（阻塞 hook 挡在原生 UI 之前是协议约束）。超时后的
+  旧卡再点选会写入决策文件但无人消费（drain 清理孤儿决策）。
 - ~~决策卡翻面在真机未生效~~ → **已定位并修复（2026-07-05）**：根因是
   Lark 卡片 `config` 缺 `update_multi: true`——应用发的交互卡默认为
   "独享卡片"，而消息 PATCH 更新接口只支持共享卡片，patch 一律被拒，
@@ -403,6 +404,35 @@ hook 配置必须放大 Claude 侧超时（否则 60s 默认值先杀掉 hook、
   已发出的独享卡无法补救（可接受）。
 - 决策文件与 pending 由 hook 退出时清理；hook 被杀（超时/断电）遗留的
   pending 由 drain 按 deadline+60s 收尾。
+
+### 运行时重启语义（2026-07-06 补）
+
+claude_headless 的 worker（SDK client + CLI 子进程 + in-flight can_use_tool
+Future）都活在 runtime 进程内，**runtime 重启即全灭**。真机踩到的后果：重启
+前发出的 ask/permission 卡还留在飞书上，点提交只落决策账、注入时 KeyError
+被 WS 层吞掉——用户看到 toast 但卡片不翻、答案不生效、会话装作 running。
+三项修复：
+
+- transport 注入路径在 worker 缺失时抛 `TransportUnavailable`（不再裸
+  KeyError）；callback 层捕获后发提示文本并把卡片翻成"⚠️ 卡片已失效"
+  （`decision_result` 的 `action="stale"` 渲染）。
+- runtime 启动时一次性 sweep：orchestrator 拥有的 claude_headless 会话若
+  仍标 running，settle 为 `stop_reason=runtime_restart`（TUI 观察会话不受
+  影响——daemon worker 独立于 runtime 存活）。
+- `bypassPermissions` 不再摘掉 can_use_tool 桥：CLI 在 bypass 下对常规工具
+  自动放行（不调回调），但对 AskUserQuestion 仍会调（真机实测），摘桥会
+  顺带杀死飞书答题闭环。
+
+另：TUI 观察会话的状态卡模型此前恒为"—"（daemon job/state patch 无 model
+字段，实测确认），现从 hook payload 的 `transcript_path` 尾读最近一条
+assistant 记录的 model 回填（model 为空或 stop 事件时读，避免每事件 IO）。
+
+回执形态（2026-07-06 起）：飞书直写成功与 headless turn 提交的确认**优先
+用消息表情回应**（对用户那条消息随机贴 DONE/OK/THUMBSUP/MUSCLE/APPLAUSE
+之一），reaction 失败或渠道不支持时回退文本「✅ 已发送到终端会话」。
+Telegram 不走该池——其 runtime 已对每条入站消息预贴 ✅，二次 reaction 会
+覆盖原回执。启动 sweep 对每个 ingress 入口（lark ws / telegram 轮询 /
+`--once`）都作为前置栅栏执行，进程内幂等一次。
 
 ### v2 验证记录（2026-07-05）
 

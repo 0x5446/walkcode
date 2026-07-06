@@ -42,8 +42,9 @@ launch through the profile wrappers in the
 **read and write the same session at the same time**:
 
 - **Direct write from IM**: a message in the session topic is injected into
-  the terminal session (as if typed there), acknowledged with a short receipt;
-  terminal-side input and model replies stream back into the topic.
+  the terminal session (as if typed there), acknowledged with an emoji
+  reaction on your message (text receipt as fallback); terminal-side input
+  and model replies stream back into the topic.
 - **Permission approvals on IM**: tools that would prompt for permission
   (Bash / Edit / Write, minus whatever your allow rules already cover) render
   as cards — Allow / Always allow / Deny — and a click takes effect in the
@@ -69,7 +70,7 @@ the waiting hook first):
 ```
 
 Tunables: `WALKCODE_CLAUDE_GATE_MODE=auto|off|ask_only`,
-`WALKCODE_CLAUDE_GATE_TIMEOUT` (default 1800s; timeout means deny),
+`WALKCODE_CLAUDE_GATE_TIMEOUT` (default 1800s; on timeout the hook abstains and the native terminal prompt takes over),
 `WALKCODE_CLAUDE_GATE_TOOLS` (replace the default gated tool set). Fail-safe:
 when the walkcode service is not running the hook abstains and the native
 terminal prompt flow keeps working; `WALKCODE_CLAUDE_DAEMON_MODE=off` reverts

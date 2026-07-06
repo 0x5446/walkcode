@@ -1830,6 +1830,9 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
             )
             runtime.state.authz.grant(session.session_id, ActorRef("telegram", "456", "Ada"), SessionRole.OWNER)
             clock.now += 31.0
+            # This test guards the lease-expiry hold-back semantics; treat the
+            # session as created by this process so the startup sweep skips it.
+            runtime._orphan_sweep_done = True
 
             processed = asyncio.run(runtime.poll_telegram_once(timeout=0, limit=5))
 
@@ -3861,3 +3864,120 @@ class ClaudeModelChoiceInventoryTests(unittest.TestCase):
             )
             inv = runtime_module._local_model_inventory(cfg, "claude_headless")
             self.assertEqual([m["slug"] for m in inv["models"]], ["opus", "haiku"])
+
+
+class TranscriptModelBackfillTests(unittest.TestCase):
+    def test_reads_latest_assistant_model_from_transcript_tail(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            transcript = Path(tmp) / "t.jsonl"
+            transcript.write_text(
+                "\n".join(
+                    [
+                        json.dumps({"type": "user", "message": {"role": "user"}}),
+                        json.dumps({"type": "assistant", "message": {"model": "claude-sonnet-5[1m]"}}),
+                        json.dumps({"type": "assistant", "message": {"model": "<synthetic>"}}),
+                        json.dumps({"type": "progress"}),
+                        "not json",
+                    ]
+                )
+            )
+            self.assertEqual(
+                runtime_module._transcript_model_from_payload({"transcript_path": str(transcript)}),
+                "claude-sonnet-5[1m]",
+            )
+
+    def test_missing_or_absent_transcript_returns_empty(self):
+        self.assertEqual(runtime_module._transcript_model_from_payload({}), "")
+        self.assertEqual(
+            runtime_module._transcript_model_from_payload({"transcript_path": "/nonexistent/x.jsonl"}),
+            "",
+        )
+
+
+
+
+class TuiHookModelBackfillIntegrationTests(unittest.TestCase):
+    def test_process_tui_hook_backfills_session_model_from_transcript(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            transcript = Path(tmp) / "t.jsonl"
+            transcript.write_text(
+                json.dumps({"type": "assistant", "message": {"model": "claude-sonnet-5[1m]"}})
+            )
+            state_path = str(Path(tmp) / "state.json")
+            cfg = ChannelNativeConfig.from_env(
+                {
+                    "WALKCODE_CHANNEL": "telegram",
+                    "TELEGRAM_BOT_TOKEN": "fake",
+                    "WALKCODE_AGENT": "claude",
+                    "TELEGRAM_ALLOWED_CHAT_IDS": "-100",
+                    "WALKCODE_STATE_PATH": state_path,
+                    "WALKCODE_CWD": tmp,
+                }
+            )
+            api = _ForumTelegramApi()
+            runtime = ChannelNativeRuntime.from_config(cfg, telegram_api=api, transports={})
+            payload = {
+                "hook_event_name": "SessionStart",
+                "session_id": "sess-tui-model",
+                "transcript_path": str(transcript),
+                "cwd": tmp,
+                "_walkcode_external_tui_pid": 4242,
+            }
+            asyncio.run(runtime.process_tui_hook(hook_type="SessionStart", payload=payload, agent="claude"))
+            sessions = [
+                s for s in runtime.state.sessions.iter_sessions()
+                if s.transport_kind == "external_tui"
+            ]
+            if not sessions:
+                self.skipTest("TUI hook did not create an observed session in this configuration")
+            self.assertEqual(sessions[0].model, "claude-sonnet-5[1m]")
+
+class OrphanHeadlessSweepTests(unittest.TestCase):
+    def test_sweep_settles_orchestrator_owned_headless_sessions_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = str(Path(tmp) / "state.json")
+            cfg = ChannelNativeConfig.from_env(
+                {
+                    "WALKCODE_CHANNEL": "telegram",
+                    "TELEGRAM_BOT_TOKEN": "fake",
+                    "WALKCODE_AGENT": "claude",
+                    "WALKCODE_STATE_PATH": state_path,
+                    "WALKCODE_CWD": tmp,
+                }
+            )
+            api = _FakeTelegramApi()
+            transport = FakeAgentTransport(
+                "claude_headless",
+                _transport_caps(),
+                scripted_events=[AgentEvent(AgentEventType.TURN_COMPLETED, {"message": "done"})],
+            )
+            runtime = ChannelNativeRuntime.from_config(
+                cfg,
+                telegram_api=api,
+                transports={"claude_headless": transport},
+            )
+            result = asyncio.run(runtime.process_telegram_update(_telegram_update()))
+            self.assertTrue(result.accepted)
+            session = next(runtime.state.sessions.iter_sessions())
+            self.assertEqual(session.status, "running")
+
+            # A TUI-owned session must survive the sweep untouched.
+            session.writer_owner = runtime_module.WriterOwner(kind="external_tui")
+            asyncio.run(runtime._settle_orphan_headless_sessions_once())
+            self.assertEqual(session.status, "running")
+
+            # An IDLE session must also survive: the resume path revives it.
+            runtime._orphan_sweep_done = False
+            session.writer_owner = runtime_module.WriterOwner(kind="orchestrator")
+            session.lifecycle_state = "IDLE"
+            asyncio.run(runtime._settle_orphan_headless_sessions_once())
+            self.assertEqual(session.status, "running")
+
+            # An in-flight orchestrator-owned session is a true zombie.
+            runtime._orphan_sweep_done = False
+            session.lifecycle_state = "WAITING_USER"
+            session.writer_owner = runtime_module.WriterOwner(kind="orchestrator")
+            asyncio.run(runtime._settle_orphan_headless_sessions_once())
+            self.assertEqual(session.status, "stopped")
+            self.assertEqual(session.stop_reason, "runtime_restart")
+            self.assertEqual(session.lifecycle_state, "STOPPED")

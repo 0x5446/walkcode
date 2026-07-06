@@ -22,7 +22,9 @@ import sys
 import tempfile
 import urllib.error
 import urllib.request
-from collections.abc import Callable
+import random
+
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal, Protocol
@@ -1298,6 +1300,9 @@ class SessionRegistry:
 
     def get(self, session_id: str) -> Session:
         return self._sessions[session_id]
+
+    def iter_sessions(self) -> Iterator[Session]:
+        yield from self._sessions.values()
 
     def resolve_binding(self, key: BindingKey) -> str | None:
         return self._binding_to_session.get(key)
@@ -3369,9 +3374,14 @@ class FakeChannelAdapter:
         self.downloaded_attachments: list[str] = []
         self.acknowledged_callbacks: list[str] = []
         self.deleted_messages: list[dict[str, Any]] = []
+        self.reactions: list[dict[str, Any]] = []
 
     def capabilities(self) -> ChannelCapabilities:
         return self._capabilities
+
+    async def react_to_message(self, binding: ChannelBinding, message_id: str, emoji: str = "DONE") -> bool:
+        self.reactions.append({"binding": binding.key(), "message_id": str(message_id), "emoji": emoji})
+        return True
 
     async def send_view(self, binding: ChannelBinding, view_model: dict[str, Any]) -> str:
         self.sent_views.append({"binding": binding.key(), "view": dict(view_model)})
@@ -4444,6 +4454,16 @@ class LarkChannelAdapter:
     def capabilities(self) -> ChannelCapabilities:
         return self._capabilities
 
+    async def react_to_message(self, binding: ChannelBinding, message_id: str, emoji: str = "DONE") -> bool:
+        # emoji is a Lark emoji_type key (DONE/OK/THUMBSUP/...), not a glyph.
+        if not message_id:
+            return False
+        result = await self.api.call(
+            "reactMessage",
+            {"message_id": message_id, "emoji_type": emoji},
+        )
+        return bool(result.get("ok", True)) if isinstance(result, dict) else True
+
     def binding_for(self, chat_id: str, root_id: str = "") -> ChannelBinding:
         return ChannelBinding(
             channel_kind="lark",
@@ -5126,7 +5146,13 @@ class ClaudeHeadlessTransport:
             # awaiting. Write-once is enforced inside the bridge.
             bridge.resolve(rid, dict(decision))
             return
-        client = self._clients[handle.handle_id]
+        client = self._clients.get(handle.handle_id)
+        if client is None:
+            # The worker (and its in-flight can_use_tool Future) lived in a
+            # previous runtime process; a card clicked after a restart lands
+            # here. Raise instead of KeyError so the callback path can tell
+            # the user the card is stale rather than dying silently.
+            raise TransportUnavailable("claude headless worker is gone (runtime restarted)")
         approve = getattr(client, "approve_permission", None)
         if approve is None:
             raise CapabilityUnsupported("Claude headless permission approval is not available")
@@ -5142,7 +5168,9 @@ class ClaudeHeadlessTransport:
         if bridge is not None and bridge.has_pending(rid):
             bridge.resolve(rid, {"action": "answers", "answers": dict(answers)})
             return
-        client = self._clients[handle.handle_id]
+        client = self._clients.get(handle.handle_id)
+        if client is None:
+            raise TransportUnavailable("claude headless worker is gone (runtime restarted)")
         answer = getattr(client, "answer_user_question", None)
         if answer is None:
             raise CapabilityUnsupported("Claude headless AskUserQuestion answers are not available")
@@ -5259,10 +5287,10 @@ class ClaudeHeadlessTransport:
 
     def _permission_bridging_supported(self, sdk: Any) -> bool:
         # Only wire can_use_tool when the SDK exposes the PermissionResult types
-        # the bridge returns, and only when the mode isn't blanket-bypass. A
-        # bypass mode auto-approves everything, so there is nothing to card.
-        if str(self.permission_mode or "") == "bypassPermissions":
-            return False
+        # the bridge returns. bypassPermissions still keeps the bridge: the CLI
+        # auto-approves regular tools without consulting can_use_tool, but it
+        # DOES invoke the callback for AskUserQuestion (live-verified 2026-07),
+        # and dropping the bridge there would silently kill the IM answer loop.
         return (
             getattr(sdk, "PermissionResultAllow", None) is not None
             and getattr(sdk, "PermissionResultDeny", None) is not None
@@ -6594,6 +6622,30 @@ class Orchestrator:
             self.authz.grant(session.session_id, owner, SessionRole.OWNER)
         return session
 
+    # Per-channel reaction pools for lightweight acks (Lark values are
+    # emoji_type keys). Telegram is deliberately absent: its runtime already
+    # pre-acks every inbound message with ✅ (_ack_telegram_received), and a
+    # second setMessageReaction would overwrite that receipt.
+    _ACK_REACTIONS: dict[str, tuple[str, ...]] = {
+        "lark": ("DONE", "OK", "THUMBSUP", "MUSCLE", "APPLAUSE"),
+    }
+
+    async def _react_ack(self, session: Session, message_id: str) -> bool:
+        """Best-effort emoji reaction on the user's message instead of a text
+        receipt — one API call either way, but no extra bubble in the topic."""
+        if not message_id:
+            return False
+        binding = session.channel_binding
+        channel = self.channels.get(binding.channel_kind) if binding is not None else None
+        react = getattr(channel, "react_to_message", None)
+        pool = self._ACK_REACTIONS.get(binding.channel_kind) if binding is not None else None
+        if channel is None or react is None or not pool:
+            return False
+        try:
+            return bool(await react(binding, message_id, random.choice(pool)))
+        except Exception:
+            return False
+
     async def submit_user_input(
         self,
         session_id: str,
@@ -6601,6 +6653,7 @@ class Orchestrator:
         *,
         actor: ActorRef,
         generation: int,
+        ack_message_id: str = "",
     ) -> SubmitResult:
         session = self.sessions.get(session_id)
         if self.authz is not None:
@@ -6624,7 +6677,9 @@ class Orchestrator:
                 # the message directly (as if typed in the TUI), so no takeover
                 # is needed and the terminal stays attached. Falls through to
                 # the takeover prompt when the daemon or the job is gone.
-                daemon_result = await self._try_external_daemon_reply(session, turn)
+                daemon_result = await self._try_external_daemon_reply(
+                    session, turn, ack_message_id=ack_message_id
+                )
                 if daemon_result is not None:
                     return daemon_result
             if validation.reason in {BlockedReason.EXTERNAL_TUI_READONLY, BlockedReason.SESSION_STOPPED} and (
@@ -6666,6 +6721,9 @@ class Orchestrator:
             session.lifecycle_state = "ERROR_RECOVERABLE"
             await self.refresh_session_status_card(session)
             raise
+        # "Got it, on it" reaction on the user's message — the status card
+        # says the turn started, but the emoji is the at-a-glance receipt.
+        await self._react_ack(session, ack_message_id)
         await self.refresh_session_status_card(session)
         if self.defer_event_drain:
             self._start_background_event_drain(session.session_id, transport, handle)
@@ -6679,6 +6737,8 @@ class Orchestrator:
         self,
         session: Session,
         turn: TurnInput,
+        *,
+        ack_message_id: str = "",
     ) -> SubmitResult | None:
         """Inject a message into a TUI-owned Claude session via the daemon.
 
@@ -6725,11 +6785,15 @@ class Orchestrator:
         session.last_progress_at = self._now()
         session.last_progress_event = "external_tui.daemon_reply"
         session.last_event_seq += 1
-        await self._send_session_view(
-            session,
-            {"type": "text", "text": "✅ 已发送到终端会话"},
-            idempotency_key=f"daemon_reply_ack:{session.last_event_seq}",
-        )
+        # Reaction on the user's own message beats a "✅ 已发送到终端会话"
+        # bubble; the text receipt stays as the fallback when the channel
+        # can't react (or the reaction call fails).
+        if not await self._react_ack(session, ack_message_id):
+            await self._send_session_view(
+                session,
+                {"type": "text", "text": "✅ 已发送到终端会话"},
+                idempotency_key=f"daemon_reply_ack:{session.last_event_seq}",
+            )
         await self.refresh_session_status_card(session)
         self._notify_state_changed()
         return SubmitResult(True, "daemon_reply")
@@ -7288,6 +7352,7 @@ class Orchestrator:
                                     turn,
                                     actor=actor,
                                     generation=session.generation,
+                                    ack_message_id=inbound.message_id,
                                 )
                                 await self._delete_blocked_readonly_input_if_possible(inbound, session, result)
                         else:
@@ -7301,6 +7366,7 @@ class Orchestrator:
                                     turn,
                                     actor=actor,
                                     generation=session.generation,
+                                    ack_message_id=inbound.message_id,
                                 )
                                 await self._delete_blocked_readonly_input_if_possible(inbound, session, result)
         except Exception:
@@ -7426,6 +7492,47 @@ class Orchestrator:
             error=f"{type(last_exc).__name__}: {last_exc}" if last_exc else "unknown",
         )
 
+    async def _notify_interaction_delivery_failure(
+        self,
+        inbound: InboundEvent,
+        session: Session,
+        ctx: InteractionContext,
+        exc: Exception,
+    ) -> None:
+        # The decision is on record but never reached the worker (typically:
+        # the runtime restarted and the in-flight prompt died with the old
+        # process). Silence here reads as "I clicked and nothing happened" —
+        # tell the user and retire the card instead.
+        _log_degrade(
+            "interaction_decision_delivery_failed",
+            kind=ctx.kind,
+            session_id=ctx.session_id,
+            error=f"{type(exc).__name__}: {exc}",
+        )
+        binding = session.channel_binding
+        channel = self.channels.get(binding.channel_kind) if binding is not None else None
+        if channel is not None and binding is not None:
+            try:
+                await channel.send_view(
+                    binding,
+                    {
+                        "type": "text",
+                        "text": (
+                            "⚠️ 选择已记录，但这张卡片对应的会话进程已经不在了"
+                            "（服务重启过）。请回到根会话发一条新消息重新开始。"
+                        ),
+                    },
+                )
+            except Exception:
+                pass
+        await self._flip_decided_card(
+            inbound,
+            kind=ctx.kind,
+            tool_name=ctx.tool_name,
+            action="stale",
+            detail="会话进程已重启，这张卡片已失效。",
+        )
+
     async def _handle_callback_event(self, inbound: InboundEvent) -> SubmitResult:
         token = str((inbound.callback or {}).get("token", ""))
         data = str((inbound.callback or {}).get("data", "") or token)
@@ -7496,11 +7603,19 @@ class Orchestrator:
             approval_decision = dict(decision.decision or {})
             if session.transport_kind == "codex_app_server":
                 approval_decision["_tool_input"] = dict(ctx.tool_input)
-            await transport.approve_permission(
-                self._handle_for_session(session),
-                ctx.transport_request_id or ctx.interaction_id,
-                approval_decision,
-            )
+            try:
+                await transport.approve_permission(
+                    self._handle_for_session(session),
+                    ctx.transport_request_id or ctx.interaction_id,
+                    approval_decision,
+                )
+            except TransportUnavailable as exc:
+                # Only the stale-worker path (runtime restarted, worker gone)
+                # retires the card. Any other failure must keep propagating so
+                # the inbound ledger fails and the click stays retryable —
+                # flipping those to "stale" would silently eat the decision.
+                await self._notify_interaction_delivery_failure(inbound, session, ctx, exc)
+                return SubmitResult(False, BlockedReason.NOT_FOUND)
             if ctx.hitl_request_id:
                 self.hitls.mark_decided(
                     ctx.hitl_request_id,
@@ -7516,14 +7631,21 @@ class Orchestrator:
                 action=str(approval_decision.get("action", "")),
             )
         if decision.accepted and ctx.kind == "ask_user_question":
-            await self._handle_ask_user_decision(
-                session,
-                ctx,
-                decision,
-                actor=actor,
-                idempotency_key=f"{inbound.event_id}:ask_user_view",
-                edit_card=inbound,
-            )
+            try:
+                await self._handle_ask_user_decision(
+                    session,
+                    ctx,
+                    decision,
+                    actor=actor,
+                    idempotency_key=f"{inbound.event_id}:ask_user_view",
+                    edit_card=inbound,
+                )
+            except TransportUnavailable as exc:
+                # Same narrowing as the permission branch: only worker-gone is
+                # stale. Local prompt sends (incomplete/awaiting_other/update
+                # branches) raising here must not retire a still-valid card.
+                await self._notify_interaction_delivery_failure(inbound, session, ctx, exc)
+                return SubmitResult(False, BlockedReason.NOT_FOUND)
             # Final answer (all questions done) → flip the clicked card to a
             # result; toggle/next-question keep the card interactive.
             if str((decision.decision or {}).get("action", "")) == "answers":
