@@ -319,8 +319,10 @@ token 回调路由（`_handle_callback_event`）、决策卡翻面。唯一新�
 2. 判定是否 gate（见下）；不 gate → 无输出退出（原生流程不受影响）；
 3. gate → 写 pending，轮询 decisions（0.25s）；心跳过期（>45s）→ 弃权
    （walkcode 服务没在跑时终端原生提示继续可用，**不失能终端**）；
-4. 拿到决策 → 输出 `hookSpecificOutput`；超时（默认 1800s，对齐 headless
-   bridge）→ deny（fail-safe 与 headless 一致：绝不 fail-open）。
+4. 拿到决策 → 输出 `hookSpecificOutput`；超时（默认 1800s）→ **弃权**回落
+   终端原生弹窗（`timeout_decision` 返回 pass；trace 记
+   `gate_timeout_abstain`。早期版本为超时 deny，后经复盘修正为"IM 先答、
+   超时终端接管"，两端都不失能）。
 
 hook 配置必须放大 Claude 侧超时（否则 60s 默认值先杀掉 hook、静默退回原生流）：
 

@@ -27,6 +27,7 @@ import contextlib
 import hashlib
 import json
 import os
+import re
 import time
 from pathlib import Path
 from typing import Any, AsyncIterator
@@ -79,6 +80,16 @@ GATE_INJECT_VERIFY_POLL_SECONDS = 0.5
 # Terminal-resolved rids kept as tombstones so a late card click flips to
 # "answered in the terminal" instead of pretending the click took effect.
 _NOTIFY_TOMBSTONE_LIMIT = 256
+
+# needs format (live-verified): "approve <Tool>: <detail>". The tool token is
+# matched EXACTLY — substring matching would let an "Edit" card drive a
+# "MultiEdit"/"NotebookEdit" dialog (deep-review finding, 9-dimension hit).
+_APPROVE_NEEDS_RE = re.compile(r"^approve\s+([^\s:]+)\s*(?::|$)")
+
+# Sentinel for "the daemon control plane could not be queried" — distinct
+# from None ("queried fine, job not in the list"). Folding the two into None
+# turned probe outages into fake injection success (deep-review finding).
+_JOB_STATE_UNAVAILABLE = object()
 
 _ESC = b"\x1b"
 _RIGHT_ARROW = b"\x1b[C"  # multiSelect: option page -> Submit page
@@ -421,28 +432,35 @@ class ClaudeDaemonClient:
                 "rows": rows,
                 "attachId": attach_id,
             }
-            writer.write(json.dumps(request).encode("utf-8") + b"\n")
-            await writer.drain()
             try:
-                line = await asyncio.wait_for(reader.readline(), timeout=self.request_timeout)
-            except asyncio.TimeoutError as exc:
-                raise TransportUnavailable("Claude daemon attach handshake timed out") from exc
-            if not line:
-                raise TransportUnavailable("Claude daemon closed during attach handshake")
-            _raise_on_error(_decode_line(line))
-            drain_task = asyncio.create_task(self._drain_pty_stream(reader))
-            try:
-                if settle > 0:
-                    await asyncio.sleep(settle)
-                for data, delay in frames:
-                    writer.write(data)
-                    await writer.drain()
-                    if delay > 0:
-                        await asyncio.sleep(delay)
-            finally:
-                drain_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await drain_task
+                writer.write(json.dumps(request).encode("utf-8") + b"\n")
+                await writer.drain()
+                try:
+                    line = await asyncio.wait_for(reader.readline(), timeout=self.request_timeout)
+                except asyncio.TimeoutError as exc:
+                    raise TransportUnavailable("Claude daemon attach handshake timed out") from exc
+                if not line:
+                    raise TransportUnavailable("Claude daemon closed during attach handshake")
+                _raise_on_error(_decode_line(line))
+                drain_task = asyncio.create_task(self._drain_pty_stream(reader))
+                try:
+                    if settle > 0:
+                        await asyncio.sleep(settle)
+                    for data, delay in frames:
+                        writer.write(data)
+                        await writer.drain()
+                        if delay > 0:
+                            await asyncio.sleep(delay)
+                finally:
+                    drain_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await drain_task
+            except OSError as exc:
+                # BrokenPipe / ConnectionReset mid-write must degrade like any
+                # other control-plane outage, not escape the injection guard.
+                raise TransportUnavailable(
+                    f"Claude daemon attach connection failed: {exc}"
+                ) from exc
         finally:
             writer.close()
             with contextlib.suppress(Exception):
@@ -774,12 +792,21 @@ class ClaudeDaemonTransport:
                 "not_injectable", "answer shape is outside the verified keystroke matrix"
             )
         job = await self._gate_job_state(short)
-        needs_before = str((job or {}).get("needs", "") or "").strip()
+        if job is _JOB_STATE_UNAVAILABLE:
+            claude_gate.trace("inject_probe_unavailable", rid=rid, short=short)
+            raise claude_gate.GateInjectionFailed(
+                "inject_failed", "daemon state probe unavailable; not injecting blind"
+            )
+        needs_before = str((job or {}).get("needs", "") or "").strip() if isinstance(job, dict) else ""
         if not self._gate_dialog_matches(entry, job, needs_before):
-            claude_gate.trace("inject_dialog_mismatch", rid=rid, short=short, needs=needs_before)
+            # Log only the dialog kind (text before the colon): the detail can
+            # carry command lines / paths / question text (review finding).
+            needs_kind = needs_before.split(":", 1)[0][:32]
+            claude_gate.trace("inject_dialog_mismatch", rid=rid, short=short, needs_kind=needs_kind)
             self._tombstone_notify_rid(rid)
             raise claude_gate.GateInjectionFailed(
-                "dialog_mismatch", f"dialog state does not match this request: {needs_before!r}"
+                "dialog_mismatch",
+                f"dialog state does not match this request ({needs_kind or 'no dialog'})",
             )
         try:
             await self.client.attach_send_keys(short, frames)
@@ -813,28 +840,34 @@ class ClaudeDaemonTransport:
             "tool_input": request.get("tool_input") if isinstance(request.get("tool_input"), dict) else {},
         }
         job = await self._gate_job_state(short)
-        needs = str((job or {}).get("needs", "") or "").strip()
+        if not isinstance(job, dict):
+            # No job or probe outage: either way, no dialog is confirmed waiting.
+            return False
+        needs = str(job.get("needs", "") or "").strip()
         return self._gate_dialog_matches(entry, job, needs)
 
-    async def _gate_job_state(self, short: str) -> dict[str, Any] | None:
+    async def _gate_job_state(self, short: str) -> Any:
+        """Job dict, None (queried fine, job absent), or _JOB_STATE_UNAVAILABLE."""
         try:
             jobs = await self.client.list_jobs()
         except (TransportUnavailable, ClaudeDaemonError):
-            return None
+            return _JOB_STATE_UNAVAILABLE
         for job in jobs:
             if claude_daemon_short_id(job.get("short") or job.get("sessionId")) == short:
                 return job
         return None
 
     @staticmethod
-    def _gate_dialog_matches(
-        entry: dict[str, Any], job: dict[str, Any] | None, needs: str
-    ) -> bool:
+    def _gate_dialog_matches(entry: dict[str, Any], job: Any, needs: str) -> bool:
         # Pre-injection guard: the job must still be blocked on the dialog
         # this card mirrors. Needs formats (live-verified):
         #   permission: "approve <Tool>: <detail>"
         #   ask:        "answer: <question> (<label> · <label> ...)"
-        if job is None or str(job.get("tempo", "") or "") != "blocked" or not needs:
+        # Matching is anchored and exact wherever possible: a fuzzy match here
+        # is what would let a stale card drive the WRONG dialog.
+        if not isinstance(job, dict):
+            return False
+        if str(job.get("tempo", "") or "") != "blocked" or not needs:
             return False
         if str(entry.get("kind", "")) == claude_gate.KIND_ASK_USER:
             if not needs.startswith("answer:"):
@@ -849,19 +882,29 @@ class ClaudeDaemonTransport:
                 or ""
             ).strip()
             if not question_text:
-                return True
-            # Prefix match tolerates daemon-side truncation of long questions.
-            return question_text[:40] in needs
+                # Nothing to bind the dialog to this request: do not inject.
+                return False
+            # Anchored prefix (tolerates daemon-side truncation of the tail).
+            rendered = needs[len("answer:"):].strip()
+            return rendered.startswith(question_text[:40])
         tool_name = str(entry.get("tool_name", "") or "")
-        return needs.startswith("approve ") and (not tool_name or tool_name in needs)
+        match = _APPROVE_NEEDS_RE.match(needs)
+        if match is None or not tool_name:
+            return False
+        return match.group(1) == tool_name
 
     async def _gate_dialog_resolved(self, short: str, needs_before: str) -> bool:
         deadline = time.monotonic() + GATE_INJECT_VERIFY_TIMEOUT_SECONDS
         while True:
             await asyncio.sleep(GATE_INJECT_VERIFY_POLL_SECONDS)
             job = await self._gate_job_state(short)
+            if job is _JOB_STATE_UNAVAILABLE:
+                # Probe outage proves nothing — keep trying, then fail honest.
+                if time.monotonic() >= deadline:
+                    return False
+                continue
             if job is None:
-                return True  # job finished and left the list: dialog is gone
+                return True  # queried fine, job left the list: dialog is gone
             needs = str(job.get("needs", "") or "").strip()
             if not needs or needs != needs_before:
                 return True
@@ -873,14 +916,22 @@ class ClaudeDaemonTransport:
     def _deliver_gate_decision(self, rid: str, payload: dict[str, Any]) -> None:
         # A decision only counts when a hook is still waiting for it AND the
         # write-once actually landed. A stale card click (hook timed out and
-        # cleaned its pending) or a lost race must not leave orphan decision
-        # files, and must not feed always_allow via the observer.
+        # cleaned its pending, or the runtime restarted and lost the notify
+        # registry) or a lost race must not leave orphan decision files, must
+        # not feed always_allow via the observer — and must NOT read as
+        # success to the caller, or the card flips to "allowed" while nothing
+        # actually happened (deep-review finding, 6-dimension hit).
         if claude_gate.read_pending(self.gate_state_path, rid) is None:
             claude_gate.trace("decision_dropped_no_pending", rid=rid, action=payload.get("action"))
-            return
+            raise claude_gate.GateInjectionFailed(
+                "stale_gate",
+                "no pending gate is waiting for this decision (request settled or runtime restarted)",
+            )
         if not claude_gate.write_decision(self.gate_state_path, rid, payload):
             claude_gate.trace("decision_dropped_already_decided", rid=rid, action=payload.get("action"))
-            return
+            raise claude_gate.GateInjectionFailed(
+                "already_resolved", "another surface already decided this request"
+            )
         self._notify_gate_decision(rid, payload)
 
     def _notify_gate_decision(self, rid: str, decision: dict[str, Any]) -> None:

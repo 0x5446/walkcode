@@ -13,6 +13,7 @@ from walkcode.channel_native import (
     ChannelBinding,
     ChannelNativeConfig,
     TransportHandle,
+    TransportUnavailable,
 )
 from walkcode.channel_native import claude_gate
 from walkcode.channel_native import claude_daemon as claude_daemon_mod
@@ -349,22 +350,26 @@ class DaemonTransportGateTests(unittest.TestCase):
             self.assertEqual(decision["action"], "answers")
             self.assertEqual(decision["answers"], {"0": "蓝"})
 
-    def test_stale_card_decision_without_pending_is_dropped(self):
-        # Hook timed out and cleaned its pending: a late card click must not
-        # leave an orphan decision file nor feed the always_allow observer.
+    def test_stale_card_decision_without_pending_raises_stale_gate(self):
+        # Hook timed out / runtime restarted and the pending is gone: a late
+        # card click must not leave an orphan decision file, must not feed the
+        # always_allow observer — and must NOT read as success (the caller
+        # flips the card to "已失效" instead of "已允许").
         with tempfile.TemporaryDirectory() as tmp:
             state = Path(tmp) / "state.json"
             transport = ClaudeDaemonTransport(config_dir="/tmp/profile", gate_state_path=state)
             seen = []
             transport.on_gate_decision = lambda rid, decision: seen.append(rid)
             handle = TransportHandle(handle_id="h", transport_kind="claude_daemon", ref={})
-            asyncio.run(
-                transport.approve_permission(handle, "toolu_gone", {"action": "always_allow"})
-            )
+            with self.assertRaises(claude_gate.GateInjectionFailed) as caught:
+                asyncio.run(
+                    transport.approve_permission(handle, "toolu_gone", {"action": "always_allow"})
+                )
+            self.assertEqual(caught.exception.reason, "stale_gate")
             self.assertIsNone(claude_gate.read_decision(state, "toolu_gone"))
             self.assertEqual(seen, [])
 
-    def test_lost_write_once_race_does_not_notify(self):
+    def test_lost_write_once_race_raises_already_resolved(self):
         with tempfile.TemporaryDirectory() as tmp:
             state = Path(tmp) / "state.json"
             transport = ClaudeDaemonTransport(config_dir="/tmp/profile", gate_state_path=state)
@@ -373,7 +378,9 @@ class DaemonTransportGateTests(unittest.TestCase):
             handle = TransportHandle(handle_id="h", transport_kind="claude_daemon", ref={})
             claude_gate.write_pending(state, {"rid": "toolu_3", "tool_name": "Edit"})
             claude_gate.write_decision(state, "toolu_3", {"action": "deny"})
-            asyncio.run(transport.approve_permission(handle, "toolu_3", {"action": "allow"}))
+            with self.assertRaises(claude_gate.GateInjectionFailed) as caught:
+                asyncio.run(transport.approve_permission(handle, "toolu_3", {"action": "allow"}))
+            self.assertEqual(caught.exception.reason, "already_resolved")
             self.assertEqual(claude_gate.read_decision(state, "toolu_3")["action"], "deny")
             self.assertEqual(seen, [])
 
@@ -861,6 +868,64 @@ class NotifyGateInjectionTests(unittest.TestCase):
                 )
             self.assertEqual(second.exception.reason, "already_resolved")
 
+    def test_tool_name_matching_is_exact_not_substring(self):
+        # Review finding (9-dimension hit): "Edit" must NOT drive an
+        # "approve MultiEdit: ..." dialog via substring matching.
+        with tempfile.TemporaryDirectory() as tmp:
+            client = _InjectStubClient(jobs=[_blocked_job("approve MultiEdit: /tmp/y")])
+            transport = self._transport(tmp, client)
+            transport.register_notify_gate("rid-1", _notify_request())  # tool Edit
+            with self.assertRaises(claude_gate.GateInjectionFailed) as caught:
+                asyncio.run(
+                    transport.approve_permission(self._handle(), "rid-1", {"action": "allow"})
+                )
+            self.assertEqual(caught.exception.reason, "dialog_mismatch")
+            self.assertEqual(client.injections, [])
+
+    def test_probe_outage_never_reads_as_success(self):
+        # Review finding: list_jobs failure must not be folded into "dialog
+        # is gone" — neither before nor after the keys are written.
+        class _OutageClient(_InjectStubClient):
+            async def list_jobs(self):
+                raise TransportUnavailable("socket gone")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            transport = self._transport(tmp, _OutageClient())
+            transport.register_notify_gate("rid-1", _notify_request())
+            with self.assertRaises(claude_gate.GateInjectionFailed) as caught:
+                asyncio.run(
+                    transport.approve_permission(self._handle(), "rid-1", {"action": "allow"})
+                )
+            self.assertEqual(caught.exception.reason, "inject_failed")
+            self.assertFalse(transport.recently_injected(SHORT))
+
+    def test_probe_outage_after_injection_raises_not_cleared(self):
+        class _OutageAfterInject(_InjectStubClient):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.fail_after_inject = False
+
+            async def list_jobs(self):
+                if self.fail_after_inject:
+                    raise TransportUnavailable("socket gone")
+                return await super().list_jobs()
+
+            async def attach_send_keys(self, short, frames, **kwargs):
+                await super().attach_send_keys(short, frames, **kwargs)
+                self.fail_after_inject = True
+
+        with tempfile.TemporaryDirectory() as tmp:
+            client = _OutageAfterInject(jobs=[_blocked_job("approve Edit: /tmp/x")])
+            client.clear_after_inject = False
+            transport = self._transport(tmp, client)
+            transport.register_notify_gate("rid-1", _notify_request())
+            with self.assertRaises(claude_gate.GateInjectionFailed) as caught:
+                asyncio.run(
+                    transport.approve_permission(self._handle(), "rid-1", {"action": "allow"})
+                )
+            self.assertEqual(caught.exception.reason, "not_cleared")
+            self.assertFalse(transport.recently_injected(SHORT))
+
     def test_unmappable_answers_raise_not_injectable(self):
         with tempfile.TemporaryDirectory() as tmp:
             client = _InjectStubClient(jobs=[_blocked_job("answer: 颜色? (红)")])
@@ -996,7 +1061,44 @@ class NotifyGateDrainTests(unittest.TestCase):
                 ]
             )
             self.assertIsNone(claude_gate.read_pending(state, "toolu_ask"))
-            self.assertIsNone(runtime.transports["claude_daemon"].notify_gate("toolu_ask"))
+            # The degraded form still registers (suppresses the duplicate
+            # needs notice; reaped when the terminal answers). Injection is
+            # impossible anyway: there is no interactive card to click.
+            self.assertIsNotNone(runtime.transports["claude_daemon"].notify_gate("toolu_ask"))
+
+    def test_notify_always_allow_failure_hands_over_to_card_without_retry(self):
+        # Review finding: a failed auto-injection may already have pressed a
+        # key — the drain must not auto-retry; it falls through to a human
+        # card in the same tick and the pending is consumed.
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime, session, api = _runtime_with_observed_session(tmp)
+            state = runtime.state_store.path
+            client = _InjectStubClient(jobs=[_blocked_job("approve Edit: /tmp/x")])
+            client.clear_after_inject = False  # injection never confirms
+            runtime.transports["claude_daemon"].client = client
+            runtime._gate_always_allow.add((session.session_id, "Edit"))
+            claude_gate.write_pending(state, _notify_request())
+            old_poll = claude_daemon_mod.GATE_INJECT_VERIFY_POLL_SECONDS
+            old_timeout = claude_daemon_mod.GATE_INJECT_VERIFY_TIMEOUT_SECONDS
+            claude_daemon_mod.GATE_INJECT_VERIFY_POLL_SECONDS = 0.01
+            claude_daemon_mod.GATE_INJECT_VERIFY_TIMEOUT_SECONDS = 0.05
+            try:
+                asyncio.run(runtime.drain_claude_gate_requests())
+                asyncio.run(runtime.drain_claude_gate_requests())
+            finally:
+                claude_daemon_mod.GATE_INJECT_VERIFY_POLL_SECONDS = old_poll
+                claude_daemon_mod.GATE_INJECT_VERIFY_TIMEOUT_SECONDS = old_timeout
+            # Exactly one automatic keypress across both ticks.
+            self.assertEqual(len(client.injections), 1)
+            self.assertIsNone(claude_gate.read_pending(state, "toolu_edit_1"))
+            # The human card went out as the fallback surface.
+            self.assertTrue(
+                [
+                    p
+                    for m, p in api.calls
+                    if m == "sendMessage" and "Edit" in str(p.get("text", ""))
+                ]
+            )
 
     def test_notify_card_waits_for_dialog_and_drops_when_never_rendered(self):
         # Auto-approved tool calls never render a dialog: no dialog, no card
@@ -1249,6 +1351,30 @@ class DaemonStatePatchSemanticsTests(unittest.TestCase):
                     for method, payload in api.calls
                     if method == "sendMessage" and "已在终端处理" in str(payload.get("text", ""))
                 ]
+            )
+            self.assertIsNone(transport.notify_gate("rid-1"))
+
+    def test_cleared_needs_retires_gates_even_when_lifecycle_flipped_away(self):
+        # Review finding: a tool event can move the session out of
+        # WAITING_PERMISSION before the needs-cleared patch arrives; the
+        # tombstone must not depend on lifecycle state.
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime, session, _api = _runtime_with_observed_session(tmp)
+            transport = runtime.transports["claude_daemon"]
+            transport.register_notify_gate("rid-1", _notify_request())
+            last = asyncio.run(
+                runtime._apply_claude_daemon_state_patch(
+                    session.session_id,
+                    {"tempo": "blocked", "needs": "approve Edit: /tmp/x"},
+                    "",
+                    short=SHORT,
+                )
+            )
+            session.lifecycle_state = "EXTERNAL_OBSERVED_READONLY"  # tool event raced
+            asyncio.run(
+                runtime._apply_claude_daemon_state_patch(
+                    session.session_id, {"tempo": "active", "needs": ""}, last, short=SHORT
+                )
             )
             self.assertIsNone(transport.notify_gate("rid-1"))
 

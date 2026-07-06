@@ -75,7 +75,8 @@ v1 落地后的真机复盘暴露：权限与 AskUserQuestion 在飞书端只有
    进程内 Future 换成 gate spool 文件 rendezvous：
    `pending/<rid>.json`（hook→runtime）+ `decisions/<rid>.json`
    （runtime→hook，write-once）+ `serve.heartbeat`（runtime 活性）。
-   rid = `tool_use_id`。fail-safe 与 headless 一致：超时 deny、绝不 fail-open；
+   rid = `tool_use_id`。fail-safe：超时**弃权**回落终端原生弹窗（v2 初版为
+   超时 deny，后修正——deny 会让两端都无法作答；弃权保证终端始终可用）；
    runtime 不在跑（心跳过期）时 hook 弃权，终端原生提示流不受影响。
 3. **gate 判定保守**：AskUserQuestion 恒拦；权限 gate 只拦会原生提问的工具
    （默认 Bash/Edit/Write/MultiEdit/NotebookEdit + mcp__*，减去 allow 规则、

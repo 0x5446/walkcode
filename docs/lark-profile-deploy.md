@@ -218,15 +218,26 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.walkcode.work-claude
 - `/status`、`/sessions`、`/model`；
 - TUI 起会话 → 话题只读观察 → 接管提示 → 接管后可写。
 
-daemon-native 会话（wrapper 裸启动）另验（ADR 0046 v2）：
+daemon-native 会话（wrapper 裸启动）另验（ADR 0046 v3，真双端）：
 
 - 飞书发消息 → 终端实时出现该输入，飞书**无 "TUI input" 回显**、用户消息
   被贴表情回执（reaction 失败时回退 "✅ 已发送到终端会话" 文本）；
-- 会话内触发 AskUserQuestion → 飞书出选项卡，点选/提交后终端不弹 dialog、
-  模型按所选答案继续；
-- 会话内触发权限工具（如 Edit）→ 飞书出权限卡，点允许/拒绝真放行/拦截；
-  "始终允许"本会话内同工具不再发卡（重启 walkcode 后失效属预期）；
-- 空闲会话不弹权限橙卡；无 "waiting for your input" 英文透传；
+- 会话内触发 AskUserQuestion → **终端原生对话框与飞书卡片同时出现**（卡片
+  带"终端与飞书均可回答，先答先生效"注记）；飞书点选提交 → 终端对话框被
+  按键注入解除、卡片翻"✅ 已回答"、模型按答案继续；
+- 会话内触发权限工具（如 Bash 写命令）→ 终端权限框与飞书权限卡同时出现；
+  飞书点允许 → 命令执行、卡翻"✅ 已允许"；点拒绝 → 命令不执行、turn 取消
+  回 idle（会话可继续输入）；
+- **终端先答**：终端按键后话题出现"✅ 已在终端处理"，其后迟点旧卡 →
+  卡片如实翻"已在终端处理，本卡片未生效"（不得显示成功）；
+- "始终允许"：本会话内同工具后续**零卡片自动放行**（serve 日志见
+  `auto_allow_session ... mode=notify` + `inject_ok`；重启 walkcode 后
+  记忆失效属预期）；
+- 自动放行类调用（如 `date` 这类安全只读命令）不发卡、不留悬空按钮；
+- v3 卡在场时无旧橙色提醒卡、无 "Claude needs your permission" 英文透传；
+  空闲会话不弹权限橙卡；
+- `permission_mode=dontAsk` 与非 daemon 普通 TUI 会话仍走 v2 阻塞 gate
+  （飞书为主答、终端等待）；
 - 终端 `/exit`（detach）→ 状态卡不标已结束、无 Take over 按钮；
   `claude stop <short>` 后状态卡才转已结束。
 

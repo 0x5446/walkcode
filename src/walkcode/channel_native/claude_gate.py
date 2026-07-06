@@ -29,10 +29,11 @@ Decision mapping mirrors ``_ClaudePermissionBridge._result_from_decision``:
                                   "updatedInput": {questions, answers}}
     pass                      -> no output (native permission flow takes over)
 
-Fail-safe posture matches the headless bridge: no decision inside the wait
-budget -> deny. But when the runtime is not draining (stale heartbeat) the
-hook *abstains* instead of denying blind, so a TUI without its walkcode
-service keeps the native terminal prompt flow.
+Fail-safe posture: no decision inside the wait budget -> the hook ABSTAINS
+(returns no output) and Claude Code falls back to its native terminal prompt
+— see ``timeout_decision``. Likewise when the runtime is not draining (stale
+heartbeat) the hook abstains up front, so a TUI without its walkcode service
+keeps the native terminal prompt flow. Nothing here denies blind.
 
 This module must stay stdlib-only: the blocking hook path has to be
 import-light, and both ``channel_native/__init__`` and ``claude_daemon``
@@ -324,7 +325,8 @@ def wait_for_decision(
 
     Returns the decision dict, ``{"action": "pass", ...}`` when the runtime
     stops draining mid-wait (stale heartbeat -> abstain to the native flow),
-    or ``None`` on timeout (caller emits a deny).
+    or ``None`` on timeout (caller abstains to the native prompt via
+    ``timeout_decision``).
     """
     deadline = time.monotonic() + max(1.0, float(timeout))
     while time.monotonic() < deadline:

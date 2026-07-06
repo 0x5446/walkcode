@@ -2252,7 +2252,10 @@ class ChannelNativeRuntime:
         if decision is None:
             decision = claude_gate.timeout_decision(kind)
             claude_gate.trace(
-                "gate_timeout_deny", rid=rid, tool=tool_name, elapsed=int(time.monotonic() - started)
+                "gate_timeout_abstain",
+                rid=rid,
+                tool=tool_name,
+                elapsed=int(time.monotonic() - started),
             )
         else:
             claude_gate.trace(
@@ -2311,7 +2314,12 @@ class ChannelNativeRuntime:
                 if transport is not None:
                     try:
                         waiting = await transport.notify_dialog_waiting(request)
-                    except Exception:
+                    except Exception as exc:
+                        claude_gate.trace(
+                            "notify_dialog_probe_failed",
+                            rid=rid,
+                            error=f"{type(exc).__name__}: {exc}",
+                        )
                         waiting = False
                 if not waiting:
                     if now - created_at > CLAUDE_GATE_NOTIFY_DIALOG_GRACE_SECONDS:
@@ -2337,16 +2345,18 @@ class ChannelNativeRuntime:
                 and (session_id, tool_name) in self._gate_always_allow
             ):
                 if mode == claude_gate.MODE_NOTIFY:
-                    injected = await self._auto_inject_gate_allow(rid, request, session_id)
-                    if injected:
+                    # Single attempt, never a timed retry: a failed injection
+                    # may already have written keys, and a second automatic
+                    # press could confirm the WRONG dialog (review finding).
+                    outcome = await self._auto_inject_gate_allow(rid, request, session_id)
+                    if outcome in {"ok", "skip"}:
                         claude_gate.remove_pending(state_path, rid)
                         self._gate_dispatched[rid] = now
-                        processed += 1
+                        if outcome == "ok":
+                            processed += 1
                         continue
-                    if now - created_at <= CLAUDE_GATE_UNROUTABLE_GRACE_SECONDS:
-                        # Dialog probably not rendered yet; retry next tick,
-                        # then fall through to a normal card.
-                        continue
+                    # outcome == "card": fall through to a human card — clicks
+                    # re-run the pre-injection dialog check, so they stay safe.
                 else:
                     claude_gate.trace("auto_allow_session", rid=rid, tool=tool_name)
                     claude_gate.write_decision(
@@ -2359,14 +2369,14 @@ class ChannelNativeRuntime:
                 posted = await self.orchestrator.post_claude_gate_prompt(session_id, request)
             if posted:
                 if mode == claude_gate.MODE_NOTIFY:
-                    # Card is up: the runtime owns the pending from here on
-                    # (the hook abstained long ago). Injectable forms register
-                    # for keystroke delivery; degraded notices don't.
+                    # Card (or degraded notice) is up: the runtime owns the
+                    # pending from here on (the hook abstained long ago).
+                    # Degraded ask forms register too — the entry suppresses
+                    # the duplicate needs notice and is reaped by the watcher
+                    # when the terminal answers; unmappable answers are still
+                    # rejected at injection time (keys_for_ask_answer -> None).
                     transport = self._claude_daemon_transport()
-                    if transport is not None and (
-                        str(request.get("kind", "")) != claude_gate.KIND_ASK_USER
-                        or claude_gate.ask_form_injectable(request.get("tool_input", {}) or {})
-                    ):
+                    if transport is not None:
                         transport.register_notify_gate(rid, request, session_id=session_id)
                     claude_gate.remove_pending(state_path, rid)
                 self._gate_dispatched[rid] = now
@@ -2413,15 +2423,20 @@ class ChannelNativeRuntime:
 
     async def _auto_inject_gate_allow(
         self, rid: str, request: dict[str, Any], session_id: str
-    ) -> bool:
+    ) -> str:
         """Session-scoped always_allow, v3 shape: press "1" on the dialog.
 
         The v2 memory wrote an allow decision file; with notify mode nobody
         reads decisions, so the same memory auto-injects allow-once instead.
+
+        Returns "ok" (injected), "skip" (the terminal settled it first —
+        drop the pending quietly), or "card" (injection could not be
+        confirmed — hand over to a human card, never auto-retry: the keys
+        may already have been written).
         """
         transport = self._claude_daemon_transport()
         if transport is None:
-            return False
+            return "card"
         transport.register_notify_gate(rid, request, session_id=session_id)
         handle = TransportHandle(
             handle_id=f"claude-daemon-{request.get('daemon_short', '')}",
@@ -2434,16 +2449,18 @@ class ChannelNativeRuntime:
             )
         except claude_gate.GateInjectionFailed as exc:
             claude_gate.trace("auto_allow_inject_missed", rid=rid, reason=exc.reason)
-            return False
+            if exc.reason in {"dialog_mismatch", "already_resolved", "stale_gate"}:
+                return "skip"
+            return "card"
         except Exception as exc:
             claude_gate.trace(
                 "auto_allow_inject_error", rid=rid, error=f"{type(exc).__name__}: {exc}"
             )
-            return False
+            return "card"
         claude_gate.trace(
             "auto_allow_session", rid=rid, tool=request.get("tool_name", ""), mode="notify"
         )
-        return True
+        return "ok"
 
     def _record_gate_decision(self, rid: str, decision: dict[str, Any]) -> None:
         if str(decision.get("action", "") or "") != "always_allow":
@@ -2666,18 +2683,21 @@ class ChannelNativeRuntime:
                 )
             last_needs = blocking_needs
         elif needs is not None or needs_text:
+            transport = self._claude_daemon_transport()
+            injected = bool(
+                short and transport is not None and transport.recently_injected(short)
+            )
+            if short and transport is not None:
+                # Whoever answered, this job's open notify gates are done:
+                # tombstone them so a late card click flips honestly. This
+                # must NOT depend on lifecycle_state — a tool event can flip
+                # WAITING_PERMISSION away before this patch arrives (review
+                # finding + live-E2E observation).
+                transport.resolve_notify_gates_for_short(short)
             was_waiting = session.lifecycle_state == "WAITING_PERMISSION"
             if was_waiting:
                 session.lifecycle_state = "EXTERNAL_OBSERVED_READONLY"
                 changed = True
-                transport = self._claude_daemon_transport()
-                injected = bool(
-                    short and transport is not None and transport.recently_injected(short)
-                )
-                if short and transport is not None:
-                    # Whoever answered, this job's open notify gates are done:
-                    # tombstone them so a late card click flips honestly.
-                    transport.resolve_notify_gates_for_short(short)
                 # Sync the terminal-side decision back to the channel (the
                 # notice/card would otherwise look pending forever) — unless
                 # the clearing was our own injection: the clicked card already

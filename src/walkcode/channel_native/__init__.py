@@ -7659,6 +7659,8 @@ class Orchestrator:
         )
         if exc.reason in {"dialog_mismatch", "already_resolved"}:
             action, detail = "terminal", "已在终端处理（或对话框已变化），本卡片未生效。"
+        elif exc.reason == "stale_gate":
+            action, detail = "stale", "这个请求已经结束或服务重启过，这张卡片已失效；如终端仍在等待，请直接在终端处理。"
         elif exc.reason == "not_injectable":
             action, detail = "degraded", "该回答形态暂不支持从飞书注入，请在终端完成选择。"
         else:
