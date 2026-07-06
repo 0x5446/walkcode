@@ -151,7 +151,10 @@ Google Vertex), and troubleshooting live in
 Note: `WALKCODE_CLAUDE_SETTINGS` cannot be combined with this switch on the
 same profile (rejected at startup); once enabled, the profile's new headless
 sessions hard-depend on the local tap — run `remove` to decouple when not
-actively debugging.
+actively debugging. Terminal TUI sessions bypass the proxy by default; to
+route them into the same dashboard, see the "Optional: terminal TUI sessions"
+section of the deploy doc (soft dependency — falls back to direct connection
+when the tap is down).
 
 ## Run Locally
 
