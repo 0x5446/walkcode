@@ -100,10 +100,12 @@ launchd job），WalkCode 只做只读透传，不感知、不依赖 claude-tap 
   置在同一个 profile 上（配置阶段直接报错）。需要两者兼得的话，目前得二选一,或
   者把 `WALKCODE_CLAUDE_SETTINGS` 里想要的 model/hooks/permissions 配置临时挪到
   `CLAUDE_CONFIG_DIR/settings.json` 默认路径里,调试完再挪回来。
-- Vertex 判断只读进程 `os.environ`，不看 `CLAUDE_CONFIG_DIR/settings.json` 里可
-  能定义的 `CLAUDE_CODE_USE_VERTEX`。这跟 WalkCode 现有其它 provider 相关配置
-  （见 ARCHITECTURE.md 和 `WALKCODE_ENV_FILE` 的说明）一样，要求这类开关必须体
-  现在运行时的真实进程环境里，不是新增限制。
+- 覆盖同时写 `ANTHROPIC_BASE_URL` 和 `ANTHROPIC_VERTEX_BASE_URL` 两个变量（v0.10.59
+  起无条件；v0.10.58 曾按进程 env 的 `CLAUDE_CODE_USE_VERTEX` 门控——真机部署发现
+  launchd 跑的 serve 进程环境里根本没有这个变量，Vertex 开关只在 profile 的
+  `settings.json` 里，导致 Vertex profile 的流量静默绕过代理）。两个变量都指向同
+  一个代理地址，非 Vertex 模式下多出来的 `ANTHROPIC_VERTEX_BASE_URL` 会被 Claude
+  Code 忽略，无副作用。
 - 非标准 Vertex 网关（路径没有 `/v1` 前缀）需要额外的 `--tap-allow-path`，这是
   claude-tap 自身路径白名单的限制，文档里已注明排查方法（看 sidecar 日志里的
   `Blocked non-API path`）。

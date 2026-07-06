@@ -596,16 +596,22 @@ class ClaudeHeadlessTransportTests(unittest.TestCase):
             anthropic_base_url="http://127.0.0.1:18899",
         )
 
-        with mock.patch.dict(os.environ, {}, clear=False):
-            os.environ.pop("CLAUDE_CODE_USE_VERTEX", None)
-            kwargs = transport._option_kwargs(LaunchSpec(cwd="/tmp/project", session_id="s1"))
+        kwargs = transport._option_kwargs(LaunchSpec(cwd="/tmp/project", session_id="s1"))
 
         # CLAUDE_CONFIG_DIR still goes through plain env (needed pre-spawn to
         # locate settings/credentials); the base URL override goes through
         # --settings (see test_option_kwargs_anthropic_base_url_only for why
         # plain env alone is not reliably honored here).
         self.assertEqual(kwargs["env"], {"CLAUDE_CONFIG_DIR": "/tmp/claude-profiles/work"})
-        self.assertEqual(json.loads(kwargs["settings"]), {"env": {"ANTHROPIC_BASE_URL": "http://127.0.0.1:18899"}})
+        self.assertEqual(
+            json.loads(kwargs["settings"]),
+            {
+                "env": {
+                    "ANTHROPIC_BASE_URL": "http://127.0.0.1:18899",
+                    "ANTHROPIC_VERTEX_BASE_URL": "http://127.0.0.1:18899",
+                }
+            },
+        )
 
     def test_option_kwargs_anthropic_base_url_only(self):
         # Plain options.env is confirmed (via CLAUDE_CONFIG_DIR) to reach the
@@ -617,21 +623,9 @@ class ClaudeHeadlessTransportTests(unittest.TestCase):
         # layer Claude Code actually honors.
         transport = ClaudeHeadlessTransport(anthropic_base_url="http://127.0.0.1:18899")
 
-        with mock.patch.dict(os.environ, {}, clear=False):
-            os.environ.pop("CLAUDE_CODE_USE_VERTEX", None)
-            kwargs = transport._option_kwargs(LaunchSpec(cwd="/tmp/project", session_id="s1"))
+        kwargs = transport._option_kwargs(LaunchSpec(cwd="/tmp/project", session_id="s1"))
 
         self.assertNotIn("env", kwargs)
-        self.assertEqual(json.loads(kwargs["settings"]), {"env": {"ANTHROPIC_BASE_URL": "http://127.0.0.1:18899"}})
-
-    def test_option_kwargs_anthropic_base_url_also_overrides_vertex_when_vertex_enabled(self):
-        # Claude Code reads ANTHROPIC_VERTEX_BASE_URL instead of
-        # ANTHROPIC_BASE_URL when Vertex routing is active.
-        transport = ClaudeHeadlessTransport(anthropic_base_url="http://127.0.0.1:18899")
-
-        with mock.patch.dict(os.environ, {"CLAUDE_CODE_USE_VERTEX": "1"}):
-            kwargs = transport._option_kwargs(LaunchSpec(cwd="/tmp/project", session_id="s1"))
-
         self.assertEqual(
             json.loads(kwargs["settings"]),
             {
@@ -641,6 +635,29 @@ class ClaudeHeadlessTransportTests(unittest.TestCase):
                 }
             },
         )
+
+    def test_option_kwargs_anthropic_base_url_overrides_vertex_regardless_of_process_env(self):
+        # The Vertex switch may live only in the profile's settings.json —
+        # invisible to this runtime's process env (a launchd-run serve has
+        # neither; confirmed live: an env-gated variant silently bypassed the
+        # proxy for Vertex-routed profiles). Both variables must be set no
+        # matter what the process env says.
+        transport = ClaudeHeadlessTransport(anthropic_base_url="http://127.0.0.1:18899")
+
+        expected = {
+            "env": {
+                "ANTHROPIC_BASE_URL": "http://127.0.0.1:18899",
+                "ANTHROPIC_VERTEX_BASE_URL": "http://127.0.0.1:18899",
+            }
+        }
+        with mock.patch.dict(os.environ, {"CLAUDE_CODE_USE_VERTEX": "1"}):
+            kwargs = transport._option_kwargs(LaunchSpec(cwd="/tmp/project", session_id="s1"))
+        self.assertEqual(json.loads(kwargs["settings"]), expected)
+
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("CLAUDE_CODE_USE_VERTEX", None)
+            kwargs = transport._option_kwargs(LaunchSpec(cwd="/tmp/project", session_id="s1"))
+        self.assertEqual(json.loads(kwargs["settings"]), expected)
 
     def test_option_kwargs_anthropic_base_url_ignores_settings_field(self):
         # WALKCODE_CLAUDE_SETTINGS + WALKCODE_CLAUDE_ANTHROPIC_BASE_URL together
@@ -654,11 +671,17 @@ class ClaudeHeadlessTransportTests(unittest.TestCase):
             anthropic_base_url="http://127.0.0.1:18899",
         )
 
-        with mock.patch.dict(os.environ, {}, clear=False):
-            os.environ.pop("CLAUDE_CODE_USE_VERTEX", None)
-            kwargs = transport._option_kwargs(LaunchSpec(cwd="/tmp/project", session_id="s1"))
+        kwargs = transport._option_kwargs(LaunchSpec(cwd="/tmp/project", session_id="s1"))
 
-        self.assertEqual(json.loads(kwargs["settings"]), {"env": {"ANTHROPIC_BASE_URL": "http://127.0.0.1:18899"}})
+        self.assertEqual(
+            json.loads(kwargs["settings"]),
+            {
+                "env": {
+                    "ANTHROPIC_BASE_URL": "http://127.0.0.1:18899",
+                    "ANTHROPIC_VERTEX_BASE_URL": "http://127.0.0.1:18899",
+                }
+            },
+        )
 
     def test_option_kwargs_settings_path_without_anthropic_base_url_passthrough(self):
         transport = ClaudeHeadlessTransport(settings="/tmp/vertex.json")
