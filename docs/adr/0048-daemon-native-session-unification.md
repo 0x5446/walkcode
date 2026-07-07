@@ -106,3 +106,43 @@ attach**——但肌肉记忆没跟上，且飞书生的 headless 会话终端�
 - 未做（后续）：飞书 Live E2E（真实例 `WALKCODE_CLAUDE_SPAWN_MODE=daemon`
   开关 + Playwright 点卡全场景，重点：权限卡、AskUserQuestion、stop 流），
   通过后把默认值切到 daemon；Codex 侧等价统一不在本 ADR 范围。
+
+## Deep-review 记录（2026-07-07，14 维度 codex 引擎）
+
+首版实现（commit b2a869b）经 deep-review 发现一个 Critical + 一批 Warning，
+均已在同分支修复、656 单测绿、真机 E2E 复测通过：
+
+1. **[Critical, 已修] ingress lock 自锁**：`_spawn_claude_daemon_native_session`
+   重入 `_ingress_lock`，而 `serve_lark_ws`/`poll_telegram_once` 已在锁内调用
+   `handle_inbound_event`。asyncio.Lock 不可重入 → 开启 spawn_mode=daemon 后
+   首条消息必然死锁。修复：spawner 去掉重入（注册由调用方的锁串行化），补真实
+   入口锁死回归测试（旧代码会 `wait_for` 超时）。首版单测/E2E 都直连绕过入口锁
+   才漏掉——这是"测试形态与生产入口不一致"的典型盲区。
+2. **[Warning, 已修] spawn_bg_job 孤儿 job**：仅 ready 超时 reap，list/ready 探测
+   抛异常时漏 kill。修复：整个 ready-wait 包统一 try/except，任何非正常返回都
+   best-effort kill 并记 `claude_daemon_spawn_reap_failed`。
+3. **[Warning, 已修] 注册失败孤儿 job**：spawn 成功后 create/authz 抛异常不回收。
+   修复：注册段 try/except + `_reap_daemon_job`。
+4. **[Warning, 已修] 收编年龄阈值竞态**：30s < spawn 最坏窗口，watcher 可能误收
+   自家在途 job 再被 spawner 当 duplicate kill。修复：阈值提到 60s（> ready
+   超时 20s + 轮询余量），补 45s 边界不收编测试。
+5. **[Warning, 已修] watcher 内联收编阻塞**：收编的网络副作用挡住已知会话的
+   subscribe 建立。修复：已知会话先建 watcher，未知 job 收编推后；收编前加锁外
+   预检消除最常见的孤儿 binding 竞态。
+6. **[Warning, 已修] 可观测性**：reap 静默吞错、`_describe_claude_daemon` 不暴露
+   spawn/adopt 策略。修复：reap 失败落 stderr；describe 加 `spawn_mode`/
+   `list_adopt`/`daemon_spawner_installed`。
+7. **[Warning, 已修] 文档陈旧**：设计文档旧 takeover/`--resume` 语义、lark 部署
+   漏写收编依赖 `WALKCODE_LARK_TUI_CHAT_ID`。已更新。
+
+**已知并接受（未在本 ADR 修）**：
+- **spawn_bg_job 继承完整 os.environ**（安全维度提出）：bg worker 能读到
+  `LARK_APP_SECRET`/`TELEGRAM_BOT_TOKEN` 等。这与现有 headless SDK spawn 行为
+  **一致**（后者同样把完整 os.environ + `CLAUDE_CONFIG_DIR` 传给 worker），且
+  wrapper 裸启动的会话也继承登录 shell 全 env——非本 PR 新增的洞。收敛 env 需
+  同时改 headless 与 daemon 两条 spawn 路径并逐一验证各 profile 认证不回归，
+  留作独立硬化 PR。
+- **list 收编的信任边界**：收编按 `source=shell` 过滤，无法区分 wrapper 会话与
+  Agent-tool 子代理；但收编只作用于**本 profile 的 daemon**（同 `CLAUDE_CONFIG_DIR`），
+  即用户自己经该 profile 起的会话树。默认 `auto`，可 `WALKCODE_CLAUDE_LIST_ADOPT=off`
+  关闭。默认 spawn_mode=headless 时收编是纯兜底。

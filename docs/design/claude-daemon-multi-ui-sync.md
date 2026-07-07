@@ -34,6 +34,14 @@ Claude daemon 只托管 **bg 会话**（`claude --bg` 启动，或 TUI 内 `/bg`
 要让日常会话获得多端同步，用 `claude --bg` 起会话或对现有 TUI 会话 `/bg`
 后重新 attach。没有 bg 会话的 profile 不会有 daemon 进程，属正常现象。
 
+> **ADR 0048 更新（2026-07-07）**：上表「观察会话永远要先 takeover」「普通 TUI
+> 仍走 hooks + takeover」描述的是 daemon-native 之前的默认。现在：
+> (1) `daemon_live` 的外部观察会话首选 daemon `reply` 直写，只有非 daemon 的
+> 普通 TUI 观察会话才回落 takeover；(2) 飞书**新建**会话在
+> `WALKCODE_CLAUDE_SPAWN_MODE=daemon` 下直接生为 daemon bg worker（不再必然
+> headless）；(3) wrapper 的 `--resume/-r <hex-id>` 不再原样透传，而是按意图
+> 处理（活会话 attach、死会话 bg 复活），见 ADR 0048 与 lark-profile-deploy.md。
+
 ## 协议依据（已实测验证）
 
 - socket 路径可确定性推导：`/tmp/cc-daemon-<uid>/<sha256(CLAUDE_CONFIG_DIR)[:8]>/control.sock`。

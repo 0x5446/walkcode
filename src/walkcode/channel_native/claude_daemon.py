@@ -28,6 +28,7 @@ import hashlib
 import json
 import os
 import re
+import sys
 import time
 from pathlib import Path
 from typing import Any, AsyncIterator
@@ -684,31 +685,45 @@ class ClaudeDaemonTransport:
             raise TransportUnavailable(
                 f"claude --bg output had no parseable short id: {output.strip()[:200]!r}"
             )
-        deadline = time.monotonic() + ready_timeout
-        session_id = ""
-        job_cwd = ""
-        while time.monotonic() < deadline:
-            try:
+        # `claude --bg` has already created a live worker. From here EVERY exit
+        # that is not a clean return must best-effort reap it — a list/ready
+        # probe raising (socket blip, daemon restart, protocol drift) used to
+        # leave an orphan worker that list adoption would later resurface as a
+        # duplicate session (ADR 0048 review finding). One try/except covers
+        # ready-timeout, probe errors, and unexpected failures alike.
+        try:
+            deadline = time.monotonic() + ready_timeout
+            while time.monotonic() < deadline:
                 jobs = await self.client.list_jobs()
-            except ClaudeDaemonError as exc:
-                raise TransportUnavailable(f"daemon list failed after --bg: {exc}") from exc
-            entry = next(
-                (job for job in jobs if claude_daemon_short_id(job.get("short")) == short),
-                None,
-            )
-            if entry is not None:
-                session_id = str(entry.get("sessionId", "") or "")
-                job_cwd = str(entry.get("cwd", "") or "")
-                if session_id and await self.client.job_ready(short):
-                    return {"short": short, "session_id": session_id, "cwd": job_cwd or cwd}
-            await asyncio.sleep(SPAWN_BG_POLL_SECONDS)
-        # Leaving a half-born job behind would strand an idle worker nobody
-        # tracks; best-effort reap before reporting the failure.
-        with contextlib.suppress(Exception):
+                entry = next(
+                    (job for job in jobs if claude_daemon_short_id(job.get("short")) == short),
+                    None,
+                )
+                if entry is not None:
+                    session_id = str(entry.get("sessionId", "") or "")
+                    job_cwd = str(entry.get("cwd", "") or "")
+                    if session_id and await self.client.job_ready(short):
+                        return {"short": short, "session_id": session_id, "cwd": job_cwd or cwd}
+                await asyncio.sleep(SPAWN_BG_POLL_SECONDS)
+            reason = f"job {short} never became ready within {ready_timeout:.0f}s"
+        except Exception as exc:
+            reason = f"job {short} probe failed: {type(exc).__name__}: {exc}"
+        await self._reap_orphan(short)
+        raise TransportUnavailable(f"claude --bg {reason}")
+
+    async def _reap_orphan(self, short: str) -> None:
+        """Best-effort kill of a spawned-but-unusable job; kill failure logged."""
+        try:
             await self.client.kill(short)
-        raise TransportUnavailable(
-            f"claude --bg job {short} never became ready within {ready_timeout:.0f}s"
-        )
+        except Exception as exc:
+            # Not raised: the caller is already failing over to headless. But a
+            # silent suppress would hide a leaked worker — make it greppable.
+            print(
+                f"walkcode degrade=claude_daemon_spawn_reap_failed short={short} "
+                f"error={type(exc).__name__}: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
 
     @staticmethod
     async def _run_bg_cli(argv: list[str], *, cwd: str, env: dict[str, str]) -> str:

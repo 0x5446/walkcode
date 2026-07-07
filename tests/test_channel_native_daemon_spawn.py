@@ -331,6 +331,37 @@ class OrchestratorDaemonSpawnerTests(unittest.TestCase):
         self.assertEqual(len(orchestrator.transports["claude_headless"].handles), 1)
 
 
+class SpawnBgJobReapTests(unittest.IsolatedAsyncioTestCase):
+    """spawn_bg_job must reap the just-created worker on ANY probe failure,
+    not only ready-timeout — else an orphan bg worker is leaked."""
+
+    async def test_list_jobs_failure_after_bg_reaps(self):
+        from walkcode.channel_native.claude_daemon import ClaudeDaemonError
+
+        class _ListFailsClient(_SpawnStubClient):
+            async def list_jobs(self):
+                raise ClaudeDaemonError("EIO", "socket blip")
+
+        client = _ListFailsClient()
+        transport = ClaudeDaemonTransport(config_dir="/tmp/profile", client=client)
+        runner, _ = _canned_runner()
+        with self.assertRaises(TransportUnavailable):
+            await transport.spawn_bg_job("/tmp", bg_runner=runner, ready_timeout=1.0)
+        self.assertEqual(client.kills, [SHORT])
+
+    async def test_job_ready_failure_after_bg_reaps(self):
+        class _ReadyFailsClient(_SpawnStubClient):
+            async def job_ready(self, short):
+                raise RuntimeError("ready probe blew up")
+
+        client = _ReadyFailsClient()
+        transport = ClaudeDaemonTransport(config_dir="/tmp/profile", client=client)
+        runner, _ = _canned_runner()
+        with self.assertRaises(TransportUnavailable):
+            await transport.spawn_bg_job("/tmp", bg_runner=runner, ready_timeout=1.0)
+        self.assertEqual(client.kills, [SHORT])
+
+
 class _FakeTelegramApi:
     def __init__(self):
         self.token = "fake"
@@ -452,6 +483,66 @@ class RuntimeDaemonSpawnTests(unittest.TestCase):
             )
             self.assertIsNone(session)
 
+    def test_register_failure_reaps_job_and_returns_none(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = _runtime(tmp, WALKCODE_CLAUDE_SPAWN_MODE="daemon")
+            transport = runtime._claude_daemon_transport()
+
+            async def fake_spawn(cwd, *, settings="", cli_path="", **kwargs):
+                return {"short": SHORT, "session_id": AGENT_SESSION_ID, "cwd": cwd}
+
+            transport.spawn_bg_job = fake_spawn
+            kills: list[str] = []
+
+            async def fake_kill(short, *, signal="SIGTERM"):
+                kills.append(short)
+                return {"ok": True}
+
+            transport.client.kill = fake_kill
+
+            # Force the registration to blow up after spawn succeeded.
+            def boom(*a, **k):
+                raise RuntimeError("registry exploded")
+
+            runtime.state.sessions.create_observed_session = boom
+            session = asyncio.run(
+                runtime._spawn_claude_daemon_native_session(
+                    _user_binding(), "claude_headless", tmp, _actor()
+                )
+            )
+            self.assertIsNone(session)
+            self.assertEqual(kills, [SHORT])  # orphan job reaped
+
+    def test_spawn_under_ingress_lock_does_not_deadlock(self):
+        # Regression for the ADR 0048 review Critical: the real Lark/Telegram
+        # entry holds _ingress_lock around handle_inbound_event; the spawner
+        # must not re-acquire it (asyncio.Lock is not reentrant → self-deadlock).
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = _runtime(tmp, WALKCODE_CLAUDE_SPAWN_MODE="daemon")
+            transport = runtime._claude_daemon_transport()
+
+            async def fake_spawn(cwd, *, settings="", cli_path="", **kwargs):
+                return {"short": SHORT, "session_id": AGENT_SESSION_ID, "cwd": cwd}
+
+            transport.spawn_bg_job = fake_spawn
+
+            async def drive():
+                # Exactly what serve_lark_ws / poll_telegram_once do.
+                async with runtime._ingress_lock:
+                    return await asyncio.wait_for(
+                        runtime.orchestrator.handle_inbound_event(
+                            _inbound(),
+                            agent_transport_kind="claude_headless",
+                            cwd=tmp,
+                        ),
+                        timeout=5.0,
+                    )
+
+            result = asyncio.run(drive())
+            self.assertTrue(result.accepted)
+            self.assertEqual(result.reason, "daemon_reply")
+            self.assertEqual(transport.client.replies, [(SHORT, "帮我修一下测试")])
+
 
 def _wild_job(*, age_seconds: float = 120.0, source: str = "shell") -> dict:
     return {
@@ -493,6 +584,17 @@ class ListAdoptionTests(unittest.TestCase):
             )
             self.assertEqual(session_id, "")
 
+    def test_job_within_spawn_window_not_adopted(self):
+        # 45s is older than the retired 30s threshold but still inside the
+        # spawner's worst-case register window; must not be adopted, or the
+        # watcher would steal the runtime's own in-flight job.
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = _runtime(tmp)
+            session_id = asyncio.run(
+                runtime._maybe_adopt_wild_claude_daemon_job(_wild_job(age_seconds=45.0))
+            )
+            self.assertEqual(session_id, "")
+
     def test_non_shell_source_is_skipped(self):
         with tempfile.TemporaryDirectory() as tmp:
             runtime = _runtime(tmp)
@@ -525,6 +627,66 @@ class ListAdoptionTests(unittest.TestCase):
             runtime = _runtime(tmp, WALKCODE_CLAUDE_LIST_ADOPT="off")
             session_id = asyncio.run(runtime._maybe_adopt_wild_claude_daemon_job(_wild_job()))
             self.assertEqual(session_id, "")
+
+
+class WatcherWiringTests(unittest.IsolatedAsyncioTestCase):
+    """_sync_claude_daemon_watchers must create subscribe watchers for known
+    external-TUI sessions and not let a slow wild-job adoption block them."""
+
+    async def test_known_session_gets_watcher_before_adoption(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = _runtime(tmp)
+            transport = runtime._claude_daemon_transport()
+            # Register a known external-TUI session for a "known" job.
+            known_uuid = "aaaa1111-2222-3333-4444-555566667777"
+            known_short = "aaaa1111"
+            runtime.state.sessions.create_observed_session(
+                session_id="tui-claude-known",
+                binding=ChannelBinding("telegram", "bot", "chat", "topic", "root"),
+                cwd=tmp,
+                external_ref={
+                    "source": "native_tui_hook",
+                    "resume_ref": {
+                        "transport_kind": "claude_headless",
+                        "agent_session_id": known_uuid,
+                    },
+                },
+                owner=_actor(),
+            )
+
+            order: list[str] = []
+
+            async def fake_list_jobs():
+                return [
+                    {"short": known_short, "sessionId": known_uuid, "source": "shell",
+                     "tempo": "active", "state": "running"},
+                    _wild_job(),
+                ]
+
+            transport.client.list_jobs = fake_list_jobs
+
+            async def slow_adopt(job):
+                order.append("adopt")
+                await asyncio.sleep(0.05)
+                return ""
+
+            runtime._maybe_adopt_wild_claude_daemon_job = slow_adopt
+
+            def fake_start(session_id, short, transport_, watchers):
+                order.append(f"watch:{short}")
+                # Sentinel task so the watcher dict is populated without a socket.
+                watchers[short] = asyncio.ensure_future(asyncio.sleep(0))
+
+            runtime._start_daemon_watcher_if_eligible = fake_start
+
+            watchers: dict = {}
+            await runtime._sync_claude_daemon_watchers(transport, watchers)
+            await asyncio.gather(*watchers.values(), return_exceptions=True)
+
+            # Known job's watcher must be wired before the wild-job adoption runs.
+            self.assertEqual(order[0], f"watch:{known_short}")
+            self.assertIn("adopt", order)
+            self.assertLess(order.index(f"watch:{known_short}"), order.index("adopt"))
 
 
 class BindingCapabilityGuardTests(unittest.TestCase):
