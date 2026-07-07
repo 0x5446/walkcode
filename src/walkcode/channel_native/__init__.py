@@ -461,6 +461,25 @@ def _configured_agent_options(source: Any) -> dict[str, dict[str, Any]]:
                 f"invalid WALKCODE_CLAUDE_DAEMON_MODE: {claude_daemon_mode}; use auto or off"
             )
         claude["daemon_mode"] = claude_daemon_mode
+    claude_spawn_mode = str(source.get("WALKCODE_CLAUDE_SPAWN_MODE") or "").strip().lower()
+    if claude_spawn_mode:
+        if claude_spawn_mode not in {"headless", "daemon"}:
+            raise ChannelConfigError(
+                f"invalid WALKCODE_CLAUDE_SPAWN_MODE: {claude_spawn_mode}; use headless or daemon"
+            )
+        if claude_spawn_mode == "daemon" and claude_daemon_mode == "off":
+            raise ChannelConfigError(
+                "WALKCODE_CLAUDE_SPAWN_MODE=daemon requires the daemon transport; "
+                "unset WALKCODE_CLAUDE_DAEMON_MODE=off"
+            )
+        claude["spawn_mode"] = claude_spawn_mode
+    claude_list_adopt = str(source.get("WALKCODE_CLAUDE_LIST_ADOPT") or "").strip().lower()
+    if claude_list_adopt:
+        if claude_list_adopt not in {"auto", "off"}:
+            raise ChannelConfigError(
+                f"invalid WALKCODE_CLAUDE_LIST_ADOPT: {claude_list_adopt}; use auto or off"
+            )
+        claude["list_adopt"] = claude_list_adopt
     claude_gate_mode = str(source.get("WALKCODE_CLAUDE_GATE_MODE") or "").strip().lower()
     if claude_gate_mode:
         if claude_gate_mode not in {"auto", "off", "ask_only"}:
@@ -6669,6 +6688,7 @@ class Orchestrator:
         defer_event_drain: bool = False,
         outbox_dispatcher: OutboxDispatcher | None = None,
         on_state_changed: Callable[[], None] | None = None,
+        daemon_spawner: Callable[..., Any] | None = None,
         now: Callable[[], float] = time.time,
     ):
         self.sessions = sessions
@@ -6687,6 +6707,11 @@ class Orchestrator:
             on_state_changed=on_state_changed,
         )
         self.on_state_changed = on_state_changed
+        # Daemon-native spawn hook (ADR 0048): when set, a brand-new channel
+        # session is offered to this callback first — it may create the session
+        # as a daemon bg worker (external-TUI shaped, daemon reply write path)
+        # and return it, or return None to fall back to start_session().
+        self.daemon_spawner = daemon_spawner
         self._background_event_drains: set[asyncio.Task] = set()
         self._now = now
         # Echo dedup for daemon replies (ADR 0046 v2): a channel message
@@ -7444,12 +7469,24 @@ class Orchestrator:
                                 # as the thread root; register it so refreshes
                                 # patch that card instead of sending a second one.
                                 binding.health_message_id = preset_card
-                            session = await self.start_session(
-                                binding,
-                                agent_transport_kind,
-                                cwd,
-                                actor,
-                            )
+                            session = None
+                            if self.daemon_spawner is not None:
+                                # ADR 0048: daemon-native spawn first; None
+                                # means "not eligible or spawn failed", and the
+                                # headless SDK path below stays authoritative.
+                                session = await self.daemon_spawner(
+                                    binding,
+                                    agent_transport_kind,
+                                    cwd,
+                                    actor,
+                                )
+                            if session is None:
+                                session = await self.start_session(
+                                    binding,
+                                    agent_transport_kind,
+                                    cwd,
+                                    actor,
+                                )
                             turn = await self.prepare_turn_from_inbound(inbound)
                             if isinstance(turn, SubmitResult):
                                 result = turn

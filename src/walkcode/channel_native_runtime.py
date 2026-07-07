@@ -78,6 +78,10 @@ from .channel_native.lark_live import AckRegistry, LarkIngressBridge, build_lark
 TELEGRAM_FORUM_TOPIC_ICON_COLORS = (0x6FB9F0, 0xFFD67E, 0xCB86DB, 0x8EEE98, 0xFF93B2, 0xFB6F5F)
 CLAUDE_DAEMON_WATCH_INTERVAL_SECONDS = 5.0
 CLAUDE_DAEMON_UNAVAILABLE_RETRY_SECONDS = 30.0
+# List-fallback adoption (ADR 0048): a wild job must have existed this long
+# before it is registered, so the runtime's own daemon-native spawn always
+# wins the race and registers its session (with the user's chat binding) first.
+CLAUDE_DAEMON_ADOPT_MIN_AGE_SECONDS = 30.0
 CLAUDE_GATE_DRAIN_INTERVAL_SECONDS = 1.0
 # A pending gate request that cannot be routed to an observed session (or
 # whose card cannot be delivered) is answered "pass" after this grace, so the
@@ -669,6 +673,10 @@ class ChannelNativeRuntime:
         daemon_transport = self._claude_daemon_transport()
         if daemon_transport is not None:
             daemon_transport.on_gate_decision = self._record_gate_decision
+            # Daemon-native spawn (ADR 0048): channel-born sessions start as
+            # daemon bg workers when WALKCODE_CLAUDE_SPAWN_MODE=daemon. The
+            # orchestrator calls this before start_session; None falls back.
+            self.orchestrator.daemon_spawner = self._spawn_claude_daemon_native_session
 
     @classmethod
     def from_env(
@@ -2145,6 +2153,215 @@ class ChannelNativeRuntime:
             )
         return alive
 
+    # -- daemon-native spawn + list adoption (ADR 0048) -----------------------
+
+    async def _spawn_claude_daemon_native_session(
+        self,
+        binding: ChannelBinding,
+        transport_kind: str,
+        cwd: str,
+        owner: ActorRef,
+    ):
+        """Create a channel-born session as a daemon bg worker.
+
+        The session is registered external-TUI shaped — writer external_tui,
+        nested claude resume_ref — so every already-verified v3 mechanism
+        (daemon reply writes, subscribe watcher, hook content, dual gate)
+        applies from the first turn. Returns None on any failure so the
+        orchestrator falls back to the headless SDK spawn.
+        """
+        if transport_kind != "claude_headless":
+            return None
+        options = self.config.agent_options.get("claude", {})
+        if str(options.get("spawn_mode", "") or "headless") != "daemon":
+            return None
+        transport = self._claude_daemon_transport()
+        if transport is None:
+            return None
+        from .channel_native import _log_degrade
+
+        headless = self.transports.get("claude_headless")
+        settings = ""
+        cli_path = ""
+        if isinstance(headless, ClaudeHeadlessTransport):
+            cli_path = str(headless.cli_path or "")
+            try:
+                if headless.anthropic_base_url:
+                    # Same tap/base-url override file the headless SDK spawn
+                    # uses — the bg worker must hit the same upstream.
+                    settings = headless._anthropic_base_url_settings_override()
+                elif headless.settings:
+                    settings = str(headless.settings)
+            except Exception as exc:
+                _log_degrade(
+                    "claude_daemon_spawn_settings_failed",
+                    error=exc,
+                    fallback="headless_spawn",
+                )
+                return None
+        try:
+            job = await transport.spawn_bg_job(cwd, settings=settings, cli_path=cli_path)
+        except (TransportUnavailable, CapabilityUnsupported) as exc:
+            _log_degrade(
+                "claude_daemon_spawn_failed",
+                error=exc,
+                fallback="headless_spawn",
+            )
+            return None
+        agent_session_id = str(job.get("session_id", "") or "")
+        short = str(job.get("short", "") or "")
+        nested_resume_ref = {
+            "transport_kind": "claude_headless",
+            "agent_session_id": agent_session_id,
+        }
+        external_ref = {
+            "source": "walkcode_daemon_spawn",
+            "agent": "claude",
+            "resume_ref": nested_resume_ref,
+            "daemon_short": short,
+            "daemon_live": True,
+        }
+        # The binding is the user's own chat/topic; this origin marker blocks
+        # the hook-claim path from repainting it as a readonly observation
+        # topic (_ensure_tui_observed_binding_capabilities).
+        binding.capabilities["origin"] = "daemon_spawn"
+        writer_actor = ActorRef(
+            channel_kind=self.config.channel.kind,
+            actor_id=f"claude_daemon:{short}",
+            display_name="claude bg worker",
+        )
+        async with self._ingress_lock:
+            existing = self.state.sessions.find_by_resume_ref(
+                transport_kind="claude_headless",
+                resume_ref={"agent_session_id": agent_session_id},
+            )
+            if existing:
+                # A fresh uuid colliding with a known session means state is
+                # inconsistent; reap the just-spawned job and go headless.
+                _log_degrade(
+                    "claude_daemon_spawn_duplicate_session",
+                    session_id=existing,
+                    fallback="headless_spawn",
+                )
+                try:
+                    await transport.client.kill(short)
+                except Exception:
+                    pass
+                return None
+            session = self.state.sessions.create_observed_session(
+                session_id=self._tui_observed_session_id(
+                    "claude", "claude_headless", nested_resume_ref
+                ),
+                binding=binding,
+                cwd=str(job.get("cwd", "") or cwd),
+                external_ref=external_ref,
+                owner=writer_actor,
+            )
+            initial_title = str(binding.capabilities.get("initial_title", "") or "").strip()
+            if initial_title:
+                session.cached_title = initial_title
+                session.title_source = "initial_user_input"
+            if self.state.authz is not None:
+                self.state.authz.grant(session.session_id, owner, SessionRole.OWNER)
+            self.save_state()
+        return session
+
+    async def _maybe_adopt_wild_claude_daemon_job(self, job: dict[str, Any]) -> str:
+        """List-fallback session bootstrap (ADR 0048).
+
+        Registers a live daemon job walkcode has never seen (hook not
+        configured, spool lost, or an idle `claude --bg` that has produced no
+        hook events yet) as a TUI-observed session, using the same binding
+        shape hooks would create. Conservative on purpose: only CLI-born jobs
+        (source=shell), only after a settle age so the runtime's own spawn
+        path always registers its session (with the user's chat binding)
+        first, and deduped against resume_ref under the ingress lock.
+        Returns the session id ('' when not adopted).
+        """
+        if self.config.agent != "claude":
+            return ""
+        options = self.config.agent_options.get("claude", {})
+        if str(options.get("list_adopt", "") or "auto") == "off":
+            return ""
+        if str(job.get("source", "") or "") != "shell":
+            return ""
+        agent_session_id = str(job.get("sessionId", "") or "")
+        short = claude_daemon_short_id(job.get("short") or agent_session_id)
+        if not agent_session_id or not short:
+            return ""
+        created_at = job.get("createdAt") or job.get("startedAt")
+        try:
+            created_seconds = float(created_at) / 1000.0
+        except (TypeError, ValueError):
+            return ""
+        if self._now() - created_seconds < CLAUDE_DAEMON_ADOPT_MIN_AGE_SECONDS:
+            return ""
+        flat_resume_ref = {"agent_session_id": agent_session_id}
+        nested_resume_ref = {
+            "transport_kind": "claude_headless",
+            "agent_session_id": agent_session_id,
+        }
+        try:
+            binding = await self._create_tui_observed_binding(
+                "claude", "claude_headless", flat_resume_ref, {}
+            )
+        except Exception as exc:
+            print(
+                f"claude daemon list adopt skipped ({short}): {type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+            return ""
+        external_ref = {
+            "source": "claude_daemon_list",
+            "agent": "claude",
+            "resume_ref": nested_resume_ref,
+        }
+        actor = ActorRef(
+            channel_kind=self.config.channel.kind,
+            actor_id=f"local_tui:claude_headless:{agent_session_id}",
+            display_name="claude TUI",
+        )
+        async with self._ingress_lock:
+            existing = self.state.sessions.find_by_resume_ref(
+                transport_kind="claude_headless",
+                resume_ref=flat_resume_ref,
+            )
+            if existing:
+                return existing
+            session = self.state.sessions.create_observed_session(
+                session_id=self._tui_observed_session_id(
+                    "claude", "claude_headless", nested_resume_ref
+                ),
+                binding=binding,
+                cwd=str(job.get("cwd", "") or self.config.cwd),
+                external_ref=external_ref,
+                owner=actor,
+            )
+            session.transport_ref["daemon_live"] = True
+            session.cached_title = _telegram_session_topic_name(
+                "claude", f"TUI {agent_session_id}"
+            )
+            session.title_source = "tui_hook"
+            self._grant_tui_channel_owners(session.session_id, binding)
+            self.save_state()
+        await self.orchestrator.refresh_session_status_card(session)
+        return session.session_id
+
+    def _tui_observed_session_id(
+        self, agent_name: str, transport_kind: str, resume_ref: dict[str, Any]
+    ) -> str:
+        identity = _resume_ref_identity(transport_kind, resume_ref)
+        session_id = f"tui-{agent_name}-{hashlib.sha1(identity.encode()).hexdigest()[:12]}"
+        base_session_id = session_id
+        suffix = 1
+        while True:
+            try:
+                self.state.sessions.get(session_id)
+            except KeyError:
+                return session_id
+            suffix += 1
+            session_id = f"{base_session_id}-{suffix}"
+
     # -- PreToolUse gate (ADR 0046 v2) ---------------------------------------
     #
     # Headless sessions close the permission / AskUserQuestion loop in-process
@@ -2564,9 +2781,12 @@ class ChannelNativeRuntime:
                 resume_ref={"agent_session_id": str(job.get("sessionId", "") or "")},
             )
             if not session_id:
-                # Unknown to walkcode (no hook observed it yet, or it is a
-                # walkcode-owned headless worker). Hooks stay the creation
-                # channel; list-based session bootstrap is a follow-up step.
+                # Unknown to walkcode: hooks stay the primary creation channel
+                # (clean cwd/transcript), but a live job nobody registered —
+                # hook not configured, spool lost, idle `claude --bg` with no
+                # first prompt yet — gets adopted from the list (ADR 0048).
+                session_id = await self._maybe_adopt_wild_claude_daemon_job(job)
+            if not session_id:
                 continue
             session = self.state.sessions.get(session_id)
             if session.status == "stopped":
@@ -2851,17 +3071,7 @@ class ChannelNativeRuntime:
             return None
 
         binding = await self._create_tui_observed_binding(agent_name, transport_kind, resume_ref, payload)
-        identity = _resume_ref_identity(transport_kind, resume_ref)
-        session_id = f"tui-{agent_name}-{hashlib.sha1(identity.encode()).hexdigest()[:12]}"
-        base_session_id = session_id
-        suffix = 1
-        while True:
-            try:
-                self.state.sessions.get(session_id)
-            except KeyError:
-                break
-            suffix += 1
-            session_id = f"{base_session_id}-{suffix}"
+        session_id = self._tui_observed_session_id(agent_name, transport_kind, resume_ref)
         session = self.state.sessions.create_observed_session(
             session_id=session_id,
             binding=binding,
@@ -2968,6 +3178,12 @@ class ChannelNativeRuntime:
     def _ensure_tui_observed_binding_capabilities(session) -> bool:
         binding = session.channel_binding
         if binding is None or binding.channel_kind not in {"telegram", "lark"}:
+            return False
+        if binding.capabilities.get("origin") == "daemon_spawn":
+            # Channel-born daemon session (ADR 0048): the binding is the
+            # user's own chat/topic. Repainting it as a readonly observation
+            # topic would strip the interactive semantics the user started
+            # the session with.
             return False
         if not binding.thread_id:
             return False

@@ -103,7 +103,7 @@ TUI 会话仍由 hooks 创建为 `external_tui` + `EXTERNAL_OBSERVED_READONLY`�
 hooks 仍是会话创建的主通道（能拿到干净的 cwd/transcript）。list 轮询解决的
 是"hook 没配 / spool 丢失"时的兜底发现，以及为已知会话维护 watcher 的启停。
 v1 范围：**watcher 只为已存在的 walkcode 会话服务**（resume_ref ↔ JobRecord.sessionId
-匹配），list 兜底建会话作为后续步骤。
+匹配），list 兜底建会话作为后续步骤（已由 ADR 0048 落地，见「本期不做」）。
 
 ### 能力位
 
@@ -205,8 +205,14 @@ takeover 从不可逆变为可逆，且会话生命周期脱离 walkcode 进程�
 
 - ~~`permission-response` 闭环审批~~ → 已由 v2 的 PreToolUse gate 取代
   （permission-response 实测为空壳，见「协议依据」）。
-- `dispatch` 新建 daemon 会话（飞书新建会话仍走 headless SDK）。
-- list 兜底自动建会话（无 hook 场景）。
+- ~~`dispatch` 新建 daemon 会话（飞书新建会话仍走 headless SDK）~~ →
+  已由 ADR 0048 落地（2026-07-07）：不逆向 dispatch 的内部 `d` spec，改用
+  官方 CLI 面 `claude --bg` 子进程 spawn + 外部观察形态预注册 + 首轮
+  daemon reply 注入；`WALKCODE_CLAUDE_SPAWN_MODE=daemon` 门禁（默认
+  headless，飞书 Live E2E 通过后切换）。
+- ~~list 兜底自动建会话（无 hook 场景）~~ → 已由 ADR 0048 落地：watcher
+  的 list 轮询收编 walkcode 不认识的活 job（`source=shell` + 30s 年龄阈值
+  + resume_ref 去重），`WALKCODE_CLAUDE_LIST_ADOPT=off` 可关。
 - Codex 侧持久订阅化改造（现有 per-turn drain 继续用；协议已是 app-server）。
 
 ## 测试与验证

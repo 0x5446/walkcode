@@ -51,6 +51,24 @@ CLAUDE_DAEMON_PROTO = 1
 # these codes mean "fall back to takeover", not "daemon is broken".
 REPLY_REJECTED_CODES = frozenset({"ENOJOB", "ENOREPLY", "ERESPAWNING"})
 
+# `claude --bg` spawn (ADR 0048): CLI call + list/ready settle budgets. The
+# live-measured happy path is <2s end to end; the generous ceilings only bound
+# the fallback-to-headless latency when the daemon is wedged.
+SPAWN_BG_CLI_TIMEOUT_SECONDS = 60.0
+SPAWN_BG_READY_TIMEOUT_SECONDS = 20.0
+SPAWN_BG_POLL_SECONDS = 0.5
+
+# `claude --bg` colors its stdout even when piped under FORCE_COLOR-style
+# environments (live-observed), so the short id is parsed ANSI-stripped.
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+_BACKGROUNDED_RE = re.compile(r"backgrounded · ([0-9a-f]{8})")
+
+
+def parse_backgrounded_short(output: str) -> str:
+    """Extract the job short id from `claude --bg` output ('' if absent)."""
+    match = _BACKGROUNDED_RE.search(_ANSI_RE.sub("", output or ""))
+    return match.group(1) if match else ""
+
 # -- keystroke injection (v3 true dual-surface, ADR 0046 v3) ------------------
 #
 # A second attacher's raw PTY bytes drive the native permission /
@@ -621,9 +639,103 @@ class ClaudeDaemonTransport:
 
     async def launch(self, spec: LaunchSpec) -> TransportHandle:
         raise CapabilityUnsupported(
-            "Claude daemon transport cannot create sessions (dispatch not implemented); "
-            "new sessions go through claude_headless"
+            "Claude daemon transport cannot create structured sessions; daemon-native "
+            "spawn goes through the runtime's spawn_bg_job path (ADR 0048)"
         )
+
+    async def spawn_bg_job(
+        self,
+        cwd: str,
+        *,
+        settings: str = "",
+        cli_path: str = "",
+        bg_runner: Any = None,
+        ready_timeout: float = SPAWN_BG_READY_TIMEOUT_SECONDS,
+    ) -> dict[str, str]:
+        """Create a daemon-born session via the official `claude --bg` CLI surface.
+
+        The daemon's own `dispatch` op is CLI-internal (its `d` spec is
+        undocumented and Zod-validated); `claude --bg` is the stable way to get
+        a job that is a daemon worker from birth (live-verified TTY-less on
+        2026-07-07: prints 'backgrounded · <short>', job lands in `list` with
+        the full sessionId and cwd). Returns {short, session_id, cwd} once the
+        job is ready for `reply`. Raises TransportUnavailable on any failure so
+        callers can fall back to the headless SDK spawn.
+        """
+        argv = [cli_path or "claude", "--bg"]
+        if settings:
+            argv += ["--settings", settings]
+        env = dict(os.environ)
+        # A nested-CLAUDE environment refuses --bg ("session persistence is
+        # disabled"); the runtime itself is never nested, but a dev running
+        # `walkcode native serve` from inside a Claude session would be.
+        env.pop("CLAUDECODE", None)
+        if self.config_dir:
+            env["CLAUDE_CONFIG_DIR"] = self.config_dir
+        runner = bg_runner or self._run_bg_cli
+        try:
+            output = await runner(argv, cwd=cwd, env=env)
+        except TransportUnavailable:
+            raise
+        except Exception as exc:
+            raise TransportUnavailable(f"claude --bg failed: {type(exc).__name__}: {exc}") from exc
+        short = parse_backgrounded_short(output)
+        if not short:
+            raise TransportUnavailable(
+                f"claude --bg output had no parseable short id: {output.strip()[:200]!r}"
+            )
+        deadline = time.monotonic() + ready_timeout
+        session_id = ""
+        job_cwd = ""
+        while time.monotonic() < deadline:
+            try:
+                jobs = await self.client.list_jobs()
+            except ClaudeDaemonError as exc:
+                raise TransportUnavailable(f"daemon list failed after --bg: {exc}") from exc
+            entry = next(
+                (job for job in jobs if claude_daemon_short_id(job.get("short")) == short),
+                None,
+            )
+            if entry is not None:
+                session_id = str(entry.get("sessionId", "") or "")
+                job_cwd = str(entry.get("cwd", "") or "")
+                if session_id and await self.client.job_ready(short):
+                    return {"short": short, "session_id": session_id, "cwd": job_cwd or cwd}
+            await asyncio.sleep(SPAWN_BG_POLL_SECONDS)
+        # Leaving a half-born job behind would strand an idle worker nobody
+        # tracks; best-effort reap before reporting the failure.
+        with contextlib.suppress(Exception):
+            await self.client.kill(short)
+        raise TransportUnavailable(
+            f"claude --bg job {short} never became ready within {ready_timeout:.0f}s"
+        )
+
+    @staticmethod
+    async def _run_bg_cli(argv: list[str], *, cwd: str, env: dict[str, str]) -> str:
+        proc = await asyncio.create_subprocess_exec(
+            *argv,
+            cwd=cwd or None,
+            env=env,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        try:
+            raw, _ = await asyncio.wait_for(
+                proc.communicate(), timeout=SPAWN_BG_CLI_TIMEOUT_SECONDS
+            )
+        except asyncio.TimeoutError:
+            with contextlib.suppress(ProcessLookupError):
+                proc.kill()
+            raise TransportUnavailable(
+                f"claude --bg timed out after {SPAWN_BG_CLI_TIMEOUT_SECONDS:.0f}s"
+            ) from None
+        output = raw.decode("utf-8", errors="replace")
+        if proc.returncode != 0:
+            raise TransportUnavailable(
+                f"claude --bg exited {proc.returncode}: {output.strip()[:200]}"
+            )
+        return output
 
     async def resume(self, spec: ResumeSpec) -> TransportHandle:
         short = claude_daemon_short_from_resume_ref(spec.resume_ref)
