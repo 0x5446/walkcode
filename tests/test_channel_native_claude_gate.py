@@ -817,7 +817,8 @@ class NotifyGateInjectionTests(unittest.TestCase):
             asyncio.run(
                 transport.approve_permission(self._handle(), "rid-1", {"action": "allow"})
             )
-            self.assertEqual(client.injections, [(SHORT, [b"1", b"\r"])])
+            # Permission allow is a single "1", no trailing Enter (round-2).
+            self.assertEqual(client.injections, [(SHORT, [b"1"])])
             self.assertIsNone(claude_gate.read_decision(transport.gate_state_path, "rid-1"))
             self.assertIsNone(transport.notify_gate("rid-1"))
             self.assertTrue(transport.recently_injected(SHORT))
@@ -1023,7 +1024,8 @@ class NotifyGateDrainTests(unittest.TestCase):
                 asyncio.run(runtime.drain_claude_gate_requests())
             finally:
                 claude_daemon_mod.GATE_INJECT_VERIFY_POLL_SECONDS = old_poll
-            self.assertEqual(client.injections, [(SHORT, [b"1", b"\r"])])
+            # Permission auto-allow is a single "1", no trailing Enter (round-2).
+            self.assertEqual(client.injections, [(SHORT, [b"1"])])
             self.assertIsNone(claude_gate.read_pending(state, "toolu_edit_1"))
             self.assertFalse(
                 [

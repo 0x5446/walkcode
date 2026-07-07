@@ -73,17 +73,26 @@ def parse_backgrounded_short(output: str) -> str:
 # -- keystroke injection (v3 true dual-surface, ADR 0046 v3) ------------------
 #
 # A second attacher's raw PTY bytes drive the native permission /
-# AskUserQuestion dialogs exactly like a keyboard. All sequences below were
-# live-verified on Claude Code 2.1.201 (mapping table: "交互闭环 v3" in
-# docs/design/claude-daemon-multi-ui-sync.md). Non-obvious dialog behaviors
-# the mapping relies on:
+# AskUserQuestion dialogs exactly like a keyboard. Sequences live-verified on
+# Claude Code 2.1.201/2.1.202 (mapping table: "交互闭环 v3" in
+# docs/design/claude-daemon-multi-ui-sync.md; 2026-07-07 corrections in ADR
+# 0048). Non-obvious dialog behaviors the mapping relies on:
 #
-# - digit semantics vary by dialog kind: single-select / multi-question
-#   digits confirm in one press (no Enter); multiSelect digits only toggle;
-# - Enter is context-dependent and is only ever sent after non-empty Other
-#   free text (Enter on an empty Other item cancels the whole dialog);
-# - multiSelect submits via right-arrow to the Submit page then "1";
-#   multi-question auto-advances per answer and ends on the same Submit page.
+# - select-style digits (single-select, submit pages): a digit on a slot that
+#   is NOT the current highlight confirms in one press; a digit on the
+#   ALREADY-highlighted slot only re-selects and the dialog waits for Enter
+#   (2026-07-07 live finding — the 2026-07-06 "one press, no Enter" results
+#   were all of the first kind). Hence digit+Enter for these paths.
+# - permission dialogs act on the digit INSTANTLY (live-verified) and get NO
+#   trailing Enter: queued permission prompts (parallel tool_use) render the
+#   next dialog locally without model latency, so a trailing Enter could
+#   confirm the NEXT dialog's default (= allow) — see keys_for_permission.
+# - multiSelect digits only toggle; Enter after non-empty Other text confirms
+#   (Enter on an empty Other item cancels the whole dialog);
+# - multiSelect submits via right-arrow to the Submit page then "1"+Enter;
+#   multi-question auto-advances per answer and ends on the same Submit page —
+#   but an answer sitting on the highlighted slot 1 would NOT advance, so
+#   those dialogs degrade to the terminal (keys_for_ask_answer -> None).
 
 KeyFrame = tuple[bytes, float]  # (raw PTY bytes, delay after writing them)
 
@@ -104,6 +113,11 @@ OBSERVER_ATTACH_ID = "walkcode-observer"
 OBSERVER_ATTACH_COLS = 200
 OBSERVER_ATTACH_ROWS = 50
 OBSERVER_RECONNECT_SECONDS = 5.0
+# Consecutive job_alive()==None (control-plane unprobeable) checks before the
+# observer reconnect loop gives up; the runtime's watcher sync rebuilds it if
+# the job reappears in list. Bounds a hot loop against a truly-dead job while
+# surviving transient daemon blips.
+OBSERVER_PROBE_GIVEUP = 5
 
 # Post-injection verify: the dialog must resolve (needs cleared / changed /
 # tempo off blocked) within this window, or the card degrades to "answer in
@@ -148,13 +162,15 @@ def keys_for_permission(action: str) -> list[KeyFrame] | None:
     """
     normalized = str(action or "").strip().lower()
     if normalized in {"allow", "allow_once", "accept", "acceptforsession", "always_allow"}:
-        # Digit + Enter (2026-07-07 live finding): a digit that lands on the
-        # ALREADY-highlighted slot only re-selects in select-style dialogs;
-        # Enter confirms it. When the digit did act on its own, the trailing
-        # Enter falls on the post-dialog composer and is a no-op — a new
-        # dialog cannot render within one INTER_KEY_DELAY (model latency is
-        # seconds), so the Enter can never confirm the wrong dialog.
-        return [(b"1", INTER_KEY_DELAY_SECONDS), (b"\r", INTER_KEY_DELAY_SECONDS)]
+        # Single "1", NO trailing Enter (deep-review round-2 finding):
+        # permission dialogs act on the digit instantly (live-verified
+        # 2026-07-06), and queued permission prompts — parallel tool_use in
+        # one assistant message is common — render the NEXT dialog locally
+        # with no model latency in between, so a trailing Enter could land on
+        # that next dialog and confirm its default, silently allowing an
+        # unreviewed tool call. Ask-style dialogs keep digit+Enter instead:
+        # their next dialog is always separated by a full model turn.
+        return [(b"1", INTER_KEY_DELAY_SECONDS)]
     if normalized == "deny":
         # ESC only — never append Enter here: if the ESC were ever swallowed,
         # a trailing Enter would confirm the highlighted item, i.e. ALLOW.
@@ -209,6 +225,16 @@ def keys_for_ask_answer(
         slot = _option_slot(_question_option_labels(question), value)
         if slot is None:
             # Free text inside a multi-question dialog is unverified.
+            return None
+        if slot == 1:
+            # Multi-question advances by the digit itself. A digit on the
+            # ALREADY-highlighted slot 1 only re-selects and does NOT advance
+            # (same rule that forced digit+Enter for single-select,
+            # 2026-07-07); the next question's digit would then land on this
+            # one and corrupt every later answer. There is no per-question
+            # Enter to confirm-and-advance safely here (an Enter mid-page may
+            # submit the whole dialog early), so degrade the whole thing to
+            # the terminal rather than risk a wrong multi-answer submission.
             return None
         frames.append((str(slot).encode("ascii"), INTER_KEY_DELAY_SECONDS))
     frames.append((b"1", INTER_KEY_DELAY_SECONDS))  # Submit answers page
@@ -528,6 +554,7 @@ class ClaudeDaemonClient:
         cols: int = OBSERVER_ATTACH_COLS,
         rows: int = OBSERVER_ATTACH_ROWS,
         attach_id: str = OBSERVER_ATTACH_ID,
+        on_ready: "asyncio.Event | None" = None,
     ) -> None:
         """Hold a read-only attach open until the connection drops.
 
@@ -536,9 +563,11 @@ class ClaudeDaemonClient:
         connection a Feishu-spawned or detached job renders its dialogs into
         the PTY but list/subscribe stay frozen, blinding the notify-gate
         probe. The PTY stream is drained and discarded; no bytes are written.
-        Returns when the daemon closes the connection (job gone, daemon
-        restart); raises TransportUnavailable/ClaudeDaemonError on handshake
-        failure like every other control-plane call.
+        ``on_ready`` is set once the attach handshake succeeds, so spawn can
+        wait for a real attacher before submitting the first turn. Returns
+        when the daemon closes the connection (job gone, daemon restart);
+        raises TransportUnavailable/ClaudeDaemonError on handshake failure
+        like every other control-plane call.
         """
         reader, writer = await self._connect()
         try:
@@ -560,6 +589,8 @@ class ClaudeDaemonClient:
             if not line:
                 raise TransportUnavailable("Claude daemon closed during attach handshake")
             _raise_on_error(_decode_line(line))
+            if on_ready is not None:
+                on_ready.set()
             await self._drain_pty_stream(reader)
         finally:
             writer.close()
@@ -697,6 +728,10 @@ class ClaudeDaemonTransport:
         # short -> persistent observer-attach task (ADR 0048): keeps ≥1
         # attacher on every watched job so the daemon publishes state patches.
         self._observers: dict[str, asyncio.Task[None]] = {}
+        # short -> Event set once the observer's attach handshake first
+        # succeeds, so spawn can wait for a real attacher before the first
+        # turn (ensure_observer_ready).
+        self._observer_ready: dict[str, asyncio.Event] = {}
 
     # -- persistent observer attach (ADR 0048) ------------------------------
 
@@ -708,25 +743,87 @@ class ClaudeDaemonTransport:
         task = self._observers.get(short)
         if task is not None and not task.done():
             return
+        ready = self._observer_ready.get(short)
+        if ready is None or ready.is_set():
+            # Fresh Event per (re)built task so readiness reflects THIS
+            # attach, not a stale success from a task that has since exited.
+            ready = asyncio.Event()
+            self._observer_ready[short] = ready
         self._observers[short] = asyncio.get_running_loop().create_task(
-            self._observe_job_forever(short),
+            self._observe_job_forever(short, ready),
             name=f"walkcode-claude-daemon-observer-{short}",
         )
 
+    async def ensure_observer_ready(self, short: str, *, timeout: float) -> bool:
+        """Start the observer and wait until its attach handshake lands.
+
+        Returns True once attached, False on timeout. Spawn calls this before
+        submitting the first turn so the very first permission/ask dialog is
+        published (the daemon only emits tempo/needs while ≥1 attacher is
+        connected). Timeout is best-effort: the caller proceeds anyway (the
+        first turn still carries model latency before any dialog, and the
+        watcher sync keeps re-ensuring the observer), it just logs a degrade.
+        """
+        short = claude_daemon_short_id(short)
+        if not short:
+            return False
+        self.ensure_observer(short)
+        ready = self._observer_ready.get(short)
+        if ready is None:
+            return False
+        if ready.is_set():
+            return True
+        try:
+            await asyncio.wait_for(ready.wait(), timeout=timeout)
+            return True
+        except asyncio.TimeoutError:
+            return False
+
     def stop_observer(self, short: str) -> None:
-        task = self._observers.pop(claude_daemon_short_id(short), None)
+        short = claude_daemon_short_id(short)
+        task = self._observers.pop(short, None)
+        self._observer_ready.pop(short, None)
         if task is not None and not task.done():
             task.cancel()
 
-    def stop_all_observers(self) -> None:
-        for short in list(self._observers):
-            self.stop_observer(short)
+    def stop_all_observers(self) -> list[asyncio.Task[None]]:
+        """Cancel every observer task; return the ones still needing an await.
 
-    async def _observe_job_forever(self, short: str) -> None:
-        """Reconnect loop for one job's observer attach; exits when it dies."""
+        Cancellation is not synchronous — ``attach_observe``'s ``finally``
+        only closes its socket once the CancelledError is delivered. The
+        caller (the watcher loop's ``finally``) must await the returned tasks
+        so the event loop does not close with pending observer connections
+        (round-2 review finding).
+        """
+        pending: list[asyncio.Task[None]] = []
+        for short in list(self._observers):
+            task = self._observers.pop(short, None)
+            self._observer_ready.pop(short, None)
+            if task is not None and not task.done():
+                task.cancel()
+                pending.append(task)
+        return pending
+
+    async def _observe_job_forever(
+        self, short: str, ready: asyncio.Event | None = None
+    ) -> None:
+        """Reconnect loop for one job's observer attach; exits when it dies.
+
+        Exit conditions: job definitively gone (``job_alive() is False``), or
+        the control plane stays unprobeable (``None``) for
+        ``OBSERVER_PROBE_GIVEUP`` consecutive checks. A single transient probe
+        outage must NOT end the observer — that was the round-2 review finding:
+        one ``None`` used to kill it permanently, and if a subscribe watcher
+        happened to still exist the runtime's sync would not rebuild it,
+        leaving the job with zero attachers and frozen tempo/needs patches.
+        The bounded give-up keeps a truly-dead-but-unprobeable job from
+        looping forever; the runtime's watcher sync re-ensures the observer
+        if the job reappears in ``list``.
+        """
+        none_streak = 0
         while True:
             try:
-                await self.client.attach_observe(short)
+                await self.client.attach_observe(short, on_ready=ready)
             except asyncio.CancelledError:
                 raise
             except (TransportUnavailable, ClaudeDaemonError):
@@ -738,14 +835,17 @@ class ClaudeDaemonTransport:
                     file=sys.stderr,
                 )
             alive = await self.client.job_alive(short)
-            if alive is not True:
-                # Job gone (False) — done for good. Probe outage (None):
-                # also stop; the runtime's watcher sync re-ensures the
-                # observer on its next discovery pass, so a daemon blip
-                # cannot leak a hot reconnect loop. The finished task stays
-                # in the dict until ensure_observer replaces it — a done
-                # entry is inert.
-                return
+            if alive is False:
+                return  # job gone for good
+            if alive is None:
+                none_streak += 1
+                if none_streak >= OBSERVER_PROBE_GIVEUP:
+                    # Control plane unreachable too long — give up cleanly.
+                    # ensure_observer (watcher sync) rebuilds if the job comes
+                    # back into list; a done entry in _observers is inert.
+                    return
+            else:
+                none_streak = 0  # alive is True
             await asyncio.sleep(OBSERVER_RECONNECT_SECONDS)
 
     def capabilities(self) -> TransportCapabilities:

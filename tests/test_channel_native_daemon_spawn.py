@@ -70,10 +70,13 @@ class _SpawnStubClient:
         self.replies: list[tuple[str, str]] = []
         self.observes: list[str] = []
 
-    async def attach_observe(self, short: str, **kwargs):
-        # Records the attach then "drops the connection" immediately;
-        # job_alive() below returns False so the observer loop exits cleanly.
+    async def attach_observe(self, short: str, *, on_ready=None, **kwargs):
+        # Signal the readiness barrier (spawn awaits it), then "drop the
+        # connection"; job_alive() below returns False so the observer loop
+        # exits cleanly.
         self.observes.append(short)
+        if on_ready is not None:
+            on_ready.set()
 
     async def job_alive(self, short: str):
         return False
@@ -697,8 +700,10 @@ class _ObserverStubClient:
         self.attach_calls = 0
         self.alive: bool | None = True
 
-    async def attach_observe(self, short: str, **kwargs):
+    async def attach_observe(self, short: str, *, on_ready=None, **kwargs):
         self.attach_calls += 1
+        if on_ready is not None:
+            on_ready.set()
         self.attach_started.set()
         await self.drop.wait()
         self.drop.clear()
@@ -766,6 +771,58 @@ class ObserverAttachLifecycleTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.gather(task, return_exceptions=True)
             self.assertTrue(task.cancelled())
             self.assertNotIn(SHORT, transport._observers)
+
+    async def test_transient_none_probe_does_not_kill_observer(self):
+        # A single job_alive()==None (control-plane blip) must NOT end the
+        # observer — the round-2 finding. It should reconnect; only
+        # OBSERVER_PROBE_GIVEUP consecutive None probes end it.
+        from walkcode.channel_native import claude_daemon as cd
+        with tempfile.TemporaryDirectory() as tmp:
+            transport, client = self._transport(tmp)
+            client.alive = None
+            with patch.object(cd, "OBSERVER_RECONNECT_SECONDS", 0.001):
+                transport.ensure_observer(SHORT)
+                # First attach happens, then one drop → None probe → reconnect.
+                await asyncio.wait_for(client.attach_started.wait(), timeout=2.0)
+                client.attach_started.clear()
+                client.drop.set()
+                await asyncio.wait_for(client.attach_started.wait(), timeout=2.0)
+                self.assertGreaterEqual(client.attach_calls, 2)  # survived the blip
+                self.assertFalse(transport._observers[SHORT].done())
+            transport.stop_all_observers()
+            await asyncio.gather(*transport._observers.values(), return_exceptions=True)
+
+    async def test_ready_event_fires_on_attach(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            transport, client = self._transport(tmp)
+
+            async def attach_and_set(short, *, on_ready=None, **kw):
+                client.attach_calls += 1
+                if on_ready is not None:
+                    on_ready.set()
+                await client.drop.wait()
+                raise TransportUnavailable("drop")
+
+            client.attach_observe = attach_and_set
+            ok = await transport.ensure_observer_ready(SHORT, timeout=2.0)
+            self.assertTrue(ok)
+            transport.stop_all_observers()
+            await asyncio.gather(*transport._observers.values(), return_exceptions=True)
+
+    async def test_ready_times_out_when_attach_never_lands(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            transport, client = self._transport(tmp)
+
+            async def attach_never_ready(short, *, on_ready=None, **kw):
+                # never sets on_ready; blocks until dropped
+                await client.drop.wait()
+                raise TransportUnavailable("drop")
+
+            client.attach_observe = attach_never_ready
+            ok = await transport.ensure_observer_ready(SHORT, timeout=0.05)
+            self.assertFalse(ok)
+            transport.stop_all_observers()
+            await asyncio.gather(*transport._observers.values(), return_exceptions=True)
 
 
 class WatcherWiringTests(unittest.IsolatedAsyncioTestCase):
@@ -859,6 +916,60 @@ class WatcherWiringTests(unittest.IsolatedAsyncioTestCase):
                 *watchers.values(),
                 *[t for t in transport._observers.values()],
                 return_exceptions=True,
+            )
+
+    async def test_sync_rebuilds_dead_observer_while_watcher_alive(self):
+        # The Critical: observer exited (transient outage) but the subscribe
+        # watcher is still alive. The old sync `continue`d on `short in
+        # watchers` and never rebuilt the observer → zero attachers → frozen
+        # state patches. The sync must re-ensure the observer every tick.
+        known_uuid = "aaaa1111-2222-3333-4444-555566667777"
+        known_short = "aaaa1111"
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = _runtime(tmp)
+            transport = runtime._claude_daemon_transport()
+            runtime.state.sessions.create_observed_session(
+                session_id="tui-claude-known",
+                binding=ChannelBinding("telegram", "bot", "chat", "topic", "root"),
+                cwd=tmp,
+                external_ref={
+                    "source": "native_tui_hook",
+                    "resume_ref": {
+                        "transport_kind": "claude_headless",
+                        "agent_session_id": known_uuid,
+                    },
+                },
+                owner=_actor(),
+            )
+
+            async def fake_list_jobs():
+                return [{"short": known_short, "sessionId": known_uuid,
+                         "source": "shell", "tempo": "active", "state": "running"}]
+
+            transport.client.list_jobs = fake_list_jobs
+
+            # A live subscribe watcher and a DONE observer task (simulating an
+            # observer that exited on a transient outage).
+            async def _idle():
+                await asyncio.sleep(3600)
+            live_watcher = asyncio.ensure_future(_idle())
+            watchers = {known_short: live_watcher}
+            done_obs = asyncio.ensure_future(asyncio.sleep(0))
+            await done_obs
+            transport._observers[known_short] = done_obs
+
+            await runtime._sync_claude_daemon_watchers(transport, watchers)
+
+            # Same live watcher kept (not orphaned), observer rebuilt fresh.
+            self.assertIs(watchers[known_short], live_watcher)
+            self.assertIn(known_short, transport._observers)
+            self.assertIsNot(transport._observers[known_short], done_obs)
+            self.assertFalse(transport._observers[known_short].done())
+
+            live_watcher.cancel()
+            transport.stop_all_observers()
+            await asyncio.gather(
+                live_watcher, *transport._observers.values(), return_exceptions=True
             )
 
 

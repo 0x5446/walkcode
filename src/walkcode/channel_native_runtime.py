@@ -87,6 +87,10 @@ CLAUDE_DAEMON_UNAVAILABLE_RETRY_SECONDS = 30.0
 # threshold below that window lets the watcher adopt the runtime's own in-flight
 # job, which the spawner then kills as a duplicate (ADR 0048 review finding).
 CLAUDE_DAEMON_ADOPT_MIN_AGE_SECONDS = 60.0
+# Bounded wait for the spawn-time observer attach handshake before the first
+# turn is submitted (ADR 0048 round-2): long enough for a local unix-socket
+# attach, short enough not to stall the ingress path if the daemon is wedged.
+CLAUDE_DAEMON_OBSERVER_READY_TIMEOUT_SECONDS = 3.0
 CLAUDE_GATE_DRAIN_INTERVAL_SECONDS = 1.0
 # A pending gate request that cannot be routed to an observed session (or
 # whose card cannot be delivered) is answered "pass" after this grace, so the
@@ -2297,11 +2301,29 @@ class ChannelNativeRuntime:
             return None
         # Observer attach BEFORE the first turn is submitted: the daemon only
         # publishes state patches while ≥1 attacher is connected (live-E2E
-        # finding 2026-07-07), and the first dialog can open seconds after the
-        # first reply lands. Starting it here — the caller submits the user
-        # input only after this returns — closes that window; the watcher
-        # sync re-ensures it for the rest of the session's life.
-        transport.ensure_observer(short)
+        # finding 2026-07-07), and the first dialog can open right after the
+        # first reply lands. Await the attach handshake (bounded) so the very
+        # first permission/ask dialog is already observable — fire-and-forget
+        # would race the first reply (round-2 review finding). Timeout is
+        # non-fatal: the first turn still carries model latency before any
+        # dialog, and the watcher sync keeps the observer alive afterwards.
+        try:
+            attached = await transport.ensure_observer_ready(
+                short, timeout=CLAUDE_DAEMON_OBSERVER_READY_TIMEOUT_SECONDS
+            )
+        except Exception as exc:
+            attached = False
+            _log_degrade(
+                "claude_daemon_observer_ready_error",
+                error=exc,
+                fallback="proceed_watcher_reensures",
+            )
+        if not attached:
+            _log_degrade(
+                "claude_daemon_observer_ready_timeout",
+                short=short,
+                fallback="proceed_watcher_reensures",
+            )
         # State is persisted by the outer handle_inbound_event flow (submit ->
         # refresh_session_status_card -> on_state_changed). Calling save_state()
         # here would checkpoint the inbound ledger's in-progress mark mid-turn,
@@ -2836,11 +2858,17 @@ class ChannelNativeRuntime:
                     )
                 await asyncio.sleep(delay)
         finally:
-            transport.stop_all_observers()
+            observer_tasks = transport.stop_all_observers()
             for task in watchers.values():
                 task.cancel()
-            if watchers:
-                await asyncio.gather(*watchers.values(), return_exceptions=True)
+            pending = [*watchers.values(), *observer_tasks]
+            if pending:
+                # Await observers too: cancel() only requests cancellation;
+                # their attach sockets close in the CancelledError handler, so
+                # the loop must not shut down before they drain (round-2
+                # review finding — the old code awaited only subscribe
+                # watchers and left observer tasks pending).
+                await asyncio.gather(*pending, return_exceptions=True)
 
     async def _sync_claude_daemon_watchers(
         self,
@@ -2861,15 +2889,27 @@ class ChannelNativeRuntime:
             if job.get("dying") or job.get("outcome"):
                 continue
             short = claude_daemon_short_id(job.get("short") or job.get("sessionId"))
-            if not short or short in watchers:
+            if not short:
                 continue
             session_id = self.state.sessions.find_by_resume_ref(
                 transport_kind="claude_headless",
                 resume_ref={"agent_session_id": str(job.get("sessionId", "") or "")},
             )
             if not session_id:
-                unknown_jobs.append(job)
+                # Only try to adopt when there is no watcher yet; a job that
+                # already has a watcher already has a session.
+                if short not in watchers:
+                    unknown_jobs.append(job)
                 continue
+            # Reconcile EVERY tick, not just when the subscribe watcher is
+            # absent: the observer attach and the subscribe watcher are
+            # independent connections, and the observer can exit on a
+            # transient control-plane outage while the watcher stays alive.
+            # Gating this on `short not in watchers` (the old bug) would then
+            # leave a live job with zero attachers, freezing its tempo/needs
+            # patches and re-blinding the notify gate. ensure_observer and the
+            # watcher create are both idempotent, so re-calling is a no-op
+            # when everything is already healthy.
             self._start_daemon_watcher_if_eligible(session_id, short, transport, watchers)
         for job in unknown_jobs:
             short = claude_daemon_short_id(job.get("short") or job.get("sessionId"))
@@ -2891,7 +2931,10 @@ class ChannelNativeRuntime:
         transport: ClaudeDaemonTransport,
         watchers: dict[str, asyncio.Task[None]],
     ) -> None:
-        session = self.state.sessions.get(session_id)
+        try:
+            session = self.state.sessions.get(session_id)
+        except KeyError:
+            return
         if session.status == "stopped":
             return
         if not (session.writer_owner and session.writer_owner.kind == "external_tui"):
@@ -2900,7 +2943,15 @@ class ChannelNativeRuntime:
         # attacher (live-E2E finding 2026-07-07): keep a persistent observer
         # attach alongside the subscribe watcher so dialogs on never-attached
         # (Feishu-spawned) or detached jobs still surface via needs/tempo.
+        # ensure_observer rebuilds a task that exited on a transient outage
+        # and no-ops when one is already running — safe to call every tick.
         transport.ensure_observer(short)
+        # Idempotent: only create the subscribe watcher when absent, so the
+        # every-tick observer reconciliation above does not orphan a live
+        # watcher task by overwriting it.
+        existing = watchers.get(short)
+        if existing is not None and not existing.done():
+            return
         watchers[short] = asyncio.create_task(
             self._watch_claude_daemon_job(session_id, short, transport),
             name=f"walkcode-claude-daemon-sub-{short}",

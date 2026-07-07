@@ -61,8 +61,10 @@ attach**——但肌肉记忆没跟上，且飞书生的 headless 会话终端�
    watcher 的 list 轮询发现「walkcode 不认识的活 job」（hook 没配 / spool
    丢 / `claude --bg` 起完还没发首条 prompt）时，按 hook 同款外部观察形态
    补建会话（观察 binding、嵌套 resume_ref、`daemon_live`）。保守过滤：仅
-   `source=shell`、job 年龄 > 30s（`createdAt`，让 spawner 永远先注册赢下
-   自家会话）、resume_ref 双重去重（ingress lock 内二次确认）。
+   `source=shell`、job 年龄 > 60s（`CLAUDE_DAEMON_ADOPT_MIN_AGE_SECONDS`，
+   由 `createdAt` 判定，让 spawner 永远先注册赢下自家会话——阈值从初版 30s
+   提到 60s 见下 deep-review 记录）、resume_ref 双重去重（ingress lock 内
+   二次确认）。
 3. **wrapper `--resume <id>` DWIM**（3 个 claude wrapper，机器本地脚本）：
    仅拦「恰好 `--resume/-r <hex-id>` 两参」的调用——daemon 里活着 → 转
    `claude attach <short>`（匹配优先 sessionId 前缀，attach 用 entry 自己的
@@ -91,8 +93,8 @@ attach**——但肌肉记忆没跟上，且飞书生的 headless 会话终端�
 - 无人 attach 的 bg 会话原生对话框照常渲染（协议文档 §1.6.6），飞书卡片经
   attach 注入作答——v3 机制不变，只是第一 attacher 从终端变成注入连接。
 - 收编的野生会话含 Agent-tool bg 子代理（`source=shell` 区分不了）；hooks
-  今天本来就观察它们，收编只是把发现从「首个 hook 事件」提前到「30s 内的
-  list 轮询」，不引入新类别的噪音。
+  今天本来就观察它们，收编只是把发现从「首个 hook 事件」提前到「job 满
+  60s 后的 list 轮询」，不引入新类别的噪音。
 - `claude --bg` 是官方 CLI 面但 bg 特性本身 experimental：spawn 失败整体
   回落 headless，行为与 ADR 0046 的 probe 门禁一致。
 - wrapper DWIM 改变 `--resume` 的字面语义（活会话不再报错而是 attach）；
@@ -184,6 +186,45 @@ attacher 期间发布 tempo/needs patch——`list`/`subscribe` 账本冻结、n
 spawner_installed 此前只在 `--json` 可见，与部署文档承诺不符）。协议
 文档 §1.6.6 与 multi-ui-sync 设计文档已同步修正。
 
+## Deep-review round-2 记录（2026-07-07，14 维度 codex，针对硬化+默认值增量）
+
+对 `5ca415b..HEAD`（observer attach + 键位 + 默认值切换）再跑一轮，多维度
+共识 + 源码回证发现并修复：
+
+1. **[Critical, 已修] observer 生命周期三缺陷**（~6 维度命中）：
+   (a) `_sync_claude_daemon_watchers` 对 `short in watchers` 提前 `continue`，
+   observer 因瞬时探测失败退出后、subscribe watcher 仍活时不会被重建 →
+   job 回到零 attacher、状态补丁再次冻结。修复：每 tick 对所有已知活 job
+   独立 `ensure_observer`（watcher 创建改为幂等，不覆盖存活任务）。
+   (b) `_observe_job_forever` 遇 `job_alive() is None`（控制面瞬断）即永久
+   退出。修复：`None` 按 `OBSERVER_PROBE_GIVEUP=5` 次退避重试，仅明确
+   `False` 才退出。(c) `stop_all_observers` 只 cancel 不 await，事件循环
+   关闭可能残留 observer 连接。修复：返回被取消任务，watcher `finally`
+   一并 `gather`。补三条回归测试（瞬断不杀 observer、watcher 存活时重建
+   死 observer、真实关闭路径 await）。
+2. **[Warning, 已修] 首轮早于 observer attach 的竞态**（5 维度命中）：
+   spawner 原为 fire-and-forget `ensure_observer`，首轮 reply 可能先于
+   attach 握手落地、第一张卡再次失明。修复：新增 `ensure_observer_ready`
+   （attach 握手成功即 set 就绪 Event），spawner 首轮前有界等待
+   （`CLAUDE_DAEMON_OBSERVER_READY_TIMEOUT_SECONDS=3s`）；超时非致命
+   （首轮仍有模型延迟余量、watcher 兜底），落 degrade 日志。
+3. **[Warning, 已修] 权限 allow 尾随 Enter 的错注窗口**（errors+security+risk
+   跨维度共识，回证 VERIFIED）：round-1 给 allow 也补了 Enter，但权限框
+   对数字即时生效，且并行 tool_use 会无模型延迟连弹下一个权限框，尾随
+   Enter 可能确认下一个框的默认项（=allow）静默放行。修复：**权限 allow
+   回退为单 `b"1"` 不加 Enter**（即 v0.11.0 已发布并 Live-E2E 过的行为）；
+   ask 类保留 digit+Enter（其下一框隔着完整模型 turn，无此窗口）。
+4. **[Warning, 已修] 多题问答高亮首项污染**（data+completeness 共识，回证
+   VERIFIED）：多题每题只发数字，若某题答案落在高亮 slot 1 不前进、污染
+   后续答案。修复：`keys_for_ask_answer` 对"多题任一答案 slot==1"返回
+   None、降级到终端作答，补对应测试。
+5. **[Suggestion/Warning, 已修] 文档一致性**：模块头旧键位矩阵、设计文档
+   Step 0 表、ADR "30s 阈值"与"默认 headless 收编兜底"旧说法均已加修正
+   横幅/更正为当前值（60s / 默认 daemon）。
+
+671 单测绿；round-2 键位改动均为"回退到已发布验证行为"或"证明无害的
+附加 Enter"或"更保守的终端降级"，无新增真机风险。
+
 **已知并接受（未在本 ADR 修）**：
 - **spawn_bg_job 继承完整 os.environ**（安全维度提出）：bg worker 能读到
   `LARK_APP_SECRET`/`TELEGRAM_BOT_TOKEN` 等。这与现有 headless SDK spawn 行为
@@ -194,4 +235,6 @@ spawner_installed 此前只在 `--json` 可见，与部署文档承诺不符）�
 - **list 收编的信任边界**：收编按 `source=shell` 过滤，无法区分 wrapper 会话与
   Agent-tool 子代理；但收编只作用于**本 profile 的 daemon**（同 `CLAUDE_CONFIG_DIR`），
   即用户自己经该 profile 起的会话树。默认 `auto`，可 `WALKCODE_CLAUDE_LIST_ADOPT=off`
-  关闭。默认 spawn_mode=headless 时收编是纯兜底。
+  关闭。当前默认 `spawn_mode=daemon`：收编用于补登记未经 hook 建立的活
+  daemon job（hook 没配 / spool 丢 / 刚起还没发首条 prompt）；显式
+  `headless` 或 `daemon_mode=off` 时收编退回纯兜底语义。

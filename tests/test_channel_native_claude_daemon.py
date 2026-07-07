@@ -276,12 +276,14 @@ class KeystrokeMappingTests(unittest.TestCase):
 
     # -- permission dialog ----------------------------------------------------
 
-    def test_permission_allow_and_always_allow_press_1_then_enter(self):
-        # Digit + Enter (2026-07-07 live finding): a digit on the highlighted
-        # slot only re-selects in select-style dialogs; the Enter confirms it
-        # and is a no-op when the digit already acted.
+    def test_permission_allow_and_always_allow_press_1_no_enter(self):
+        # Permission dialogs act on the digit instantly and get NO trailing
+        # Enter (round-2 review finding): queued permission prompts render the
+        # next dialog with no model latency, so a trailing Enter could confirm
+        # the NEXT dialog's default (= allow). Ask-style dialogs keep the Enter
+        # because their next dialog is a full model turn away.
         for action in ("allow", "allow_once", "accept", "acceptForSession", "always_allow"):
-            self.assertEqual(_key_bytes(keys_for_permission(action)), [b"1", b"\r"], action)
+            self.assertEqual(_key_bytes(keys_for_permission(action)), [b"1"], action)
 
     def test_permission_deny_is_position_independent_esc(self):
         self.assertEqual(_key_bytes(keys_for_permission("deny")), [b"\x1b"])
@@ -359,8 +361,21 @@ class KeystrokeMappingTests(unittest.TestCase):
                 {"question": "Color?", "options": ["red", "blue", "green"]},
             ]
         }
-        frames = keys_for_ask_answer(tool_input, {0: "apple", "1": "blue"})
-        self.assertEqual(_key_bytes(frames), [b"1", b"2", b"1", b"\r"])
+        # Non-slot-1 answers: each digit advances, Submit page is "1" + Enter.
+        frames = keys_for_ask_answer(tool_input, {0: "banana", "1": "blue"})
+        self.assertEqual(_key_bytes(frames), [b"2", b"2", b"1", b"\r"])
+
+    def test_multi_question_answer_on_highlighted_slot1_degrades(self):
+        # A digit on the already-highlighted slot 1 does not advance the
+        # multi-question dialog, so any answer landing there would corrupt the
+        # later answers — degrade to the terminal (round-2 review finding).
+        tool_input = {
+            "questions": [
+                {"question": "Fruit?", "options": ["apple", "banana"]},
+                {"question": "Color?", "options": ["red", "blue", "green"]},
+            ]
+        }
+        self.assertIsNone(keys_for_ask_answer(tool_input, {0: "apple", "1": "blue"}))
 
     def test_multi_question_with_multi_select_is_not_injectable(self):
         tool_input = {
