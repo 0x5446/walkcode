@@ -614,6 +614,27 @@ hook 侧判定"是否 daemon job"：session_id 规范化为 8-hex short id
 `gate_tui_hook`（runtime 层，可 import claude_daemon）；`claude_gate.py`
 保持纯 stdlib，不产生循环依赖。
 
+### observer attach：daemon 生 / detach 会话的状态盲区（2026-07-07 补）
+
+ADR 0048 live-E2E 发现：**daemon 只在 job 有 ≥1 attacher 连接期间发布
+state patch（tempo/needs）**。wrapper 起的会话终端天然 attach 着所以此前
+一切正常；飞书生的 bg worker（以及终端 `/exit` detach 后的会话）零
+attacher，对话框在 PTY 里照常渲染（attach 回放可见、注入可用），但
+`list`/`subscribe` 账本冻结、`needs` 恒空——notify gate 的对话框探针据此
+误判"从未渲染"，飞书卡片永不发出，会话静默卡死。
+
+解法是把 ADR 里"第一 attacher 从终端变成注入连接"落实为常驻连接：runtime
+对每个被观察的 daemon job 保持一条只读 **observer attach**
+（`attachId=walkcode-observer`，200x50 与 pty-host 生成默认一致，PTY 流
+排空丢弃、永不写字节）。挂接点两处：daemon spawner 注册成功后、首轮注入
+**之前**（保证首个对话框的 patch 就有 attacher 可推）；watcher 发现循环
+对所有受观察 job 兜底 ensure（覆盖 wrapper 会话 detach 后的窗口）。断线
+按 5s 重连，job 消失自行退出。
+
+同批实测修正键位矩阵：select 类对话框数字键落在已高亮选项上只重选不确认，
+通用注入序列改为**数字 + Enter**（数字已确认时 Enter 是 no-op）；deny 的
+ESC 保持单键（详见协议文档 §1.6.6）。
+
 ### 注入前/后校验与竞态防护
 
 - **注入前**：取 subscribe 最新 state 快照，要求 `tempo=blocked` 且 `needs`

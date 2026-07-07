@@ -91,6 +91,20 @@ ATTACH_SETTLE_SECONDS = 0.8
 INTER_KEY_DELAY_SECONDS = 0.15
 DEFAULT_INJECT_ATTACH_ID = "walkcode-injector"
 
+# Persistent observer attach (ADR 0048 live-E2E finding, 2026-07-07): the
+# daemon only publishes state patches (tempo/needs) to its ledger while the
+# job has at least one attacher. A never-attached job — exactly what a
+# Feishu-spawned or detached session is — renders its dialogs in the PTY but
+# the supervisor's list/subscribe view stays frozen, so the notify-gate probe
+# concludes "no dialog" and the dual-surface card is never posted. The fix is
+# the ADR's own sentence made literal: walkcode holds one long-lived attach
+# per watched job ("第一 attacher 从终端变成注入连接"). Size matches the
+# pty-host spawn default (200x50) so our handshake never changes the layout.
+OBSERVER_ATTACH_ID = "walkcode-observer"
+OBSERVER_ATTACH_COLS = 200
+OBSERVER_ATTACH_ROWS = 50
+OBSERVER_RECONNECT_SECONDS = 5.0
+
 # Post-injection verify: the dialog must resolve (needs cleared / changed /
 # tempo off blocked) within this window, or the card degrades to "answer in
 # the terminal" — no blind retries (a second pass could double-press).
@@ -134,8 +148,16 @@ def keys_for_permission(action: str) -> list[KeyFrame] | None:
     """
     normalized = str(action or "").strip().lower()
     if normalized in {"allow", "allow_once", "accept", "acceptforsession", "always_allow"}:
-        return [(b"1", INTER_KEY_DELAY_SECONDS)]
+        # Digit + Enter (2026-07-07 live finding): a digit that lands on the
+        # ALREADY-highlighted slot only re-selects in select-style dialogs;
+        # Enter confirms it. When the digit did act on its own, the trailing
+        # Enter falls on the post-dialog composer and is a no-op — a new
+        # dialog cannot render within one INTER_KEY_DELAY (model latency is
+        # seconds), so the Enter can never confirm the wrong dialog.
+        return [(b"1", INTER_KEY_DELAY_SECONDS), (b"\r", INTER_KEY_DELAY_SECONDS)]
     if normalized == "deny":
+        # ESC only — never append Enter here: if the ESC were ever swallowed,
+        # a trailing Enter would confirm the highlighted item, i.e. ALLOW.
         return [(_ESC, INTER_KEY_DELAY_SECONDS)]
     return None
 
@@ -190,6 +212,7 @@ def keys_for_ask_answer(
             return None
         frames.append((str(slot).encode("ascii"), INTER_KEY_DELAY_SECONDS))
     frames.append((b"1", INTER_KEY_DELAY_SECONDS))  # Submit answers page
+    frames.append((b"\r", INTER_KEY_DELAY_SECONDS))  # confirm if "1" was the highlight
     return frames
 
 
@@ -228,7 +251,17 @@ def _frames_for_single_select(labels: list[str], value: Any) -> list[KeyFrame] |
         return None
     slot = _option_slot(labels, value)
     if slot is not None:
-        return [(str(slot).encode("ascii"), INTER_KEY_DELAY_SECONDS)]
+        # Digit + Enter (2026-07-07 live finding): a digit on a slot that is
+        # NOT the current highlight selects and confirms in one stroke, but a
+        # digit on the ALREADY-highlighted slot (e.g. answering "option 1"
+        # while ❯ sits on 1) only re-selects — the dialog stays open waiting
+        # for Enter. The trailing Enter makes the sequence universal: it
+        # confirms in the second case and is a no-op composer keypress in the
+        # first (no new dialog can render within one INTER_KEY_DELAY).
+        return [
+            (str(slot).encode("ascii"), INTER_KEY_DELAY_SECONDS),
+            (b"\r", INTER_KEY_DELAY_SECONDS),
+        ]
     text = _sanitize_other_text(value)
     if not text:
         return None
@@ -261,6 +294,9 @@ def _frames_for_multi_select(labels: list[str], value: Any) -> list[KeyFrame] | 
         return None
     frames.append((_RIGHT_ARROW, INTER_KEY_DELAY_SECONDS))
     frames.append((b"1", INTER_KEY_DELAY_SECONDS))  # "1. Submit answers"
+    # Same universal digit+Enter rule as single-select: "1" on the Submit
+    # page is the highlighted default, so it may need the confirm stroke.
+    frames.append((b"\r", INTER_KEY_DELAY_SECONDS))
     return frames
 
 
@@ -485,6 +521,51 @@ class ClaudeDaemonClient:
             with contextlib.suppress(Exception):
                 await writer.wait_closed()
 
+    async def attach_observe(
+        self,
+        short: str,
+        *,
+        cols: int = OBSERVER_ATTACH_COLS,
+        rows: int = OBSERVER_ATTACH_ROWS,
+        attach_id: str = OBSERVER_ATTACH_ID,
+    ) -> None:
+        """Hold a read-only attach open until the connection drops.
+
+        The daemon only publishes state patches (tempo/needs) while the job
+        has at least one attacher (live-verified 2026-07-07): without this
+        connection a Feishu-spawned or detached job renders its dialogs into
+        the PTY but list/subscribe stay frozen, blinding the notify-gate
+        probe. The PTY stream is drained and discarded; no bytes are written.
+        Returns when the daemon closes the connection (job gone, daemon
+        restart); raises TransportUnavailable/ClaudeDaemonError on handshake
+        failure like every other control-plane call.
+        """
+        reader, writer = await self._connect()
+        try:
+            request = {
+                "proto": CLAUDE_DAEMON_PROTO,
+                "op": "attach",
+                "auth": self._auth(),
+                "short": short,
+                "cols": cols,
+                "rows": rows,
+                "attachId": attach_id,
+            }
+            writer.write(json.dumps(request).encode("utf-8") + b"\n")
+            await writer.drain()
+            try:
+                line = await asyncio.wait_for(reader.readline(), timeout=self.request_timeout)
+            except asyncio.TimeoutError as exc:
+                raise TransportUnavailable("Claude daemon attach handshake timed out") from exc
+            if not line:
+                raise TransportUnavailable("Claude daemon closed during attach handshake")
+            _raise_on_error(_decode_line(line))
+            await self._drain_pty_stream(reader)
+        finally:
+            writer.close()
+            with contextlib.suppress(Exception):
+                await writer.wait_closed()
+
     @staticmethod
     async def _drain_pty_stream(reader: asyncio.StreamReader) -> None:
         with contextlib.suppress(Exception):
@@ -613,6 +694,59 @@ class ClaudeDaemonTransport:
         # short -> last successful injection ts: lets the daemon watcher tell
         # "needs cleared because Feishu injected" from "terminal answered".
         self._recent_injections: dict[str, float] = {}
+        # short -> persistent observer-attach task (ADR 0048): keeps ≥1
+        # attacher on every watched job so the daemon publishes state patches.
+        self._observers: dict[str, asyncio.Task[None]] = {}
+
+    # -- persistent observer attach (ADR 0048) ------------------------------
+
+    def ensure_observer(self, short: str) -> None:
+        """Keep one persistent observer attach alive for this job."""
+        short = claude_daemon_short_id(short)
+        if not short:
+            return
+        task = self._observers.get(short)
+        if task is not None and not task.done():
+            return
+        self._observers[short] = asyncio.get_running_loop().create_task(
+            self._observe_job_forever(short),
+            name=f"walkcode-claude-daemon-observer-{short}",
+        )
+
+    def stop_observer(self, short: str) -> None:
+        task = self._observers.pop(claude_daemon_short_id(short), None)
+        if task is not None and not task.done():
+            task.cancel()
+
+    def stop_all_observers(self) -> None:
+        for short in list(self._observers):
+            self.stop_observer(short)
+
+    async def _observe_job_forever(self, short: str) -> None:
+        """Reconnect loop for one job's observer attach; exits when it dies."""
+        while True:
+            try:
+                await self.client.attach_observe(short)
+            except asyncio.CancelledError:
+                raise
+            except (TransportUnavailable, ClaudeDaemonError):
+                pass
+            except Exception as exc:  # pragma: no cover - defensive
+                print(
+                    f"claude daemon observer error ({short}): "
+                    f"{type(exc).__name__}: {exc}",
+                    file=sys.stderr,
+                )
+            alive = await self.client.job_alive(short)
+            if alive is not True:
+                # Job gone (False) — done for good. Probe outage (None):
+                # also stop; the runtime's watcher sync re-ensures the
+                # observer on its next discovery pass, so a daemon blip
+                # cannot leak a hot reconnect loop. The finished task stays
+                # in the dict until ensure_observer replaces it — a done
+                # entry is inert.
+                return
+            await asyncio.sleep(OBSERVER_RECONNECT_SECONDS)
 
     def capabilities(self) -> TransportCapabilities:
         return TransportCapabilities(

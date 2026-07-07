@@ -2292,6 +2292,13 @@ class ChannelNativeRuntime:
             )
             await self._reap_daemon_job(transport, short, reason="spawn_register_failed")
             return None
+        # Observer attach BEFORE the first turn is submitted: the daemon only
+        # publishes state patches while ≥1 attacher is connected (live-E2E
+        # finding 2026-07-07), and the first dialog can open seconds after the
+        # first reply lands. Starting it here — the caller submits the user
+        # input only after this returns — closes that window; the watcher
+        # sync re-ensures it for the rest of the session's life.
+        transport.ensure_observer(short)
         # State is persisted by the outer handle_inbound_event flow (submit ->
         # refresh_session_status_card -> on_state_changed). Calling save_state()
         # here would checkpoint the inbound ledger's in-progress mark mid-turn,
@@ -2311,6 +2318,7 @@ class ChannelNativeRuntime:
             return
         from .channel_native import _log_degrade
 
+        transport.stop_observer(short)
         try:
             await transport.client.kill(short)
         except Exception as exc:
@@ -2825,6 +2833,7 @@ class ChannelNativeRuntime:
                     )
                 await asyncio.sleep(delay)
         finally:
+            transport.stop_all_observers()
             for task in watchers.values():
                 task.cancel()
             if watchers:
@@ -2884,6 +2893,11 @@ class ChannelNativeRuntime:
             return
         if not (session.writer_owner and session.writer_owner.kind == "external_tui"):
             return
+        # The daemon only publishes state patches while the job has ≥1
+        # attacher (live-E2E finding 2026-07-07): keep a persistent observer
+        # attach alongside the subscribe watcher so dialogs on never-attached
+        # (Feishu-spawned) or detached jobs still surface via needs/tempo.
+        transport.ensure_observer(short)
         watchers[short] = asyncio.create_task(
             self._watch_claude_daemon_job(session_id, short, transport),
             name=f"walkcode-claude-daemon-sub-{short}",
@@ -2916,6 +2930,7 @@ class ChannelNativeRuntime:
                             short=short,
                         )
                         self.save_state()
+                    transport.stop_observer(short)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -5553,6 +5568,18 @@ def _format_status(status: dict[str, Any]) -> str:
     lines.append(f"  - live_ingress={channel.get('live_ingress')} configured={channel.get('configured')}")
     item = status.get("agent_status", {})
     lines.append(f"agent_status: available={item.get('available')}")
+    daemon = status.get("claude_daemon", {})
+    if daemon:
+        if daemon.get("enabled"):
+            lines.append(
+                "claude_daemon: enabled=True "
+                f"socket_present={daemon.get('socket_present')} "
+                f"spawn_mode={daemon.get('spawn_mode', '-')} "
+                f"list_adopt={daemon.get('list_adopt', '-')} "
+                f"spawner_installed={daemon.get('daemon_spawner_installed')}"
+            )
+        else:
+            lines.append(f"claude_daemon: enabled=False reason={daemon.get('reason', '-')}")
     hook_status = status.get("tui_hook_status", {})
     if hook_status.get("checked"):
         missing = ",".join(hook_status.get("missing") or []) or "-"

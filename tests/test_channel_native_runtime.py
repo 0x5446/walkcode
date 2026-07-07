@@ -2059,6 +2059,28 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
         self.assertEqual(status["profile"], "work")
         self.assertIn("profile: work", runtime_module._format_status(status))
 
+    def test_format_status_renders_claude_daemon_policy(self):
+        text = runtime_module._format_status(
+            {
+                "claude_daemon": {
+                    "enabled": True,
+                    "socket_present": False,
+                    "spawn_mode": "daemon",
+                    "list_adopt": "auto",
+                    "daemon_spawner_installed": True,
+                }
+            }
+        )
+        self.assertIn("claude_daemon: enabled=True", text)
+        self.assertIn("spawn_mode=daemon", text)
+        self.assertIn("list_adopt=auto", text)
+        self.assertIn("spawner_installed=True", text)
+
+        disabled = runtime_module._format_status(
+            {"claude_daemon": {"enabled": False, "reason": "daemon_mode is off"}}
+        )
+        self.assertIn("claude_daemon: enabled=False reason=daemon_mode is off", disabled)
+
     def test_load_native_env_has_no_implicit_default_env_file(self):
         merged = runtime_module._load_native_env({"WALKCODE_AGENT": "claude"})
 

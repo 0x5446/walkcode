@@ -4,8 +4,10 @@ Date: 2026-07-07
 
 Status: Accepted; implemented 2026-07-07 — spawn 路径真机 E2E 通过（真 work
 daemon：spawner 起 bg job → 首轮 daemon reply 注入 → turn 跑完 transcript
-验证 → kill 收尾），单测 650 绿。`WALKCODE_CLAUDE_SPAWN_MODE` 默认 headless，
-飞书 Live E2E（真实例开关）后再切 daemon。
+验证 → kill 收尾）。飞书 Live E2E 已于同日在 work2 真实例完成（见下
+「飞书 Live E2E 记录」：主链路一次通过，暴露并修复一个 Critical——零
+attacher 的 job 不发布 state patch，修法为常驻 observer attach）。
+`WALKCODE_CLAUDE_SPAWN_MODE` 默认仍为 headless，切 daemon 待用户拍板。
 
 ## Context
 
@@ -103,9 +105,15 @@ attach**——但肌肉记忆没跟上，且飞书生的 headless 会话终端�
   kill）与 runtime 级 E2E（真 work daemon 走 spawner → submit_user_input →
   `daemon_reply` → transcript 含标记 → headless 零调用）均通过；wrapper
   DWIM 活/死/透传三分支 pty 下验证（死分支真实复活 fork 实测）。
-- 未做（后续）：飞书 Live E2E（真实例 `WALKCODE_CLAUDE_SPAWN_MODE=daemon`
-  开关 + Playwright 点卡全场景，重点：权限卡、AskUserQuestion、stop 流），
-  通过后把默认值切到 daemon；Codex 侧等价统一不在本 ADR 范围。
+- 飞书 Live E2E：已完成（2026-07-07，work2 真实例 + Playwright 点卡，
+  见下节）。权限卡流在本机三 profile 全为 `bypassPermissions` 的现实配置下
+  不会出现（headless 与 daemon 语义在该配置下等价——env 的
+  `WALKCODE_CLAUDE_PERMISSION_MODE=bypassPermissions` 与 profile
+  `defaultMode: bypassPermissions` 殊途同归），AskUserQuestion 流已全量
+  验证；若未来改用会弹权限的 mode，dual gate 与 ask 走同一 notify 管线，
+  且注入键位（allow=1+Enter / deny=ESC）已按新矩阵修正。
+- 未做（后续）：默认值切 daemon（等用户拍板）；Codex 侧等价统一不在本
+  ADR 范围。
 
 ## Deep-review 记录（2026-07-07，14 维度 codex 引擎）
 
@@ -134,6 +142,40 @@ attach**——但肌肉记忆没跟上，且飞书生的 headless 会话终端�
    `list_adopt`/`daemon_spawner_installed`。
 7. **[Warning, 已修] 文档陈旧**：设计文档旧 takeover/`--resume` 语义、lark 部署
    漏写收编依赖 `WALKCODE_LARK_TUI_CHAT_ID`。已更新。
+
+## 飞书 Live E2E 记录（2026-07-07，work2 实例真机）
+
+真飞书（ccp bot）+ 分支 serve（`WALKCODE_CLAUDE_SPAWN_MODE=daemon`）实测。
+主链路一次通过：首条消息 → daemon spawner 起 bg job → 外部 TUI 形态注册 →
+状态卡（`Agent: external_tui`、双端同步注记）→ 首轮 turn 完成、内容经
+hooks 渲染 → 追问经 daemon reply 注入（表情回执、无 "TUI input" 回显）→
+tap 路由正常出话。binding `origin=daemon_spawn` 豁免生效（用户话题未被
+重涂只读）。
+
+**[Critical, 已修] 零 attacher 的 job 不发布 state patch**：AskUserQuestion
+对话框在 PTY 内正常渲染（attach 回放可见），但 daemon 只在 job 有 ≥1
+attacher 期间发布 tempo/needs patch——`list`/`subscribe` 账本冻结、needs
+恒空，notify gate 探针判"从未渲染"并静默丢弃 pending，飞书卡片永不出现、
+会话卡在 WAITING_PERMISSION。此前 v3 全部验证都在 wrapper 会话上做
+（终端天然 attach），盲区恰好覆盖本 ADR 新生的"生而无 attacher"会话。
+修复：transport 增加常驻只读 observer attach（`walkcode-observer`，
+200x50 同 pty-host 默认，断线 5s 重连、job 消失自愈退出）；spawner 注册
+成功后、首轮注入前 ensure；watcher 发现循环对所有受观察 job 兜底 ensure
+（同时覆盖 wrapper 会话 detach 后的同款盲区）。修复后同场景复测全通：
+对话框 patch 即时到达（`needs="answer: …"` 文档格式）、卡片正常发出、
+点卡选项 → `inject_ok frames=2` → 卡片翻「✅ 已回答」→ 模型按答案继续；
+`/stop` 后状态卡转已结束、daemon job 清零、无孤儿无 degrade 日志。
+
+**[Warning, 已修] select 对话框数字键不总是确认**：数字落在已高亮选项上
+只重选、需 Enter 确认（落在非高亮选项上才是一击确认——2026-07-06 的三次
+实测均属后者，结论以偏概全）。单选/多选提交/多题提交注入序列统一改为
+数字 + Enter（数字已确认时 Enter 为 no-op，新对话框不可能在一个按键间隔
+内渲染，无错注风险）；deny 的 ESC 保持单键（ESC 后补 Enter 可能确认高亮
+项 = allow，方向性危险）。真机注入复测通过。
+
+附带：doctor 文本输出补 `claude_daemon:` 行（spawn_mode/list_adopt/
+spawner_installed 此前只在 `--json` 可见，与部署文档承诺不符）。协议
+文档 §1.6.6 与 multi-ui-sync 设计文档已同步修正。
 
 **已知并接受（未在本 ADR 修）**：
 - **spawn_bg_job 继承完整 os.environ**（安全维度提出）：bg worker 能读到

@@ -30,7 +30,10 @@ from walkcode.channel_native import (
     TransportCapabilities,
     TransportUnavailable,
 )
+from unittest.mock import patch
+
 from walkcode.channel_native.claude_daemon import (
+    OBSERVER_ATTACH_ID,
     ClaudeDaemonTransport,
     parse_backgrounded_short,
 )
@@ -65,6 +68,19 @@ class _SpawnStubClient:
         self.ready = ready
         self.kills: list[str] = []
         self.replies: list[tuple[str, str]] = []
+        self.observes: list[str] = []
+
+    async def attach_observe(self, short: str, **kwargs):
+        # Records the attach then "drops the connection" immediately;
+        # job_alive() below returns False so the observer loop exits cleanly.
+        self.observes.append(short)
+
+    async def job_alive(self, short: str):
+        return False
+
+    async def subscribe(self, short: str, *, tail: int = 0):
+        return
+        yield  # pragma: no cover - makes this an (empty) async generator
 
     async def list_jobs(self):
         if not self.listed:
@@ -456,6 +472,11 @@ class RuntimeDaemonSpawnTests(unittest.TestCase):
             self.assertTrue(
                 runtime.state.authz.can_submit(session.session_id, _actor()).allowed
             )
+            # Observer attach must be requested at spawn time — BEFORE the
+            # first turn is injected — so dialog state patches are published
+            # from the session's very first turn (the daemon only publishes
+            # tempo/needs while >=1 attacher is connected).
+            self.assertIn(SHORT, transport._observers)
 
     def test_spawn_failure_returns_none_for_headless_fallback(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -629,6 +650,86 @@ class ListAdoptionTests(unittest.TestCase):
             self.assertEqual(session_id, "")
 
 
+class _ObserverStubClient:
+    """Client stub whose attach_observe holds until told to drop."""
+
+    def __init__(self):
+        self.attach_started = asyncio.Event()
+        self.drop = asyncio.Event()
+        self.attach_calls = 0
+        self.alive: bool | None = True
+
+    async def attach_observe(self, short: str, **kwargs):
+        self.attach_calls += 1
+        self.attach_started.set()
+        await self.drop.wait()
+        self.drop.clear()
+        raise TransportUnavailable("connection dropped")
+
+    async def job_alive(self, short: str):
+        return self.alive
+
+
+class ObserverAttachLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    """Persistent observer attach (ADR 0048): the daemon only publishes
+    tempo/needs state patches while a job has >=1 attacher, so walkcode holds
+    one long-lived attach per watched job."""
+
+    def _transport(self, tmp: str) -> tuple[ClaudeDaemonTransport, _ObserverStubClient]:
+        client = _ObserverStubClient()
+        return ClaudeDaemonTransport(config_dir=tmp, client=client), client
+
+    async def test_ensure_observer_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            transport, client = self._transport(tmp)
+            transport.ensure_observer(SHORT)
+            task = transport._observers[SHORT]
+            transport.ensure_observer(SHORT)
+            self.assertIs(transport._observers[SHORT], task)
+            await asyncio.wait_for(client.attach_started.wait(), timeout=2.0)
+            self.assertEqual(client.attach_calls, 1)
+            transport.stop_all_observers()
+            await asyncio.gather(task, return_exceptions=True)
+
+    async def test_observer_reconnects_while_job_alive(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            transport, client = self._transport(tmp)
+            with patch(
+                "walkcode.channel_native.claude_daemon.OBSERVER_RECONNECT_SECONDS", 0.01
+            ):
+                transport.ensure_observer(SHORT)
+                await asyncio.wait_for(client.attach_started.wait(), timeout=2.0)
+                client.attach_started.clear()
+                client.drop.set()  # connection drops; job still alive
+                await asyncio.wait_for(client.attach_started.wait(), timeout=2.0)
+                self.assertEqual(client.attach_calls, 2)
+                transport.stop_all_observers()
+                await asyncio.gather(*transport._observers.values(), return_exceptions=True)
+
+    async def test_observer_exits_when_job_is_gone(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            transport, client = self._transport(tmp)
+            transport.ensure_observer(SHORT)
+            await asyncio.wait_for(client.attach_started.wait(), timeout=2.0)
+            client.alive = False
+            client.drop.set()
+            task = transport._observers[SHORT]
+            await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), timeout=2.0)
+            self.assertTrue(task.done())
+            self.assertEqual(client.attach_calls, 1)
+
+    async def test_stop_observer_cancels_the_task(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            transport, client = self._transport(tmp)
+            transport.ensure_observer(SHORT)
+            await asyncio.wait_for(client.attach_started.wait(), timeout=2.0)
+            task = transport._observers.get(SHORT)
+            transport.stop_observer(SHORT)
+            await asyncio.gather(task, return_exceptions=True)
+            self.assertTrue(task.cancelled())
+            self.assertNotIn(SHORT, transport._observers)
+
+
 class WatcherWiringTests(unittest.IsolatedAsyncioTestCase):
     """_sync_claude_daemon_watchers must create subscribe watchers for known
     external-TUI sessions and not let a slow wild-job adoption block them."""
@@ -687,6 +788,40 @@ class WatcherWiringTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(order[0], f"watch:{known_short}")
             self.assertIn("adopt", order)
             self.assertLess(order.index(f"watch:{known_short}"), order.index("adopt"))
+
+    async def test_start_watcher_also_ensures_observer_attach(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = _runtime(tmp)
+            transport = runtime._claude_daemon_transport()
+            known_uuid = "aaaa1111-2222-3333-4444-555566667777"
+            known_short = "aaaa1111"
+            runtime.state.sessions.create_observed_session(
+                session_id="tui-claude-known",
+                binding=ChannelBinding("telegram", "bot", "chat", "topic", "root"),
+                cwd=tmp,
+                external_ref={
+                    "source": "native_tui_hook",
+                    "resume_ref": {
+                        "transport_kind": "claude_headless",
+                        "agent_session_id": known_uuid,
+                    },
+                },
+                owner=_actor(),
+            )
+            watchers: dict = {}
+            runtime._start_daemon_watcher_if_eligible(
+                "tui-claude-known", known_short, transport, watchers
+            )
+            self.assertIn(known_short, watchers)
+            self.assertIn(known_short, transport._observers)
+            transport.stop_all_observers()
+            for task in watchers.values():
+                task.cancel()
+            await asyncio.gather(
+                *watchers.values(),
+                *[t for t in transport._observers.values()],
+                return_exceptions=True,
+            )
 
 
 class BindingCapabilityGuardTests(unittest.TestCase):
