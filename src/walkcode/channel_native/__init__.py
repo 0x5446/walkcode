@@ -467,12 +467,22 @@ def _configured_agent_options(source: Any) -> dict[str, dict[str, Any]]:
             raise ChannelConfigError(
                 f"invalid WALKCODE_CLAUDE_SPAWN_MODE: {claude_spawn_mode}; use headless or daemon"
             )
+        # An EXPLICIT daemon request that also disables the daemon transport
+        # is a contradiction the operator must resolve; the resolved default
+        # below degrades instead of erroring.
         if claude_spawn_mode == "daemon" and claude_daemon_mode == "off":
             raise ChannelConfigError(
                 "WALKCODE_CLAUDE_SPAWN_MODE=daemon requires the daemon transport; "
                 "unset WALKCODE_CLAUDE_DAEMON_MODE=off"
             )
-        claude["spawn_mode"] = claude_spawn_mode
+    else:
+        # Daemon-native is the default (ADR 0048, flipped after the Feishu
+        # live E2E on 2026-07-07): channel-born sessions spawn as daemon bg
+        # workers. WALKCODE_CLAUDE_DAEMON_MODE=off means there is no daemon
+        # transport to spawn through, so the default resolves to headless
+        # rather than failing startup — off stays a one-variable escape hatch.
+        claude_spawn_mode = "headless" if claude_daemon_mode == "off" else "daemon"
+    claude["spawn_mode"] = claude_spawn_mode
     claude_list_adopt = str(source.get("WALKCODE_CLAUDE_LIST_ADOPT") or "").strip().lower()
     if claude_list_adopt:
         if claude_list_adopt not in {"auto", "off"}:

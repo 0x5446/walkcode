@@ -7,7 +7,9 @@ daemon：spawner 起 bg job → 首轮 daemon reply 注入 → turn 跑完 trans
 验证 → kill 收尾）。飞书 Live E2E 已于同日在 work2 真实例完成（见下
 「飞书 Live E2E 记录」：主链路一次通过，暴露并修复一个 Critical——零
 attacher 的 job 不发布 state patch，修法为常驻 observer attach）。
-`WALKCODE_CLAUDE_SPAWN_MODE` 默认仍为 headless，切 daemon 待用户拍板。
+`WALKCODE_CLAUDE_SPAWN_MODE` 默认已切为 **daemon**（用户拍板，同日）；
+`headless` 保留为逃生口，`WALKCODE_CLAUDE_DAEMON_MODE=off` 时默认自动
+降级 headless（只有显式 daemon+off 的矛盾组合才报配置错误）。
 
 ## Context
 
@@ -43,8 +45,9 @@ attach**——但肌肉记忆没跟上，且飞书生的 headless 会话终端�
 目标心智模型：**活会话一律 attach/daemon 读写；resume 只用于复活死会话；
 复活也复活成 bg（保双端）。**
 
-1. **飞书新建会话 daemon 化**（`WALKCODE_CLAUDE_SPAWN_MODE=daemon`，默认
-   `headless`）：orchestrator 新增 `daemon_spawner` 钩子，飞书首条消息建会话
+1. **飞书新建会话 daemon 化**（`WALKCODE_CLAUDE_SPAWN_MODE`，默认 `daemon`
+   ——Live E2E 通过后切换；`headless` 为逃生口）：orchestrator 新增
+   `daemon_spawner` 钩子，飞书首条消息建会话
    时先走 runtime 的 `_spawn_claude_daemon_native_session`——
    `ClaudeDaemonTransport.spawn_bg_job`（子进程 `claude --bg`，注入与 headless
    spawn 相同的 `--settings` tap/base-url 覆盖，env 去 `CLAUDECODE` 加
@@ -67,8 +70,11 @@ attach**——但肌肉记忆没跟上，且飞书生的 headless 会话终端�
    再 attach，打印 fork 出的新 session id（walkcode 经 hooks/list 自动收编）。
    `--fork-session` 等任何额外参数、非 hex id 原样透传；
    `WALKCODE_NO_BG=1` 跳过；`WALKCODE_RESUME_DWIM_DRYRUN=1` 只打印决策。
-4. **门禁与守卫**：`spawn_mode=daemon` 与 `WALKCODE_CLAUDE_DAEMON_MODE=off`
-   组合在配置解析期报错；`_ensure_tui_observed_binding_capabilities` 对
+4. **门禁与守卫**：**显式** `spawn_mode=daemon` 与
+   `WALKCODE_CLAUDE_DAEMON_MODE=off` 组合在配置解析期报错（矛盾配置必须
+   由操作者解决）；未显式设置时默认值由解析器就地归一——`daemon_mode=off`
+   则解析为 `headless`（off 保持单变量逃生口，不炸启动），否则 `daemon`；
+   `_ensure_tui_observed_binding_capabilities` 对
    `origin=daemon_spawn` 的 binding 直接豁免——飞书生会话的 binding 是用户
    自己的话题，不能被 hook 认领路径重涂成只读观察话题。
 
@@ -112,8 +118,9 @@ attach**——但肌肉记忆没跟上，且飞书生的 headless 会话终端�
   `defaultMode: bypassPermissions` 殊途同归），AskUserQuestion 流已全量
   验证；若未来改用会弹权限的 mode，dual gate 与 ask 走同一 notify 管线，
   且注入键位（allow=1+Enter / deny=ESC）已按新矩阵修正。
-- 未做（后续）：默认值切 daemon（等用户拍板）；Codex 侧等价统一不在本
-  ADR 范围。
+- 默认值已切 daemon（2026-07-07，用户拍板）：解析器就地归一 spawn_mode，
+  新增默认值/降级/显式 headless 三个配置形态测试。
+- 未做（后续）：Codex 侧等价统一不在本 ADR 范围。
 
 ## Deep-review 记录（2026-07-07，14 维度 codex 引擎）
 

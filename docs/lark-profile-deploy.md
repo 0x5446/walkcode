@@ -145,10 +145,13 @@ claude 实例默认启用 daemon 多端同步（ADR 0046）：TUI 会话飞书�
 `reply`，socket 路径由 `WALKCODE_CLAUDE_CONFIG_DIR` 自动推导。要禁用（回到
 纯 hooks + takeover）设 `WALKCODE_CLAUDE_DAEMON_MODE=off`。
 
-大一统开关（ADR 0048）：`WALKCODE_CLAUDE_SPAWN_MODE=daemon` 让飞书新建会话
-也生而为 daemon bg worker（终端可 attach、飞书 v3 真双端；默认 `headless`，
-飞书 Live E2E 通过后切换）；`WALKCODE_CLAUDE_LIST_ADOPT=off` 关掉 list 兜底
-收编（默认开：walkcode 不认识的活 daemon job 会被补建为观察会话）。
+大一统（ADR 0048，2026-07-07 Live E2E 通过后已成默认）：飞书新建会话生而为
+daemon bg worker（终端可 attach、飞书 v3 真双端）。`WALKCODE_CLAUDE_SPAWN_MODE`
+默认 `daemon`；设 `headless` 回到 SDK spawn（逃生口），设
+`WALKCODE_CLAUDE_DAEMON_MODE=off` 时默认自动降级 headless（不会炸启动，
+只有显式 `SPAWN_MODE=daemon` + `DAEMON_MODE=off` 的矛盾组合才在配置期报错）。
+`WALKCODE_CLAUDE_LIST_ADOPT=off` 关掉 list 兜底收编（默认开：walkcode
+不认识的活 daemon job 会被补建为观察会话）。
 
 ⚠️ 收编（及一切 TUI 观察会话）依赖一个可解析的观察群：`LARK_ALLOWED_CHAT_IDS`
 若不止一个，必须显式设 `WALKCODE_LARK_TUI_CHAT_ID`，否则收编只会静默跳过并

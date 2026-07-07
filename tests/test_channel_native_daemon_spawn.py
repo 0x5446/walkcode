@@ -208,11 +208,30 @@ class SpawnModeConfigTests(unittest.TestCase):
             self.assertEqual(cfg.agent_options["claude"]["spawn_mode"], "daemon")
             self.assertEqual(cfg.agent_options["claude"]["list_adopt"], "off")
 
-    def test_defaults_are_absent(self):
+    def test_spawn_mode_defaults_to_daemon(self):
+        # ADR 0048: daemon-native is the default after the 2026-07-07 live
+        # E2E; the parser resolves the value so consumers see one truth.
         with tempfile.TemporaryDirectory() as tmp:
             cfg = ChannelNativeConfig.from_env(self._env(tmp))
-            self.assertNotIn("spawn_mode", cfg.agent_options["claude"])
+            self.assertEqual(cfg.agent_options["claude"]["spawn_mode"], "daemon")
             self.assertNotIn("list_adopt", cfg.agent_options["claude"])
+
+    def test_daemon_off_degrades_default_spawn_mode_to_headless(self):
+        # Only the EXPLICIT daemon+off combination is a config error; the
+        # default must keep WALKCODE_CLAUDE_DAEMON_MODE=off working as a
+        # single-variable escape hatch instead of failing startup.
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = ChannelNativeConfig.from_env(
+                self._env(tmp, WALKCODE_CLAUDE_DAEMON_MODE="off")
+            )
+            self.assertEqual(cfg.agent_options["claude"]["spawn_mode"], "headless")
+
+    def test_explicit_headless_is_respected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = ChannelNativeConfig.from_env(
+                self._env(tmp, WALKCODE_CLAUDE_SPAWN_MODE="headless")
+            )
+            self.assertEqual(cfg.agent_options["claude"]["spawn_mode"], "headless")
 
 
 def _channel_caps() -> ChannelCapabilities:
@@ -426,15 +445,34 @@ def _user_binding() -> ChannelBinding:
 
 
 class RuntimeDaemonSpawnTests(unittest.TestCase):
-    def test_spawn_mode_default_is_off(self):
+    def test_explicit_headless_spawn_mode_skips_daemon_spawn(self):
         with tempfile.TemporaryDirectory() as tmp:
-            runtime = _runtime(tmp)
+            runtime = _runtime(tmp, WALKCODE_CLAUDE_SPAWN_MODE="headless")
             session = asyncio.run(
                 runtime._spawn_claude_daemon_native_session(
                     _user_binding(), "claude_headless", tmp, _actor()
                 )
             )
             self.assertIsNone(session)
+
+    def test_default_spawn_mode_is_daemon(self):
+        # No env override: the resolved default must route through the
+        # daemon spawner (ADR 0048 post-live-E2E default flip).
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = _runtime(tmp)
+            transport = runtime._claude_daemon_transport()
+
+            async def fake_spawn(cwd, *, settings="", cli_path="", **kwargs):
+                return {"short": SHORT, "session_id": AGENT_SESSION_ID, "cwd": cwd}
+
+            transport.spawn_bg_job = fake_spawn
+            session = asyncio.run(
+                runtime._spawn_claude_daemon_native_session(
+                    _user_binding(), "claude_headless", tmp, _actor()
+                )
+            )
+            self.assertIsNotNone(session)
+            self.assertEqual(session.transport_ref.get("daemon_short"), SHORT)
 
     def test_daemon_mode_spawns_external_shaped_session(self):
         with tempfile.TemporaryDirectory() as tmp:

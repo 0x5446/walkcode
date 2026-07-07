@@ -37,8 +37,9 @@ Claude daemon 只托管 **bg 会话**（`claude --bg` 启动，或 TUI 内 `/bg`
 > **ADR 0048 更新（2026-07-07）**：上表「观察会话永远要先 takeover」「普通 TUI
 > 仍走 hooks + takeover」描述的是 daemon-native 之前的默认。现在：
 > (1) `daemon_live` 的外部观察会话首选 daemon `reply` 直写，只有非 daemon 的
-> 普通 TUI 观察会话才回落 takeover；(2) 飞书**新建**会话在
-> `WALKCODE_CLAUDE_SPAWN_MODE=daemon` 下直接生为 daemon bg worker（不再必然
+> 普通 TUI 观察会话才回落 takeover；(2) 飞书**新建**会话默认生而为 daemon
+> bg worker（`WALKCODE_CLAUDE_SPAWN_MODE` 默认 `daemon`，2026-07-07 飞书
+> Live E2E 通过后切换；`headless` 为逃生口，`DAEMON_MODE=off` 自动降级
 > headless）；(3) wrapper 的 `--resume/-r <hex-id>` 不再原样透传，而是按意图
 > 处理（活会话 attach、死会话 bg 复活），见 ADR 0048 与 lark-profile-deploy.md。
 
@@ -216,8 +217,8 @@ takeover 从不可逆变为可逆，且会话生命周期脱离 walkcode 进程�
 - ~~`dispatch` 新建 daemon 会话（飞书新建会话仍走 headless SDK）~~ →
   已由 ADR 0048 落地（2026-07-07）：不逆向 dispatch 的内部 `d` spec，改用
   官方 CLI 面 `claude --bg` 子进程 spawn + 外部观察形态预注册 + 首轮
-  daemon reply 注入；`WALKCODE_CLAUDE_SPAWN_MODE=daemon` 门禁（默认
-  headless，飞书 Live E2E 通过后切换）。
+  daemon reply 注入；`WALKCODE_CLAUDE_SPAWN_MODE` 门禁
+  （2026-07-07 飞书 Live E2E 通过后默认已切 daemon，headless 为逃生口）。
 - ~~list 兜底自动建会话（无 hook 场景）~~ → 已由 ADR 0048 落地：watcher
   的 list 轮询收编 walkcode 不认识的活 job（`source=shell` + 30s 年龄阈值
   + resume_ref 去重），`WALKCODE_CLAUDE_LIST_ADOPT=off` 可关。

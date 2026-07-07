@@ -783,8 +783,11 @@ class ChannelNativeRuntime:
             "socket_present": os.path.exists(socket_path),
             "config_dir": transport.config_dir,
             # Rollout visibility (ADR 0048): daemon transport enabled does not
-            # mean new sessions are daemon-born (default is still headless), so
-            # surface the actual spawn/adoption policy for status/doctor.
+            # by itself mean new sessions are daemon-born (spawn_mode can be
+            # headless), so surface the actual spawn/adoption policy for
+            # status/doctor. The config parser resolves the default (daemon,
+            # or headless when daemon_mode=off); the fallback below only
+            # guards states that never went through the parser.
             "spawn_mode": str(options.get("spawn_mode", "") or "headless"),
             "list_adopt": str(options.get("list_adopt", "") or "auto"),
             "daemon_spawner_installed": self.orchestrator.daemon_spawner is not None,
