@@ -78,6 +78,19 @@ from .channel_native.lark_live import AckRegistry, LarkIngressBridge, build_lark
 TELEGRAM_FORUM_TOPIC_ICON_COLORS = (0x6FB9F0, 0xFFD67E, 0xCB86DB, 0x8EEE98, 0xFF93B2, 0xFB6F5F)
 CLAUDE_DAEMON_WATCH_INTERVAL_SECONDS = 5.0
 CLAUDE_DAEMON_UNAVAILABLE_RETRY_SECONDS = 30.0
+# List-fallback adoption (ADR 0048): a wild job must have existed this long
+# before it is registered, so the runtime's own daemon-native spawn always
+# wins the race and registers its session (with the user's chat binding) first.
+# MUST exceed the spawner's own worst-case register latency — the daemon-native
+# spawn holds a job in the daemon list (with its real createdAt) for up to
+# SPAWN_BG_READY_TIMEOUT_SECONDS before it registers under the ingress lock; a
+# threshold below that window lets the watcher adopt the runtime's own in-flight
+# job, which the spawner then kills as a duplicate (ADR 0048 review finding).
+CLAUDE_DAEMON_ADOPT_MIN_AGE_SECONDS = 60.0
+# Bounded wait for the spawn-time observer attach handshake before the first
+# turn is submitted (ADR 0048 round-2): long enough for a local unix-socket
+# attach, short enough not to stall the ingress path if the daemon is wedged.
+CLAUDE_DAEMON_OBSERVER_READY_TIMEOUT_SECONDS = 3.0
 CLAUDE_GATE_DRAIN_INTERVAL_SECONDS = 1.0
 # A pending gate request that cannot be routed to an observed session (or
 # whose card cannot be delivered) is answered "pass" after this grace, so the
@@ -669,6 +682,10 @@ class ChannelNativeRuntime:
         daemon_transport = self._claude_daemon_transport()
         if daemon_transport is not None:
             daemon_transport.on_gate_decision = self._record_gate_decision
+            # Daemon-native spawn (ADR 0048): channel-born sessions start as
+            # daemon bg workers when WALKCODE_CLAUDE_SPAWN_MODE=daemon. The
+            # orchestrator calls this before start_session; None falls back.
+            self.orchestrator.daemon_spawner = self._spawn_claude_daemon_native_session
 
     @classmethod
     def from_env(
@@ -763,11 +780,21 @@ class ChannelNativeRuntime:
                 "reason": "daemon_mode is off or the agent is not claude",
             }
         socket_path = transport.client.socket_path
+        options = self.config.agent_options.get("claude", {})
         return {
             "enabled": True,
             "socket_path": socket_path,
             "socket_present": os.path.exists(socket_path),
             "config_dir": transport.config_dir,
+            # Rollout visibility (ADR 0048): daemon transport enabled does not
+            # by itself mean new sessions are daemon-born (spawn_mode can be
+            # headless), so surface the actual spawn/adoption policy for
+            # status/doctor. The config parser resolves the default (daemon,
+            # or headless when daemon_mode=off); the fallback below only
+            # guards states that never went through the parser.
+            "spawn_mode": str(options.get("spawn_mode", "") or "headless"),
+            "list_adopt": str(options.get("list_adopt", "") or "auto"),
+            "daemon_spawner_installed": self.orchestrator.daemon_spawner is not None,
         }
 
     def _describe_runtime_status(self) -> dict[str, Any]:
@@ -2145,6 +2172,298 @@ class ChannelNativeRuntime:
             )
         return alive
 
+    # -- daemon-native spawn + list adoption (ADR 0048) -----------------------
+
+    async def _spawn_claude_daemon_native_session(
+        self,
+        binding: ChannelBinding,
+        transport_kind: str,
+        cwd: str,
+        owner: ActorRef,
+    ):
+        """Create a channel-born session as a daemon bg worker.
+
+        The session is registered external-TUI shaped — writer external_tui,
+        nested claude resume_ref — so every already-verified v3 mechanism
+        (daemon reply writes, subscribe watcher, hook content, dual gate)
+        applies from the first turn. Returns None on any failure so the
+        orchestrator falls back to the headless SDK spawn.
+
+        Concurrency contract (ADR 0048): the sole caller is
+        ``Orchestrator.handle_inbound_event`` via the ``daemon_spawner`` hook,
+        which runs under ``_ingress_lock`` (held by ``serve_lark_ws`` /
+        ``poll_telegram_once`` around ``process_*``). This method therefore
+        MUST NOT re-acquire ``_ingress_lock`` — ``asyncio.Lock`` is not
+        reentrant, so doing so self-deadlocks the whole ingress path. The
+        registration below is already serialized by the caller's lock.
+        """
+        if transport_kind != "claude_headless":
+            return None
+        options = self.config.agent_options.get("claude", {})
+        if str(options.get("spawn_mode", "") or "headless") != "daemon":
+            return None
+        transport = self._claude_daemon_transport()
+        if transport is None:
+            return None
+        from .channel_native import _log_degrade
+
+        headless = self.transports.get("claude_headless")
+        settings = ""
+        cli_path = ""
+        if isinstance(headless, ClaudeHeadlessTransport):
+            cli_path = str(headless.cli_path or "")
+            try:
+                if headless.anthropic_base_url:
+                    # Same tap/base-url override file the headless SDK spawn
+                    # uses — the bg worker must hit the same upstream.
+                    settings = headless._anthropic_base_url_settings_override()
+                elif headless.settings:
+                    settings = str(headless.settings)
+            except Exception as exc:
+                _log_degrade(
+                    "claude_daemon_spawn_settings_failed",
+                    error=exc,
+                    fallback="headless_spawn",
+                )
+                return None
+        try:
+            job = await transport.spawn_bg_job(cwd, settings=settings, cli_path=cli_path)
+        except (TransportUnavailable, CapabilityUnsupported) as exc:
+            _log_degrade(
+                "claude_daemon_spawn_failed",
+                error=exc,
+                fallback="headless_spawn",
+            )
+            return None
+        agent_session_id = str(job.get("session_id", "") or "")
+        short = str(job.get("short", "") or "")
+        nested_resume_ref = {
+            "transport_kind": "claude_headless",
+            "agent_session_id": agent_session_id,
+        }
+        external_ref = {
+            "source": "walkcode_daemon_spawn",
+            "agent": "claude",
+            "resume_ref": nested_resume_ref,
+            "daemon_short": short,
+            "daemon_live": True,
+        }
+        writer_actor = ActorRef(
+            channel_kind=self.config.channel.kind,
+            actor_id=f"claude_daemon:{short}",
+            display_name="claude bg worker",
+        )
+        # No _ingress_lock here — the caller already holds it (see contract in
+        # the docstring). Any failure after spawn_bg_job succeeded must reap the
+        # orphan job: otherwise a live worker is left that nobody tracks (and
+        # that list adoption would later resurface as a duplicate session).
+        try:
+            existing = self.state.sessions.find_by_resume_ref(
+                transport_kind="claude_headless",
+                resume_ref={"agent_session_id": agent_session_id},
+            )
+            if existing:
+                # A fresh uuid colliding with a known session means state is
+                # inconsistent; reap the just-spawned job and go headless.
+                _log_degrade(
+                    "claude_daemon_spawn_duplicate_session",
+                    session_id=existing,
+                    fallback="headless_spawn",
+                )
+                await self._reap_daemon_job(transport, short, reason="spawn_duplicate_session")
+                return None
+            # The binding is the user's own chat/topic; this origin marker
+            # blocks the hook-claim path from repainting it as a readonly
+            # observation topic (_ensure_tui_observed_binding_capabilities).
+            binding.capabilities["origin"] = "daemon_spawn"
+            session = self.state.sessions.create_observed_session(
+                session_id=self._tui_observed_session_id(
+                    "claude", "claude_headless", nested_resume_ref
+                ),
+                binding=binding,
+                cwd=str(job.get("cwd", "") or cwd),
+                external_ref=external_ref,
+                owner=writer_actor,
+            )
+            initial_title = str(binding.capabilities.get("initial_title", "") or "").strip()
+            if initial_title:
+                session.cached_title = initial_title
+                session.title_source = "initial_user_input"
+            if self.state.authz is not None:
+                self.state.authz.grant(session.session_id, owner, SessionRole.OWNER)
+        except Exception as exc:
+            _log_degrade(
+                "claude_daemon_spawn_register_failed",
+                error=exc,
+                fallback="headless_spawn",
+            )
+            await self._reap_daemon_job(transport, short, reason="spawn_register_failed")
+            return None
+        # Observer attach BEFORE the first turn is submitted: the daemon only
+        # publishes state patches while ≥1 attacher is connected (live-E2E
+        # finding 2026-07-07), and the first dialog can open right after the
+        # first reply lands. Await the attach handshake (bounded) so the very
+        # first permission/ask dialog is already observable — fire-and-forget
+        # would race the first reply (round-2 review finding). Timeout is
+        # non-fatal: the first turn still carries model latency before any
+        # dialog, and the watcher sync keeps the observer alive afterwards.
+        try:
+            attached = await transport.ensure_observer_ready(
+                short, timeout=CLAUDE_DAEMON_OBSERVER_READY_TIMEOUT_SECONDS
+            )
+        except Exception as exc:
+            attached = False
+            _log_degrade(
+                "claude_daemon_observer_ready_error",
+                error=exc,
+                fallback="proceed_watcher_reensures",
+            )
+        if not attached:
+            _log_degrade(
+                "claude_daemon_observer_ready_timeout",
+                short=short,
+                fallback="proceed_watcher_reensures",
+            )
+        # State is persisted by the outer handle_inbound_event flow (submit ->
+        # refresh_session_status_card -> on_state_changed). Calling save_state()
+        # here would checkpoint the inbound ledger's in-progress mark mid-turn,
+        # so a crash before completion would reject the replayed message.
+        return session
+
+    async def _reap_daemon_job(
+        self, transport: "ClaudeDaemonTransport", short: str, *, reason: str
+    ) -> None:
+        """Best-effort kill of a half-born daemon job, with the failure logged.
+
+        Silent suppression here (the old behavior) meant an orphan worker left
+        by a failed spawn/adoption was invisible — the reap outcome must be
+        observable so operators can tell "reaped" from "leaked" (ADR 0048).
+        """
+        if not short:
+            return
+        from .channel_native import _log_degrade
+
+        transport.stop_observer(short)
+        try:
+            await transport.client.kill(short)
+        except Exception as exc:
+            _log_degrade(
+                "claude_daemon_reap_failed",
+                short=short,
+                reason=reason,
+                error=exc,
+                fallback="orphan_job_may_persist",
+            )
+
+    async def _maybe_adopt_wild_claude_daemon_job(self, job: dict[str, Any]) -> str:
+        """List-fallback session bootstrap (ADR 0048).
+
+        Registers a live daemon job walkcode has never seen (hook not
+        configured, spool lost, or an idle `claude --bg` that has produced no
+        hook events yet) as a TUI-observed session, using the same binding
+        shape hooks would create. Conservative on purpose: only CLI-born jobs
+        (source=shell), only after a settle age so the runtime's own spawn
+        path always registers its session (with the user's chat binding)
+        first, and deduped against resume_ref under the ingress lock.
+        Returns the session id ('' when not adopted).
+        """
+        if self.config.agent != "claude":
+            return ""
+        options = self.config.agent_options.get("claude", {})
+        if str(options.get("list_adopt", "") or "auto") == "off":
+            return ""
+        if str(job.get("source", "") or "") != "shell":
+            return ""
+        agent_session_id = str(job.get("sessionId", "") or "")
+        short = claude_daemon_short_id(job.get("short") or agent_session_id)
+        if not agent_session_id or not short:
+            return ""
+        created_at = job.get("createdAt") or job.get("startedAt")
+        try:
+            created_seconds = float(created_at) / 1000.0
+        except (TypeError, ValueError):
+            return ""
+        if self._now() - created_seconds < CLAUDE_DAEMON_ADOPT_MIN_AGE_SECONDS:
+            return ""
+        flat_resume_ref = {"agent_session_id": agent_session_id}
+        nested_resume_ref = {
+            "transport_kind": "claude_headless",
+            "agent_session_id": agent_session_id,
+        }
+        # Unlocked pre-check before the channel side effect: if a hook (or the
+        # daemon spawner) already registered this session, skip building an
+        # observation binding entirely. Creating the Lark root message /
+        # Telegram topic first and only then discovering the session exists
+        # (under the lock below) would orphan that channel object (ADR 0048
+        # review finding). The locked recheck stays authoritative for the
+        # residual TOCTOU window.
+        existing_pre = self.state.sessions.find_by_resume_ref(
+            transport_kind="claude_headless",
+            resume_ref=flat_resume_ref,
+        )
+        if existing_pre:
+            return existing_pre
+        try:
+            binding = await self._create_tui_observed_binding(
+                "claude", "claude_headless", flat_resume_ref, {}
+            )
+        except Exception as exc:
+            print(
+                f"claude daemon list adopt skipped ({short}): {type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+            return ""
+        external_ref = {
+            "source": "claude_daemon_list",
+            "agent": "claude",
+            "resume_ref": nested_resume_ref,
+        }
+        actor = ActorRef(
+            channel_kind=self.config.channel.kind,
+            actor_id=f"local_tui:claude_headless:{agent_session_id}",
+            display_name="claude TUI",
+        )
+        async with self._ingress_lock:
+            existing = self.state.sessions.find_by_resume_ref(
+                transport_kind="claude_headless",
+                resume_ref=flat_resume_ref,
+            )
+            if existing:
+                return existing
+            session = self.state.sessions.create_observed_session(
+                session_id=self._tui_observed_session_id(
+                    "claude", "claude_headless", nested_resume_ref
+                ),
+                binding=binding,
+                cwd=str(job.get("cwd", "") or self.config.cwd),
+                external_ref=external_ref,
+                owner=actor,
+            )
+            session.transport_ref["daemon_live"] = True
+            session.cached_title = _telegram_session_topic_name(
+                "claude", f"TUI {agent_session_id}"
+            )
+            session.title_source = "tui_hook"
+            self._grant_tui_channel_owners(session.session_id, binding)
+            self.save_state()
+        await self.orchestrator.refresh_session_status_card(session)
+        return session.session_id
+
+    def _tui_observed_session_id(
+        self, agent_name: str, transport_kind: str, resume_ref: dict[str, Any]
+    ) -> str:
+        identity = _resume_ref_identity(transport_kind, resume_ref)
+        session_id = f"tui-{agent_name}-{hashlib.sha1(identity.encode()).hexdigest()[:12]}"
+        base_session_id = session_id
+        suffix = 1
+        while True:
+            try:
+                self.state.sessions.get(session_id)
+            except KeyError:
+                return session_id
+            suffix += 1
+            session_id = f"{base_session_id}-{suffix}"
+
     # -- PreToolUse gate (ADR 0046 v2) ---------------------------------------
     #
     # Headless sessions close the permission / AskUserQuestion loop in-process
@@ -2539,10 +2858,17 @@ class ChannelNativeRuntime:
                     )
                 await asyncio.sleep(delay)
         finally:
+            observer_tasks = transport.stop_all_observers()
             for task in watchers.values():
                 task.cancel()
-            if watchers:
-                await asyncio.gather(*watchers.values(), return_exceptions=True)
+            pending = [*watchers.values(), *observer_tasks]
+            if pending:
+                # Await observers too: cancel() only requests cancellation;
+                # their attach sockets close in the CancelledError handler, so
+                # the loop must not shut down before they drain (round-2
+                # review finding — the old code awaited only subscribe
+                # watchers and left observer tasks pending).
+                await asyncio.gather(*pending, return_exceptions=True)
 
     async def _sync_claude_daemon_watchers(
         self,
@@ -2553,30 +2879,83 @@ class ChannelNativeRuntime:
             if task.done():
                 watchers.pop(short, None)
         jobs = await transport.client.list_jobs()
+        # Two passes: known jobs first so their subscribe watchers come up
+        # immediately, THEN wild-job adoption (which does channel network I/O
+        # to build an observation binding). Inlining adoption in a single pass
+        # let one slow adoption stall subscribe creation for every known job
+        # behind it in the list (ADR 0048 review finding).
+        unknown_jobs: list[dict[str, Any]] = []
         for job in jobs:
             if job.get("dying") or job.get("outcome"):
                 continue
             short = claude_daemon_short_id(job.get("short") or job.get("sessionId"))
-            if not short or short in watchers:
+            if not short:
                 continue
             session_id = self.state.sessions.find_by_resume_ref(
                 transport_kind="claude_headless",
                 resume_ref={"agent_session_id": str(job.get("sessionId", "") or "")},
             )
             if not session_id:
-                # Unknown to walkcode (no hook observed it yet, or it is a
-                # walkcode-owned headless worker). Hooks stay the creation
-                # channel; list-based session bootstrap is a follow-up step.
+                # Only try to adopt when there is no watcher yet; a job that
+                # already has a watcher already has a session.
+                if short not in watchers:
+                    unknown_jobs.append(job)
                 continue
+            # Reconcile EVERY tick, not just when the subscribe watcher is
+            # absent: the observer attach and the subscribe watcher are
+            # independent connections, and the observer can exit on a
+            # transient control-plane outage while the watcher stays alive.
+            # Gating this on `short not in watchers` (the old bug) would then
+            # leave a live job with zero attachers, freezing its tempo/needs
+            # patches and re-blinding the notify gate. ensure_observer and the
+            # watcher create are both idempotent, so re-calling is a no-op
+            # when everything is already healthy.
+            self._start_daemon_watcher_if_eligible(session_id, short, transport, watchers)
+        for job in unknown_jobs:
+            short = claude_daemon_short_id(job.get("short") or job.get("sessionId"))
+            if not short or short in watchers:
+                continue
+            # Unknown to walkcode: hooks stay the primary creation channel
+            # (clean cwd/transcript), but a live job nobody registered —
+            # hook not configured, spool lost, idle `claude --bg` with no
+            # first prompt yet — gets adopted from the list (ADR 0048).
+            session_id = await self._maybe_adopt_wild_claude_daemon_job(job)
+            if not session_id:
+                continue
+            self._start_daemon_watcher_if_eligible(session_id, short, transport, watchers)
+
+    def _start_daemon_watcher_if_eligible(
+        self,
+        session_id: str,
+        short: str,
+        transport: ClaudeDaemonTransport,
+        watchers: dict[str, asyncio.Task[None]],
+    ) -> None:
+        try:
             session = self.state.sessions.get(session_id)
-            if session.status == "stopped":
-                continue
-            if not (session.writer_owner and session.writer_owner.kind == "external_tui"):
-                continue
-            watchers[short] = asyncio.create_task(
-                self._watch_claude_daemon_job(session_id, short, transport),
-                name=f"walkcode-claude-daemon-sub-{short}",
-            )
+        except KeyError:
+            return
+        if session.status == "stopped":
+            return
+        if not (session.writer_owner and session.writer_owner.kind == "external_tui"):
+            return
+        # The daemon only publishes state patches while the job has ≥1
+        # attacher (live-E2E finding 2026-07-07): keep a persistent observer
+        # attach alongside the subscribe watcher so dialogs on never-attached
+        # (Feishu-spawned) or detached jobs still surface via needs/tempo.
+        # ensure_observer rebuilds a task that exited on a transient outage
+        # and no-ops when one is already running — safe to call every tick.
+        transport.ensure_observer(short)
+        # Idempotent: only create the subscribe watcher when absent, so the
+        # every-tick observer reconciliation above does not orphan a live
+        # watcher task by overwriting it.
+        existing = watchers.get(short)
+        if existing is not None and not existing.done():
+            return
+        watchers[short] = asyncio.create_task(
+            self._watch_claude_daemon_job(session_id, short, transport),
+            name=f"walkcode-claude-daemon-sub-{short}",
+        )
 
     async def _watch_claude_daemon_job(
         self,
@@ -2605,6 +2984,7 @@ class ChannelNativeRuntime:
                             short=short,
                         )
                         self.save_state()
+                    transport.stop_observer(short)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -2851,17 +3231,7 @@ class ChannelNativeRuntime:
             return None
 
         binding = await self._create_tui_observed_binding(agent_name, transport_kind, resume_ref, payload)
-        identity = _resume_ref_identity(transport_kind, resume_ref)
-        session_id = f"tui-{agent_name}-{hashlib.sha1(identity.encode()).hexdigest()[:12]}"
-        base_session_id = session_id
-        suffix = 1
-        while True:
-            try:
-                self.state.sessions.get(session_id)
-            except KeyError:
-                break
-            suffix += 1
-            session_id = f"{base_session_id}-{suffix}"
+        session_id = self._tui_observed_session_id(agent_name, transport_kind, resume_ref)
         session = self.state.sessions.create_observed_session(
             session_id=session_id,
             binding=binding,
@@ -2968,6 +3338,12 @@ class ChannelNativeRuntime:
     def _ensure_tui_observed_binding_capabilities(session) -> bool:
         binding = session.channel_binding
         if binding is None or binding.channel_kind not in {"telegram", "lark"}:
+            return False
+        if binding.capabilities.get("origin") == "daemon_spawn":
+            # Channel-born daemon session (ADR 0048): the binding is the
+            # user's own chat/topic. Repainting it as a readonly observation
+            # topic would strip the interactive semantics the user started
+            # the session with.
             return False
         if not binding.thread_id:
             return False
@@ -5246,6 +5622,18 @@ def _format_status(status: dict[str, Any]) -> str:
     lines.append(f"  - live_ingress={channel.get('live_ingress')} configured={channel.get('configured')}")
     item = status.get("agent_status", {})
     lines.append(f"agent_status: available={item.get('available')}")
+    daemon = status.get("claude_daemon", {})
+    if daemon:
+        if daemon.get("enabled"):
+            lines.append(
+                "claude_daemon: enabled=True "
+                f"socket_present={daemon.get('socket_present')} "
+                f"spawn_mode={daemon.get('spawn_mode', '-')} "
+                f"list_adopt={daemon.get('list_adopt', '-')} "
+                f"spawner_installed={daemon.get('daemon_spawner_installed')}"
+            )
+        else:
+            lines.append(f"claude_daemon: enabled=False reason={daemon.get('reason', '-')}")
     hook_status = status.get("tui_hook_status", {})
     if hook_status.get("checked"):
         missing = ",".join(hook_status.get("missing") or []) or "-"

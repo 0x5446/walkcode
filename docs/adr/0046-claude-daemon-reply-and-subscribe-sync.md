@@ -10,7 +10,8 @@ watcher、takeover 回落、`WALKCODE_CLAUDE_DAEMON_MODE` 门禁（细节与验�
 真双端（推翻 v2「双端同时可答不可行」结论，见文末 v3 段；键位映射与生产注入
 路径均真机实测，单测 621 绿，work 实例 Live E2E 全场景通过：飞书答/终端答/
 deny/always-allow 记忆自动注入/迟点击诚实翻卡）。
-list 兜底建会话、Codex 持久订阅仍为后续步骤。
+list 兜底建会话与飞书新建会话 daemon 化已由 ADR 0048 落地（2026-07-07）；
+Codex 持久订阅仍为后续步骤。
 
 ## Context
 

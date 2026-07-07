@@ -322,17 +322,32 @@ simultaneously. Each gets the full terminal stream. The last attacher's
 terminal dimensions win for resize purposes. The `attachers` map on the
 job tracks all connected clients.
 
-**Keystroke injection via second attacher（2026-07-06 实测）:** 第二个
-attacher（自定义 `attachId`）在握手成功、短暂 settle（~0.8s）后写入的
-原始字节会进入 worker 的终端输入处理器，与真人键盘输入等价——**能直接
-驱动原生对话框**（AskUserQuestion 单选实测三次：注入 `b"N"` 一击选中即
-确认、无需回车，subscribe 观测 blocked→idle/resolved）。注入发生在 raw
-PTY 字节层，不区分对话框类型。相关事实：
+**Keystroke injection via second attacher（2026-07-06 实测，2026-07-07
+修正）:** 第二个 attacher（自定义 `attachId`）在握手成功、短暂 settle
+（~0.8s）后写入的原始字节会进入 worker 的终端输入处理器，与真人键盘输入
+等价——**能直接驱动原生对话框**。注入发生在 raw PTY 字节层，不区分对话框
+类型。相关事实：
 
 - 原生对话框（AskUserQuestion / 权限提示）**无自动超时**，无限等待键盘输入；
-- 无任何 attacher 时对话框仍在 job 的 PTY 内渲染，`state` patch 的 `needs`
-  照常出现（ask 形如 `answer: <question> (<label1> · <label2> ...)`，
-  选项按序号 1 起排列；permission 形如 `approve <Tool>: <detail>`）；
+- **键位矩阵修正（2026-07-07 实测）**：select 类对话框中，数字键落在
+  **非当前高亮**选项上是"一击选中即确认"（2026-07-06 三次实测均属此列）；
+  数字键落在**已高亮**选项上只重新选中、对话框继续等 Enter。通用安全序列
+  是**数字 + Enter**——数字已确认时，多出的 Enter 落在对话框关闭后的空
+  composer 上是 no-op（新对话框不可能在一个按键间隔内渲染出来）。deny 的
+  ESC 保持单键：ESC 后补 Enter 反而可能确认高亮项（= allow）。
+- 无任何 attacher 时对话框仍在 job 的 PTY 内渲染（attach 回放可见），
+  **但 `state` patch 不会发布**——见下一条；
+- **state patch（tempo/needs）只在 job 有 ≥1 attacher 连接期间发布
+  （2026-07-07 实测，ADR 0048 live-E2E finding）**：零 attacher 的 job
+  （飞书生的 bg worker、终端 detach 后的会话）弹出/解除对话框时，
+  `list`/`subscribe`/attach 握手回显的账本全部冻结在上一次有 attacher 时
+  的状态，`needs` 为空；期间只可能偶发出现 bg-agent 状态摘要式的自然语言
+  needs（不可依赖）。`claude agents --json` 走另一条数据源（waitingFor/
+  state 是准的），但不含对话框原文、无法用于精确匹配。WalkCode 的解法是
+  每个被观察 job 常驻一条只读 observer attach（`walkcode-observer`，
+  200x50 与 pty-host 默认一致）。有 attacher 在场时 needs 恢复文档格式
+  （ask 形如 `answer: <question> (<label1> · <label2> ...)`，选项按序号
+  1 起排列；permission 形如 `approve <Tool>: <detail>`）；
 - 已有 attacher（如用户终端）不影响第二连接注入，双方输入互不互斥。
 
 WalkCode v3 真双端方案（`claude-daemon-multi-ui-sync.md`「交互闭环 v3」）

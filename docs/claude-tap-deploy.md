@@ -122,6 +122,8 @@ worker 的调用**加上 `"${tap_settings[@]}"`——daemon-native wrapper（裸
 
 - `claude --bg` → `claude --bg "${tap_settings[@]}"`（裸启动的主路径，真正发
   起上游请求的 worker 在这里创建，只改最后的 exec 会漏掉它）
+- `claude --bg --resume <id>` → 同上加 `"${tap_settings[@]}"`（`--resume`
+  DWIM 的死会话复活路径，见 ADR 0048，这里同样创建新 worker）
 - `exec claude "$@"` → `exec claude "${tap_settings[@]}" "$@"`（带参数/回退路径）
 
 `claude attach` 只是附着已有 worker，不需要加。

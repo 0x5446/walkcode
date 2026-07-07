@@ -817,6 +817,7 @@ class NotifyGateInjectionTests(unittest.TestCase):
             asyncio.run(
                 transport.approve_permission(self._handle(), "rid-1", {"action": "allow"})
             )
+            # Permission allow is a single "1", no trailing Enter (round-2).
             self.assertEqual(client.injections, [(SHORT, [b"1"])])
             self.assertIsNone(claude_gate.read_decision(transport.gate_state_path, "rid-1"))
             self.assertIsNone(transport.notify_gate("rid-1"))
@@ -848,7 +849,7 @@ class NotifyGateInjectionTests(unittest.TestCase):
             asyncio.run(
                 transport.answer_user_question(self._handle(), "rid-ask", {"0": "蓝"})
             )
-            self.assertEqual(client.injections, [(SHORT, [b"2"])])
+            self.assertEqual(client.injections, [(SHORT, [b"2", b"\r"])])
 
     def test_dialog_mismatch_raises_and_tombstones(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1023,6 +1024,7 @@ class NotifyGateDrainTests(unittest.TestCase):
                 asyncio.run(runtime.drain_claude_gate_requests())
             finally:
                 claude_daemon_mod.GATE_INJECT_VERIFY_POLL_SECONDS = old_poll
+            # Permission auto-allow is a single "1", no trailing Enter (round-2).
             self.assertEqual(client.injections, [(SHORT, [b"1"])])
             self.assertIsNone(claude_gate.read_pending(state, "toolu_edit_1"))
             self.assertFalse(

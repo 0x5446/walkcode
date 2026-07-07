@@ -145,10 +145,33 @@ claude 实例默认启用 daemon 多端同步（ADR 0046）：TUI 会话飞书�
 `reply`，socket 路径由 `WALKCODE_CLAUDE_CONFIG_DIR` 自动推导。要禁用（回到
 纯 hooks + takeover）设 `WALKCODE_CLAUDE_DAEMON_MODE=off`。
 
+大一统（ADR 0048，2026-07-07 Live E2E 通过后已成默认）：飞书新建会话生而为
+daemon bg worker（终端可 attach、飞书 v3 真双端）。`WALKCODE_CLAUDE_SPAWN_MODE`
+默认 `daemon`；设 `headless` 回到 SDK spawn（逃生口），设
+`WALKCODE_CLAUDE_DAEMON_MODE=off` 时默认自动降级 headless（不会炸启动，
+只有显式 `SPAWN_MODE=daemon` + `DAEMON_MODE=off` 的矛盾组合才在配置期报错）。
+`WALKCODE_CLAUDE_LIST_ADOPT=off` 关掉 list 兜底收编（默认开：walkcode
+不认识的活 daemon job 会被补建为观察会话）。
+
+⚠️ 收编（及一切 TUI 观察会话）依赖一个可解析的观察群：`LARK_ALLOWED_CHAT_IDS`
+若不止一个，必须显式设 `WALKCODE_LARK_TUI_CHAT_ID`，否则收编只会静默跳过并
+打 `claude daemon list adopt skipped ...`——开关看似生效却见不到观察会话。
+只有单条白名单群时才会自动用它当观察群。收编策略可在 `native doctor` 的
+`claude_daemon.spawn_mode` / `list_adopt` 字段核对实际生效值。
+
 三个 claude wrapper 已是 daemon-native：裸启动 = `claude --bg` + attach，
 会话生而为 daemon worker，飞书直写不再需要 takeover。逃生口：
 `WALKCODE_NO_BG=1 claude-personal` 回到普通 TUI；带任意参数的调用不受影响。
 注意 attach 模式下 `/exit` = detach（会话保活），结束用 `claude stop <short>`。
+
+wrapper 另带 `--resume <id>` DWIM（ADR 0048）：daemon 里该会话还活着 →
+自动转 `claude attach`（官方 CLI 本来就拒绝 resume 运行中的 bg job）；
+已死 → `claude --bg --resume <id>` 复活为 bg worker 再 attach，保住飞书
+双端（注意 fork 语义，产生新 session id，wrapper 会打印；walkcode 经
+hooks/list 自动收编新会话）。只拦「恰好 `--resume <id>` 两个参数且 id 为
+hex」的调用；`--fork-session` 等任何额外参数、非 hex id（如交互挑选器）
+原样透传。逃生口同上 `WALKCODE_NO_BG=1`；调试用
+`WALKCODE_RESUME_DWIM_DRYRUN=1`（只打印决策不执行）。
 
 ## 4. launchd（×4）
 

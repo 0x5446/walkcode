@@ -34,6 +34,15 @@ Claude daemon 只托管 **bg 会话**（`claude --bg` 启动，或 TUI 内 `/bg`
 要让日常会话获得多端同步，用 `claude --bg` 起会话或对现有 TUI 会话 `/bg`
 后重新 attach。没有 bg 会话的 profile 不会有 daemon 进程，属正常现象。
 
+> **ADR 0048 更新（2026-07-07）**：上表「观察会话永远要先 takeover」「普通 TUI
+> 仍走 hooks + takeover」描述的是 daemon-native 之前的默认。现在：
+> (1) `daemon_live` 的外部观察会话首选 daemon `reply` 直写，只有非 daemon 的
+> 普通 TUI 观察会话才回落 takeover；(2) 飞书**新建**会话默认生而为 daemon
+> bg worker（`WALKCODE_CLAUDE_SPAWN_MODE` 默认 `daemon`，2026-07-07 飞书
+> Live E2E 通过后切换；`headless` 为逃生口，`DAEMON_MODE=off` 自动降级
+> headless）；(3) wrapper 的 `--resume/-r <hex-id>` 不再原样透传，而是按意图
+> 处理（活会话 attach、死会话 bg 复活），见 ADR 0048 与 lark-profile-deploy.md。
+
 ## 协议依据（已实测验证）
 
 - socket 路径可确定性推导：`/tmp/cc-daemon-<uid>/<sha256(CLAUDE_CONFIG_DIR)[:8]>/control.sock`。
@@ -103,7 +112,7 @@ TUI 会话仍由 hooks 创建为 `external_tui` + `EXTERNAL_OBSERVED_READONLY`�
 hooks 仍是会话创建的主通道（能拿到干净的 cwd/transcript）。list 轮询解决的
 是"hook 没配 / spool 丢失"时的兜底发现，以及为已知会话维护 watcher 的启停。
 v1 范围：**watcher 只为已存在的 walkcode 会话服务**（resume_ref ↔ JobRecord.sessionId
-匹配），list 兜底建会话作为后续步骤。
+匹配），list 兜底建会话作为后续步骤（已由 ADR 0048 落地，见「本期不做」）。
 
 ### 能力位
 
@@ -205,8 +214,14 @@ takeover 从不可逆变为可逆，且会话生命周期脱离 walkcode 进程�
 
 - ~~`permission-response` 闭环审批~~ → 已由 v2 的 PreToolUse gate 取代
   （permission-response 实测为空壳，见「协议依据」）。
-- `dispatch` 新建 daemon 会话（飞书新建会话仍走 headless SDK）。
-- list 兜底自动建会话（无 hook 场景）。
+- ~~`dispatch` 新建 daemon 会话（飞书新建会话仍走 headless SDK）~~ →
+  已由 ADR 0048 落地（2026-07-07）：不逆向 dispatch 的内部 `d` spec，改用
+  官方 CLI 面 `claude --bg` 子进程 spawn + 外部观察形态预注册 + 首轮
+  daemon reply 注入；`WALKCODE_CLAUDE_SPAWN_MODE` 门禁
+  （2026-07-07 飞书 Live E2E 通过后默认已切 daemon，headless 为逃生口）。
+- ~~list 兜底自动建会话（无 hook 场景）~~ → 已由 ADR 0048 落地：watcher
+  的 list 轮询收编 walkcode 不认识的活 job（`source=shell` + 30s 年龄阈值
+  + resume_ref 去重），`WALKCODE_CLAUDE_LIST_ADOPT=off` 可关。
 - Codex 侧持久订阅化改造（现有 per-turn drain 继续用；协议已是 app-server）。
 
 ## 测试与验证
@@ -511,7 +526,10 @@ Multi-attach），第二个 attacher 写入的原始 PTY 字节能直接驱动�
    阻塞 gate 在挡，不是对话框超时）。对话框在无人 attach 时也照常在 job 的
    PTY 内渲染，`needs` 照常出现——注入不依赖终端是否有人挂着。
 
-单选对话框的关键性质：**数字键一击即选中并确认，无需回车**（三次实测一致）。
+单选对话框的关键性质（**2026-07-07 修正**）：数字键落在**非当前高亮**选项上
+一击即选中并确认；落在**已高亮**选项上只重选、需 Enter 确认。2026-07-06 的三次
+实测恰好都命中前者，得出"无需回车"的过窄结论。权威规则见下「按键映射表」的
+修正横幅与 ADR 0048 round-2 记录。
 
 ### 目标形态（闭环）
 
@@ -533,6 +551,17 @@ PreToolUse gate hook ──捕获完整 tool_input 落 pending(mode=notify)─�
 没人答就一直挂着（可选加提醒，不加硬超时）。
 
 ### 按键映射表（Step 0 全部实测于 Claude Code 2.1.201）
+
+> ⚠️ **2026-07-07 修正（权威版见此横幅，下表为历史 Step 0 记录）**：飞书
+> Live E2E 后键位矩阵有两处更正，代码 `keys_for_*` 已按新规则实现——
+> (1) **select 类普通选项（Ask 单选、多选/多题的 Submit 页 `1`）改为
+> 数字 + Enter**：数字落已高亮选项只重选，Enter 补确认；落非高亮选项时
+> Enter 是空操作。(2) **权限框 allow 保持单独 `b"1"`、不加 Enter**：权限
+> 对话框对数字即时生效，且并行 tool_use 会在无模型延迟下连弹下一个权限框，
+> 尾随 Enter 可能误确认下一个框的默认项（= allow）；deny 仍单独 ESC。
+> (3) **多题问答某题答案若落在高亮 slot 1**：该数字不前进、会污染后续答案，
+> 故 `keys_for_ask_answer` 对这种组合返回 None、降级到终端作答。下表"一击
+> 即确认无需回车"的措辞按此横幅理解。
 
 | 对话框形态 | 按键序列 | 状态 |
 |---|---|---|
@@ -599,6 +628,27 @@ hook 侧判定"是否 daemon job"：session_id 规范化为 8-hex short id
 （约 200ms 预算，失败/超时一律按非 daemon 处理 → 走阻塞路径）。探测放在
 `gate_tui_hook`（runtime 层，可 import claude_daemon）；`claude_gate.py`
 保持纯 stdlib，不产生循环依赖。
+
+### observer attach：daemon 生 / detach 会话的状态盲区（2026-07-07 补）
+
+ADR 0048 live-E2E 发现：**daemon 只在 job 有 ≥1 attacher 连接期间发布
+state patch（tempo/needs）**。wrapper 起的会话终端天然 attach 着所以此前
+一切正常；飞书生的 bg worker（以及终端 `/exit` detach 后的会话）零
+attacher，对话框在 PTY 里照常渲染（attach 回放可见、注入可用），但
+`list`/`subscribe` 账本冻结、`needs` 恒空——notify gate 的对话框探针据此
+误判"从未渲染"，飞书卡片永不发出，会话静默卡死。
+
+解法是把 ADR 里"第一 attacher 从终端变成注入连接"落实为常驻连接：runtime
+对每个被观察的 daemon job 保持一条只读 **observer attach**
+（`attachId=walkcode-observer`，200x50 与 pty-host 生成默认一致，PTY 流
+排空丢弃、永不写字节）。挂接点两处：daemon spawner 注册成功后、首轮注入
+**之前**（保证首个对话框的 patch 就有 attacher 可推）；watcher 发现循环
+对所有受观察 job 兜底 ensure（覆盖 wrapper 会话 detach 后的窗口）。断线
+按 5s 重连，job 消失自行退出。
+
+同批实测修正键位矩阵：select 类对话框数字键落在已高亮选项上只重选不确认，
+通用注入序列改为**数字 + Enter**（数字已确认时 Enter 是 no-op）；deny 的
+ESC 保持单键（详见协议文档 §1.6.6）。
 
 ### 注入前/后校验与竞态防护
 

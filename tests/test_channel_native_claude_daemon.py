@@ -276,7 +276,12 @@ class KeystrokeMappingTests(unittest.TestCase):
 
     # -- permission dialog ----------------------------------------------------
 
-    def test_permission_allow_and_always_allow_press_1(self):
+    def test_permission_allow_and_always_allow_press_1_no_enter(self):
+        # Permission dialogs act on the digit instantly and get NO trailing
+        # Enter (round-2 review finding): queued permission prompts render the
+        # next dialog with no model latency, so a trailing Enter could confirm
+        # the NEXT dialog's default (= allow). Ask-style dialogs keep the Enter
+        # because their next dialog is a full model turn away.
         for action in ("allow", "allow_once", "accept", "acceptForSession", "always_allow"):
             self.assertEqual(_key_bytes(keys_for_permission(action)), [b"1"], action)
 
@@ -292,14 +297,16 @@ class KeystrokeMappingTests(unittest.TestCase):
     def _single(self, options, **extra):
         return {"questions": [{"question": "Which fruit?", "options": options, **extra}]}
 
-    def test_single_select_digit_confirms_in_one_press(self):
+    def test_single_select_digit_then_enter(self):
+        # The Enter is required when the picked slot is already highlighted
+        # (digit alone only re-selects); it is a no-op otherwise.
         frames = keys_for_ask_answer(self._single(["apple", "banana", "cherry"]), {0: "banana"})
-        self.assertEqual(_key_bytes(frames), [b"2"])
+        self.assertEqual(_key_bytes(frames), [b"2", b"\r"])
 
     def test_single_select_accepts_dict_options_and_str_answer_key(self):
         options = [{"label": "apple", "value": "a"}, {"label": "banana", "value": "b"}]
         frames = keys_for_ask_answer(self._single(options), {"0": "banana"})
-        self.assertEqual(_key_bytes(frames), [b"2"])
+        self.assertEqual(_key_bytes(frames), [b"2", b"\r"])
 
     def test_single_select_free_text_goes_through_other_slot(self):
         frames = keys_for_ask_answer(self._single(["apple", "banana", "cherry"]), {0: "mango"})
@@ -328,17 +335,17 @@ class KeystrokeMappingTests(unittest.TestCase):
     def test_multi_select_toggles_then_right_arrow_then_submit(self):
         question = self._single(["python", "go", "rust"], multiSelect=True)
         frames = keys_for_ask_answer(question, {0: ["python", "rust"]})
-        self.assertEqual(_key_bytes(frames), [b"1", b"3", b"\x1b[C", b"1"])
+        self.assertEqual(_key_bytes(frames), [b"1", b"3", b"\x1b[C", b"1", b"\r"])
 
     def test_multi_select_single_string_answer_is_wrapped(self):
         question = self._single(["python", "go"], allow_multiple=True)
         frames = keys_for_ask_answer(question, {0: "go"})
-        self.assertEqual(_key_bytes(frames), [b"2", b"\x1b[C", b"1"])
+        self.assertEqual(_key_bytes(frames), [b"2", b"\x1b[C", b"1", b"\r"])
 
     def test_multi_select_duplicate_pick_does_not_toggle_back_off(self):
         question = self._single(["python", "go"], multiSelect=True)
         frames = keys_for_ask_answer(question, {0: ["go", "go"]})
-        self.assertEqual(_key_bytes(frames), [b"2", b"\x1b[C", b"1"])
+        self.assertEqual(_key_bytes(frames), [b"2", b"\x1b[C", b"1", b"\r"])
 
     def test_multi_select_free_text_is_not_injectable(self):
         question = self._single(["python", "go"], multiSelect=True)
@@ -354,8 +361,21 @@ class KeystrokeMappingTests(unittest.TestCase):
                 {"question": "Color?", "options": ["red", "blue", "green"]},
             ]
         }
-        frames = keys_for_ask_answer(tool_input, {0: "apple", "1": "blue"})
-        self.assertEqual(_key_bytes(frames), [b"1", b"2", b"1"])
+        # Non-slot-1 answers: each digit advances, Submit page is "1" + Enter.
+        frames = keys_for_ask_answer(tool_input, {0: "banana", "1": "blue"})
+        self.assertEqual(_key_bytes(frames), [b"2", b"2", b"1", b"\r"])
+
+    def test_multi_question_answer_on_highlighted_slot1_degrades(self):
+        # A digit on the already-highlighted slot 1 does not advance the
+        # multi-question dialog, so any answer landing there would corrupt the
+        # later answers — degrade to the terminal (round-2 review finding).
+        tool_input = {
+            "questions": [
+                {"question": "Fruit?", "options": ["apple", "banana"]},
+                {"question": "Color?", "options": ["red", "blue", "green"]},
+            ]
+        }
+        self.assertIsNone(keys_for_ask_answer(tool_input, {0: "apple", "1": "blue"}))
 
     def test_multi_question_with_multi_select_is_not_injectable(self):
         tool_input = {
@@ -378,6 +398,34 @@ class KeystrokeMappingTests(unittest.TestCase):
     def test_option_slot_past_digit_9_is_not_injectable(self):
         many = [f"opt{i}" for i in range(9)]  # Other would land on slot 10
         self.assertIsNone(keys_for_ask_answer(self._single(many), {0: "free text"}))
+
+
+class AttachObserveTests(unittest.IsolatedAsyncioTestCase):
+    async def test_observer_holds_readonly_attach_with_observer_identity(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            async with _FakeDaemonServer(str(Path(tmp) / "control.sock")) as server:
+                server.attach_stream = b"\x1b[2J? dialog waiting\r\n"
+                client = _client_for(server, tmp)
+                task = asyncio.create_task(client.attach_observe(SHORT))
+                for _ in range(200):
+                    if server.attaches:
+                        break
+                    await asyncio.sleep(0.01)
+                self.assertTrue(server.attaches, "observer never attached")
+                request = server.attaches[0]["request"]
+                self.assertEqual(request["attachId"], "walkcode-observer")
+                self.assertEqual(request["short"], SHORT)
+                # Size matches the pty-host spawn default so the observer
+                # handshake never changes the job's terminal layout.
+                self.assertEqual(request["cols"], 200)
+                self.assertEqual(request["rows"], 50)
+                await asyncio.sleep(0.05)
+                self.assertFalse(task.done(), "observer must hold the connection")
+                task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+                await asyncio.wait_for(server.attaches[0]["done"].wait(), timeout=2.0)
+                self.assertEqual(server.attaches[0]["bytes"], b"", "observer wrote bytes")
 
 
 class AttachSendKeysTests(unittest.IsolatedAsyncioTestCase):

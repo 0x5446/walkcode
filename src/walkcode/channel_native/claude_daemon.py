@@ -28,6 +28,7 @@ import hashlib
 import json
 import os
 import re
+import sys
 import time
 from pathlib import Path
 from typing import Any, AsyncIterator
@@ -51,26 +52,72 @@ CLAUDE_DAEMON_PROTO = 1
 # these codes mean "fall back to takeover", not "daemon is broken".
 REPLY_REJECTED_CODES = frozenset({"ENOJOB", "ENOREPLY", "ERESPAWNING"})
 
+# `claude --bg` spawn (ADR 0048): CLI call + list/ready settle budgets. The
+# live-measured happy path is <2s end to end; the generous ceilings only bound
+# the fallback-to-headless latency when the daemon is wedged.
+SPAWN_BG_CLI_TIMEOUT_SECONDS = 60.0
+SPAWN_BG_READY_TIMEOUT_SECONDS = 20.0
+SPAWN_BG_POLL_SECONDS = 0.5
+
+# `claude --bg` colors its stdout even when piped under FORCE_COLOR-style
+# environments (live-observed), so the short id is parsed ANSI-stripped.
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+_BACKGROUNDED_RE = re.compile(r"backgrounded · ([0-9a-f]{8})")
+
+
+def parse_backgrounded_short(output: str) -> str:
+    """Extract the job short id from `claude --bg` output ('' if absent)."""
+    match = _BACKGROUNDED_RE.search(_ANSI_RE.sub("", output or ""))
+    return match.group(1) if match else ""
+
 # -- keystroke injection (v3 true dual-surface, ADR 0046 v3) ------------------
 #
 # A second attacher's raw PTY bytes drive the native permission /
-# AskUserQuestion dialogs exactly like a keyboard. All sequences below were
-# live-verified on Claude Code 2.1.201 (mapping table: "交互闭环 v3" in
-# docs/design/claude-daemon-multi-ui-sync.md). Non-obvious dialog behaviors
-# the mapping relies on:
+# AskUserQuestion dialogs exactly like a keyboard. Sequences live-verified on
+# Claude Code 2.1.201/2.1.202 (mapping table: "交互闭环 v3" in
+# docs/design/claude-daemon-multi-ui-sync.md; 2026-07-07 corrections in ADR
+# 0048). Non-obvious dialog behaviors the mapping relies on:
 #
-# - digit semantics vary by dialog kind: single-select / multi-question
-#   digits confirm in one press (no Enter); multiSelect digits only toggle;
-# - Enter is context-dependent and is only ever sent after non-empty Other
-#   free text (Enter on an empty Other item cancels the whole dialog);
-# - multiSelect submits via right-arrow to the Submit page then "1";
-#   multi-question auto-advances per answer and ends on the same Submit page.
+# - select-style digits (single-select, submit pages): a digit on a slot that
+#   is NOT the current highlight confirms in one press; a digit on the
+#   ALREADY-highlighted slot only re-selects and the dialog waits for Enter
+#   (2026-07-07 live finding — the 2026-07-06 "one press, no Enter" results
+#   were all of the first kind). Hence digit+Enter for these paths.
+# - permission dialogs act on the digit INSTANTLY (live-verified) and get NO
+#   trailing Enter: queued permission prompts (parallel tool_use) render the
+#   next dialog locally without model latency, so a trailing Enter could
+#   confirm the NEXT dialog's default (= allow) — see keys_for_permission.
+# - multiSelect digits only toggle; Enter after non-empty Other text confirms
+#   (Enter on an empty Other item cancels the whole dialog);
+# - multiSelect submits via right-arrow to the Submit page then "1"+Enter;
+#   multi-question auto-advances per answer and ends on the same Submit page —
+#   but an answer sitting on the highlighted slot 1 would NOT advance, so
+#   those dialogs degrade to the terminal (keys_for_ask_answer -> None).
 
 KeyFrame = tuple[bytes, float]  # (raw PTY bytes, delay after writing them)
 
 ATTACH_SETTLE_SECONDS = 0.8
 INTER_KEY_DELAY_SECONDS = 0.15
 DEFAULT_INJECT_ATTACH_ID = "walkcode-injector"
+
+# Persistent observer attach (ADR 0048 live-E2E finding, 2026-07-07): the
+# daemon only publishes state patches (tempo/needs) to its ledger while the
+# job has at least one attacher. A never-attached job — exactly what a
+# Feishu-spawned or detached session is — renders its dialogs in the PTY but
+# the supervisor's list/subscribe view stays frozen, so the notify-gate probe
+# concludes "no dialog" and the dual-surface card is never posted. The fix is
+# the ADR's own sentence made literal: walkcode holds one long-lived attach
+# per watched job ("第一 attacher 从终端变成注入连接"). Size matches the
+# pty-host spawn default (200x50) so our handshake never changes the layout.
+OBSERVER_ATTACH_ID = "walkcode-observer"
+OBSERVER_ATTACH_COLS = 200
+OBSERVER_ATTACH_ROWS = 50
+OBSERVER_RECONNECT_SECONDS = 5.0
+# Consecutive job_alive()==None (control-plane unprobeable) checks before the
+# observer reconnect loop gives up; the runtime's watcher sync rebuilds it if
+# the job reappears in list. Bounds a hot loop against a truly-dead job while
+# surviving transient daemon blips.
+OBSERVER_PROBE_GIVEUP = 5
 
 # Post-injection verify: the dialog must resolve (needs cleared / changed /
 # tempo off blocked) within this window, or the card degrades to "answer in
@@ -115,8 +162,18 @@ def keys_for_permission(action: str) -> list[KeyFrame] | None:
     """
     normalized = str(action or "").strip().lower()
     if normalized in {"allow", "allow_once", "accept", "acceptforsession", "always_allow"}:
+        # Single "1", NO trailing Enter (deep-review round-2 finding):
+        # permission dialogs act on the digit instantly (live-verified
+        # 2026-07-06), and queued permission prompts — parallel tool_use in
+        # one assistant message is common — render the NEXT dialog locally
+        # with no model latency in between, so a trailing Enter could land on
+        # that next dialog and confirm its default, silently allowing an
+        # unreviewed tool call. Ask-style dialogs keep digit+Enter instead:
+        # their next dialog is always separated by a full model turn.
         return [(b"1", INTER_KEY_DELAY_SECONDS)]
     if normalized == "deny":
+        # ESC only — never append Enter here: if the ESC were ever swallowed,
+        # a trailing Enter would confirm the highlighted item, i.e. ALLOW.
         return [(_ESC, INTER_KEY_DELAY_SECONDS)]
     return None
 
@@ -169,8 +226,19 @@ def keys_for_ask_answer(
         if slot is None:
             # Free text inside a multi-question dialog is unverified.
             return None
+        if slot == 1:
+            # Multi-question advances by the digit itself. A digit on the
+            # ALREADY-highlighted slot 1 only re-selects and does NOT advance
+            # (same rule that forced digit+Enter for single-select,
+            # 2026-07-07); the next question's digit would then land on this
+            # one and corrupt every later answer. There is no per-question
+            # Enter to confirm-and-advance safely here (an Enter mid-page may
+            # submit the whole dialog early), so degrade the whole thing to
+            # the terminal rather than risk a wrong multi-answer submission.
+            return None
         frames.append((str(slot).encode("ascii"), INTER_KEY_DELAY_SECONDS))
     frames.append((b"1", INTER_KEY_DELAY_SECONDS))  # Submit answers page
+    frames.append((b"\r", INTER_KEY_DELAY_SECONDS))  # confirm if "1" was the highlight
     return frames
 
 
@@ -209,7 +277,17 @@ def _frames_for_single_select(labels: list[str], value: Any) -> list[KeyFrame] |
         return None
     slot = _option_slot(labels, value)
     if slot is not None:
-        return [(str(slot).encode("ascii"), INTER_KEY_DELAY_SECONDS)]
+        # Digit + Enter (2026-07-07 live finding): a digit on a slot that is
+        # NOT the current highlight selects and confirms in one stroke, but a
+        # digit on the ALREADY-highlighted slot (e.g. answering "option 1"
+        # while ❯ sits on 1) only re-selects — the dialog stays open waiting
+        # for Enter. The trailing Enter makes the sequence universal: it
+        # confirms in the second case and is a no-op composer keypress in the
+        # first (no new dialog can render within one INTER_KEY_DELAY).
+        return [
+            (str(slot).encode("ascii"), INTER_KEY_DELAY_SECONDS),
+            (b"\r", INTER_KEY_DELAY_SECONDS),
+        ]
     text = _sanitize_other_text(value)
     if not text:
         return None
@@ -242,6 +320,9 @@ def _frames_for_multi_select(labels: list[str], value: Any) -> list[KeyFrame] | 
         return None
     frames.append((_RIGHT_ARROW, INTER_KEY_DELAY_SECONDS))
     frames.append((b"1", INTER_KEY_DELAY_SECONDS))  # "1. Submit answers"
+    # Same universal digit+Enter rule as single-select: "1" on the Submit
+    # page is the highlighted default, so it may need the confirm stroke.
+    frames.append((b"\r", INTER_KEY_DELAY_SECONDS))
     return frames
 
 
@@ -466,6 +547,56 @@ class ClaudeDaemonClient:
             with contextlib.suppress(Exception):
                 await writer.wait_closed()
 
+    async def attach_observe(
+        self,
+        short: str,
+        *,
+        cols: int = OBSERVER_ATTACH_COLS,
+        rows: int = OBSERVER_ATTACH_ROWS,
+        attach_id: str = OBSERVER_ATTACH_ID,
+        on_ready: "asyncio.Event | None" = None,
+    ) -> None:
+        """Hold a read-only attach open until the connection drops.
+
+        The daemon only publishes state patches (tempo/needs) while the job
+        has at least one attacher (live-verified 2026-07-07): without this
+        connection a Feishu-spawned or detached job renders its dialogs into
+        the PTY but list/subscribe stay frozen, blinding the notify-gate
+        probe. The PTY stream is drained and discarded; no bytes are written.
+        ``on_ready`` is set once the attach handshake succeeds, so spawn can
+        wait for a real attacher before submitting the first turn. Returns
+        when the daemon closes the connection (job gone, daemon restart);
+        raises TransportUnavailable/ClaudeDaemonError on handshake failure
+        like every other control-plane call.
+        """
+        reader, writer = await self._connect()
+        try:
+            request = {
+                "proto": CLAUDE_DAEMON_PROTO,
+                "op": "attach",
+                "auth": self._auth(),
+                "short": short,
+                "cols": cols,
+                "rows": rows,
+                "attachId": attach_id,
+            }
+            writer.write(json.dumps(request).encode("utf-8") + b"\n")
+            await writer.drain()
+            try:
+                line = await asyncio.wait_for(reader.readline(), timeout=self.request_timeout)
+            except asyncio.TimeoutError as exc:
+                raise TransportUnavailable("Claude daemon attach handshake timed out") from exc
+            if not line:
+                raise TransportUnavailable("Claude daemon closed during attach handshake")
+            _raise_on_error(_decode_line(line))
+            if on_ready is not None:
+                on_ready.set()
+            await self._drain_pty_stream(reader)
+        finally:
+            writer.close()
+            with contextlib.suppress(Exception):
+                await writer.wait_closed()
+
     @staticmethod
     async def _drain_pty_stream(reader: asyncio.StreamReader) -> None:
         with contextlib.suppress(Exception):
@@ -594,6 +725,128 @@ class ClaudeDaemonTransport:
         # short -> last successful injection ts: lets the daemon watcher tell
         # "needs cleared because Feishu injected" from "terminal answered".
         self._recent_injections: dict[str, float] = {}
+        # short -> persistent observer-attach task (ADR 0048): keeps ≥1
+        # attacher on every watched job so the daemon publishes state patches.
+        self._observers: dict[str, asyncio.Task[None]] = {}
+        # short -> Event set once the observer's attach handshake first
+        # succeeds, so spawn can wait for a real attacher before the first
+        # turn (ensure_observer_ready).
+        self._observer_ready: dict[str, asyncio.Event] = {}
+
+    # -- persistent observer attach (ADR 0048) ------------------------------
+
+    def ensure_observer(self, short: str) -> None:
+        """Keep one persistent observer attach alive for this job."""
+        short = claude_daemon_short_id(short)
+        if not short:
+            return
+        task = self._observers.get(short)
+        if task is not None and not task.done():
+            return
+        ready = self._observer_ready.get(short)
+        if ready is None or ready.is_set():
+            # Fresh Event per (re)built task so readiness reflects THIS
+            # attach, not a stale success from a task that has since exited.
+            ready = asyncio.Event()
+            self._observer_ready[short] = ready
+        self._observers[short] = asyncio.get_running_loop().create_task(
+            self._observe_job_forever(short, ready),
+            name=f"walkcode-claude-daemon-observer-{short}",
+        )
+
+    async def ensure_observer_ready(self, short: str, *, timeout: float) -> bool:
+        """Start the observer and wait until its attach handshake lands.
+
+        Returns True once attached, False on timeout. Spawn calls this before
+        submitting the first turn so the very first permission/ask dialog is
+        published (the daemon only emits tempo/needs while ≥1 attacher is
+        connected). Timeout is best-effort: the caller proceeds anyway (the
+        first turn still carries model latency before any dialog, and the
+        watcher sync keeps re-ensuring the observer), it just logs a degrade.
+        """
+        short = claude_daemon_short_id(short)
+        if not short:
+            return False
+        self.ensure_observer(short)
+        ready = self._observer_ready.get(short)
+        if ready is None:
+            return False
+        if ready.is_set():
+            return True
+        try:
+            await asyncio.wait_for(ready.wait(), timeout=timeout)
+            return True
+        except asyncio.TimeoutError:
+            return False
+
+    def stop_observer(self, short: str) -> None:
+        short = claude_daemon_short_id(short)
+        task = self._observers.pop(short, None)
+        self._observer_ready.pop(short, None)
+        if task is not None and not task.done():
+            task.cancel()
+
+    def stop_all_observers(self) -> list[asyncio.Task[None]]:
+        """Cancel every observer task; return the ones still needing an await.
+
+        Cancellation is not synchronous — ``attach_observe``'s ``finally``
+        only closes its socket once the CancelledError is delivered. The
+        caller (the watcher loop's ``finally``) must await the returned tasks
+        so the event loop does not close with pending observer connections
+        (round-2 review finding).
+        """
+        pending: list[asyncio.Task[None]] = []
+        for short in list(self._observers):
+            task = self._observers.pop(short, None)
+            self._observer_ready.pop(short, None)
+            if task is not None and not task.done():
+                task.cancel()
+                pending.append(task)
+        return pending
+
+    async def _observe_job_forever(
+        self, short: str, ready: asyncio.Event | None = None
+    ) -> None:
+        """Reconnect loop for one job's observer attach; exits when it dies.
+
+        Exit conditions: job definitively gone (``job_alive() is False``), or
+        the control plane stays unprobeable (``None``) for
+        ``OBSERVER_PROBE_GIVEUP`` consecutive checks. A single transient probe
+        outage must NOT end the observer — that was the round-2 review finding:
+        one ``None`` used to kill it permanently, and if a subscribe watcher
+        happened to still exist the runtime's sync would not rebuild it,
+        leaving the job with zero attachers and frozen tempo/needs patches.
+        The bounded give-up keeps a truly-dead-but-unprobeable job from
+        looping forever; the runtime's watcher sync re-ensures the observer
+        if the job reappears in ``list``.
+        """
+        none_streak = 0
+        while True:
+            try:
+                await self.client.attach_observe(short, on_ready=ready)
+            except asyncio.CancelledError:
+                raise
+            except (TransportUnavailable, ClaudeDaemonError):
+                pass
+            except Exception as exc:  # pragma: no cover - defensive
+                print(
+                    f"claude daemon observer error ({short}): "
+                    f"{type(exc).__name__}: {exc}",
+                    file=sys.stderr,
+                )
+            alive = await self.client.job_alive(short)
+            if alive is False:
+                return  # job gone for good
+            if alive is None:
+                none_streak += 1
+                if none_streak >= OBSERVER_PROBE_GIVEUP:
+                    # Control plane unreachable too long — give up cleanly.
+                    # ensure_observer (watcher sync) rebuilds if the job comes
+                    # back into list; a done entry in _observers is inert.
+                    return
+            else:
+                none_streak = 0  # alive is True
+            await asyncio.sleep(OBSERVER_RECONNECT_SECONDS)
 
     def capabilities(self) -> TransportCapabilities:
         return TransportCapabilities(
@@ -621,9 +874,117 @@ class ClaudeDaemonTransport:
 
     async def launch(self, spec: LaunchSpec) -> TransportHandle:
         raise CapabilityUnsupported(
-            "Claude daemon transport cannot create sessions (dispatch not implemented); "
-            "new sessions go through claude_headless"
+            "Claude daemon transport cannot create structured sessions; daemon-native "
+            "spawn goes through the runtime's spawn_bg_job path (ADR 0048)"
         )
+
+    async def spawn_bg_job(
+        self,
+        cwd: str,
+        *,
+        settings: str = "",
+        cli_path: str = "",
+        bg_runner: Any = None,
+        ready_timeout: float = SPAWN_BG_READY_TIMEOUT_SECONDS,
+    ) -> dict[str, str]:
+        """Create a daemon-born session via the official `claude --bg` CLI surface.
+
+        The daemon's own `dispatch` op is CLI-internal (its `d` spec is
+        undocumented and Zod-validated); `claude --bg` is the stable way to get
+        a job that is a daemon worker from birth (live-verified TTY-less on
+        2026-07-07: prints 'backgrounded · <short>', job lands in `list` with
+        the full sessionId and cwd). Returns {short, session_id, cwd} once the
+        job is ready for `reply`. Raises TransportUnavailable on any failure so
+        callers can fall back to the headless SDK spawn.
+        """
+        argv = [cli_path or "claude", "--bg"]
+        if settings:
+            argv += ["--settings", settings]
+        env = dict(os.environ)
+        # A nested-CLAUDE environment refuses --bg ("session persistence is
+        # disabled"); the runtime itself is never nested, but a dev running
+        # `walkcode native serve` from inside a Claude session would be.
+        env.pop("CLAUDECODE", None)
+        if self.config_dir:
+            env["CLAUDE_CONFIG_DIR"] = self.config_dir
+        runner = bg_runner or self._run_bg_cli
+        try:
+            output = await runner(argv, cwd=cwd, env=env)
+        except TransportUnavailable:
+            raise
+        except Exception as exc:
+            raise TransportUnavailable(f"claude --bg failed: {type(exc).__name__}: {exc}") from exc
+        short = parse_backgrounded_short(output)
+        if not short:
+            raise TransportUnavailable(
+                f"claude --bg output had no parseable short id: {output.strip()[:200]!r}"
+            )
+        # `claude --bg` has already created a live worker. From here EVERY exit
+        # that is not a clean return must best-effort reap it — a list/ready
+        # probe raising (socket blip, daemon restart, protocol drift) used to
+        # leave an orphan worker that list adoption would later resurface as a
+        # duplicate session (ADR 0048 review finding). One try/except covers
+        # ready-timeout, probe errors, and unexpected failures alike.
+        try:
+            deadline = time.monotonic() + ready_timeout
+            while time.monotonic() < deadline:
+                jobs = await self.client.list_jobs()
+                entry = next(
+                    (job for job in jobs if claude_daemon_short_id(job.get("short")) == short),
+                    None,
+                )
+                if entry is not None:
+                    session_id = str(entry.get("sessionId", "") or "")
+                    job_cwd = str(entry.get("cwd", "") or "")
+                    if session_id and await self.client.job_ready(short):
+                        return {"short": short, "session_id": session_id, "cwd": job_cwd or cwd}
+                await asyncio.sleep(SPAWN_BG_POLL_SECONDS)
+            reason = f"job {short} never became ready within {ready_timeout:.0f}s"
+        except Exception as exc:
+            reason = f"job {short} probe failed: {type(exc).__name__}: {exc}"
+        await self._reap_orphan(short)
+        raise TransportUnavailable(f"claude --bg {reason}")
+
+    async def _reap_orphan(self, short: str) -> None:
+        """Best-effort kill of a spawned-but-unusable job; kill failure logged."""
+        try:
+            await self.client.kill(short)
+        except Exception as exc:
+            # Not raised: the caller is already failing over to headless. But a
+            # silent suppress would hide a leaked worker — make it greppable.
+            print(
+                f"walkcode degrade=claude_daemon_spawn_reap_failed short={short} "
+                f"error={type(exc).__name__}: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+
+    @staticmethod
+    async def _run_bg_cli(argv: list[str], *, cwd: str, env: dict[str, str]) -> str:
+        proc = await asyncio.create_subprocess_exec(
+            *argv,
+            cwd=cwd or None,
+            env=env,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        try:
+            raw, _ = await asyncio.wait_for(
+                proc.communicate(), timeout=SPAWN_BG_CLI_TIMEOUT_SECONDS
+            )
+        except asyncio.TimeoutError:
+            with contextlib.suppress(ProcessLookupError):
+                proc.kill()
+            raise TransportUnavailable(
+                f"claude --bg timed out after {SPAWN_BG_CLI_TIMEOUT_SECONDS:.0f}s"
+            ) from None
+        output = raw.decode("utf-8", errors="replace")
+        if proc.returncode != 0:
+            raise TransportUnavailable(
+                f"claude --bg exited {proc.returncode}: {output.strip()[:200]}"
+            )
+        return output
 
     async def resume(self, spec: ResumeSpec) -> TransportHandle:
         short = claude_daemon_short_from_resume_ref(spec.resume_ref)
