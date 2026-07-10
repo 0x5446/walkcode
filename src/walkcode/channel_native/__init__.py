@@ -3871,10 +3871,21 @@ def render_view_text(view_model: dict[str, Any]) -> str:
     if view_type == "tui_permission_notice":
         tool = str(view_model.get("tool_name", "") or "tool")
         summary = str(view_model.get("summary", "") or "")
-        rows = [f"⏳ TUI is waiting for your approval: {tool}"]
+        prefix = "⏰ TUI is still waiting" if view_model.get("reminder") else "⏳ TUI is waiting"
+        rows = [f"{prefix} for your approval: {tool}"]
         if summary:
             rows.append(summary)
-        rows.append("Answer in the terminal, or take over this session.")
+        if view_model.get("probe_blind"):
+            rows.append("(walkcode cannot reach the dialog state right now — no buttons on this notice)")
+        attach_short = str(view_model.get("attach_short", "") or "")
+        if view_model.get("daemon_spawned"):
+            rows.append(
+                f"Attach from a terminal to answer: claude attach {attach_short}"
+                if attach_short
+                else "Attach this session from a terminal to answer."
+            )
+        else:
+            rows.append("Answer in the terminal, or take over this session.")
         return "\n".join(rows)
     if view_type == "tool_progress":
         def _status_label(value: str) -> str:

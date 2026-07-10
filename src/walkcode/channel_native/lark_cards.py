@@ -425,21 +425,34 @@ _DECISION_LABELS = {
 def _tui_permission_notice_card(view: dict[str, Any]) -> dict[str, Any]:
     tool = str(view.get("tool_name", "") or "工具")
     summary = str(view.get("summary", "") or "")
+    reminder = bool(view.get("reminder"))
+    probe_blind = bool(view.get("probe_blind"))
+    daemon_spawned = bool(view.get("daemon_spawned"))
+    attach_short = str(view.get("attach_short", "") or "")
     rows = [f"终端里的会话正在等你确认一个操作：**`{escape_lark_md(_inline(tool))}`**"]
     if summary:
         rows.append(escape_lark_md(_clip(_inline(summary), 300, "...")))
+    if probe_blind:
+        rows.append("walkcode 暂时探测不到这个对话框的状态（守护进程未应答），所以这张卡没有可点的按钮。")
+    # Post-gate this card only appears for confirmations that did NOT route
+    # to a Feishu approval card (tool outside the gate set, gate off/ask_only,
+    # the gate abstained, or a dialog kind without an injection path). A
+    # Feishu-born (daemon_spawn) session has no terminal the user is sitting
+    # at — pointing it to "the terminal" was a dead end (2026-07-09,
+    # fallback-model dialog stuck 6.5h) — so it gets the attach command.
+    if daemon_spawned:
+        note = (
+            f"这个确认暂不支持飞书按钮。终端处理：`claude attach {escape_lark_md(attach_short)}` 后选择。"
+            if attach_short
+            else "这个确认暂不支持飞书按钮，需要在终端 attach 这个会话后处理。"
+        )
+    else:
+        note = "这个确认未走飞书审批通道，需要在终端里处理。"
+    title = "⏰ 终端还在等你确认" if reminder else "⏳ 终端在等你确认"
     return _card_message(
-        "⏳ 终端在等你确认",
+        title,
         "orange",
-        [
-            _md_div("\n".join(rows)),
-            # Post-gate this card only appears for confirmations that did NOT
-            # route to a Feishu approval card (tool outside the gate set, gate
-            # off/ask_only, or the gate abstained) — so the terminal is the
-            # only place to answer. No takeover pitch: daemon-native sessions
-            # are already dual-writable.
-            _note("这个确认未走飞书审批通道，需要在终端里处理。"),
-        ],
+        [_md_div("\n".join(rows)), _note(note)],
     )
 
 

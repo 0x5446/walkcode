@@ -756,6 +756,13 @@ class _InjectStubClient:
                     job["tempo"] = "idle"
 
 
+class _OutageStubClient(_InjectStubClient):
+    """Control-plane outage: every list_jobs times out / refuses."""
+
+    async def list_jobs(self):
+        raise TransportUnavailable("control socket down")
+
+
 SHORT = AGENT_SESSION_ID.split("-")[0]
 
 
@@ -1001,6 +1008,10 @@ class NotifyGateDrainTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             runtime, _session, _api = _runtime_with_observed_session(tmp)
             state = runtime.state_store.path
+            # Daemon queried fine, job absent: a backed NOT_WAITING verdict —
+            # tri-state holds pendings on probe outages, so this cleanup test
+            # must not rely on the stub client raising.
+            runtime.transports["claude_daemon"].client = _InjectStubClient(jobs=[])
             request = _notify_request(rid="toolu_orphan")
             request["session_id"] = "99999999-9999-9999-9999-999999999999"
             request["resume_ref"] = {"agent_session_id": request["session_id"]}
@@ -1127,6 +1138,168 @@ class NotifyGateDrainTests(unittest.TestCase):
             asyncio.run(runtime.drain_claude_gate_requests())
             self.assertIsNone(claude_gate.read_pending(state, "toolu_edit_1"))
             self.assertIsNone(runtime.transports["claude_daemon"].notify_gate("toolu_edit_1"))
+
+    def test_notify_probe_outage_holds_pending_instead_of_dropping(self):
+        # 2026-07-09 incident: probe timeouts during a host stall were read
+        # as "never rendered" and a live Edit dialog lost its card. A blind
+        # probe must hold the pending, not age it toward the drop.
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime, _session, api = _runtime_with_observed_session(tmp)
+            state = runtime.state_store.path
+            runtime.transports["claude_daemon"].client = _OutageStubClient()
+            stale = _notify_request()
+            stale["created_at"] = time.time() - 60  # far past the 30s grace
+            claude_gate.write_pending(state, stale)
+            asyncio.run(runtime.drain_claude_gate_requests())
+            self.assertIsNotNone(claude_gate.read_pending(state, "toolu_edit_1"))
+            self.assertFalse(
+                [p for m, p in api.calls if m == "sendMessage" and "Edit" in str(p.get("text", ""))]
+            )
+
+    def test_notify_probe_long_blind_sends_notice_once_then_expires(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime, _session, api = _runtime_with_observed_session(tmp)
+            state = runtime.state_store.path
+            runtime.transports["claude_daemon"].client = _OutageStubClient()
+            stale = _notify_request()
+            stale["created_at"] = time.time() - 60
+            claude_gate.write_pending(state, stale)
+            import walkcode.channel_native_runtime as runtime_mod
+
+            old_notice = runtime_mod.CLAUDE_GATE_PROBE_BLIND_NOTICE_SECONDS
+            runtime_mod.CLAUDE_GATE_PROBE_BLIND_NOTICE_SECONDS = -1.0
+            try:
+                asyncio.run(runtime.drain_claude_gate_requests())
+                asyncio.run(runtime.drain_claude_gate_requests())
+            finally:
+                runtime_mod.CLAUDE_GATE_PROBE_BLIND_NOTICE_SECONDS = old_notice
+            notices = [
+                p
+                for m, p in api.calls
+                if m == "sendMessage" and "cannot reach the dialog" in str(p.get("text", ""))
+            ]
+            self.assertEqual(len(notices), 1)  # once, not per tick
+            self.assertIsNotNone(claude_gate.read_pending(state, "toolu_edit_1"))
+            # Past the hard cap the blind pending is finally reaped.
+            expired = _notify_request()
+            expired["created_at"] = (
+                time.time() - runtime_mod.CLAUDE_GATE_NOTIFY_PENDING_MAX_AGE_SECONDS - 1
+            )
+            claude_gate.write_pending(state, expired)
+            asyncio.run(runtime.drain_claude_gate_requests())
+            self.assertIsNone(claude_gate.read_pending(state, "toolu_edit_1"))
+
+    def test_notify_probe_blind_with_hook_evidence_posts_card(self):
+        # The PermissionRequest hook is direct render proof: even with the
+        # control plane out, the interactive card goes up (clicks re-verify
+        # the dialog before injecting, so a stale card degrades honestly).
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime, _session, api = _runtime_with_observed_session(tmp)
+            state = runtime.state_store.path
+            runtime.transports["claude_daemon"].client = _OutageStubClient()
+            runtime._dialog_render_evidence[(SHORT, "Edit")] = time.time()
+            claude_gate.write_pending(state, _notify_request())
+            asyncio.run(runtime.drain_claude_gate_requests())
+            self.assertIsNone(claude_gate.read_pending(state, "toolu_edit_1"))
+            self.assertTrue(
+                [p for m, p in api.calls if m == "sendMessage" and "Edit" in str(p.get("text", ""))]
+            )
+            self.assertIsNotNone(runtime.transports["claude_daemon"].notify_gate("toolu_edit_1"))
+
+    def test_blind_evidence_same_tool_parallel_pending_needs_rid(self):
+        # Two parallel Edit pendings, blind probe. The PermissionRequest hook
+        # fired for pending A only (rid-keyed evidence). A gets its card; B —
+        # sharing (short, "Edit") but with no rid evidence and a same-tool
+        # sibling — must NOT get a card off A's evidence (would let the user
+        # approve the wrong Edit).
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime, _session, api = _runtime_with_observed_session(tmp)
+            state = runtime.state_store.path
+            runtime.transports["claude_daemon"].client = _OutageStubClient()
+            a = _notify_request(rid="toolu_edit_A")
+            b = _notify_request(rid="toolu_edit_B")
+            claude_gate.write_pending(state, a)
+            claude_gate.write_pending(state, b)
+            # rid-bound evidence for A only.
+            runtime._dialog_render_evidence[(SHORT, "toolu_edit_A")] = time.time()
+            asyncio.run(runtime.drain_claude_gate_requests())
+            self.assertIsNone(claude_gate.read_pending(state, "toolu_edit_A"))  # A carded
+            self.assertIsNotNone(claude_gate.read_pending(state, "toolu_edit_B"))  # B held
+            self.assertIsNotNone(runtime.transports["claude_daemon"].notify_gate("toolu_edit_A"))
+            self.assertIsNone(runtime.transports["claude_daemon"].notify_gate("toolu_edit_B"))
+
+    def test_blind_evidence_tool_keyed_only_when_unique(self):
+        # Single Edit pending, only tool-keyed evidence (legacy path): trusted
+        # because there is no same-tool sibling.
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime, _session, api = _runtime_with_observed_session(tmp)
+            state = runtime.state_store.path
+            runtime.transports["claude_daemon"].client = _OutageStubClient()
+            runtime._dialog_render_evidence[(SHORT, "Edit")] = time.time()
+            claude_gate.write_pending(state, _notify_request())
+            asyncio.run(runtime.drain_claude_gate_requests())
+            self.assertIsNone(claude_gate.read_pending(state, "toolu_edit_1"))
+            self.assertIsNotNone(runtime.transports["claude_daemon"].notify_gate("toolu_edit_1"))
+
+    def test_blind_evidence_stale_before_created_is_ignored(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime, _session, api = _runtime_with_observed_session(tmp)
+            state = runtime.state_store.path
+            runtime.transports["claude_daemon"].client = _OutageStubClient()
+            req = _notify_request()
+            claude_gate.write_pending(state, req)
+            # Evidence 10s older than the pending's creation: not fresh.
+            runtime._dialog_render_evidence[(SHORT, "toolu_edit_1")] = req["created_at"] - 10
+            asyncio.run(runtime.drain_claude_gate_requests())
+            self.assertIsNotNone(claude_gate.read_pending(state, "toolu_edit_1"))  # held, no card
+
+    def test_blind_rid_reuse_between_passes_resets_clock(self):
+        # A rid removed one pass, reused the next, must not inherit the old
+        # blind clock or the already-noticed flag.
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime, _session, _api = _runtime_with_observed_session(tmp)
+            state = runtime.state_store.path
+            runtime.transports["claude_daemon"].client = _OutageStubClient()
+            expired = _notify_request()
+            import walkcode.channel_native_runtime as rt
+
+            expired["created_at"] = time.time() - rt.CLAUDE_GATE_NOTIFY_PENDING_MAX_AGE_SECONDS - 1
+            claude_gate.write_pending(state, expired)
+            asyncio.run(runtime.drain_claude_gate_requests())  # reaped as expired-blind
+            self.assertNotIn("toolu_edit_1", runtime._gate_probe_blind_since)
+            self.assertNotIn("toolu_edit_1", runtime._gate_blind_noticed)
+            fresh = _notify_request()  # same rid, fresh
+            claude_gate.write_pending(state, fresh)
+            asyncio.run(runtime.drain_claude_gate_requests())
+            # Fresh pending established a NEW blind clock (near now), not the
+            # old expired one.
+            self.assertIn("toolu_edit_1", runtime._gate_probe_blind_since)
+            self.assertGreater(runtime._gate_probe_blind_since["toolu_edit_1"], fresh["created_at"] - 1)
+
+    def test_blind_notice_skip_traces_reason(self):
+        # No routable session -> notice skipped with a reason trace, no crash.
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime, _session, _api = _runtime_with_observed_session(tmp)
+            unroutable = _notify_request(rid="toolu_orphan")
+            unroutable["session_id"] = "99999999-9999-9999-9999-999999999999"
+            unroutable["resume_ref"] = {"agent_session_id": unroutable["session_id"]}
+            sent = asyncio.run(runtime._send_gate_blind_notice(unroutable))
+            self.assertFalse(sent)
+
+    def test_notify_absent_verdict_still_drops_after_grace_with_evidence(self):
+        # Evidence changes the trace (settled in terminal, not never
+        # rendered) but not the outcome: a daemon-backed "no dialog" past the
+        # grace removes the pending either way.
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime, _session, _api = _runtime_with_observed_session(tmp)
+            state = runtime.state_store.path
+            runtime.transports["claude_daemon"].client = _InjectStubClient(jobs=[])
+            runtime._dialog_render_evidence[(SHORT, "Edit")] = time.time()
+            stale = _notify_request()
+            stale["created_at"] = time.time() - 60
+            claude_gate.write_pending(state, stale)
+            asyncio.run(runtime.drain_claude_gate_requests())
+            self.assertIsNone(claude_gate.read_pending(state, "toolu_edit_1"))
 
     def test_permission_request_notice_suppressed_while_notify_gate_open(self):
         # v3: the dialog renders natively, so the PermissionRequest hook fires
@@ -1455,6 +1628,193 @@ class DaemonStatePatchSemanticsTests(unittest.TestCase):
                 runtime.orchestrator._status_card_actions(session),
                 [{"action": "request_takeover", "label": "Take over"}],
             )
+
+    def test_blocked_with_empty_needs_flips_waiting_not_unblocked(self):
+        # Live-observed variant (2026-07-09): tempo=blocked with an empty
+        # needs line. Reading it as "unblocked" would clear a wait that is
+        # still happening; instead it blocks with a placeholder summary.
+        from walkcode.channel_native_runtime import BLOCKED_NEEDS_UNKNOWN
+
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime, session, api = _runtime_with_observed_session(tmp)
+            last = asyncio.run(
+                runtime._apply_claude_daemon_state_patch(
+                    session.session_id, {"tempo": "blocked", "needs": ""}, ""
+                )
+            )
+            self.assertEqual(last, BLOCKED_NEEDS_UNKNOWN)
+            self.assertEqual(session.lifecycle_state, "WAITING_PERMISSION")
+            self.assertTrue(
+                [
+                    p
+                    for m, p in api.calls
+                    if m == "sendMessage" and BLOCKED_NEEDS_UNKNOWN in str(p.get("text", ""))
+                ]
+            )
+            # Clearing later syncs back without the placeholder suffix.
+            last = asyncio.run(
+                runtime._apply_claude_daemon_state_patch(
+                    session.session_id, {"tempo": "active", "needs": ""}, last
+                )
+            )
+            self.assertEqual(last, "")
+            self.assertEqual(session.lifecycle_state, "EXTERNAL_OBSERVED_READONLY")
+            cleared = [
+                str(p.get("text", ""))
+                for m, p in api.calls
+                if m == "sendMessage" and "已在终端处理" in str(p.get("text", ""))
+            ]
+            self.assertTrue(cleared)
+            self.assertNotIn(BLOCKED_NEEDS_UNKNOWN, cleared[-1])
+
+    def test_placeholder_upgrade_to_real_needs_sends_new_card(self):
+        # blocked+empty needs first (placeholder), then the real needs
+        # arrives: the user must get the real text, not stay on the
+        # "内容未读到" placeholder until the 30-min watchdog.
+        from walkcode.channel_native_runtime import BLOCKED_NEEDS_UNKNOWN
+
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime, session, api = _runtime_with_observed_session(tmp)
+            last = asyncio.run(
+                runtime._apply_claude_daemon_state_patch(
+                    session.session_id, {"tempo": "blocked", "needs": ""}, ""
+                )
+            )
+            self.assertEqual(last, BLOCKED_NEEDS_UNKNOWN)
+            last = asyncio.run(
+                runtime._apply_claude_daemon_state_patch(
+                    session.session_id,
+                    {"tempo": "blocked", "needs": "approve Edit: /tmp/x.py"},
+                    last,
+                )
+            )
+            self.assertEqual(last, "approve Edit: /tmp/x.py")
+            self.assertTrue(
+                [
+                    p
+                    for m, p in api.calls
+                    if m == "sendMessage" and "approve Edit" in str(p.get("text", ""))
+                ]
+            )
+
+
+class WaitingPermissionWatchdogTests(unittest.TestCase):
+    """Session-level safety net over the fresh daemon job list (2026-07-09:
+    a fallback-model dialog sat blocked 6.5h unnoticed, and a session whose
+    dialog vanished kept claiming WAITING_PERMISSION for a day)."""
+
+    def _stale_waiting_session(self, tmp: str):
+        runtime, session, api = _runtime_with_observed_session(tmp)
+        session.lifecycle_state = "WAITING_PERMISSION"
+        session.last_progress_at = time.time() - 3600
+        return runtime, session, api
+
+    def test_dialog_gone_reconciles_only_after_persistent_dwell(self):
+        # A single not-blocked observation must NOT clear the wait — the
+        # daemon-restart window lists zero jobs for a moment (2026-07-09).
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime, session, _api = self._stale_waiting_session(tmp)
+            asyncio.run(runtime._reconcile_waiting_permission_sessions([]))
+            self.assertEqual(session.lifecycle_state, "WAITING_PERMISSION")  # first tick: record only
+            # Backdate the not-blocked clock past the dwell, then a second
+            # tick reconciles.
+            runtime._waiting_not_blocked_since[session.session_id] = time.time() - 3600
+            asyncio.run(runtime._reconcile_waiting_permission_sessions([]))
+            self.assertEqual(session.lifecycle_state, "EXTERNAL_OBSERVED_READONLY")
+            self.assertEqual(
+                session.last_progress_event, "external_tui.waiting_permission_reconciled"
+            )
+
+    def test_fresh_progress_under_lock_blocks_stale_clear(self):
+        # Race: a blocked patch lands while reconcile queues for the lock. It
+        # keeps lifecycle at WAITING_PERMISSION but bumps last_progress_at, so
+        # the under-lock last_progress dwell must veto the stale not-blocked
+        # clear (deep-review round-2 finding).
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime, session, _api = self._stale_waiting_session(tmp)
+            # not-blocked verdict persisted long ago...
+            runtime._waiting_not_blocked_since[session.session_id] = time.time() - 3600
+            # ...but a patch just bumped progress (the racing blocked patch).
+            session.last_progress_at = time.time()
+            asyncio.run(runtime._reconcile_waiting_permission_sessions([]))
+            self.assertEqual(session.lifecycle_state, "WAITING_PERMISSION")
+
+    def test_blocked_again_before_dwell_cancels_reconcile(self):
+        # not-blocked, then blocked again: the clock resets, no clear.
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime, session, _api = self._stale_waiting_session(tmp)
+            asyncio.run(runtime._reconcile_waiting_permission_sessions([]))
+            self.assertIn(session.session_id, runtime._waiting_not_blocked_since)
+            blocked_jobs = [
+                {"short": SHORT, "sessionId": AGENT_SESSION_ID, "tempo": "blocked", "needs": "approve Edit: /x"}
+            ]
+            asyncio.run(runtime._reconcile_waiting_permission_sessions(blocked_jobs))
+            self.assertNotIn(session.session_id, runtime._waiting_not_blocked_since)
+            self.assertEqual(session.lifecycle_state, "WAITING_PERMISSION")
+
+    def test_reconcile_matches_by_short_when_uuid_drifts(self):
+        # resume drifts the full session uuid; the job short still matches, so
+        # the session is recognized as still blocked (not cleared).
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime, session, api = self._stale_waiting_session(tmp)
+            drifted = [
+                {
+                    "short": SHORT,
+                    "sessionId": "99999999-aaaa-bbbb-cccc-dddddddddddd",
+                    "tempo": "blocked",
+                    "needs": "approve Edit: /tmp/x",
+                }
+            ]
+            asyncio.run(runtime._reconcile_waiting_permission_sessions(drifted))
+            self.assertEqual(session.lifecycle_state, "WAITING_PERMISSION")
+            self.assertNotIn(session.session_id, runtime._waiting_not_blocked_since)
+
+    def test_still_blocked_sends_reminder_once_per_interval(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime, session, api = self._stale_waiting_session(tmp)
+            jobs = [
+                {
+                    "short": SHORT,
+                    "sessionId": AGENT_SESSION_ID,
+                    "tempo": "blocked",
+                    "needs": "choose: retry on fallback model or edit prompt",
+                }
+            ]
+            asyncio.run(runtime._reconcile_waiting_permission_sessions(jobs))
+            asyncio.run(runtime._reconcile_waiting_permission_sessions(jobs))
+            reminders = [
+                p
+                for m, p in api.calls
+                if m == "sendMessage" and "retry on fallback model" in str(p.get("text", ""))
+            ]
+            self.assertEqual(len(reminders), 1)
+            self.assertEqual(session.lifecycle_state, "WAITING_PERMISSION")
+
+    def test_recent_progress_defers_reconcile(self):
+        # Patches may still be in flight: a fresh WAITING_PERMISSION is left
+        # alone even when the job list momentarily lacks the job.
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime, session, _api = self._stale_waiting_session(tmp)
+            session.last_progress_at = time.time()
+            asyncio.run(runtime._reconcile_waiting_permission_sessions([]))
+            self.assertEqual(session.lifecycle_state, "WAITING_PERMISSION")
+
+    def test_control_plane_outage_does_not_reach_reconcile(self):
+        # ADR 0049 invariant: the watchdog only ever runs on a successful
+        # list_jobs. A TransportUnavailable in _sync must skip reconcile
+        # entirely, leaving stale waits untouched.
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime, session, _api = self._stale_waiting_session(tmp)
+            transport = runtime.transports["claude_daemon"]
+            transport.client = _OutageStubClient()
+            watchers: dict = {}
+            # _sync raises TransportUnavailable on list_jobs; the forever loop
+            # swallows it, but here we assert reconcile was never entered by
+            # checking the session is untouched.
+            with self.assertRaises(TransportUnavailable):
+                asyncio.run(runtime._sync_claude_daemon_watchers(transport, watchers))
+            self.assertEqual(session.lifecycle_state, "WAITING_PERMISSION")
+            self.assertNotIn(session.session_id, runtime._waiting_not_blocked_since)
 
 
 if __name__ == "__main__":
