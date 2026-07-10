@@ -138,6 +138,17 @@ _APPROVE_NEEDS_RE = re.compile(r"^approve\s+([^\s:]+)\s*(?::|$)")
 # turned probe outages into fake injection success (deep-review finding).
 _JOB_STATE_UNAVAILABLE = object()
 
+# Tri-state verdicts for the notify-gate dialog probe. WAITING / NOT_WAITING
+# are backed by a daemon answer; UNKNOWN means the control plane did not
+# answer, which is NOT evidence the dialog never rendered. Collapsing UNKNOWN
+# into NOT_WAITING is the 2026-07-09 incident: every probe during a host-wide
+# stall timed out, the drain read the string of Falses as "never rendered",
+# and a live Edit permission dialog lost its Feishu card while the user was
+# away for 8 minutes.
+DIALOG_WAITING = "waiting"
+DIALOG_NOT_WAITING = "not_waiting"
+DIALOG_UNKNOWN = "unknown"
+
 _ESC = b"\x1b"
 _RIGHT_ARROW = b"\x1b[C"  # multiSelect: option page -> Submit page
 # Dialog slots are picked with a single digit key; anything past 9 has no key.
@@ -1184,28 +1195,36 @@ class ClaudeDaemonTransport:
             self._recent_injections.pop(next(iter(self._recent_injections)))
         claude_gate.trace("inject_ok", rid=rid, short=short, frames=len(frames))
 
-    async def notify_dialog_waiting(self, request: dict[str, Any]) -> bool:
-        """Is the native dialog for this notify pending rendered and waiting?
+    async def notify_dialog_state(self, request: dict[str, Any]) -> str:
+        """Tri-state probe: is the native dialog for this notify pending up?
 
         The card must mirror a real dialog: Claude Code auto-approves some
         tool calls (safe read-only Bash, sandboxed commands), in which case
         no dialog ever renders and posting a card would leave dangling live
-        buttons (live-E2E finding, 2026-07-06).
+        buttons (live-E2E finding, 2026-07-06). That drop decision is only
+        valid on a daemon-backed answer, so a probe outage is reported as
+        DIALOG_UNKNOWN instead of being folded into "not waiting" — the
+        caller must not let UNKNOWN age a pending toward never_rendered
+        (2026-07-09 incident).
         """
         short = str(request.get("daemon_short", "") or "")
         if not short:
-            return False
+            return DIALOG_NOT_WAITING
         entry = {
             "kind": str(request.get("kind", "") or ""),
             "tool_name": str(request.get("tool_name", "") or ""),
             "tool_input": request.get("tool_input") if isinstance(request.get("tool_input"), dict) else {},
         }
         job = await self._gate_job_state(short)
+        if job is _JOB_STATE_UNAVAILABLE:
+            return DIALOG_UNKNOWN
         if not isinstance(job, dict):
-            # No job or probe outage: either way, no dialog is confirmed waiting.
-            return False
+            # Queried fine, job absent: definitively no dialog to mirror.
+            return DIALOG_NOT_WAITING
         needs = str(job.get("needs", "") or "").strip()
-        return self._gate_dialog_matches(entry, job, needs)
+        if self._gate_dialog_matches(entry, job, needs):
+            return DIALOG_WAITING
+        return DIALOG_NOT_WAITING
 
     async def _gate_job_state(self, short: str) -> Any:
         """Job dict, None (queried fine, job absent), or _JOB_STATE_UNAVAILABLE."""

@@ -379,6 +379,46 @@ class OtherViewTests(unittest.TestCase):
         self.assertNotIn("[bold](", body)
         self.assertIn("\\<at", body)
 
+    def test_tui_notice_daemon_spawned_points_to_attach_not_terminal(self):
+        # A Feishu-born session has no terminal the user is sitting at:
+        # "answer in the terminal" was a dead end (2026-07-09).
+        message = render_lark_message(
+            {
+                "type": "tui_permission_notice",
+                "tool_name": "",
+                "summary": "choose: retry on fallback model or edit prompt",
+                "daemon_spawned": True,
+                "attach_short": "67be2ec7",
+            }
+        )
+        flat = str(message)
+        self.assertIn("claude attach 67be2ec7", flat)
+        self.assertNotIn("需要在终端里处理", flat)
+
+    def test_tui_notice_terminal_session_keeps_original_wording(self):
+        message = render_lark_message(
+            {
+                "type": "tui_permission_notice",
+                "tool_name": "Edit",
+                "summary": "approve Edit: /tmp/x",
+                "daemon_spawned": False,
+                "attach_short": "abcd1234",
+            }
+        )
+        flat = str(message)
+        self.assertIn("需要在终端里处理", flat)
+        self.assertNotIn("claude attach", flat)
+
+    def test_tui_notice_probe_blind_and_reminder_variants(self):
+        blind = render_lark_message(
+            {"type": "tui_permission_notice", "tool_name": "Edit", "probe_blind": True}
+        )
+        self.assertIn("探测不到", str(blind))
+        reminder = render_lark_message(
+            {"type": "tui_permission_notice", "tool_name": "Edit", "reminder": True}
+        )
+        self.assertIn("还在等你确认", str(reminder))
+
 
 if __name__ == "__main__":
     unittest.main()
