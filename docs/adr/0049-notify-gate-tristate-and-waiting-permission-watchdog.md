@@ -153,9 +153,16 @@ daemon 背书的裁决）：
   `waiting_permission_reminder`、`waiting_permission_reconciled`、
   `waiting_permission_watchdog_unmatched` 等 gate trace。
 
-第二轮回证：上述修复项复查通过，无残留 Critical。测试从 682 增至 691（+9
-回归：同名并行证据、tool 键唯一性、证据新鲜度边界、rid 复用、盲区跳过留痕、
-占位升级、看门狗持续 dwell/short 兜底/控制面故障不触发对账）。
+第二轮回证：5 条修复里 4 条 FIXED，1 条 INCOMPLETE——看门狗反向清理的锁内
+复核只查了 session 状态，没复查 `last_progress_at`。竞态：reconcile 锁外算好
+「该清理」后 await 拿锁，若等锁期间 blocked patch 回来（它保持
+WAITING_PERMISSION 但 bump `last_progress_at`），仅查 lifecycle 会放行，用陈旧
+not-blocked 快照错清。修法：锁内加 `last_progress_at` dwell 复核——任何 patch
+都会 bump 它，dwell 不再成立就退让。补一条竞态回归测试。
+
+第三轮回证：全部 FIXED，无残留 Critical。测试从 682 增至 692（+10 回归：
+同名并行证据、tool 键唯一性、证据新鲜度边界、rid 复用、盲区跳过留痕、
+占位升级、看门狗持续 dwell/short 兜底/控制面故障不触发对账/锁内 progress 复核）。
 
 ## 后续
 

@@ -3468,15 +3468,25 @@ class ChannelNativeRuntime:
                 if now - not_blocked_since < WAITING_PERMISSION_RECONCILE_MIN_AGE_SECONDS:
                     continue
                 async with self._ingress_lock:
+                    # Re-verify under the lock. The last_progress_at dwell is
+                    # the load-bearing check: _apply_claude_daemon_state_patch
+                    # bumps it on EVERY patch, so if a blocked patch landed
+                    # while we queued for the lock (it keeps lifecycle at
+                    # WAITING_PERMISSION, which the status check alone would
+                    # wave through), the dwell no longer holds and we back off
+                    # instead of clearing on a stale not-blocked snapshot
+                    # (deep-review round-2 finding).
+                    lock_now = self._now()
                     if (
                         session.status != "running"
                         or session.lifecycle_state != "WAITING_PERMISSION"
                         or not (session.writer_owner and session.writer_owner.kind == "external_tui")
+                        or lock_now - (session.last_progress_at or 0.0)
+                        < WAITING_PERMISSION_RECONCILE_MIN_AGE_SECONDS
                     ):
-                        self._waiting_not_blocked_since.pop(session.session_id, None)
                         continue
                     session.lifecycle_state = "EXTERNAL_OBSERVED_READONLY"
-                    session.last_progress_at = now
+                    session.last_progress_at = lock_now
                     session.last_progress_event = "external_tui.waiting_permission_reconciled"
                     transport = self._claude_daemon_transport()
                     resolved: list[str] = []

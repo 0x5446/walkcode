@@ -1725,6 +1725,20 @@ class WaitingPermissionWatchdogTests(unittest.TestCase):
                 session.last_progress_event, "external_tui.waiting_permission_reconciled"
             )
 
+    def test_fresh_progress_under_lock_blocks_stale_clear(self):
+        # Race: a blocked patch lands while reconcile queues for the lock. It
+        # keeps lifecycle at WAITING_PERMISSION but bumps last_progress_at, so
+        # the under-lock last_progress dwell must veto the stale not-blocked
+        # clear (deep-review round-2 finding).
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime, session, _api = self._stale_waiting_session(tmp)
+            # not-blocked verdict persisted long ago...
+            runtime._waiting_not_blocked_since[session.session_id] = time.time() - 3600
+            # ...but a patch just bumped progress (the racing blocked patch).
+            session.last_progress_at = time.time()
+            asyncio.run(runtime._reconcile_waiting_permission_sessions([]))
+            self.assertEqual(session.lifecycle_state, "WAITING_PERMISSION")
+
     def test_blocked_again_before_dwell_cancels_reconcile(self):
         # not-blocked, then blocked again: the clock resets, no clear.
         with tempfile.TemporaryDirectory() as tmp:
