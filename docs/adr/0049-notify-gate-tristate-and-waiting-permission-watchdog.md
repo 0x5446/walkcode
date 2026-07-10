@@ -118,6 +118,45 @@ daemon 背书的裁决）：
   "探针抛异常=当作没渲染"的混淆行为，已改为 daemon 背书的 job-absent
   裁决，语义不变。
 
+## Deep-review 记录（2026-07-10，host=Claude → codex engine，14 维 + 重点回证）
+
+首轮 14 维并行审查捞出一个多维度共识的 Critical 和若干 Warning，已全部修复：
+
+- **Critical（6 维命中：correctness/errors/security/design/completeness/feasibility）——
+  同名工具并行 pending 的证据串台**：`_dialog_render_evidence` 原按
+  `(daemon_short, tool_name)` 记账，两个并行 `Edit` pending 时，一个
+  PermissionRequest hook 会让另一个 pending 也被判「已渲染」发出交互卡；
+  而点击前 `_gate_dialog_matches` 的 permission 分支也只比工具名，可能把
+  按键打到当前那个 `Edit` 对话框——用户以为批第二个，实际批了第一个。
+  修法：证据改用 hook 的 `tool_use_id`（== gate rid）做精确键 `(short, rid)`；
+  tool 名键仅在「该 tool 在本轮只有唯一 live pending」时才信（drain 开头
+  做一次 same-tool 普查）。
+- **Warning——看门狗单次空列表误对账**：反向对账原来一次 not-blocked 就清
+  WAITING_PERMISSION，daemon 重启窗口的瞬时空列表会误伤。修法：新增
+  per-session `_waiting_not_blocked_since`，not-blocked 必须**持续**跨
+  `WAITING_PERMISSION_RECONCILE_MIN_AGE_SECONDS` 才清；匹配加 short 兜底
+  （resume 漂移 uuid 时仍能识别为仍阻塞）；提醒/清理分支都在 `_ingress_lock`
+  内复核 status/lifecycle/writer_owner 后才动手。
+- **Warning——占位 needs 不升级**：blocked+空 needs 发了 `BLOCKED_NEEDS_UNKNOWN`
+  占位后，真实 needs 到达时因 `already_waiting` 被抑制，用户一直看占位。
+  修法：`placeholder_upgrade` 例外放行。
+- **Warning——盲区提醒/hook 提醒绕过诚实层**：`_send_gate_blind_notice` 和
+  `_send_tui_hook_output` 手写 view，daemon_spawn 会话拿不到 attach 指引，
+  退回死路文案。修法：全部改走 `_tui_permission_notice_view`（新增
+  `probe_blind`/`tool_name` 参数）。
+- **Warning——rid 复用继承旧盲区状态**：drain 末尾按 live_rids 清理会把本轮
+  刚删的 rid 当 live，跨轮复用同 rid 的新 pending 继承旧盲区时钟。修法：
+  新增 `_forget_gate_probe_state(rid)`，在每个 remove_pending/register 分支
+  即时清理。
+- **Warning（observability）——盲区/看门狗留痕不足**：补
+  `notify_dialog_probe_blind`、`notify_dialog_blind_notice_skipped`（带 reason）、
+  `waiting_permission_reminder`、`waiting_permission_reconciled`、
+  `waiting_permission_watchdog_unmatched` 等 gate trace。
+
+第二轮回证：上述修复项复查通过，无残留 Critical。测试从 682 增至 691（+9
+回归：同名并行证据、tool 键唯一性、证据新鲜度边界、rid 复用、盲区跳过留痕、
+占位升级、看门狗持续 dwell/short 兜底/控制面故障不触发对账）。
+
 ## 后续
 
 - `choose:`（及未来未知格式）对话框的飞书交互层：`_gate_dialog_matches`

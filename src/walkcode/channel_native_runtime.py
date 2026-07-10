@@ -717,8 +717,11 @@ class ChannelNativeRuntime:
         # (daemon_short, tool_name) -> ts of the last PermissionRequest hook:
         # direct proof the native dialog rendered, trusted over a blind probe.
         self._dialog_render_evidence: dict[tuple[str, str], float] = {}
-        # session_id -> ts of the last WAITING_PERMISSION reminder card.
+        # session_id -> ts of the last WAITING_PERMISSION reminder card, and
+        # session_id -> first watchdog tick that saw the job not blocked (the
+        # backward reconcile requires the verdict to persist across a dwell).
         self._waiting_reminder_at: dict[str, float] = {}
+        self._waiting_not_blocked_since: dict[str, float] = {}
         daemon_transport = self._claude_daemon_transport()
         if daemon_transport is not None:
             daemon_transport.on_gate_decision = self._record_gate_decision
@@ -2649,6 +2652,17 @@ class ChannelNativeRuntime:
         live_rids: set[str] = set()
         processed = 0
         now = time.time()
+        # Per-pass census: how many live notify pendings share (short, tool)?
+        # Generic (tool-keyed) render evidence is only trusted when the
+        # answer is "exactly one" — see _dialog_render_evidence_fresh.
+        same_tool_counts: dict[tuple[str, str], int] = {}
+        for request in requests:
+            if claude_gate.pending_mode(request) == claude_gate.MODE_NOTIFY:
+                census_key = (
+                    str(request.get("daemon_short", "") or ""),
+                    str(request.get("tool_name", "") or ""),
+                )
+                same_tool_counts[census_key] = same_tool_counts.get(census_key, 0) + 1
         for request in requests:
             rid = str(request.get("rid", "") or "")
             live_rids.add(rid)
@@ -2685,11 +2699,19 @@ class ChannelNativeRuntime:
                         )
                         # An exception is an outage, not a verdict.
                         dialog_state = DIALOG_UNKNOWN
-                rendered_evidence = self._dialog_render_evidence_fresh(request, created_at)
+                census_key = (
+                    str(request.get("daemon_short", "") or ""),
+                    str(request.get("tool_name", "") or ""),
+                )
+                rendered_evidence = self._dialog_render_evidence_fresh(
+                    request,
+                    created_at,
+                    unique_same_tool=same_tool_counts.get(census_key, 0) == 1,
+                )
                 if dialog_state == DIALOG_WAITING:
                     self._gate_probe_blind_since.pop(rid, None)
                 elif dialog_state == DIALOG_NOT_WAITING:
-                    self._gate_probe_blind_since.pop(rid, None)
+                    self._forget_gate_probe_state(rid)
                     if now - created_at > CLAUDE_GATE_NOTIFY_DIALOG_GRACE_SECONDS:
                         # With hook evidence the dialog DID render — it was
                         # settled in the terminal before a card went out;
@@ -2703,8 +2725,9 @@ class ChannelNativeRuntime:
                         claude_gate.remove_pending(state_path, rid)
                     continue
                 elif rendered_evidence:
-                    # Blind probe but the PermissionRequest hook proved the
-                    # dialog rendered: post the interactive card. Clicks
+                    # Blind probe but the PermissionRequest hook proved this
+                    # pending's dialog rendered (rid-bound, or tool-bound with
+                    # no same-tool sibling): post the interactive card. Clicks
                     # re-verify the dialog before injecting, so a card that
                     # outlives the dialog degrades honestly instead of
                     # driving the wrong one.
@@ -2712,6 +2735,13 @@ class ChannelNativeRuntime:
                     self._gate_probe_blind_since.pop(rid, None)
                 else:
                     blind_since = self._gate_probe_blind_since.setdefault(rid, now)
+                    if blind_since == now:
+                        claude_gate.trace(
+                            "notify_dialog_probe_blind",
+                            rid=rid,
+                            tool=str(request.get("tool_name", "") or ""),
+                            age=int(now - created_at),
+                        )
                     if now - created_at > CLAUDE_GATE_NOTIFY_PENDING_MAX_AGE_SECONDS:
                         # Notify pendings carry no hook deadline; cap them so
                         # an eternal outage cannot leak the spool. Genuinely
@@ -2719,6 +2749,7 @@ class ChannelNativeRuntime:
                         # WAITING_PERMISSION watchdog.
                         claude_gate.trace("notify_pending_expired_blind", rid=rid)
                         claude_gate.remove_pending(state_path, rid)
+                        self._forget_gate_probe_state(rid)
                         continue
                     if (
                         now - blind_since > CLAUDE_GATE_PROBE_BLIND_NOTICE_SECONDS
@@ -2738,6 +2769,7 @@ class ChannelNativeRuntime:
                     if mode == claude_gate.MODE_NOTIFY:
                         # No hook is waiting: the native dialog is the surface.
                         claude_gate.remove_pending(state_path, rid)
+                        self._forget_gate_probe_state(rid)
                     else:
                         claude_gate.write_decision(
                             state_path, rid, {"action": "pass", "reason": "session_not_observed"}
@@ -2756,6 +2788,7 @@ class ChannelNativeRuntime:
                     outcome = await self._auto_inject_gate_allow(rid, request, session_id)
                     if outcome in {"ok", "skip"}:
                         claude_gate.remove_pending(state_path, rid)
+                        self._forget_gate_probe_state(rid)
                         self._gate_dispatched[rid] = now
                         if outcome == "ok":
                             processed += 1
@@ -2784,6 +2817,7 @@ class ChannelNativeRuntime:
                     if transport is not None:
                         transport.register_notify_gate(rid, request, session_id=session_id)
                     claude_gate.remove_pending(state_path, rid)
+                    self._forget_gate_probe_state(rid)
                 self._gate_dispatched[rid] = now
                 processed += 1
                 self.save_state()
@@ -2791,6 +2825,7 @@ class ChannelNativeRuntime:
                 claude_gate.trace("pass_card_not_delivered", rid=rid, mode=mode)
                 if mode == claude_gate.MODE_NOTIFY:
                     claude_gate.remove_pending(state_path, rid)
+                    self._forget_gate_probe_state(rid)
                 else:
                     claude_gate.write_decision(
                         state_path, rid, {"action": "pass", "reason": "card_not_delivered"}
@@ -2814,49 +2849,89 @@ class ChannelNativeRuntime:
         return processed
 
     def _dialog_render_evidence_fresh(
-        self, request: dict[str, Any], created_at: float
+        self,
+        request: dict[str, Any],
+        created_at: float,
+        *,
+        unique_same_tool: bool = False,
     ) -> bool:
-        """Did a PermissionRequest hook confirm this pending's dialog rendered?
+        """Did a PermissionRequest hook confirm THIS pending's dialog rendered?
 
-        Keyed (daemon_short, tool_name); only evidence at or after the pending
-        was created counts (small slack for clock ordering between the hook
-        process and the drain). Over-matching across queued same-tool dialogs
-        is acceptable: the card's click path re-verifies the dialog before
-        injecting.
+        Precise form: evidence keyed (daemon_short, rid) — the hook's
+        tool_use_id IS the gate rid, so this binds to exactly one pending.
+        Fallback form: (daemon_short, tool_name), trusted only when the
+        caller confirms this rid is the ONLY live notify pending for that
+        tool on that job (``unique_same_tool``) — parallel same-tool dialogs
+        must never validate each other's cards, because the click-path
+        re-verify also matches by tool name only and would drive the WRONG
+        dialog (deep-review finding, 6-dimension consensus).
+
+        Only evidence at or after the pending was created counts (small slack
+        for clock ordering between the hook process and the drain).
         """
         short = str(request.get("daemon_short", "") or "")
         tool_name = str(request.get("tool_name", "") or "")
-        if not short or not tool_name:
+        rid = str(request.get("rid", "") or "")
+        if not short:
             return False
         now = time.time()
         for key, seen_at in list(self._dialog_render_evidence.items()):
             if now - seen_at > CLAUDE_GATE_RENDER_EVIDENCE_TTL_SECONDS:
                 self._dialog_render_evidence.pop(key, None)
-        seen_at = self._dialog_render_evidence.get((short, tool_name))
-        return seen_at is not None and seen_at >= created_at - 5.0
+        if rid:
+            seen_at = self._dialog_render_evidence.get((short, rid))
+            if seen_at is not None and seen_at >= created_at - 5.0:
+                return True
+        if tool_name and unique_same_tool:
+            seen_at = self._dialog_render_evidence.get((short, tool_name))
+            return seen_at is not None and seen_at >= created_at - 5.0
+        return False
+
+    def _forget_gate_probe_state(self, rid: str) -> None:
+        """Drop per-rid probe bookkeeping the moment its pending is removed.
+
+        The end-of-pass live_rids sweep is only a backstop: it treats rids
+        removed THIS pass as still live, so a new pending reusing the rid
+        between passes would inherit a stale blind clock or an already-sent
+        notice flag (deep-review finding).
+        """
+        self._gate_probe_blind_since.pop(rid, None)
+        self._gate_blind_noticed.discard(rid)
 
     async def _send_gate_blind_notice(self, request: dict[str, Any]) -> bool:
         """No-button notice for a pending whose probe has been blind too long."""
+        rid = str(request.get("rid", "") or "")
         session_id = self._claude_gate_session_id(request)
         if not session_id:
+            claude_gate.trace("notify_dialog_blind_notice_skipped", rid=rid, reason="no_session")
             return False
         try:
             session = self.state.sessions.get(session_id)
         except KeyError:
+            claude_gate.trace("notify_dialog_blind_notice_skipped", rid=rid, reason="session_gone")
             return False
         if session.status == "stopped" or session.channel_binding is None:
+            claude_gate.trace(
+                "notify_dialog_blind_notice_skipped",
+                rid=rid,
+                reason="stopped" if session.status == "stopped" else "no_binding",
+            )
             return False
-        rid = str(request.get("rid", "") or "")
+        # Reuse the shared notice view so a daemon-spawned session gets the
+        # attach hint here too — the hand-rolled view sent it back to the
+        # "answer in the terminal" dead end (deep-review finding).
+        view = self._tui_permission_notice_view(
+            session,
+            "",
+            short=str(request.get("daemon_short", "") or ""),
+            tool_name=str(request.get("tool_name", "") or ""),
+            probe_blind=True,
+        )
         async with self._ingress_lock:
             session.last_event_seq += 1
             await self.orchestrator._send_session_view(
                 session,
-                {
-                    "type": "tui_permission_notice",
-                    "tool_name": str(request.get("tool_name", "") or ""),
-                    "summary": "",
-                    "probe_blind": True,
-                },
+                view,
                 idempotency_key=f"external_tui:gate_blind:{rid}",
             )
             self.save_state()
@@ -3193,10 +3268,18 @@ class ChannelNativeRuntime:
             # The permission-request hook may have raced ahead with its own
             # notice card; only send ours on a fresh daemon-observed need.
             # v3 notify gates already produce a rich interactive card from the
-            # gate drain — a second orange notice would be pure noise.
+            # gate drain — a second orange notice would be pure noise. The one
+            # exception: the placeholder (blocked, needs not yet published)
+            # upgrading to the real needs text IS new information — without
+            # this the user would stare at "内容未读到" until the 30-minute
+            # watchdog reminder (deep-review finding, 5-dimension consensus).
+            placeholder_upgrade = (
+                last_needs == BLOCKED_NEEDS_UNKNOWN
+                and blocking_needs != BLOCKED_NEEDS_UNKNOWN
+            )
             if (
                 blocking_needs != last_needs
-                and not already_waiting
+                and (not already_waiting or placeholder_upgrade)
                 and not (short and self._has_open_notify_gate(short))
             ):
                 session.last_event_seq += 1
@@ -3249,29 +3332,36 @@ class ChannelNativeRuntime:
         blocking_needs: str,
         *,
         short: str = "",
+        tool_name: str = "",
         reminder: bool = False,
+        probe_blind: bool = False,
     ) -> dict[str, Any]:
         """Shared view for the orange "terminal is waiting" notice.
 
-        Carries the session form: a daemon-spawned (Feishu-born) session has
-        no terminal the user is sitting at, so the card must point at
+        Every sender of this notice type must come through here: it carries
+        the session form, and a daemon-spawned (Feishu-born) session has no
+        terminal the user is sitting at, so the card must point at
         ``claude attach <short>`` instead of "answer in the terminal" — the
         old wording was a dead end there (2026-07-09, fallback-model dialog).
         """
-        match = re.match(r"^approve\s+([A-Za-z0-9_-]+)", blocking_needs, re.IGNORECASE)
+        if not tool_name:
+            match = re.match(r"^approve\s+([A-Za-z0-9_-]+)", blocking_needs, re.IGNORECASE)
+            tool_name = match.group(1) if match else ""
         binding = session.channel_binding
         origin = ""
         if binding is not None and isinstance(binding.capabilities, dict):
             origin = str(binding.capabilities.get("origin", "") or "")
         view: dict[str, Any] = {
             "type": "tui_permission_notice",
-            "tool_name": match.group(1) if match else "",
+            "tool_name": tool_name,
             "summary": blocking_needs,
             "daemon_spawned": origin == "daemon_spawn",
             "attach_short": short,
         }
         if reminder:
             view["reminder"] = True
+        if probe_blind:
+            view["probe_blind"] = True
         return view
 
     async def _reconcile_waiting_permission_sessions(
@@ -3288,17 +3378,27 @@ class ChannelNativeRuntime:
         Backward: a session stuck in WAITING_PERMISSION while its dialog is
         gone (answered in an attached terminal, worker restarted, patch
         missed) gets its lifecycle reconciled so the status card stops
-        claiming a wait that is not happening.
+        claiming a wait that is not happening. A single not-blocked
+        observation is NOT enough: the daemon-restart window lists zero jobs
+        for a moment, and resume can drift the full session uuid — so the
+        clear requires the not-blocked verdict to PERSIST across its own
+        dwell (deep-review finding, 8-dimension consensus), and matching
+        falls back to the job short when the uuid misses.
 
         Only ever called with a list_jobs result — a control-plane outage
-        never reaches here, so "job absent" is a daemon-backed verdict, not a
-        blind one. The dwell on last_progress_at keeps this from fighting
-        patches that are still in flight.
+        never reaches here, so every verdict below is daemon-backed.
         """
-        by_agent_session = {
-            str(job.get("sessionId", "") or ""): job for job in jobs
-        }
+        by_agent_session: dict[str, dict[str, Any]] = {}
+        by_short: dict[str, dict[str, Any]] = {}
+        for job in jobs:
+            sid = str(job.get("sessionId", "") or "")
+            if sid:
+                by_agent_session[sid] = job
+            job_short = claude_daemon_short_id(job.get("short") or job.get("sessionId"))
+            if job_short:
+                by_short[job_short] = job
         now = self._now()
+        waiting_ids: set[str] = set()
         for session in list(self.state.sessions.iter_sessions()):
             if session.status != "running":
                 continue
@@ -3308,52 +3408,96 @@ class ChannelNativeRuntime:
                 continue
             resume_ref = _external_claude_resume_ref(session)
             agent_sid = str((resume_ref or {}).get("agent_session_id", "") or "")
-            if not agent_sid:
-                continue
-            if now - (session.last_progress_at or 0.0) < WAITING_PERMISSION_RECONCILE_MIN_AGE_SECONDS:
-                continue
-            job = by_agent_session.get(agent_sid)
             short = claude_daemon_short_from_resume_ref(resume_ref) if resume_ref else ""
-            blocked = isinstance(job, dict) and str(job.get("tempo", "") or "") == "blocked"
+            if not agent_sid and not short:
+                claude_gate.trace(
+                    "waiting_permission_watchdog_unmatched", session=session.session_id
+                )
+                continue
+            waiting_ids.add(session.session_id)
+            if now - (session.last_progress_at or 0.0) < WAITING_PERMISSION_RECONCILE_MIN_AGE_SECONDS:
+                self._waiting_not_blocked_since.pop(session.session_id, None)
+                continue
+            job = by_agent_session.get(agent_sid) or (by_short.get(short) if short else None)
+            needs_text = str((job or {}).get("needs", "") or "").strip()
+            # Same blocked semantics as the state-patch path: an explicit
+            # blocked tempo OR an approve-form needs line means the dialog is
+            # (still) up.
+            blocked = isinstance(job, dict) and (
+                str(job.get("tempo", "") or "") == "blocked"
+                or needs_text.lower().startswith("approve ")
+            )
             if blocked:
+                self._waiting_not_blocked_since.pop(session.session_id, None)
                 last_reminder = self._waiting_reminder_at.get(session.session_id, 0.0)
                 anchor = max(last_reminder, session.last_progress_at or 0.0)
                 if now - anchor < WAITING_PERMISSION_REMINDER_SECONDS:
                     continue
-                needs_text = str(job.get("needs", "") or "").strip() or BLOCKED_NEEDS_UNKNOWN
                 async with self._ingress_lock:
+                    # Re-verify under the lock: a subscribe watcher or hook
+                    # may have settled the wait while we queued for it.
+                    if (
+                        session.status != "running"
+                        or session.lifecycle_state != "WAITING_PERMISSION"
+                        or not (session.writer_owner and session.writer_owner.kind == "external_tui")
+                    ):
+                        continue
                     session.last_event_seq += 1
                     await self.orchestrator._send_session_view(
                         session,
                         self._tui_permission_notice_view(
-                            session, needs_text, short=short, reminder=True
+                            session,
+                            needs_text or BLOCKED_NEEDS_UNKNOWN,
+                            short=short,
+                            reminder=True,
                         ),
                         idempotency_key=f"external_tui:waiting_reminder:{session.last_event_seq}",
                     )
                     self._waiting_reminder_at[session.session_id] = now
                     self.save_state()
-                print(
-                    f"waiting_permission reminder sent: session={session.session_id} short={short}",
-                    file=sys.stderr,
+                claude_gate.trace(
+                    "waiting_permission_reminder",
+                    session=session.session_id,
+                    short=short,
+                    needs_kind=needs_text.split(":", 1)[0][:32],
                 )
             else:
-                # Daemon-backed: the job is absent or no longer blocked. The
-                # WAITING state is stale — clear it and retire open gates so
-                # late card clicks flip honestly.
+                not_blocked_since = self._waiting_not_blocked_since.setdefault(
+                    session.session_id, now
+                )
+                if now - not_blocked_since < WAITING_PERMISSION_RECONCILE_MIN_AGE_SECONDS:
+                    continue
                 async with self._ingress_lock:
+                    if (
+                        session.status != "running"
+                        or session.lifecycle_state != "WAITING_PERMISSION"
+                        or not (session.writer_owner and session.writer_owner.kind == "external_tui")
+                    ):
+                        self._waiting_not_blocked_since.pop(session.session_id, None)
+                        continue
                     session.lifecycle_state = "EXTERNAL_OBSERVED_READONLY"
                     session.last_progress_at = now
                     session.last_progress_event = "external_tui.waiting_permission_reconciled"
                     transport = self._claude_daemon_transport()
+                    resolved: list[str] = []
                     if short and transport is not None:
-                        transport.resolve_notify_gates_for_short(short)
+                        resolved = transport.resolve_notify_gates_for_short(short)
                     self._waiting_reminder_at.pop(session.session_id, None)
+                    self._waiting_not_blocked_since.pop(session.session_id, None)
                     await self.orchestrator.refresh_session_status_card(session)
                     self.save_state()
-                print(
-                    f"waiting_permission reconciled (dialog gone): session={session.session_id} short={short}",
-                    file=sys.stderr,
+                claude_gate.trace(
+                    "waiting_permission_reconciled",
+                    session=session.session_id,
+                    short=short,
+                    job_found=bool(job),
+                    resolved_gates=len(resolved),
                 )
+        # Sessions that left WAITING_PERMISSION by any other path must not
+        # keep a stale not-blocked clock for their next wait.
+        for session_id in list(self._waiting_not_blocked_since):
+            if session_id not in waiting_ids:
+                self._waiting_not_blocked_since.pop(session_id, None)
 
     async def _settle_claude_daemon_session(
         self, session_id: str, *, outcome: str, short: str = ""
@@ -3782,16 +3926,25 @@ class ChannelNativeRuntime:
                 if short and notice_tool:
                     # Direct render proof for the notify-gate probe: this hook
                     # only fires once the native dialog is up, so a blind
-                    # daemon probe must never out-vote it (2026-07-09).
+                    # daemon probe must never out-vote it (2026-07-09). The
+                    # rid-keyed entry (tool_use_id == the gate rid) is the
+                    # precise form; the tool-keyed entry is only trusted when
+                    # a single live pending holds that tool (deep-review
+                    # finding: parallel same-tool pendings must not validate
+                    # each other's cards).
                     self._dialog_render_evidence[(short, notice_tool)] = time.time()
+                    hook_tool_id = str(tool_event.payload.get("tool_id", "") or "")
+                    if hook_tool_id:
+                        self._dialog_render_evidence[(short, hook_tool_id)] = time.time()
                 if not (short and self._has_open_notify_gate(short, tool_name=notice_tool)):
                     await self.orchestrator._send_session_view(
                         session,
-                        {
-                            "type": "tui_permission_notice",
-                            "tool_name": notice_tool,
-                            "summary": str(tool_event.payload.get("summary", "") or ""),
-                        },
+                        self._tui_permission_notice_view(
+                            session,
+                            str(tool_event.payload.get("summary", "") or ""),
+                            short=short,
+                            tool_name=notice_tool,
+                        ),
                         idempotency_key=f"external_tui:permission:{session.last_event_seq}",
                     )
             return
