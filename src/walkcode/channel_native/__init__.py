@@ -235,6 +235,10 @@ class ChannelNativeConfig:
     cwd: str
     profile: str = ""
     workspace_roots: tuple[str, ...] = ()
+    # ADR 0051: after a takeover-only handoff that stale-marked pending HITL
+    # prompts, "auto" injects an invisible continue turn so the agent re-asks
+    # and the channel gets a fresh answerable card. Off until live-verified.
+    handoff_continue: str = "off"
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> "ChannelNativeConfig":
@@ -260,6 +264,11 @@ class ChannelNativeConfig:
             raise ChannelConfigError(f"unknown agent configured: {agent}")
 
         profile = _configured_profile(source)
+        handoff_continue = str(source.get("WALKCODE_HANDOFF_CONTINUE") or "").strip().lower()
+        if handoff_continue and handoff_continue not in {"auto", "off"}:
+            raise ChannelConfigError(
+                f"invalid WALKCODE_HANDOFF_CONTINUE: {handoff_continue}; use auto or off"
+            )
         return cls(
             channel=channel,
             agent=agent,
@@ -274,6 +283,7 @@ class ChannelNativeConfig:
                 for item in str(source.get("WALKCODE_WORKSPACE_ROOTS", "") or "").split(":")
                 if item.strip()
             ),
+            handoff_continue=handoff_continue or "off",
         )
 
     @property
@@ -2894,7 +2904,11 @@ class ViewModelFactory:
         }
 
     @staticmethod
-    def stale_hitl_after_takeover(request: HitlRequest) -> dict[str, Any]:
+    def stale_hitl_after_takeover(
+        request: HitlRequest,
+        *,
+        reason: str = "The prompt belonged to the read-only TUI writer before takeover.",
+    ) -> dict[str, Any]:
         return {
             "type": "hitl_stale",
             "hitl_request_id": request.hitl_request_id,
@@ -2903,7 +2917,7 @@ class ViewModelFactory:
             "transport_request_id": request.transport_request_id,
             "native_method": request.native_method,
             "prompt_kind": request.prompt_kind,
-            "reason": "The prompt belonged to the read-only TUI writer before takeover.",
+            "reason": reason,
         }
 
     @staticmethod
@@ -6683,6 +6697,19 @@ class JsonFileStateStore:
         )
 
 
+# ADR 0051: synthetic turn injected after a takeover-only handoff when
+# pending HITL prompts were stale-marked. Channel-invisible (walkcode only
+# renders agent events, never the inputs it submits itself), but it DOES
+# land in the transcript — keep the wording neutral so a later TUI resume
+# reading the history isn't confused, and instruct a re-ask explicitly so
+# the fresh answerable card actually re-appears.
+HANDOFF_CONTINUE_PROMPT = (
+    "[ui-handoff] 会话已从终端切换到飞书端继续。"
+    "若此前有未答的提问或未确认的权限请求，请立刻原样重新发起；"
+    "否则继续当前任务。"
+)
+
+
 class Orchestrator:
     def __init__(
         self,
@@ -6700,6 +6727,7 @@ class Orchestrator:
         outbox_dispatcher: OutboxDispatcher | None = None,
         on_state_changed: Callable[[], None] | None = None,
         daemon_spawner: Callable[..., Any] | None = None,
+        handoff_continue: str = "off",
         now: Callable[[], float] = time.time,
     ):
         self.sessions = sessions
@@ -6723,6 +6751,9 @@ class Orchestrator:
         # as a daemon bg worker (external-TUI shaped, daemon reply write path)
         # and return it, or return None to fall back to start_session().
         self.daemon_spawner = daemon_spawner
+        # ADR 0051: "auto" re-drives the agent after a takeover-only handoff
+        # that stale-marked pending HITL prompts (see HANDOFF_CONTINUE_PROMPT).
+        self.handoff_continue = handoff_continue
         self._background_event_drains: set[asyncio.Task] = set()
         self._now = now
         # Echo dedup for daemon replies (ADR 0046 v2): a channel message
@@ -8161,7 +8192,7 @@ class Orchestrator:
                 transport_ref={"handle_id": resumed_handle.handle_id, **dict(resumed_handle.ref)},
             )
             updated = self.sessions.get(session.session_id)
-            await self._mark_pre_takeover_hitls_stale(
+            stale_requests = await self._mark_pre_takeover_hitls_stale(
                 updated,
                 through_generation=ctx.generation,
                 takeover_id=takeover_id,
@@ -8181,6 +8212,29 @@ class Orchestrator:
                     idempotency_key=f"takeover_completed:{takeover_id}",
                 )
                 await self.refresh_session_status_card(updated)
+                # ADR 0051: a takeover-only handoff that orphaned pending
+                # prompts leaves the agent silently waiting for an answer
+                # nobody can deliver. Re-drive it with an invisible continue
+                # turn so it re-asks and the channel gets a fresh answerable
+                # card. Only here — a takeover carrying user text lets that
+                # text drive the continuation instead (no double prompt).
+                if stale_requests and self.handoff_continue == "auto":
+                    try:
+                        handle = self._handle_for_session(updated)
+                        await transport.submit_turn(
+                            handle,
+                            TurnInput(text=HANDOFF_CONTINUE_PROMPT),
+                            idempotency_key=f"handoff_continue:{takeover_id}",
+                        )
+                        await self._drain_events(updated, transport, handle)
+                    except Exception as exc:
+                        # Non-fatal: the takeover itself succeeded; the user
+                        # can still type to continue.
+                        _log_degrade(
+                            "handoff_continue_failed",
+                            session_id=updated.session_id,
+                            error=f"{type(exc).__name__}: {exc}",
+                        )
                 return SubmitResult(True, blocked_input_id=blocked_input_id)
             handle = self._handle_for_session(updated)
             await self._send_session_view(
@@ -8235,6 +8289,59 @@ class Orchestrator:
                 session,
                 ViewModelFactory.stale_hitl_after_takeover(request),
                 idempotency_key=f"hitl_stale_after_takeover:{takeover_id}:{request.hitl_request_id}",
+            )
+        return stale_requests
+
+    async def settle_hitls_for_external_claim(
+        self,
+        session: Session,
+        *,
+        prior_transport_kind: str,
+        prior_handle: TransportHandle | None,
+        through_generation: int,
+    ) -> list[HitlRequest]:
+        """External TUI claimed a structured session (ADR 0051).
+
+        The old worker's pending prompts can never be answered from the
+        channel again — the claim bumped the generation, so every stored
+        callback token is already dead. Two cleanups the generation bump
+        does NOT do by itself:
+
+        - shut the prior structured worker down so its blocked
+          ``can_use_tool`` futures resolve now (default deny) instead of
+          hanging until the permission timeout;
+        - flip the channel-side cards to an explicit stale notice, so the
+          user learns the prompt moved to the terminal *before* clicking
+          into a stale-generation rejection.
+        """
+        transport = self.transports.get(prior_transport_kind)
+        shutdown = getattr(transport, "shutdown", None) if transport is not None else None
+        if shutdown is not None and prior_handle is not None and prior_handle.handle_id:
+            try:
+                await shutdown(prior_handle, "external_tui_claim")
+            except Exception as exc:
+                # Best-effort: a worker from a previous runtime is already
+                # gone; anything else still resolves via the prompt timeout.
+                _log_degrade(
+                    "external_claim_shutdown_failed",
+                    session_id=session.session_id,
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+        stale_requests = self.hitls.mark_pending_for_session_stale(
+            session.session_id,
+            through_generation=through_generation,
+        )
+        for request in stale_requests:
+            await self._send_session_view(
+                session,
+                ViewModelFactory.stale_hitl_after_takeover(
+                    request,
+                    reason="The session was resumed in a terminal TUI; answer there instead.",
+                ),
+                idempotency_key=(
+                    f"hitl_stale_after_claim:{session.session_id}:"
+                    f"{session.generation}:{request.hitl_request_id}"
+                ),
             )
         return stale_requests
 
@@ -8935,6 +9042,7 @@ __all__ = [
     "FakeAgentTransport",
     "FakeChannelAdapter",
     "FakeExternalTuiController",
+    "HANDOFF_CONTINUE_PROMPT",
     "HitlDecision",
     "HitlRequest",
     "HitlStore",

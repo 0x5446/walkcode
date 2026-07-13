@@ -2,6 +2,7 @@ import asyncio
 import unittest
 
 from walkcode.channel_native import (
+    HANDOFF_CONTINUE_PROMPT,
     ActorRef,
     AuthorizationStore,
     BlockedReason,
@@ -74,7 +75,7 @@ def _transport_caps(**overrides) -> TransportCapabilities:
     return TransportCapabilities(**data)
 
 
-def _setup(*, resume_ref=None, caps=None, transport=None):
+def _setup(*, resume_ref=None, caps=None, transport=None, handoff_continue="off"):
     clock = _Clock()
     sessions = SessionRegistry(now=clock)
     interactions = InteractionStore(now=clock)
@@ -90,6 +91,7 @@ def _setup(*, resume_ref=None, caps=None, transport=None):
         transports={"fake-transport": transport},
         external_tui_controllers={"fake-process": FakeExternalTuiController("fake-process")},
         authz=authz,
+        handoff_continue=handoff_continue,
         now=clock,
     )
     external_ref = {}
@@ -624,6 +626,127 @@ class TakeoverOrchestratorTests(unittest.TestCase):
         ]
         self.assertEqual(len(stale_views), 1)
         self.assertEqual(stale_views[0]["hitl_request_id"], hitl.hitl_request_id)
+
+    @staticmethod
+    def _register_pending_hitl(orchestrator, session):
+        return orchestrator.hitls.register_request(
+            session_id=session.session_id,
+            generation=session.generation,
+            transport_kind=session.transport_kind,
+            transport_request_id="perm-1",
+            native_method="permission.requested",
+            native_params={"prompt": "Allow shell?"},
+            prompt_kind="permission",
+            channel_binding_key=session.channel_binding.key(),
+        )
+
+    def _status_card_takeover(self, orchestrator, channel, session):
+        session.channel_binding.capabilities["status_card"] = True
+        asyncio.run(orchestrator.refresh_session_status_card(session))
+        return asyncio.run(
+            orchestrator.handle_inbound_event(
+                InboundEvent(
+                    event_id="cb-status",
+                    channel_kind="telegram",
+                    account_id="bot",
+                    chat_id="chat",
+                    thread_id="topic",
+                    message_id="m-cb",
+                    root_message_id="root",
+                    sender_id="owner",
+                    sender_display="Owner",
+                    text="request_takeover",
+                    callback={"token": "request_takeover", "data": "request_takeover"},
+                ),
+                agent_transport_kind="fake-transport",
+                cwd="/tmp/project",
+            )
+        )
+
+    def test_takeover_only_with_pending_hitl_injects_handoff_continue(self):
+        # ADR 0051: takeover-only handoff + orphaned prompt + auto → the
+        # agent is re-driven with the invisible continue turn so it re-asks.
+        orchestrator, channel, transport, session = _setup(
+            resume_ref={
+                "transport_kind": "fake-transport",
+                "transport_ref": {"handle_id": "resume-h", "session_id": "native-1"},
+            },
+            handoff_continue="auto",
+        )
+        hitl = self._register_pending_hitl(orchestrator, session)
+
+        result = self._status_card_takeover(orchestrator, channel, session)
+
+        self.assertTrue(result.accepted)
+        self.assertEqual(
+            [turn.text for turn in transport.submitted_turns],
+            [HANDOFF_CONTINUE_PROMPT],
+        )
+        self.assertEqual(orchestrator.hitls.get(hitl.hitl_request_id).status, "stale")
+
+    def test_takeover_only_with_pending_hitl_default_off_does_not_inject(self):
+        orchestrator, channel, transport, session = _setup(
+            resume_ref={
+                "transport_kind": "fake-transport",
+                "transport_ref": {"handle_id": "resume-h", "session_id": "native-1"},
+            },
+        )
+        hitl = self._register_pending_hitl(orchestrator, session)
+
+        result = self._status_card_takeover(orchestrator, channel, session)
+
+        self.assertTrue(result.accepted)
+        self.assertEqual(transport.submitted_turns, [])
+        # The stale sweep still runs regardless of the injection flag.
+        self.assertEqual(orchestrator.hitls.get(hitl.hitl_request_id).status, "stale")
+
+    def test_takeover_only_without_pending_hitl_does_not_inject(self):
+        # No orphaned prompt → nothing to re-ask → no synthetic turn even
+        # with the flag on (an idle takeover must stay silent).
+        orchestrator, channel, transport, session = _setup(
+            resume_ref={
+                "transport_kind": "fake-transport",
+                "transport_ref": {"handle_id": "resume-h", "session_id": "native-1"},
+            },
+            handoff_continue="auto",
+        )
+
+        result = self._status_card_takeover(orchestrator, channel, session)
+
+        self.assertTrue(result.accepted)
+        self.assertEqual(transport.submitted_turns, [])
+
+    def test_takeover_with_blocked_input_does_not_inject_handoff_continue(self):
+        # A takeover carrying user text lets that text drive the
+        # continuation — injecting continue as well would double-prompt.
+        orchestrator, channel, transport, session = _setup(
+            resume_ref={
+                "transport_kind": "fake-transport",
+                "transport_ref": {"handle_id": "resume-h", "session_id": "native-1"},
+            },
+            handoff_continue="auto",
+        )
+        self._register_pending_hitl(orchestrator, session)
+        asyncio.run(
+            orchestrator.submit_user_input(
+                session.session_id,
+                TurnInput(text="run tests"),
+                actor=_actor("owner"),
+                generation=session.generation,
+            )
+        )
+        token = _takeover_token(channel)
+
+        result = asyncio.run(
+            orchestrator.handle_inbound_event(
+                _callback(token, event_id="cb-confirm"),
+                agent_transport_kind="fake-transport",
+                cwd="/tmp/project",
+            )
+        )
+
+        self.assertTrue(result.accepted)
+        self.assertEqual([turn.text for turn in transport.submitted_turns], ["run tests"])
 
     def test_stale_takeover_callback_does_not_change_transaction(self):
         orchestrator, channel, transport, session = _setup(
