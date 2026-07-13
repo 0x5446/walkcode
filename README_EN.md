@@ -36,9 +36,11 @@ matrix (add more profiles for extra model routes); see
 
 ## Dual-Drive: Terminal and IM Share One Claude Session
 
-When a Claude session runs daemon-native (`claude --bg` then attach, or a bare
-launch through the profile wrappers in the
-[deploy doc](docs/lark-profile-deploy.md)), the terminal TUI and Feishu/Lark
+When a Claude session runs daemon-native (a manual `claude --bg` then attach,
+or the explicit dual-UI opt-in described in the
+[deploy doc](docs/lark-profile-deploy.md); **since ADR 0050 the default is
+single-master UI** — a bare wrapper launch is a plain TUI with read-only IM
+observation plus takeover), the terminal TUI and Feishu/Lark
 **read and write the same session at the same time**:
 
 - **Direct write from IM**: a message in the session topic is injected into

@@ -476,12 +476,13 @@ def _configured_agent_options(source: Any) -> dict[str, dict[str, Any]]:
                 "unset WALKCODE_CLAUDE_DAEMON_MODE=off"
             )
     else:
-        # Daemon-native is the default (ADR 0048, flipped after the Feishu
-        # live E2E on 2026-07-07): channel-born sessions spawn as daemon bg
-        # workers. WALKCODE_CLAUDE_DAEMON_MODE=off means there is no daemon
-        # transport to spawn through, so the default resolves to headless
-        # rather than failing startup — off stays a one-variable escape hatch.
-        claude_spawn_mode = "headless" if claude_daemon_mode == "off" else "daemon"
+        # Single-master UI is the default (ADR 0050, reverting the ADR 0048
+        # daemon default): channel-born sessions spawn headless, TUI sessions
+        # stay hook-observed read-only with takeover as the only write
+        # handoff. The dual-UI daemon spawn path remains available as an
+        # explicit WALKCODE_CLAUDE_SPAWN_MODE=daemon opt-in (still rejected
+        # when combined with WALKCODE_CLAUDE_DAEMON_MODE=off above).
+        claude_spawn_mode = "headless"
     claude["spawn_mode"] = claude_spawn_mode
     claude_list_adopt = str(source.get("WALKCODE_CLAUDE_LIST_ADOPT") or "").strip().lower()
     if claude_list_adopt:

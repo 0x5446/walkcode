@@ -24,9 +24,10 @@ WalkCode V3 是 channel-native 的 Coding Agent runtime。它把 IM 当成一等
 
 ## 双端同步：终端与 IM 共驾同一个 Claude 会话
 
-Claude 会话以 daemon-native 方式运行时（`claude --bg` 启动后 attach，或用
-[部署文档](docs/lark-profile-deploy.md)里的 profile wrapper 裸启动），终端 TUI
-和飞书/Lark **同时可读可写同一个会话**：
+Claude 会话以 daemon-native 方式运行时（手动 `claude --bg` 启动后 attach，
+或按[部署文档](docs/lark-profile-deploy.md)显式 opt-in 双 UI 模式；**ADR 0050
+起默认是单 master UI**——wrapper 裸启动是普通 TUI，飞书只读观察 + takeover），
+终端 TUI 和飞书/Lark **同时可读可写同一个会话**：
 
 - **IM 直写**：在会话话题里发消息，文字直接注入终端会话（等同终端敲入回车），
   机器人给你的消息贴一个表情作为回执（表情不可用时回退文本「✅ 已发送到终端
