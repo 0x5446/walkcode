@@ -2253,6 +2253,35 @@ class InteractionStore:
             return None
         return self._interactions.get(interaction_id)
 
+    def clear_awaiting_other_for_session(
+        self,
+        session_id: str,
+        *,
+        through_generation: int | None = None,
+    ) -> int:
+        """Retire free-text ("Other") waits for a session's old prompts.
+
+        The handoff stale sweeps (ADR 0051) mark HitlRequests stale, but an
+        AskUserQuestion that already entered awaiting-other keeps its
+        binding mapping — later plain messages in the topic would be
+        swallowed by the dead wait instead of reaching the new writer.
+        """
+        removed = 0
+        for binding_key, interaction_id in list(self._awaiting_other_by_binding.items()):
+            ctx = self._interactions.get(interaction_id)
+            if ctx is None:
+                self._awaiting_other_by_binding.pop(binding_key, None)
+                removed += 1
+                continue
+            if ctx.session_id != session_id:
+                continue
+            if through_generation is not None and ctx.generation > through_generation:
+                continue
+            ctx.awaiting_other = None
+            self._awaiting_other_by_binding.pop(binding_key, None)
+            removed += 1
+        return removed
+
     def begin_awaiting_other(
         self,
         interaction_id: str,
@@ -2287,6 +2316,11 @@ class InteractionStore:
             self._awaiting_other_by_binding.pop(binding_key, None)
             return DecisionResult(False, BlockedReason.ALREADY_DECIDED, ctx.decision)
         if ctx.generation != current_generation:
+            # A handoff bumped the generation: the wait can never be
+            # answered again — drop the mapping so later plain messages
+            # reach the new writer instead of hitting this dead wait.
+            ctx.awaiting_other = None
+            self._awaiting_other_by_binding.pop(binding_key, None)
             return DecisionResult(False, BlockedReason.STALE_GENERATION)
         if ctx.expires_at <= self._now():
             return DecisionResult(False, BlockedReason.INVALID_TOKEN)
@@ -4005,7 +4039,7 @@ def render_view_text(view_model: dict[str, Any]) -> str:
         return f"Cannot take over automatically: {view_model.get('reason', '')}"
     if view_type == "hitl_stale":
         return (
-            "Previous human input request is no longer answerable after takeover.\n"
+            "Previous human input request is no longer answerable after the session handoff.\n"
             f"Type: {view_model.get('prompt_kind', '')}\n"
             f"Reason: {view_model.get('reason', '')}"
         )
@@ -6704,10 +6738,15 @@ class JsonFileStateStore:
 # reading the history isn't confused, and instruct a re-ask explicitly so
 # the fresh answerable card actually re-appears.
 HANDOFF_CONTINUE_PROMPT = (
-    "[ui-handoff] 会话已从终端切换到飞书端继续。"
+    "[ui-handoff] 会话已从终端切换到聊天端继续。"
     "若此前有未答的提问或未确认的权限请求，请立刻原样重新发起；"
     "否则继续当前任务。"
 )
+
+# Bound on the best-effort old-worker shutdown during an external TUI claim
+# (ADR 0051): the claim runs on the ingress-locked hook path, so a wedged
+# worker must degrade-log and move on instead of blocking ingress.
+EXTERNAL_CLAIM_SHUTDOWN_TIMEOUT_SECONDS = 5.0
 
 
 class Orchestrator:
@@ -8219,22 +8258,47 @@ class Orchestrator:
                 # card. Only here — a takeover carrying user text lets that
                 # text drive the continuation instead (no double prompt).
                 if stale_requests and self.handoff_continue == "auto":
+                    handle = self._handle_for_session(updated)
                     try:
-                        handle = self._handle_for_session(updated)
                         await transport.submit_turn(
                             handle,
                             TurnInput(text=HANDOFF_CONTINUE_PROMPT),
                             idempotency_key=f"handoff_continue:{takeover_id}",
                         )
-                        await self._drain_events(updated, transport, handle)
                     except Exception as exc:
                         # Non-fatal: the takeover itself succeeded; the user
                         # can still type to continue.
                         _log_degrade(
-                            "handoff_continue_failed",
+                            "handoff_continue_submit_failed",
                             session_id=updated.session_id,
+                            takeover_id=takeover_id,
+                            stale_hitl_count=len(stale_requests),
                             error=f"{type(exc).__name__}: {exc}",
                         )
+                        return SubmitResult(True, blocked_input_id=blocked_input_id)
+                    # Distinguishable submit-success signal for operators
+                    # (the live-E2E gate before flipping the default relies
+                    # on being able to tell "injected" from "never fired").
+                    updated.last_progress_at = self._now()
+                    updated.last_progress_event = "handoff_continue.submitted"
+                    if self.defer_event_drain:
+                        # Serve mode holds the ingress lock here: the
+                        # injected turn may pop a fresh HITL card whose
+                        # answer callback needs that lock — same deferral
+                        # rule as submit_user_input.
+                        self._start_background_event_drain(
+                            updated.session_id, transport, handle
+                        )
+                    else:
+                        try:
+                            await self._drain_events(updated, transport, handle)
+                        except Exception as exc:
+                            _log_degrade(
+                                "handoff_continue_drain_failed",
+                                session_id=updated.session_id,
+                                takeover_id=takeover_id,
+                                error=f"{type(exc).__name__}: {exc}",
+                            )
                 return SubmitResult(True, blocked_input_id=blocked_input_id)
             handle = self._handle_for_session(updated)
             await self._send_session_view(
@@ -8284,6 +8348,10 @@ class Orchestrator:
             session.session_id,
             through_generation=through_generation,
         )
+        self.interactions.clear_awaiting_other_for_session(
+            session.session_id,
+            through_generation=through_generation,
+        )
         for request in stale_requests:
             await self._send_session_view(
                 session,
@@ -8313,21 +8381,17 @@ class Orchestrator:
         - flip the channel-side cards to an explicit stale notice, so the
           user learns the prompt moved to the terminal *before* clicking
           into a stale-generation rejection.
+
+        Order matters: the user-visible sweep runs FIRST — the claim is
+        invoked from the ingress-locked hook path, so the worker shutdown
+        must never gate card flips (and is bounded below for the same
+        reason: a wedged old worker must not block ingress).
         """
-        transport = self.transports.get(prior_transport_kind)
-        shutdown = getattr(transport, "shutdown", None) if transport is not None else None
-        if shutdown is not None and prior_handle is not None and prior_handle.handle_id:
-            try:
-                await shutdown(prior_handle, "external_tui_claim")
-            except Exception as exc:
-                # Best-effort: a worker from a previous runtime is already
-                # gone; anything else still resolves via the prompt timeout.
-                _log_degrade(
-                    "external_claim_shutdown_failed",
-                    session_id=session.session_id,
-                    error=f"{type(exc).__name__}: {exc}",
-                )
         stale_requests = self.hitls.mark_pending_for_session_stale(
+            session.session_id,
+            through_generation=through_generation,
+        )
+        self.interactions.clear_awaiting_other_for_session(
             session.session_id,
             through_generation=through_generation,
         )
@@ -8343,6 +8407,28 @@ class Orchestrator:
                     f"{session.generation}:{request.hitl_request_id}"
                 ),
             )
+        transport = self.transports.get(prior_transport_kind)
+        shutdown = getattr(transport, "shutdown", None) if transport is not None else None
+        if shutdown is not None and prior_handle is not None and prior_handle.handle_id:
+            try:
+                result = await asyncio.wait_for(
+                    shutdown(prior_handle, "external_tui_claim"),
+                    timeout=EXTERNAL_CLAIM_SHUTDOWN_TIMEOUT_SECONDS,
+                )
+                if result is not None and not getattr(result, "accepted", True):
+                    _log_degrade(
+                        "external_claim_shutdown_failed",
+                        session_id=session.session_id,
+                        error=f"rejected: {getattr(result, 'reason', '') or 'unknown'}",
+                    )
+            except Exception as exc:
+                # Best-effort: a worker from a previous runtime is already
+                # gone; anything else still resolves via the prompt timeout.
+                _log_degrade(
+                    "external_claim_shutdown_failed",
+                    session_id=session.session_id,
+                    error=f"{type(exc).__name__}: {exc}",
+                )
         return stale_requests
 
     @staticmethod
@@ -8700,10 +8786,29 @@ class Orchestrator:
         channel = self.channels[session.channel_binding.channel_kind] if session.channel_binding else None
         if channel is None or session.channel_binding is None:
             return
+        # Ownership fence (ADR 0051): a handoff (external TUI claim,
+        # takeover) bumps the generation and swaps the transport while this
+        # drain may still be streaming the OLD worker's events. Processing
+        # them would register fresh-generation HITL cards for a writer that
+        # no longer owns the session — cards the stale sweep can never
+        # catch. Snapshot ownership at entry and stop the moment it moves.
+        expected_generation = session.generation
+        expected_transport_kind = session.transport_kind
         last_visible_text = ""
         saw_any_event = False
         saw_turn_completed = False
         async for event in self._iter_transport_events(transport, handle):
+            if (
+                session.generation != expected_generation
+                or session.transport_kind != expected_transport_kind
+            ):
+                _log_degrade(
+                    "event_drain_ownership_moved",
+                    session_id=session.session_id,
+                    expected_generation=expected_generation,
+                    current_generation=session.generation,
+                )
+                return
             saw_any_event = True
             if event.type == AgentEventType.TURN_COMPLETED:
                 saw_turn_completed = True

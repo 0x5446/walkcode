@@ -171,9 +171,10 @@ claude wrapper 默认回归纯 TUI（ADR 0050）：wrapper 内置
 `claude --resume <uuid>`（用状态卡上的最新 id）即夺回 TUI master。
 
 handoff 撞上 pending 提问/权限卡时（ADR 0051）：终端 resume 认领会立即
-释放原 headless worker 并把飞书旧卡翻「已过期，请到终端作答」；takeover
-方向可选 `WALKCODE_HANDOFF_CONTINUE=auto` 让悬空提问在接管后自动以新卡
-重现（默认 off，真机验证重问率后再开）。
+释放原 headless worker（限时 shutdown，pending 权限按 deny 解除）并在
+话题补发「已过期，请到终端作答」通知（原卡点按被 generation 校验拒绝）；
+takeover 方向可选 `WALKCODE_HANDOFF_CONTINUE=auto` 让悬空提问在接管后
+自动以新卡重现（默认 off，真机验证重问率后再开）。
 
 如需临时回到 daemon-native 双 UI（ADR 0048 形态：裸启动 = `claude --bg` +
 attach + `--resume` DWIM），在 wrapper 里去掉 `WALKCODE_NO_BG=1` 并把实例

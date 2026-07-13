@@ -716,6 +716,86 @@ class TakeoverOrchestratorTests(unittest.TestCase):
         self.assertTrue(result.accepted)
         self.assertEqual(transport.submitted_turns, [])
 
+    def test_handoff_continue_uses_stable_idempotency_key(self):
+        # Replays/retries must not double-inject: the synthetic turn rides
+        # a takeover-scoped idempotency key, not a random one.
+        class _KeyCapturingTransport(FakeAgentTransport):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.submit_keys = []
+
+            async def submit_turn(self, handle, turn, idempotency_key):
+                self.submit_keys.append(idempotency_key)
+                await super().submit_turn(handle, turn, idempotency_key)
+
+        transport = _KeyCapturingTransport("fake-transport", _transport_caps())
+        orchestrator, channel, transport, session = _setup(
+            resume_ref={
+                "transport_kind": "fake-transport",
+                "transport_ref": {"handle_id": "resume-h", "session_id": "native-1"},
+            },
+            transport=transport,
+            handoff_continue="auto",
+        )
+        self._register_pending_hitl(orchestrator, session)
+
+        result = self._status_card_takeover(orchestrator, channel, session)
+
+        self.assertTrue(result.accepted)
+        self.assertEqual(len(transport.submit_keys), 1)
+        self.assertRegex(transport.submit_keys[0], r"^handoff_continue:")
+
+    def test_handoff_continue_submit_failure_keeps_takeover_success(self):
+        # The injection is best-effort: a failing transport must not turn a
+        # completed takeover into a failure (the user can still type).
+        class _FailingSubmitTransport(FakeAgentTransport):
+            async def submit_turn(self, handle, turn, idempotency_key):
+                raise RuntimeError("worker rejected the synthetic turn")
+
+        transport = _FailingSubmitTransport("fake-transport", _transport_caps())
+        orchestrator, channel, transport, session = _setup(
+            resume_ref={
+                "transport_kind": "fake-transport",
+                "transport_ref": {"handle_id": "resume-h", "session_id": "native-1"},
+            },
+            transport=transport,
+            handoff_continue="auto",
+        )
+        hitl = self._register_pending_hitl(orchestrator, session)
+
+        result = self._status_card_takeover(orchestrator, channel, session)
+
+        self.assertTrue(result.accepted)
+        updated = orchestrator.sessions.get(session.session_id)
+        self.assertEqual(updated.writer_owner.kind, "orchestrator")
+        self.assertEqual(orchestrator.hitls.get(hitl.hitl_request_id).status, "stale")
+
+    def test_takeover_sweep_clears_awaiting_other_wait(self):
+        # An AskUserQuestion parked in the free-text "Other" wait must not
+        # keep swallowing plain topic messages after the handoff retired it.
+        orchestrator, channel, transport, session = _setup(
+            resume_ref={
+                "transport_kind": "fake-transport",
+                "transport_ref": {"handle_id": "resume-h", "session_id": "native-1"},
+            },
+        )
+        self._register_pending_hitl(orchestrator, session)
+        ctx = orchestrator.interactions.register_ask_user_question(
+            session_id=session.session_id,
+            generation=session.generation,
+            questions=[{"question": "Which env?", "options": ["dev", "prod"]}],
+        )
+        binding_key = session.channel_binding.key()
+        orchestrator.interactions.begin_awaiting_other(
+            ctx.interaction_id, binding_key, question_index=0
+        )
+        self.assertIsNotNone(orchestrator.interactions.awaiting_context_for_binding(binding_key))
+
+        result = self._status_card_takeover(orchestrator, channel, session)
+
+        self.assertTrue(result.accepted)
+        self.assertIsNone(orchestrator.interactions.awaiting_context_for_binding(binding_key))
+
     def test_takeover_with_blocked_input_does_not_inject_handoff_continue(self):
         # A takeover carrying user text lets that text drive the
         # continuation — injecting continue as well would double-prompt.
