@@ -11,6 +11,12 @@ attacher 的 job 不发布 state patch，修法为常驻 observer attach）。
 `headless` 保留为逃生口，`WALKCODE_CLAUDE_DAEMON_MODE=off` 时默认自动
 降级 headless（只有显式 daemon+off 的矛盾组合才报配置错误）。
 
+> **更正（2026-07-13，ADR 0050）**：默认值已翻回 `headless`。双 UI 要求
+> 全部会话跑在 bg/attach 形态，attach 端 TUI 渲染在双端并发下混乱且当前
+> 无解，默认改走单 master UI 模型（TUI master + 飞书只读观察 + takeover
+> 乒乓）。本 ADR 的 daemon spawn / 收编 / observer 机制全部保留，
+> `WALKCODE_CLAUDE_SPAWN_MODE=daemon` 为显式 opt-in。
+
 ## Context
 
 ADR 0046 v3 落地后，同一 profile 里存在三种会话形态：

@@ -211,12 +211,13 @@ class SpawnModeConfigTests(unittest.TestCase):
             self.assertEqual(cfg.agent_options["claude"]["spawn_mode"], "daemon")
             self.assertEqual(cfg.agent_options["claude"]["list_adopt"], "off")
 
-    def test_spawn_mode_defaults_to_daemon(self):
-        # ADR 0048: daemon-native is the default after the 2026-07-07 live
-        # E2E; the parser resolves the value so consumers see one truth.
+    def test_spawn_mode_defaults_to_headless(self):
+        # ADR 0050: single-master UI is the default (reverting the ADR 0048
+        # daemon default); the parser resolves the value so consumers see
+        # one truth. Dual-UI daemon spawn is an explicit opt-in.
         with tempfile.TemporaryDirectory() as tmp:
             cfg = ChannelNativeConfig.from_env(self._env(tmp))
-            self.assertEqual(cfg.agent_options["claude"]["spawn_mode"], "daemon")
+            self.assertEqual(cfg.agent_options["claude"]["spawn_mode"], "headless")
             self.assertNotIn("list_adopt", cfg.agent_options["claude"])
 
     def test_daemon_off_degrades_default_spawn_mode_to_headless(self):
@@ -458,24 +459,18 @@ class RuntimeDaemonSpawnTests(unittest.TestCase):
             )
             self.assertIsNone(session)
 
-    def test_default_spawn_mode_is_daemon(self):
-        # No env override: the resolved default must route through the
-        # daemon spawner (ADR 0048 post-live-E2E default flip).
+    def test_default_spawn_mode_is_headless(self):
+        # No env override: the resolved default must skip the daemon spawner
+        # so channel-born sessions fall through to the headless SDK path
+        # (ADR 0050 single-master default).
         with tempfile.TemporaryDirectory() as tmp:
             runtime = _runtime(tmp)
-            transport = runtime._claude_daemon_transport()
-
-            async def fake_spawn(cwd, *, settings="", cli_path="", **kwargs):
-                return {"short": SHORT, "session_id": AGENT_SESSION_ID, "cwd": cwd}
-
-            transport.spawn_bg_job = fake_spawn
             session = asyncio.run(
                 runtime._spawn_claude_daemon_native_session(
                     _user_binding(), "claude_headless", tmp, _actor()
                 )
             )
-            self.assertIsNotNone(session)
-            self.assertEqual(session.transport_ref.get("daemon_short"), SHORT)
+            self.assertIsNone(session)
 
     def test_daemon_mode_spawns_external_shaped_session(self):
         with tempfile.TemporaryDirectory() as tmp:

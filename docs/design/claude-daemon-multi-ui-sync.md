@@ -43,6 +43,13 @@ Claude daemon 只托管 **bg 会话**（`claude --bg` 启动，或 TUI 内 `/bg`
 > headless）；(3) wrapper 的 `--resume/-r <hex-id>` 不再原样透传，而是按意图
 > 处理（活会话 attach、死会话 bg 复活），见 ADR 0048 与 lark-profile-deploy.md。
 
+> **ADR 0050 更新（2026-07-13）**：`WALKCODE_CLAUDE_SPAWN_MODE` 默认已翻回
+> `headless`——attach 端 TUI 渲染在双端并发下混乱且当前无解，默认改走单
+> master UI 模型（TUI master + 飞书只读观察 + takeover 乒乓）。本文档描述
+> 的 daemon 双端机制仍完整可用，但都是 `SPAWN_MODE=daemon` 显式 opt-in 或
+> 用户手动 `claude --bg` 后的行为；本机 wrapper 已回归纯 TUI 裸启动
+> （`WALKCODE_NO_BG=1`，`--resume` 恢复官方原义）。
+
 ## 协议依据（已实测验证）
 
 - socket 路径可确定性推导：`/tmp/cc-daemon-<uid>/<sha256(CLAUDE_CONFIG_DIR)[:8]>/control.sock`。
