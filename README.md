@@ -22,6 +22,24 @@ WalkCode V3 是 channel-native 的 Coding Agent runtime。它把 IM 当成一等
 标准本地部署是 {work, personal} × {claude, codex} 的实例矩阵（可为不同模型路由
 加更多 profile），见 [docs/lark-profile-deploy.md](docs/lark-profile-deploy.md)。
 
+## 默认交互模型：单 master UI 乒乓（ADR 0050/0051）
+
+同一时刻只有一端 UI 是会话的 master，另一端只读观察：
+
+- **TUI master**：终端裸启动的会话由 hook 只读观察，飞书话题实时渲染
+  内容与状态卡，但不可直写；
+- **takeover → 飞书独占**：飞书想写先点接管卡——walkcode 终止 TUI 进程、
+  headless resume、提交被阻塞的消息；接管前悬空的提问/权限卡会收到过期
+  通知，且悬空的提问默认自动以新卡重现（`WALKCODE_HANDOFF_CONTINUE=auto`，
+  注入对话题不可见，设 `off` 关闭）；
+- **终端夺回**：`claude --resume <最新 id>`（状态卡上有）即认领回 TUI
+  master——原 headless worker 立即释放（悬空权限按拒绝解除）、飞书回到
+  只读并收到过期通知；
+- 飞书新建会话 headless 出生（飞书独占），终端 resume 即转 TUI master。
+
+每次 takeover / 终端 resume 都是 fork 语义（新 session id，walkcode 按
+血缘跟踪、话题不变）。
+
 ## 双端同步：终端与 IM 共驾同一个 Claude 会话
 
 Claude 会话以 daemon-native 方式运行时（手动 `claude --bg` 启动后 attach，

@@ -236,9 +236,10 @@ class ChannelNativeConfig:
     profile: str = ""
     workspace_roots: tuple[str, ...] = ()
     # ADR 0051: after a takeover-only handoff that stale-marked pending HITL
-    # prompts, "auto" injects an invisible continue turn so the agent re-asks
-    # and the channel gets a fresh answerable card. Off until live-verified.
-    handoff_continue: str = "off"
+    # prompts, "auto" (default — user decision 2026-07-13) injects an
+    # invisible continue turn so the agent re-asks and the channel gets a
+    # fresh answerable card. "off" is the escape hatch.
+    handoff_continue: str = "auto"
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> "ChannelNativeConfig":
@@ -283,7 +284,7 @@ class ChannelNativeConfig:
                 for item in str(source.get("WALKCODE_WORKSPACE_ROOTS", "") or "").split(":")
                 if item.strip()
             ),
-            handoff_continue=handoff_continue or "off",
+            handoff_continue=handoff_continue or "auto",
         )
 
     @property
@@ -6766,7 +6767,7 @@ class Orchestrator:
         outbox_dispatcher: OutboxDispatcher | None = None,
         on_state_changed: Callable[[], None] | None = None,
         daemon_spawner: Callable[..., Any] | None = None,
-        handoff_continue: str = "off",
+        handoff_continue: str = "auto",
         now: Callable[[], float] = time.time,
     ):
         self.sessions = sessions

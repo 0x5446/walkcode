@@ -5649,7 +5649,7 @@ def _format_status(status: dict[str, Any]) -> str:
         else:
             lines.append(f"claude_daemon: enabled=False reason={daemon.get('reason', '-')}")
     if "handoff_continue" in status:
-        lines.append(f"handoff_continue: {status.get('handoff_continue') or 'off'}")
+        lines.append(f"handoff_continue: {status.get('handoff_continue') or 'auto'}")
     hook_status = status.get("tui_hook_status", {})
     if hook_status.get("checked"):
         missing = ",".join(hook_status.get("missing") or []) or "-"

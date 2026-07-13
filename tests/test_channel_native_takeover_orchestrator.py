@@ -684,12 +684,14 @@ class TakeoverOrchestratorTests(unittest.TestCase):
         )
         self.assertEqual(orchestrator.hitls.get(hitl.hitl_request_id).status, "stale")
 
-    def test_takeover_only_with_pending_hitl_default_off_does_not_inject(self):
+    def test_takeover_only_with_pending_hitl_explicit_off_does_not_inject(self):
+        # "off" is the escape hatch (product default is auto, ADR 0051).
         orchestrator, channel, transport, session = _setup(
             resume_ref={
                 "transport_kind": "fake-transport",
                 "transport_ref": {"handle_id": "resume-h", "session_id": "native-1"},
             },
+            handoff_continue="off",
         )
         hitl = self._register_pending_hitl(orchestrator, session)
 

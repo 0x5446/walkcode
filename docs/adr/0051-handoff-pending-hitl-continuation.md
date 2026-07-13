@@ -2,7 +2,9 @@
 
 Date: 2026-07-13
 
-Status: Accepted; implemented（continue 注入默认 off，待真机验证重问率后翻默认）
+Status: Accepted; implemented。continue 注入默认 **auto**（用户拍板
+2026-07-13：直接以 auto 出厂，`off` 为逃生口；初版"off 起步待真机验证"
+的保守策略被用户决定取代，真机重问率验证降级为发版后的观察项）
 
 ## Context
 
@@ -58,7 +60,7 @@ ADR 0050 把默认交互模型定为单 master UI 乒乓：TUI master ↔（take
      终端作答」；同时清理 AskUserQuestion 的 awaiting-other 自由文本等待
      索引，防止后续普通消息被死等待吞掉。
 2. **方向一隐形 continue 注入（`WALKCODE_HANDOFF_CONTINUE=auto|off`，
-   默认 `off`）**：takeover 完成路径上，当且仅当
+   默认 `auto`）**：takeover 完成路径上，当且仅当
    - 本次 takeover 是 **takeover-only**（无伴随用户消息——带消息的
      takeover 由消息本身驱动续接，注入会双重提示），且
    - stale 清扫**确实清到了 pending HITL**（没有悬空提问的空闲接管必须
@@ -71,9 +73,11 @@ ADR 0050 把默认交互模型定为单 master UI 乒乓：TUI master ↔（take
    未答提问（把重问率从"大概率"拉到"接近必然"）。
 3. **可观测性**：`describe()` / doctor 文本输出新增 `handoff_continue`
    行；配置解析期校验取值（非 `auto|off` 报 ChannelConfigError）。
-4. **默认值策略**：`off` 起步。翻 `auto` 的门槛是真机 Live E2E 验证：
-   takeover-only + pending AskUserQuestion 场景下，注入后飞书出现新可答
-   卡且旧卡已翻 stale、无双重提问。验证过后另行翻默认（一行）。
+4. **默认值策略**：默认 `auto`（用户拍板 2026-07-13）。风险边界：注入
+   条件三重收窄（takeover-only ∧ 确有 stale HITL ∧ auto），误触发面小；
+   最坏情况是模型没有重问或换了措辞，用户手动再说一句即可，`off` 单变量
+   回退。真机 Live E2E（takeover-only + pending AskUserQuestion → 新卡
+   重现、无双重提问）保留为发版后的观察项而非发版前门槛。
 
 ## Consequences
 
@@ -119,6 +123,7 @@ ADR 0050 把默认交互模型定为单 master UI 乒乓：TUI master ↔（take
   （ingress 锁内不同步等 HITL）、drain 所有权栅栏、awaiting-other 清理、
   文案渠道中立化、submit/drain 分阶段 degrade + `handoff_continue.submitted`
   进度信号。未修项见「已知并接受」。
-- 待做（翻默认前）：真机 Live E2E——飞书生 headless 会话触发
-  AskUserQuestion → 状态卡 takeover-only →（env 置 auto）确认新卡重现、
-  旧卡收到过期通知、终端 resume 后 transcript 中 `[ui-handoff]` 行无歧义。
+- 观察项（发版后，默认已 auto）：真机场景——飞书生 headless 会话触发
+  AskUserQuestion → 状态卡 takeover-only → 确认新卡重现、旧卡收到过期
+  通知、终端 resume 后 transcript 中 `[ui-handoff]` 行无歧义；若重问率
+  不达预期，逃生口 `WALKCODE_HANDOFF_CONTINUE=off`。
