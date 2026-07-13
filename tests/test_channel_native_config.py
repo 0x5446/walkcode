@@ -30,6 +30,23 @@ class ChannelNativeConfigTests(unittest.TestCase):
         self.assertEqual(cfg.agent_transport_kind, "claude_headless")
         self.assertEqual(cfg.cwd, "/tmp/project")
         self.assertEqual(cfg.state_path, "/tmp/state.json")
+        self.assertEqual(cfg.handoff_continue, "auto")
+
+    def test_handoff_continue_defaults_auto_and_rejects_garbage(self):
+        # ADR 0051: auto is the shipped default (user decision 2026-07-13);
+        # off stays as the explicit escape hatch.
+        base = {
+            "WALKCODE_CHANNEL": "telegram",
+            "TELEGRAM_BOT_TOKEN": "tg-token",
+            "WALKCODE_AGENT": "claude",
+            "TELEGRAM_ALLOWED_CHAT_IDS": "1",
+            "WALKCODE_CWD": "/tmp/project",
+            "WALKCODE_STATE_PATH": "/tmp/state.json",
+        }
+        cfg = ChannelNativeConfig.from_env({**base, "WALKCODE_HANDOFF_CONTINUE": "off"})
+        self.assertEqual(cfg.handoff_continue, "off")
+        with self.assertRaisesRegex(ChannelConfigError, "WALKCODE_HANDOFF_CONTINUE"):
+            ChannelNativeConfig.from_env({**base, "WALKCODE_HANDOFF_CONTINUE": "on"})
 
     def test_telegram_rich_messages_are_explicit_opt_in(self):
         default_cfg = ChannelNativeConfig.from_env(

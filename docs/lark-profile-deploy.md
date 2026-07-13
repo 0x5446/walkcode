@@ -170,6 +170,13 @@ claude wrapper 默认回归纯 TUI（ADR 0050）：wrapper 内置
 `/exit` 就是退出。飞书侧对 TUI 会话只读观察，想写先过 takeover 卡；终端
 `claude --resume <uuid>`（用状态卡上的最新 id）即夺回 TUI master。
 
+handoff 撞上 pending 提问/权限卡时（ADR 0051）：终端 resume 认领会立即
+释放原 headless worker（限时 shutdown，pending 权限按 deny 解除）并在
+话题补发「已过期，请到终端作答」通知（原卡点按被 generation 校验拒绝）；
+takeover 方向默认 `WALKCODE_HANDOFF_CONTINUE=auto`——接管后悬空的提问
+自动以新卡重现（注入对话题不可见；重问由模型执行，措辞可能与原问略有
+出入）。不想要自动续接设 `WALKCODE_HANDOFF_CONTINUE=off`。
+
 如需临时回到 daemon-native 双 UI（ADR 0048 形态：裸启动 = `claude --bg` +
 attach + `--resume` DWIM），在 wrapper 里去掉 `WALKCODE_NO_BG=1` 并把实例
 env 的 `WALKCODE_CLAUDE_SPAWN_MODE` 显式设回 `daemon`；attach 模式下

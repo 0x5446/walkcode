@@ -3103,6 +3103,155 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
             self.assertEqual(updated.transport_ref["resume_ref"]["agent_session_id"], "claude-session-1")
             self.assertEqual([method for method, _payload in api.calls], [])
 
+    def test_tui_hook_claim_settles_pending_hitl_and_shuts_down_worker(self):
+        # ADR 0051: claiming a structured session whose worker is blocked on
+        # a prompt must (a) shut the worker down so the pending can_use_tool
+        # resolves now instead of at the permission timeout, and (b) flip the
+        # channel card to an explicit stale notice before the user clicks
+        # into a stale-generation rejection.
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = str(Path(tmp) / "state.json")
+            cfg = ChannelNativeConfig.from_env(
+                {
+                    "WALKCODE_CHANNEL": "telegram",
+                    "TELEGRAM_BOT_TOKEN": "fake",
+                    "WALKCODE_AGENT": "claude",
+                    "TELEGRAM_ALLOWED_CHAT_IDS": "123",
+                    "WALKCODE_STATE_PATH": state_path,
+                    "WALKCODE_CWD": tmp,
+                }
+            )
+            api = _FakeTelegramApi()
+            transport = FakeAgentTransport("claude_headless", _transport_caps())
+            runtime = ChannelNativeRuntime.from_config(
+                cfg,
+                telegram_api=api,
+                transports={"claude_headless": transport},
+            )
+            session = runtime.state.sessions.create_structured_session(
+                binding=ChannelBinding(
+                    channel_kind="telegram",
+                    account_id="bot",
+                    chat_id="123",
+                    root_message_id="3",
+                ),
+                transport_kind="claude_headless",
+                transport_ref={"handle_id": "h1", "agent_session_id": "claude-session-1"},
+                cwd=tmp,
+                owner=ActorRef("telegram", "456", "Ada"),
+            )
+            hitl = runtime.orchestrator.hitls.register_request(
+                session_id=session.session_id,
+                generation=session.generation,
+                transport_kind="claude_headless",
+                transport_request_id="perm-1",
+                native_method="permission.requested",
+                native_params={"prompt": "Allow shell?"},
+                prompt_kind="permission",
+                channel_binding_key=session.channel_binding.key(),
+            )
+
+            result = asyncio.run(
+                runtime.process_tui_hook(
+                    hook_type="sync",
+                    agent="claude",
+                    payload={
+                        "session_id": "claude-session-1",
+                        "cwd": tmp,
+                        "_walkcode_hook_process_tree": [
+                            "claude --settings /Users/alpha/.claude/profiles/vertex.json"
+                        ],
+                    },
+                )
+            )
+
+            self.assertTrue(result.accepted)
+            updated = runtime.state.sessions.get(session.session_id)
+            self.assertEqual(updated.writer_owner.kind, "external_tui")
+            self.assertEqual(transport.shutdown_calls, ["external_tui_claim"])
+            self.assertEqual(
+                runtime.orchestrator.hitls.get(hitl.hitl_request_id).status, "stale"
+            )
+            self.assertTrue(
+                any("resumed in a terminal TUI" in str(payload) for _m, payload in api.calls),
+                api.calls,
+            )
+
+    def test_tui_hook_claim_survives_worker_shutdown_failure(self):
+        # The old-worker shutdown is best-effort: a raising transport must
+        # not break the claim, and the user-visible sweep (stale + card
+        # flip) must have happened regardless (it runs before shutdown).
+        class _FailingShutdownTransport(FakeAgentTransport):
+            async def shutdown(self, handle, mode):
+                raise RuntimeError("worker is wedged")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = str(Path(tmp) / "state.json")
+            cfg = ChannelNativeConfig.from_env(
+                {
+                    "WALKCODE_CHANNEL": "telegram",
+                    "TELEGRAM_BOT_TOKEN": "fake",
+                    "WALKCODE_AGENT": "claude",
+                    "TELEGRAM_ALLOWED_CHAT_IDS": "123",
+                    "WALKCODE_STATE_PATH": state_path,
+                    "WALKCODE_CWD": tmp,
+                }
+            )
+            api = _FakeTelegramApi()
+            transport = _FailingShutdownTransport("claude_headless", _transport_caps())
+            runtime = ChannelNativeRuntime.from_config(
+                cfg,
+                telegram_api=api,
+                transports={"claude_headless": transport},
+            )
+            session = runtime.state.sessions.create_structured_session(
+                binding=ChannelBinding(
+                    channel_kind="telegram",
+                    account_id="bot",
+                    chat_id="123",
+                    root_message_id="3",
+                ),
+                transport_kind="claude_headless",
+                transport_ref={"handle_id": "h1", "agent_session_id": "claude-session-1"},
+                cwd=tmp,
+                owner=ActorRef("telegram", "456", "Ada"),
+            )
+            hitl = runtime.orchestrator.hitls.register_request(
+                session_id=session.session_id,
+                generation=session.generation,
+                transport_kind="claude_headless",
+                transport_request_id="perm-1",
+                native_method="permission.requested",
+                native_params={"prompt": "Allow shell?"},
+                prompt_kind="permission",
+                channel_binding_key=session.channel_binding.key(),
+            )
+
+            result = asyncio.run(
+                runtime.process_tui_hook(
+                    hook_type="sync",
+                    agent="claude",
+                    payload={
+                        "session_id": "claude-session-1",
+                        "cwd": tmp,
+                        "_walkcode_hook_process_tree": [
+                            "claude --settings /Users/alpha/.claude/profiles/vertex.json"
+                        ],
+                    },
+                )
+            )
+
+            self.assertTrue(result.accepted)
+            updated = runtime.state.sessions.get(session.session_id)
+            self.assertEqual(updated.writer_owner.kind, "external_tui")
+            self.assertEqual(
+                runtime.orchestrator.hitls.get(hitl.hitl_request_id).status, "stale"
+            )
+            self.assertTrue(
+                any("resumed in a terminal TUI" in str(payload) for _m, payload in api.calls),
+                api.calls,
+            )
+
     def test_tui_hook_from_walkcode_owned_claude_headless_is_ignored(self):
         with tempfile.TemporaryDirectory() as tmp:
             state_path = str(Path(tmp) / "state.json")

@@ -34,6 +34,29 @@ The standard local deployment is a {work, personal} x {claude, codex} instance
 matrix (add more profiles for extra model routes); see
 [docs/lark-profile-deploy.md](docs/lark-profile-deploy.md).
 
+## Default Interaction Model: Single-Master UI Ping-Pong (ADR 0050/0051)
+
+At any moment exactly one UI is the session's master; the other side observes
+read-only:
+
+- **TUI master**: a bare terminal launch is hook-observed; the Feishu topic
+  renders content and status cards live but cannot write.
+- **Takeover → IM-only**: to write from Feishu, confirm the takeover card —
+  WalkCode terminates the TUI process, resumes headless, and submits the
+  blocked message. Prompts orphaned by the takeover get an expiry notice, and
+  an orphaned question is automatically re-asked as a fresh card by default
+  (`WALKCODE_HANDOFF_CONTINUE=auto`; the injected nudge is invisible in the
+  topic; set `off` to disable).
+- **Terminal reclaim**: `claude --resume <latest id>` (shown on the status
+  card) claims the session back — the old headless worker is released
+  immediately (orphaned permission waits resolve as deny), and Feishu returns
+  to read-only with an expiry notice.
+- IM-born sessions start headless (IM-only); a terminal resume flips them to
+  TUI master.
+
+Every takeover / terminal resume forks a new session id; WalkCode tracks the
+lineage and the topic stays the same.
+
 ## Dual-Drive: Terminal and IM Share One Claude Session
 
 When a Claude session runs daemon-native (a manual `claude --bg` then attach,

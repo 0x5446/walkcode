@@ -742,6 +742,7 @@ class ChannelNativeRuntime:
             external_tui_controllers=external_tui_controllers or _build_external_tui_controllers(),
             outbox_dispatcher=outbox_dispatcher,
             on_state_changed=save_state,
+            handoff_continue=config.handoff_continue,
             now=now,
         )
         return cls(
@@ -767,6 +768,7 @@ class ChannelNativeRuntime:
             "runtime_status": self._describe_runtime_status(),
             "tui_hook_status": _describe_tui_hook_status(self.config.agent, codex_home),
             "claude_daemon": self._describe_claude_daemon(),
+            "handoff_continue": self.config.handoff_continue,
             "state_path": self.config.state_path,
             "cwd": self.config.cwd,
             "e2e_gates": self.e2e_gates,
@@ -3203,6 +3205,12 @@ class ChannelNativeRuntime:
             if not session.writer_owner or session.writer_owner.kind != "external_tui":
                 if not _tui_hook_can_claim_existing_session(hook_type):
                     return None
+                # Capture the structured owner's identity BEFORE the handoff
+                # rewrites transport_kind/transport_ref: the worker shutdown
+                # and stale-HITL sweep below need the old handle (ADR 0051).
+                prior_generation = session.generation
+                prior_transport_kind = session.transport_kind
+                prior_handle = Orchestrator._handle_for_session(session)
                 result = self.state.sessions.handoff_to_external_tui(
                     session.session_id,
                     generation=session.generation,
@@ -3213,6 +3221,12 @@ class ChannelNativeRuntime:
                 if not result.accepted:
                     raise ChannelConfigError(f"could not claim structured session: {result.reason}")
                 session = self.state.sessions.get(existing_id)
+                await self.orchestrator.settle_hitls_for_external_claim(
+                    session,
+                    prior_transport_kind=prior_transport_kind,
+                    prior_handle=prior_handle,
+                    through_generation=prior_generation,
+                )
             else:
                 session.transport_ref.update(external_ref)
                 if session.writer_owner is not None:
@@ -5634,6 +5648,8 @@ def _format_status(status: dict[str, Any]) -> str:
             )
         else:
             lines.append(f"claude_daemon: enabled=False reason={daemon.get('reason', '-')}")
+    if "handoff_continue" in status:
+        lines.append(f"handoff_continue: {status.get('handoff_continue') or 'auto'}")
     hook_status = status.get("tui_hook_status", {})
     if hook_status.get("checked"):
         missing = ",".join(hook_status.get("missing") or []) or "-"
