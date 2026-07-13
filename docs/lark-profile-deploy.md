@@ -244,7 +244,10 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.walkcode.work-claude
 - `/status`、`/sessions`、`/model`；
 - TUI 起会话 → 话题只读观察 → 接管提示 → 接管后可写。
 
-daemon-native 会话（wrapper 裸启动）另验（ADR 0046 v3，真双端）：
+daemon-native 会话另验（ADR 0046 v3，真双端）——**ADR 0050 后这是显式
+opt-in 路径**，验收前先去掉 wrapper 的 `WALKCODE_NO_BG=1` 并在实例 env
+显式设 `WALKCODE_CLAUDE_SPAWN_MODE=daemon`（或直接手动 `claude --bg` 起
+会话），否则以下双端行为不会出现：
 
 - 飞书发消息 → 终端实时出现该输入，飞书**无 "TUI input" 回显**、用户消息
   被贴表情回执（reaction 失败时回退 "✅ 已发送到终端会话" 文本）；

@@ -69,6 +69,7 @@ class _SpawnStubClient:
         self.kills: list[str] = []
         self.replies: list[tuple[str, str]] = []
         self.observes: list[str] = []
+        self.socket_path = "/tmp/cc-daemon-test/control.sock"
 
     async def attach_observe(self, short: str, *, on_ready=None, **kwargs):
         # Signal the readiness barrier (spawn awaits it), then "drop the
@@ -471,6 +472,19 @@ class RuntimeDaemonSpawnTests(unittest.TestCase):
                 )
             )
             self.assertIsNone(session)
+
+    def test_describe_surfaces_resolved_spawn_mode(self):
+        # Operators audit the ADR 0050 rollout via doctor/describe: the
+        # resolved default must read headless, and an explicit daemon
+        # opt-in must show as-is instead of the parser fallback.
+        with tempfile.TemporaryDirectory() as tmp:
+            described = _runtime(tmp).describe()["claude_daemon"]
+            self.assertEqual(described["spawn_mode"], "headless")
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = _runtime(tmp, WALKCODE_CLAUDE_SPAWN_MODE="daemon")
+            self.assertEqual(
+                runtime.describe()["claude_daemon"]["spawn_mode"], "daemon"
+            )
 
     def test_daemon_mode_spawns_external_shaped_session(self):
         with tempfile.TemporaryDirectory() as tmp:

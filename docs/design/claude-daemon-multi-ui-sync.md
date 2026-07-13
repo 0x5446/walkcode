@@ -175,11 +175,15 @@ pty harness 驱动真实 TUI 完成全流程（`/tmp/poc_bg_tui.py`、
   worker 的 session-start hook 会让 walkcode 建新会话/新卡片；如需沿用原
   飞书 topic，须做 fork 父子映射（后续实现项）。
 
-### 已落地：daemon-native wrapper（2026-07-05，端到端验证通过）
+### 历史状态：daemon-native wrapper（2026-07-05 落地，ADR 0050 起默认停用）
+
+> **ADR 0050（2026-07-13）**：本节描述的 wrapper bg 化是 ADR 0048 时期的
+> 默认形态。现在 wrapper 内置 `WALKCODE_NO_BG=1`，裸启动 = 普通 TUI；本节
+> 机制仅在显式 opt-in（去掉该变量 + `SPAWN_MODE=daemon`）时生效。
 
 `/bg` 无法外部触发的最终解法在 wrapper 层：**让会话从出生就是 daemon worker**，
 TUI 只是 attach 上去的视图。三个 wrapper（`~/.local/bin/claude-personal` /
-`claude-work` / `claude-work2`）已改造：
+`claude-work` / `claude-work2`）曾按此改造：
 
 ```
 裸交互启动（无参数 + tty + 非嵌套）：
@@ -225,7 +229,8 @@ takeover 从不可逆变为可逆，且会话生命周期脱离 walkcode 进程�
   已由 ADR 0048 落地（2026-07-07）：不逆向 dispatch 的内部 `d` spec，改用
   官方 CLI 面 `claude --bg` 子进程 spawn + 外部观察形态预注册 + 首轮
   daemon reply 注入；`WALKCODE_CLAUDE_SPAWN_MODE` 门禁
-  （2026-07-07 飞书 Live E2E 通过后默认已切 daemon，headless 为逃生口）。
+  （2026-07-07 曾默认切 daemon；ADR 0050 起默认翻回 headless，daemon 为
+  显式 opt-in）。
 - ~~list 兜底自动建会话（无 hook 场景）~~ → 已由 ADR 0048 落地：watcher
   的 list 轮询收编 walkcode 不认识的活 job（`source=shell` + 30s 年龄阈值
   + resume_ref 去重），`WALKCODE_CLAUDE_LIST_ADOPT=off` 可关。

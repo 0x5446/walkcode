@@ -117,8 +117,9 @@ fi
 ```
 
 片段插在 `export CLAUDE_CONFIG_DIR=...` 之后。然后给**所有会创建 Claude
-worker 的调用**加上 `"${tap_settings[@]}"`——daemon-native wrapper（裸启动 =
-`claude --bg` + attach）至少要改两处：
+worker 的调用**加上 `"${tap_settings[@]}"`。ADR 0050 后 wrapper 默认是纯
+TUI，只需改 `exec claude` 一处；若显式 opt-in 回 daemon-native wrapper
+（裸启动 = `claude --bg` + attach，ADR 0048 形态）则至少要改两处：
 
 - `claude --bg` → `claude --bg "${tap_settings[@]}"`（裸启动的主路径，真正发
   起上游请求的 worker 在这里创建，只改最后的 exec 会漏掉它）

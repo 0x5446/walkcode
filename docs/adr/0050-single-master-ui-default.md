@@ -64,6 +64,20 @@ observer attach、attach 回放与本地终端渲染相互交叠，表现为界�
 - attach 渲染混乱若未来在官方 CLI 侧修复，翻回 daemon 默认只需还原本
   ADR 的默认值一行 + wrapper，机制层无迁移成本。
 
+已知并接受：
+
+- **wrapper 回退不在仓库门禁内**（deep-review design 维度提出）：profile
+  wrapper 是机器本地脚本，`native doctor` / `upgrade.sh` 不扫描
+  `~/.local/bin/claude-*` 是否仍是 bg+attach 形态。保留旧 wrapper 的机器
+  doctor 会显示 `spawn_mode=headless` 却仍产生 daemon-native 终端会话。
+  当前唯一部署（本机）随本 ADR 同步改 wrapper；若未来 wrapper 进入分发
+  流程，再把「wrapper 含 `claude --bg` 且无 `WALKCODE_NO_BG=1` → doctor
+  warning」纳入门禁。
+- **旧 daemon 生会话的重启收敛**（deep-review data 维度提出）：默认切换
+  不迁移既有 `daemon_live` 会话；daemon job 在服务离线期间消亡的旧话题
+  依赖 watcher 的 list 同步收敛。该行为与默认值无关（daemon opt-in 下
+  同样存在），不在本 ADR 修，见 PR 记录。
+
 ## Verification
 
 - 配置解析：默认 headless、显式 daemon 生效、显式 daemon+off 报错、
