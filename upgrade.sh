@@ -170,8 +170,24 @@ restart_v3_labels() {
   for label in "${labels[@]}"; do
     label="$(echo "$label" | xargs)"
     [ -n "$label" ] || continue
-    run launchctl kickstart -k "gui/$UID_NUM/$label"
-    RESTARTED_LABELS+=("$label")
+    case "$label" in
+      com.walkcode.tap-*)
+        # Hard guard even against explicit configuration: taps proxy live
+        # Claude API traffic; kickstarting one severs every local session's
+        # in-flight request.
+        warn "$(msg \
+          "refusing to restart tap proxy ${label} (carries live Claude API traffic)." \
+          "拒绝重启 tap 代理 ${label}（承载本机 Claude 会话实时 API 流量）。")"
+        continue
+        ;;
+    esac
+    if run launchctl kickstart -k "gui/$UID_NUM/$label"; then
+      RESTARTED_LABELS+=("$label")
+    else
+      warn "$(msg \
+        "kickstart failed for ${label}; continuing with the remaining labels." \
+        "kickstart ${label} 失败；继续处理其余实例。")"
+    fi
   done
 }
 

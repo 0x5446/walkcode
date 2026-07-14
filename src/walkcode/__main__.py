@@ -207,6 +207,13 @@ def cmd_upgrade(_args) -> None:
                 "WALKCODE_V3_LAUNCHD_LABELS is empty; restarting discovered labels: "
                 + ", ".join(labels)
             )
+    # Hard guard even against explicit configuration: taps proxy live Claude
+    # API traffic; kickstarting one severs every local session's in-flight
+    # request.
+    for label in labels:
+        if label.startswith("com.walkcode.tap-"):
+            print(f"refusing to restart tap proxy {label} (carries live Claude API traffic).")
+    labels = [label for label in labels if not label.startswith("com.walkcode.tap-")]
     if labels:
         uid = os.getuid()
         for label in labels:
@@ -229,6 +236,8 @@ def cmd_upgrade(_args) -> None:
             if label_env.is_file():
                 _run(f"WALKCODE_ENV_FILE={shlex.quote(str(label_env))} walkcode native doctor")
                 ran_doctor = True
+            else:
+                print(f"no env file for {label} (expected {label_env}); doctor skipped.")
         if not ran_doctor:
             _run("walkcode native doctor")
     print("Upgrade complete.")

@@ -31,7 +31,10 @@ INSTALL_SH = REPO_ROOT / "install.sh"
 UPGRADE_SH = REPO_ROOT / "upgrade.sh"
 
 _GIT = shutil.which("git")
-_BASH = shutil.which("bash")
+# Prefer the system bash: on macOS that is 3.2, the interpreter these scripts
+# actually run under (launchd, bare terminals) — newer homebrew bash would
+# hide 3.2-only parsing bugs like unbraced vars before CJK text.
+_BASH = "/bin/bash" if os.path.exists("/bin/bash") else shutil.which("bash")
 
 FAKE_GH = """#!/usr/bin/env bash
 cmd="${1:-}"; sub="${2:-}"
@@ -329,6 +332,20 @@ class UpgradeGateTests(_ScriptGateBase):
         self.assertFalse(any("com.apple.foo" in l for l in kicks), kicks)
         # doctor runs bound to the discovered instance's env file
         self.assertIn("native doctor ok", r.stdout + r.stderr)
+
+    def test_explicit_labels_never_restart_tap_proxies(self):
+        # Taps carry live Claude API traffic — even an explicit label list
+        # must not kickstart them.
+        log = self.tmp / "launchctl.log"
+        r = self._run("upgrade.sh", extra_env=self._upgrade_env(
+            WALKCODE_V3_LAUNCHD_LABELS="com.walkcode.tap-work,com.walkcode.a-claude",
+            FAKE_LAUNCHCTL_LOG=str(log),
+        ))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        kicks = [l for l in log.read_text().splitlines() if "kickstart" in l]
+        self.assertTrue(any("com.walkcode.a-claude" in l for l in kicks), kicks)
+        self.assertFalse(any("tap-work" in l for l in kicks), kicks)
+        self.assertRegex(r.stdout + r.stderr, r"tap proxy|tap 代理")
 
     def test_shell_scripts_brace_vars_before_cjk(self):
         # macOS bash 3.2 misparses `$VAR` glued to a CJK character as part of
