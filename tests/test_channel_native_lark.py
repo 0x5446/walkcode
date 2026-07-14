@@ -364,6 +364,25 @@ class LarkRuntimeTests(_LarkRuntimeHarness):
         sent_view = api.calls[-1][1]["view"]
         self.assertIn("Active sessions", sent_view.get("text", ""))
 
+    def test_redelivered_command_event_is_not_rerun(self):
+        # Local command branches never reach the orchestrator's ledger, so
+        # they record the event themselves — a Feishu redelivery of the same
+        # event_id must not re-send the reply.
+        runtime, api, transport = self._runtime()
+
+        first = asyncio.run(
+            runtime.process_lark_event(self._message_payload(text="/status"))
+        )
+        calls_after_first = len(api.calls)
+        redelivery = asyncio.run(
+            runtime.process_lark_event(self._message_payload(text="/status"))
+        )
+
+        self.assertTrue(first.accepted)
+        self.assertFalse(redelivery.accepted)
+        self.assertEqual(redelivery.reason, BlockedReason.DUPLICATE_INBOUND)
+        self.assertEqual(len(api.calls), calls_after_first)
+
     def test_unknown_slash_outside_session_gets_error_text(self):
         runtime, api, transport = self._runtime()
 

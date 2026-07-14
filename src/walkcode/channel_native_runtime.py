@@ -1327,6 +1327,18 @@ class ChannelNativeRuntime:
             and inbound.event_id != "lark:"
             and ledger.seen(inbound.event_id)
         ):
+            from .channel_native import _log_degrade
+
+            # Dropped silently toward the user (a duplicate needs no reply),
+            # but never silently toward the operator: redeliveries are the
+            # symptom of the WS drop/ack loss this dedup exists for.
+            _log_degrade(
+                "lark_duplicate_inbound_dropped",
+                event_id=inbound.event_id,
+                chat_id=inbound.chat_id,
+                message_id=inbound.message_id,
+                is_callback=inbound.callback is not None,
+            )
             return SubmitResult(False, BlockedReason.DUPLICATE_INBOUND)
         if inbound.callback is None:
             if not self._lark_sender_allowed(inbound.sender_id):
@@ -1361,6 +1373,7 @@ class ChannelNativeRuntime:
             command = _telegram_bot_command(inbound)
             if command:
                 result = await self._handle_telegram_bot_command(channel, inbound, command)
+                self._complete_lark_local_inbound(inbound)
                 self.save_state()
                 return result
             selector = _agent_selector_command(inbound)
@@ -1375,6 +1388,7 @@ class ChannelNativeRuntime:
                         ),
                     },
                 )
+                self._complete_lark_local_inbound(inbound)
                 self.save_state()
                 return SubmitResult(True, "agent_selector_rejected")
             unknown_slash = _telegram_unknown_slash_command(inbound)
@@ -1388,6 +1402,7 @@ class ChannelNativeRuntime:
                         ),
                     },
                 )
+                self._complete_lark_local_inbound(inbound)
                 self.save_state()
                 return SubmitResult(True, "lark_unknown_slash_command")
             if unknown_slash:
@@ -1432,6 +1447,20 @@ class ChannelNativeRuntime:
                         error=f"{type(exc).__name__}: {exc}",
                     )
         return result
+
+    def _complete_lark_local_inbound(self, inbound) -> None:
+        """Record a locally-terminal Lark event in the inbound ledger.
+
+        Command/selector/unknown-slash branches reply and return without ever
+        reaching the orchestrator's start/complete lifecycle, so a Feishu
+        redelivery of the same event_id would re-run the side effect (the
+        early seen() check only knows events somebody recorded). record() is
+        used deliberately: a failed local reply should not be retried by a
+        redelivery — the user resends the command instead.
+        """
+        ledger = self.state.inbound_ledger
+        if ledger is not None and inbound.event_id != "lark:":
+            ledger.record(inbound.event_id)
 
     async def _place_lark_new_session(self, channel, inbound):
         """Root new Lark sessions at a bot-sent status card (V2 UX parity).
@@ -2018,10 +2047,21 @@ class ChannelNativeRuntime:
                     or _tui_hook_stops_session(hook_type)
                 ):
                     transcript_model, transcript_usage = _transcript_meta_from_payload(payload)
+                    meta_changed = False
                     if transcript_model and transcript_model != session.model:
                         session.model = transcript_model
+                        meta_changed = True
                     if transcript_usage and transcript_usage != session.last_usage:
                         session.last_usage = dict(transcript_usage)
+                        meta_changed = True
+                    if meta_changed:
+                        # A session created by a no-text hook (sync /
+                        # session-start) already sent its first status card
+                        # with empty 模型/上下文, and _send_tui_hook_output
+                        # returns before refreshing for those hooks — patch
+                        # the card now instead of waiting for an unrelated
+                        # later event.
+                        await self.orchestrator.refresh_session_status_card(session)
                 await self._send_tui_hook_output(session, hook_type=hook_type, payload=payload)
         except Exception:
             if ledger_started:

@@ -4155,6 +4155,54 @@ class TranscriptModelBackfillTests(unittest.TestCase):
                 },
             )
 
+    def test_codex_token_count_edge_inputs_are_safe(self):
+        # token_count records arrive with whatever codex emits: info may be
+        # missing, None, empty, or lack the context window — none of these
+        # may raise or produce a bogus usage dict.
+        f = runtime_module._codex_token_count_usage
+        self.assertEqual(f(None), {})
+        self.assertEqual(f({}), {})
+        self.assertEqual(f({"last_token_usage": None}), {})
+        self.assertEqual(f({"last_token_usage": {}}), {})
+        self.assertEqual(f({"last_token_usage": {"input_tokens": "bogus"}}), {})
+        self.assertEqual(
+            f({"last_token_usage": {"input_tokens": 100, "output_tokens": 7}}),
+            {"input_tokens": 100, "output_tokens": 7},
+        )
+
+    def test_rollout_tail_truncated_line_is_skipped(self):
+        # A >64KB rollout is tail-read from a seek that lands mid-line; the
+        # resulting half-JSON fragment must be skipped, not abort parsing.
+        with tempfile.TemporaryDirectory() as tmp:
+            rollout = Path(tmp) / "rollout.jsonl"
+            padding = json.dumps({"type": "response_item", "payload": {"blob": "x" * 70000}})
+            rollout.write_text(
+                "\n".join(
+                    [
+                        padding,
+                        json.dumps({"type": "turn_context", "payload": {"model": "gpt-5.6-sol"}}),
+                        json.dumps(
+                            {
+                                "type": "event_msg",
+                                "payload": {
+                                    "type": "token_count",
+                                    "info": {
+                                        "last_token_usage": {"input_tokens": 5, "output_tokens": 3}
+                                    },
+                                },
+                            }
+                        ),
+                    ]
+                )
+            )
+            self.assertGreater(rollout.stat().st_size, 65536)
+            model, usage = runtime_module._transcript_meta_from_payload(
+                {"transcript_path": str(rollout)}
+            )
+            self.assertEqual(model, "gpt-5.6-sol")
+            # no model_context_window in the record → usage carries none
+            self.assertEqual(usage, {"input_tokens": 5, "output_tokens": 3})
+
     def test_context_window_limit_prefers_agent_reported_window(self):
         from walkcode.channel_native import _context_window_limit
 
