@@ -711,6 +711,11 @@ class TransportCapabilities:
     multi_client_write: bool
     external_tui_takeover: bool
     requires_single_writer: bool = True
+    # True when the transport can expose a persistent per-worker event stream
+    # (open_event_stream) that outlives individual turns. The orchestrator
+    # pairs this with defer_event_drain to run one long-lived event pump per
+    # live worker instead of a per-turn drain (ADR 0052).
+    persistent_event_stream: bool = False
 
 
 @dataclass
@@ -5069,6 +5074,11 @@ class ClaudeHeadlessTransport:
         self.permission_timeout = permission_timeout
         self._clients: dict[str, Any] = {}
         self._bridges: dict[str, _ClaudePermissionBridge] = {}
+        # Single-consumer guard: the SDK's message stream distributes each
+        # message to exactly one consumer, so two concurrent readers on the
+        # same client would silently split the stream. Track handles with an
+        # open stream and refuse a second one loudly (ADR 0052).
+        self._active_stream_handles: set[str] = set()
 
     def capabilities(self) -> TransportCapabilities:
         available = self._available()
@@ -5086,7 +5096,27 @@ class ClaudeHeadlessTransport:
             multi_client_observe=False,
             multi_client_write=False,
             external_tui_takeover=available,
+            persistent_event_stream=available and self._persistent_stream_supported(),
         )
+
+    def _persistent_stream_supported(self) -> bool:
+        """True only when the client class really has receive_messages.
+
+        The pump contract (ADR 0052) needs a stream that survives turn
+        boundaries; receive_response stops at the first ResultMessage, and a
+        pump running on it would reap a healthy worker after every turn —
+        strictly worse than the per-turn drain. Fail closed: injected
+        client_factory fakes and SDKs without receive_messages keep the
+        legacy per-turn drain path.
+        """
+        if self._client_factory is not None:
+            return False
+        try:
+            sdk = self._sdk_loader()
+        except Exception:
+            return False
+        client_cls = getattr(sdk, "ClaudeSDKClient", None)
+        return client_cls is not None and callable(getattr(client_cls, "receive_messages", None))
 
     async def launch_session(self, *, cwd: str, session_id: str) -> TransportHandle:
         return await self.launch(LaunchSpec(cwd=cwd, session_id=session_id))
@@ -5183,7 +5213,7 @@ class ClaudeHeadlessTransport:
             # returned async iterator is consumed by the orchestrator's single
             # drain pass, which also picks up events emitted after the human's
             # decision unblocks the SDK.
-            return self._bridged_event_stream(handle, client, bridge)
+            return self._event_stream(handle, client, bridge, prefer_messages=False)
 
         events = getattr(client, "events", None)
         if events is not None:
@@ -5202,8 +5232,34 @@ class ClaudeHeadlessTransport:
             converted.extend(self._convert_sdk_message_to_events(message))
         return converted
 
-    async def _bridged_event_stream(self, handle: TransportHandle, client: Any, bridge: _ClaudePermissionBridge):
-        """Yield SDK events while concurrently floating bridge permission events.
+    async def open_event_stream(self, handle: TransportHandle):
+        """Persistent per-worker event stream (ADR 0052).
+
+        Unlike ``events()`` — whose receiver (``receive_response``) stops at
+        the turn's ResultMessage — this requires ``receive_messages`` so the
+        stream keeps yielding across turns, including self-initiated turns
+        (background task completions waking the CLI). The stream ends only
+        when the worker's stdout closes (process death) or the consumer stops
+        iterating. No receive_response fallback here: a pump on a per-turn
+        receiver would reap a healthy worker after every turn, so a client
+        without receive_messages must never reach this path (capabilities()
+        reports persistent_event_stream=False for it — fail closed).
+        """
+        client = self._clients.get(handle.handle_id)
+        if client is None:
+            raise TransportUnavailable("claude headless worker is gone")
+        bridge = self._bridges.get(handle.handle_id)
+        return self._event_stream(handle, client, bridge, prefer_messages=True)
+
+    async def _event_stream(
+        self,
+        handle: TransportHandle,
+        client: Any,
+        bridge: _ClaudePermissionBridge | None,
+        *,
+        prefer_messages: bool,
+    ):
+        """Yield SDK events, floating bridge permission events concurrently.
 
         The SDK message stream and the bridge's permission queue are awaited
         together with ``FIRST_COMPLETED`` so neither starves the other: while
@@ -5212,28 +5268,55 @@ class ClaudeHeadlessTransport:
         still surfaces immediately. Once the human decides, ``approve_permission``
         resolves the Future, the SDK resumes, and the message stream yields the
         tool result and the turn's completion within this same pass.
+
+        ``prefer_messages`` picks the receiver: ``receive_messages`` for the
+        persistent pump (stream survives turn boundaries), ``receive_response``
+        for per-turn drains (stops at the ResultMessage).
+
+        Single-consumer contract: the SDK distributes each message to exactly
+        one consumer, so a second concurrent stream on the same handle would
+        silently split events between readers. Guarded via
+        ``_active_stream_handles`` — a second open raises loudly instead.
         """
-        receiver = getattr(client, "receive_response", None)
-        if receiver is None:
+        if prefer_messages:
+            # Strict: the persistent pump must not silently degrade to a
+            # per-turn receiver (see open_event_stream docstring).
             receiver = getattr(client, "receive_messages", None)
+            if receiver is None:
+                raise CapabilityUnsupported(
+                    "persistent event stream requires receive_messages on the client"
+                )
+        else:
+            receiver = getattr(client, "receive_response", None) or getattr(client, "receive_messages", None)
         if receiver is None:
             raise CapabilityUnsupported("Claude headless event stream is not available")
-        stream_iter = receiver().__aiter__()
-        msg_task: asyncio.Future | None = asyncio.ensure_future(stream_iter.__anext__())
-        queue_task: asyncio.Future = asyncio.ensure_future(bridge.next_event())
+        if handle.handle_id in self._active_stream_handles:
+            raise CapabilityUnsupported(
+                f"event stream already active for handle {handle.handle_id}"
+            )
+        self._active_stream_handles.add(handle.handle_id)
+        msg_task: asyncio.Future | None = None
+        queue_task: asyncio.Future | None = None
         try:
+            stream_iter = receiver().__aiter__()
+            msg_task = asyncio.ensure_future(stream_iter.__anext__())
+            if bridge is not None:
+                queue_task = asyncio.ensure_future(bridge.next_event())
             while True:
                 if msg_task is None:
-                    # SDK stream is exhausted (turn finished). Flush any residual
-                    # floated permission events, then stop.
-                    for event in bridge.drain_ready_events():
-                        yield event
+                    # SDK stream is exhausted (worker gone / turn finished for
+                    # the per-turn receiver). Flush any residual floated
+                    # permission events, then stop.
+                    if bridge is not None:
+                        for event in bridge.drain_ready_events():
+                            yield event
                     break
+                wait_set = {msg_task} if queue_task is None else {msg_task, queue_task}
                 done, _pending = await asyncio.wait(
-                    {msg_task, queue_task},
+                    wait_set,
                     return_when=asyncio.FIRST_COMPLETED,
                 )
-                if queue_task in done:
+                if queue_task is not None and queue_task in done:
                     floated = queue_task.result()
                     queue_task = asyncio.ensure_future(bridge.next_event())
                     if floated is not None:
@@ -5248,6 +5331,7 @@ class ClaudeHeadlessTransport:
                 for event in self._convert_sdk_message_to_events(message):
                     yield event
         finally:
+            self._active_stream_handles.discard(handle.handle_id)
             for task in (msg_task, queue_task):
                 if task is not None and not task.done():
                     task.cancel()
@@ -5255,7 +5339,8 @@ class ClaudeHeadlessTransport:
                         await task
             # Fail-safe: unblock any callback still awaiting a decision so the
             # SDK's spawned task returns (deny) instead of leaking.
-            bridge.fail_pending_default_deny()
+            if bridge is not None:
+                bridge.fail_pending_default_deny()
 
     @classmethod
     def _convert_sdk_message_to_events(cls, message: Any) -> list[AgentEvent]:
@@ -5314,13 +5399,69 @@ class ClaudeHeadlessTransport:
             # Release callbacks awaiting a decision so the interrupted turn's
             # blocked can_use_tool returns (deny) instead of hanging.
             bridge.fail_pending_default_deny(reason="interrupted")
-        return await self._call_client_control(handle, "interrupt", reason, state="interrupted")
+        client = self._clients.get(handle.handle_id)
+        if client is None:
+            return ControlResult(False, BlockedReason.NOT_FOUND)
+        method = getattr(client, "interrupt", None)
+        if method is None:
+            return ControlResult(False, BlockedReason.CAPABILITY_DISABLED)
+        # The real ClaudeSDKClient.interrupt() takes no arguments; injected
+        # fakes may accept the reason. Same compatibility shape as query().
+        try:
+            await _maybe_await(method(reason))
+        except TypeError:
+            await _maybe_await(method())
+        return ControlResult(True, state="interrupted")
 
     async def shutdown(self, handle: TransportHandle, mode: str) -> ControlResult:
         bridge = self._bridges.pop(handle.handle_id, None)
         if bridge is not None:
             bridge.fail_pending_default_deny(reason="shutdown")
-        return await self._call_client_control(handle, "shutdown", mode, state="stopped")
+        client = self._clients.get(handle.handle_id)
+        if client is None:
+            # Shutting down a worker that is already gone (pump epilogue ran,
+            # runtime restarted, ...) is vacuously successful. Reporting a
+            # failure here would wedge close_session forever (it refuses to
+            # mark the session STOPPED when shutdown is not accepted).
+            return ControlResult(True, state="already_stopped")
+        # The real ClaudeSDKClient exposes disconnect() (bounded terminate →
+        # kill escalation on the CLI subprocess); the legacy "shutdown" name
+        # is kept as a fallback for injected fake clients.
+        method = getattr(client, "disconnect", None) or getattr(client, "shutdown", None)
+        if method is None:
+            self._clients.pop(handle.handle_id, None)
+            _log_degrade(
+                "claude_headless_shutdown_unsupported",
+                handle_id=handle.handle_id,
+                mode=mode,
+            )
+            return ControlResult(True, state="stopped")
+        # Untrack only AFTER the disconnect attempt ran to completion. Popping
+        # first would drop the only reference on failure — or, worse, when a
+        # bounded caller (external claim's wait_for) cancels us mid-disconnect
+        # — leaving a live subprocess nothing can ever retry against.
+        try:
+            try:
+                await _maybe_await(method(mode))
+            except TypeError:
+                await _maybe_await(method())
+        except asyncio.CancelledError:
+            # Keep the client registered: the disconnect was interrupted, a
+            # later close/claim/teardown retry can still reach the process.
+            raise
+        except Exception as exc:
+            # Keep the client registered for a possible retry; the SDK's
+            # atexit SIGTERM is the final backstop. Still report accepted so
+            # session-level cleanup (close_session marking STOPPED) proceeds.
+            _log_degrade(
+                "claude_headless_shutdown_failed",
+                handle_id=handle.handle_id,
+                mode=mode,
+                error=exc,
+            )
+            return ControlResult(True, state="stopped")
+        self._clients.pop(handle.handle_id, None)
+        return ControlResult(True, state="stopped")
 
     async def set_model(self, handle: TransportHandle, model: str) -> ControlResult:
         return await self._call_client_control(handle, "set_model", model, state="model_set")
@@ -6771,6 +6912,37 @@ HANDOFF_CONTINUE_PROMPT = (
 EXTERNAL_CLAIM_SHUTDOWN_TIMEOUT_SECONDS = 5.0
 
 
+@dataclass
+class _DrainCursor:
+    """Per-stream relay state shared by per-turn drains and the event pump.
+
+    Extracted from ``_drain_events`` locals so the persistent pump (ADR 0052)
+    can run the exact same per-event pipeline while keeping its own cursor
+    across turn boundaries.
+    """
+
+    expected_generation: int
+    expected_transport_kind: str
+    last_visible_text: str = ""
+    saw_any_event: bool = False
+    saw_turn_completed: bool = False
+
+
+@dataclass
+class _EventPumpEntry:
+    """Registry entry for a persistent per-worker event pump (ADR 0052).
+
+    Deliberately in-memory only: after a runtime restart the registry is
+    empty, so IDLE sessions revive through the resume path exactly as before.
+    """
+
+    task: "asyncio.Task[None]"
+    session_id: str
+    generation: int
+    transport_kind: str
+    handle_id: str
+
+
 class Orchestrator:
     def __init__(
         self,
@@ -6816,6 +6988,12 @@ class Orchestrator:
         # that stale-marked pending HITL prompts (see HANDOFF_CONTINUE_PROMPT).
         self.handoff_continue = handoff_continue
         self._background_event_drains: set[asyncio.Task] = set()
+        # Persistent per-worker event pumps (ADR 0052): session_id → entry.
+        # One pump per live claude_headless worker consumes the SDK message
+        # stream across turn boundaries, so self-initiated turns (background
+        # task completions) reach the channel. Never persisted — see
+        # _EventPumpEntry.
+        self._event_pumps: dict[str, _EventPumpEntry] = {}
         self._now = now
         # Echo dedup for daemon replies (ADR 0046 v2): a channel message
         # injected via daemon reply comes back as a user-prompt-submit hook;
@@ -6855,6 +7033,11 @@ class Orchestrator:
             session.title_source = "initial_user_input"
         if self.authz is not None:
             self.authz.grant(session.session_id, owner, SessionRole.OWNER)
+        if self._pump_mode(transport):
+            # Start consuming immediately: the SDK buffers only ~100 messages
+            # before backpressuring the worker, and the pump (not a per-turn
+            # drain) is this worker's single stream consumer (ADR 0052).
+            await self._start_event_pump(session, transport, handle)
         return session
 
     # Per-channel reaction pools for lightweight acks (Lark values are
@@ -6960,6 +7143,21 @@ class Orchestrator:
         # says the turn started, but the emoji is the at-a-glance receipt.
         await self._react_ack(session, ack_message_id)
         await self.refresh_session_status_card(session)
+        if self._pump_mode(transport):
+            # The persistent pump (started at launch/resume) already consumes
+            # this worker's stream; starting a drain here would split it.
+            # Reaching the fallback start below means a pump wiring gap —
+            # _start_event_pump is idempotent for a live same-handle pump, so
+            # this only creates one when it is genuinely missing.
+            if not self._pump_alive(session):
+                _log_degrade(
+                    "event_pump_missing_at_submit",
+                    session_id=session.session_id,
+                    handle_id=handle.handle_id,
+                )
+                await self._start_event_pump(session, transport, handle)
+            self._notify_state_changed()
+            return SubmitResult(True, "turn_submitted")
         if self.defer_event_drain:
             self._start_background_event_drain(session.session_id, transport, handle)
             self._notify_state_changed()
@@ -7055,6 +7253,19 @@ class Orchestrator:
         transport: AgentTransport,
         handle: TransportHandle,
     ) -> None:
+        # Pump-mode sessions must never get a second stream consumer: the SDK
+        # distributes each message to exactly one reader, so a stray drain
+        # would silently split events with the pump (ADR 0052). Any future
+        # call site that regresses lands here instead of corrupting output.
+        entry = self._event_pumps.get(session_id)
+        if entry is not None and not entry.task.done():
+            _log_degrade(
+                "background_drain_skipped_pump_active",
+                session_id=session_id,
+                handle_id=handle.handle_id,
+            )
+            return
+
         async def runner() -> None:
             session = self.sessions.get(session_id)
             try:
@@ -7081,6 +7292,280 @@ class Orchestrator:
         self._background_event_drains.add(task)
         task.add_done_callback(self._background_event_drains.discard)
 
+    # ------------------------------------------------------------------
+    # Persistent per-worker event pump (ADR 0052)
+    # ------------------------------------------------------------------
+
+    def _pump_mode(self, transport: AgentTransport) -> bool:
+        """True when this transport is driven by a persistent event pump.
+
+        Gated on ``defer_event_drain`` as well: serve loops set it True, while
+        ``serve --once`` and synchronous test paths rely on the per-turn drain
+        finishing before the caller returns — a background pump would let the
+        process exit with output still in flight.
+        """
+        if not self.defer_event_drain:
+            return False
+        caps = transport.capabilities()
+        return bool(getattr(caps, "persistent_event_stream", False))
+
+    def _pump_alive(self, session: Session) -> bool:
+        """True when a live pump serves this session's current worker handle.
+
+        Compares against the session's transport identity — never against the
+        transport's internal client map — so a runtime restart (empty pump
+        registry) or a swapped handle always reads as dead and takes the
+        resume path.
+        """
+        entry = self._event_pumps.get(session.session_id)
+        if entry is None or entry.task.done():
+            return False
+        return (
+            entry.generation == session.generation
+            and entry.transport_kind == session.transport_kind
+            and entry.handle_id == str(session.transport_ref.get("handle_id", ""))
+        )
+
+    async def _start_event_pump(
+        self,
+        session: Session,
+        transport: AgentTransport,
+        handle: TransportHandle,
+    ) -> None:
+        """Ensure exactly one pump consumes this session's worker stream."""
+        existing = self._event_pumps.get(session.session_id)
+        if existing is not None:
+            if not existing.task.done() and existing.handle_id == handle.handle_id:
+                return
+            await self._cancel_event_pump(session.session_id)
+        entry = _EventPumpEntry(
+            task=asyncio.create_task(
+                self._run_event_pump(
+                    session.session_id,
+                    transport,
+                    handle,
+                    generation=session.generation,
+                    transport_kind=session.transport_kind,
+                )
+            ),
+            session_id=session.session_id,
+            generation=session.generation,
+            transport_kind=session.transport_kind,
+            handle_id=handle.handle_id,
+        )
+        self._event_pumps[session.session_id] = entry
+
+    async def _run_event_pump(
+        self,
+        session_id: str,
+        transport: AgentTransport,
+        handle: TransportHandle,
+        *,
+        generation: int,
+        transport_kind: str,
+    ) -> None:
+        """Consume a worker's event stream across turn boundaries.
+
+        This is what carries self-initiated turns (background task
+        completions waking the CLI) to the channel — the whole point of
+        ADR 0052. Runs as an independent task; it MUST NOT touch the
+        runtime's ``_ingress_lock`` (not reentrant; inbound processing holds
+        it while awaiting orchestrator calls).
+
+        Exit modes:
+        - ownership moved (generation/transport swapped): silent — the claim
+          or takeover path owns worker cleanup;
+        - cancelled (`_cancel_event_pump`): registry cleanup only — the
+          canceller owns worker cleanup;
+        - stream closed / stream error (worker died): reap the client, and if
+          the session was mid-turn mark it ERROR_RECOVERABLE with an error
+          card, mirroring the per-turn drain's incomplete-stream epilogue.
+        """
+        session: Session | None = None
+        cursor = _DrainCursor(
+            expected_generation=generation,
+            expected_transport_kind=transport_kind,
+        )
+        exit_reason = "stream_closed"
+        try:
+            session = self.sessions.get(session_id)
+            channel = (
+                self.channels.get(session.channel_binding.channel_kind)
+                if session.channel_binding is not None
+                else None
+            )
+            if channel is None:
+                exit_reason = "no_channel"
+                return
+            stream = await _maybe_await(transport.open_event_stream(handle))
+            async for event in stream:
+                if not await self._apply_agent_event(session, channel, event, cursor):
+                    exit_reason = "ownership_moved"
+                    return
+                if event.type == AgentEventType.TURN_COMPLETED:
+                    # Persist the durable resume ref (agent_session_id) and
+                    # the IDLE lifecycle right away: this is the asset a
+                    # runtime restart needs to revive the session.
+                    self._notify_state_changed()
+        except asyncio.CancelledError:
+            exit_reason = "cancelled"
+            raise
+        except Exception as exc:
+            exit_reason = "stream_error"
+            _log_degrade(
+                "event_pump_failed",
+                session_id=session_id,
+                handle_id=handle.handle_id,
+                error=exc,
+            )
+        finally:
+            entry = self._event_pumps.get(session_id)
+            if entry is not None and entry.task is asyncio.current_task():
+                self._event_pumps.pop(session_id, None)
+            if session is not None and exit_reason in ("stream_closed", "stream_error"):
+                # A non-cancelled stream end is a worker death (the real SDK
+                # stream only closes with the process); leave a trace even on
+                # the silent IDLE path or a missing background-task result is
+                # undebuggable after the fact.
+                _log_degrade(
+                    "event_pump_stream_closed",
+                    session_id=session_id,
+                    handle_id=handle.handle_id,
+                    generation=generation,
+                    exit_reason=exit_reason,
+                    lifecycle=getattr(session, "lifecycle_state", "?"),
+                    saw_any_event=cursor.saw_any_event,
+                    saw_turn_completed=cursor.saw_turn_completed,
+                )
+                await self._settle_dead_pump(
+                    session,
+                    transport,
+                    handle,
+                    generation=generation,
+                    transport_kind=transport_kind,
+                )
+            if exit_reason != "cancelled":
+                self._notify_state_changed()
+
+    async def _settle_dead_pump(
+        self,
+        session: Session,
+        transport: AgentTransport,
+        handle: TransportHandle,
+        *,
+        generation: int,
+        transport_kind: str,
+    ) -> None:
+        """Worker died underneath the pump: settle the session, then reap it.
+
+        Ordering and fencing rules:
+        - Session-state mutation happens SYNCHRONOUSLY before any await, so
+          there is no window where a dead worker still reads as ACTIVE with a
+          valid lease (an inbound in that window would submit into the dead
+          handle).
+        - Every fence includes the handle id: by the time this late epilogue
+          runs, the resume path may already have attached a NEW worker under
+          the same generation — its state must not be clobbered.
+        """
+        stale = (
+            session.generation != generation
+            or session.transport_kind != transport_kind
+            or str(session.transport_ref.get("handle_id", "")) != handle.handle_id
+            or session.status == "stopped"
+        )
+        mark_error = not stale and session.lifecycle_state in {
+            "ACTIVE",
+            "WAITING_PERMISSION",
+            "WAITING_USER",
+            "INTERRUPTED",
+        }
+        if mark_error:
+            # Mid-turn death: same contract as the per-turn drain's
+            # incomplete-stream epilogue, applied before any await point.
+            session.last_progress_at = self._now()
+            session.last_progress_event = "turn.event_stream_incomplete"
+            session.lifecycle_state = "ERROR_RECOVERABLE"
+            session.writer_lease = None
+        shutdown = getattr(transport, "shutdown", None)
+        if shutdown is not None:
+            try:
+                await shutdown(handle, "event_stream_closed")
+            except Exception as exc:
+                _log_degrade(
+                    "event_pump_shutdown_failed",
+                    session_id=session.session_id,
+                    handle_id=handle.handle_id,
+                    error=exc,
+                )
+        if mark_error:
+            # An error card because, unlike a foreground turn, no submit
+            # caller is watching this stream.
+            await self._send_session_view(
+                session,
+                {
+                    "type": "error",
+                    "message": "Agent worker exited mid-turn; send a new message to resume.",
+                },
+                idempotency_key=f"event-pump-died:{session.last_event_seq}",
+            )
+            await self.refresh_session_status_card(session)
+        # IDLE / ERROR_RECOVERABLE (or stale/superseded handle): silent —
+        # the next inbound resumes.
+
+    async def _cancel_event_pump(self, session_id: str, *, timeout: float = 5.0) -> None:
+        """Cancel a pump and wait (bounded) for it to unwind.
+
+        Bounded because callers sit on ingress-critical paths (external
+        claim, close_session run under the serve loop's ingress lock); a pump
+        wedged in slow channel IO must not block ingress — degrade-log and
+        move on, the generation/handle fences neutralize a late pump.
+        """
+        entry = self._event_pumps.pop(session_id, None)
+        if entry is None or entry.task.done():
+            return
+        entry.task.cancel()
+        try:
+            await asyncio.wait_for(entry.task, timeout=timeout)
+        except asyncio.TimeoutError:
+            _log_degrade(
+                "event_pump_cancel_timeout",
+                session_id=session_id,
+                handle_id=entry.handle_id,
+                timeout=timeout,
+            )
+        except asyncio.CancelledError:
+            # The cancelled pump re-raising through the await is the normal
+            # unwind; a cancellation of the caller itself re-raises upstream
+            # anyway once we return.
+            pass
+        except Exception:
+            pass
+
+    async def stop_all_event_pumps(self) -> None:
+        """Serve-loop teardown: cancel every pump and reap its worker.
+
+        The cancel path deliberately skips worker shutdown (the canceller owns
+        cleanup), so this does the explicit reap; the SDK's atexit SIGTERM is
+        the final backstop.
+        """
+        for session_id in list(self._event_pumps):
+            entry = self._event_pumps.get(session_id)
+            if entry is None:
+                continue
+            await self._cancel_event_pump(session_id)
+            transport = self.transports.get(entry.transport_kind)
+            shutdown = getattr(transport, "shutdown", None) if transport is not None else None
+            if shutdown is None:
+                continue
+            with contextlib.suppress(Exception):
+                await shutdown(
+                    TransportHandle(
+                        handle_id=entry.handle_id,
+                        transport_kind=entry.transport_kind,
+                    ),
+                    "serve_shutdown",
+                )
+
     def _notify_state_changed(self) -> None:
         if self.on_state_changed is None:
             return
@@ -7100,12 +7585,38 @@ class Orchestrator:
     ) -> SubmitResult:
         if session.lifecycle_state not in {"IDLE", "ERROR_RECOVERABLE"}:
             return SubmitResult(True)
+        if session.lifecycle_state == "IDLE" and self._pump_alive(session):
+            # ADR 0052: the worker is alive and its pump is consuming events —
+            # reuse it. The next turn is another query() into the same
+            # process, which keeps background tasks (and their eventual
+            # self-initiated turns) running instead of stranding them in an
+            # abandoned worker. ERROR_RECOVERABLE is deliberately excluded:
+            # SESSION_ERROR does not close the stream, and a worker that just
+            # errored is not a trustworthy writer — it goes through the
+            # replace-and-resume path below (ADR 0030 semantics).
+            return self.sessions.acquire_structured_writer(
+                session.session_id,
+                transport_kind=session.transport_kind,
+                transport_ref=dict(session.transport_ref),
+                owner=actor,
+            )
         caps = transport.capabilities()
         if not caps.resume_after_complete:
             return SubmitResult(False, BlockedReason.CAPABILITY_DISABLED)
         resume_ref = self._durable_resume_ref(session)
         if not resume_ref:
             return SubmitResult(False, "missing_resume_ref")
+        if getattr(caps, "persistent_event_stream", False):
+            # Replacing a dead (or pump-less) worker: reap the stale pump task
+            # and the old client/subprocess before spawning the successor, or
+            # every resume leaks a worker process.
+            await self._cancel_event_pump(session.session_id)
+            stale_handle = self._handle_for_session(session)
+            if stale_handle.handle_id:
+                shutdown = getattr(transport, "shutdown", None)
+                if shutdown is not None:
+                    with contextlib.suppress(Exception):
+                        await shutdown(stale_handle, "stale_worker_replaced")
         try:
             handle = await transport.resume(
                 ResumeSpec(
@@ -7116,12 +7627,15 @@ class Orchestrator:
             )
         except Exception:
             return SubmitResult(False, "resume_failed")
-        return self.sessions.acquire_structured_writer(
+        result = self.sessions.acquire_structured_writer(
             session.session_id,
             transport_kind=session.transport_kind,
             transport_ref={"handle_id": handle.handle_id, **dict(handle.ref)},
             owner=actor,
         )
+        if result.accepted and self._pump_mode(transport):
+            await self._start_event_pump(session, transport, handle)
+        return result
 
     def _record_turn_submitted(self, session: Session) -> None:
         session.last_progress_at = self._now()
@@ -7192,6 +7706,10 @@ class Orchestrator:
         if session.status == "stopped":
             return ControlResult(True, state="stopped")
         transport = self.transports[session.transport_kind]
+        # Cancel the pump before killing the worker, or the pump sees the
+        # stream EOF first and mis-reports a mid-turn worker death right as
+        # the user closes the session (ADR 0052).
+        await self._cancel_event_pump(session_id)
         shutdown = getattr(transport, "shutdown", None)
         if shutdown is not None:
             result = await shutdown(self._handle_for_session(session), mode)
@@ -8255,6 +8773,11 @@ class Orchestrator:
                 transport_ref={"handle_id": resumed_handle.handle_id, **dict(resumed_handle.ref)},
             )
             updated = self.sessions.get(session.session_id)
+            if self._pump_mode(transport):
+                # The takeover-resumed worker gets its persistent pump under
+                # the freshly bumped generation (ADR 0052); the per-turn
+                # drains below are skipped in pump mode.
+                await self._start_event_pump(updated, transport, resumed_handle)
             stale_requests = await self._mark_pre_takeover_hitls_stale(
                 updated,
                 through_generation=ctx.generation,
@@ -8305,7 +8828,11 @@ class Orchestrator:
                     # on being able to tell "injected" from "never fired").
                     updated.last_progress_at = self._now()
                     updated.last_progress_event = "handoff_continue.submitted"
-                    if self.defer_event_drain:
+                    if self._pump_mode(transport):
+                        # The persistent pump is already consuming this
+                        # worker's stream; a drain would split it.
+                        pass
+                    elif self.defer_event_drain:
                         # Serve mode holds the ingress lock here: the
                         # injected turn may pop a fresh HITL card whose
                         # answer callback needs that lock — same deferral
@@ -8369,7 +8896,12 @@ class Orchestrator:
                 ),
                 idempotency_key=f"takeover_submitted:{takeover_id}",
             )
-            await self._drain_events(updated, transport, handle)
+            if not self._pump_mode(transport):
+                # Pump mode: the persistent pump relays this turn; a second
+                # consumer here would split the stream (and this sync drain
+                # runs under the serve loop's ingress lock — a mid-turn HITL
+                # card answer would deadlock against it).
+                await self._drain_events(updated, transport, handle)
             await self.refresh_session_status_card(updated)
             return SubmitResult(True, blocked_input_id=blocked_input_id)
         except TakeoverError as exc:
@@ -8448,6 +8980,11 @@ class Orchestrator:
         transport = self.transports.get(prior_transport_kind)
         shutdown = getattr(transport, "shutdown", None) if transport is not None else None
         if shutdown is not None and prior_handle is not None and prior_handle.handle_id:
+            # Stop the old worker's pump before killing the worker: the
+            # generation fence would catch it anyway, but a deterministic
+            # cancel avoids the pump racing the shutdown to a stream-EOF and
+            # emitting a spurious mid-turn error card (ADR 0052).
+            await self._cancel_event_pump(session.session_id)
             try:
                 result = await asyncio.wait_for(
                     shutdown(prior_handle, "external_tui_claim"),
@@ -8830,57 +9367,101 @@ class Orchestrator:
         # them would register fresh-generation HITL cards for a writer that
         # no longer owns the session — cards the stale sweep can never
         # catch. Snapshot ownership at entry and stop the moment it moves.
-        expected_generation = session.generation
-        expected_transport_kind = session.transport_kind
-        last_visible_text = ""
-        saw_any_event = False
-        saw_turn_completed = False
+        cursor = _DrainCursor(
+            expected_generation=session.generation,
+            expected_transport_kind=session.transport_kind,
+        )
         async for event in self._iter_transport_events(transport, handle):
-            if (
-                session.generation != expected_generation
-                or session.transport_kind != expected_transport_kind
-            ):
-                _log_degrade(
-                    "event_drain_ownership_moved",
-                    session_id=session.session_id,
-                    expected_generation=expected_generation,
-                    current_generation=session.generation,
-                )
+            if not await self._apply_agent_event(session, channel, event, cursor):
                 return
-            saw_any_event = True
-            if event.type == AgentEventType.TURN_COMPLETED:
-                saw_turn_completed = True
-            self._record_session_progress(session, event)
-            view = self._event_to_view(session, event)
-            session.last_event_seq += 1
-            await self.refresh_session_status_card(session)
-            if view.get("type") == "tool_progress":
-                await self._upsert_tool_progress_view(session, channel, view)
-                continue
-            # Any non-tool event ends the burst — including an empty
-            # turn-completed. Sealing must not depend on the event producing
-            # visible text, or the next turn's tools edit last turn's card.
-            self._seal_tool_progress_burst(session)
-            visible_text = render_view_text(view)
-            if not visible_text:
-                continue
-            if event.type == AgentEventType.TURN_COMPLETED and visible_text == last_visible_text:
-                continue
-            last_visible_text = visible_text
-            self.outbox.enqueue(
-                channel_binding_key=session.channel_binding.key(),
-                view_model=view,
-                idempotency_key=(
-                    f"{session.session_id}:{session.generation}:"
-                    f"{event.seq or session.last_event_seq}:{event.type}"
-                ),
-            )
-            await self._flush_outbox()
-        if saw_any_event and not saw_turn_completed and session.lifecycle_state == "ACTIVE":
+        if cursor.saw_any_event and not cursor.saw_turn_completed and session.lifecycle_state == "ACTIVE":
             session.last_progress_at = self._now()
             session.last_progress_event = "turn.event_stream_incomplete"
             session.lifecycle_state = "ERROR_RECOVERABLE"
             session.writer_lease = None
+
+    async def _apply_agent_event(
+        self,
+        session: Session,
+        channel: ChannelAdapter,
+        event: AgentEvent,
+        cursor: _DrainCursor,
+    ) -> bool:
+        """Relay one agent event to the channel. False = ownership moved, stop.
+
+        Shared by the per-turn drain (``_drain_events``) and the persistent
+        event pump (``_run_event_pump``); behavior must stay identical for
+        both callers.
+        """
+        if (
+            session.generation != cursor.expected_generation
+            or session.transport_kind != cursor.expected_transport_kind
+        ):
+            _log_degrade(
+                "event_drain_ownership_moved",
+                session_id=session.session_id,
+                expected_generation=cursor.expected_generation,
+                current_generation=session.generation,
+            )
+            return False
+        cursor.saw_any_event = True
+        if event.type == AgentEventType.TURN_COMPLETED:
+            cursor.saw_turn_completed = True
+        self._record_session_progress(session, event)
+        view = self._event_to_view(session, event)
+        session.last_event_seq += 1
+        await self.refresh_session_status_card(session)
+        if (
+            session.generation != cursor.expected_generation
+            or session.transport_kind != cursor.expected_transport_kind
+        ):
+            # Ownership moved while the status-card refresh yielded the loop
+            # (a claim/takeover ran in between): stop before sending this old
+            # worker's content into the new owner's thread.
+            _log_degrade(
+                "event_drain_ownership_moved",
+                session_id=session.session_id,
+                expected_generation=cursor.expected_generation,
+                current_generation=session.generation,
+            )
+            return False
+        if view.get("type") == "tool_progress":
+            await self._upsert_tool_progress_view(session, channel, view)
+            return True
+        # Any non-tool event ends the burst — including an empty
+        # turn-completed. Sealing must not depend on the event producing
+        # visible text, or the next turn's tools edit last turn's card.
+        self._seal_tool_progress_burst(session)
+        visible_text = render_view_text(view)
+        if not visible_text:
+            self._reset_turn_dedup(event, cursor)
+            return True
+        if event.type == AgentEventType.TURN_COMPLETED and visible_text == cursor.last_visible_text:
+            self._reset_turn_dedup(event, cursor)
+            return True
+        cursor.last_visible_text = visible_text
+        # The key snapshots the generation this stream was opened under
+        # (cursor), not the mutable session field: a concurrent handoff must
+        # not relabel an old worker's output as new-generation content.
+        self.outbox.enqueue(
+            channel_binding_key=session.channel_binding.key(),
+            view_model=view,
+            idempotency_key=(
+                f"{session.session_id}:{cursor.expected_generation}:"
+                f"{event.seq or session.last_event_seq}:{event.type}"
+            ),
+        )
+        await self._flush_outbox()
+        self._reset_turn_dedup(event, cursor)
+        return True
+
+    @staticmethod
+    def _reset_turn_dedup(event: AgentEvent, cursor: _DrainCursor) -> None:
+        # A completed turn ends the dedup scope: without this, a later
+        # (possibly self-initiated) turn whose final text matches the previous
+        # turn's delta would be silently swallowed by the pump (ADR 0052).
+        if event.type == AgentEventType.TURN_COMPLETED:
+            cursor.last_visible_text = ""
 
     async def _upsert_tool_progress_view(
         self,

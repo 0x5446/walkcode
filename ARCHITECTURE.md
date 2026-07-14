@@ -53,6 +53,13 @@ IM ChannelAdapter
 - `JsonFileStateStore` persists sessions, interaction tokens, auth state,
   inbound ledger, and durable outbox atomically.
 
+In serve mode, agent events for claude_headless flow through a **persistent
+per-worker event pump** (ADR 0052) instead of a per-turn drain: one pump task
+per live worker consumes the SDK message stream across turn boundaries, so
+self-initiated turns (background task completions waking the CLI) reach the
+channel too. The pump is the worker's single stream consumer; per-turn drains
+remain for `serve --once`, tests, and non-persistent transports.
+
 The old tmux pane, Feishu thread id, and hook callback shapes are not core V3
 identities.
 
@@ -113,6 +120,16 @@ tmux are not part of this path.
 
 Plain text in the bot starts or continues the bound agent session. `/claude` and
 `/codex` are rejected because one bot cannot multiplex several coding agents.
+
+Worker lifecycle (ADR 0052): a session's headless worker is a long-lived
+process. While its event pump is alive, follow-up messages are further
+`query()` turns into the same process — background tasks keep running and
+their eventual results are pushed back to the topic automatically. Only when
+the worker is gone (runtime restart, process death) does the next inbound
+resume a fresh worker from the durable `agent_session_id`. Reaping scope:
+close / claim / pump epilogue / serve teardown `disconnect()` workers
+registered in the CURRENT runtime process; workers orphaned by a runtime
+crash are covered by the SDK's atexit SIGTERM, not by walkcode itself.
 
 New sessions run in `WALKCODE_CWD` by default. With
 `WALKCODE_WORKSPACE_ROOTS` configured, `/repo <dir> <task>` starts the session
