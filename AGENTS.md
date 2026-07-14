@@ -37,8 +37,11 @@ scripts; orchestration and gates live in the skill.
 - `./release.sh prepare [VERSION] -m MSG` — bump `pyproject.toml`, run tests, branch
   `release/vX.Y.Z`, commit, push, open PR. `./release.sh publish [VERSION]` — tag the
   merged `main` and `gh release create --latest`. Both support `--dry-run`.
-- `./upgrade.sh` — install the latest V3 CLI, restart only labels listed in
-  `WALKCODE_V3_LAUNCHD_LABELS`, and verify with `walkcode native doctor`.
+- `./upgrade.sh` — install the latest V3 CLI, restart the V3 runtimes
+  (labels from `WALKCODE_V3_LAUNCHD_LABELS` when set, otherwise the loaded
+  `com.walkcode.*` services excluding `com.walkcode.tap-*` proxies), and
+  verify each restarted instance with `walkcode native doctor` bound to its
+  env file.
 - V3 hard rules: do not reinstall legacy hooks, do not restart old
   `walkcode serve/start` daemons, and do not share a bot token or state file
   between Claude and Codex runtimes.

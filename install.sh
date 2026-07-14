@@ -128,7 +128,7 @@ detect_legacy_remnants() {
       if grep -Eq 'walkcode([[:space:]]|</string>[[:space:]]*<string>)(serve|start)' "$plist" 2>/dev/null; then
         warn "$(msg \
           "Legacy LaunchAgent detected: $plist. Unload it before sharing a bot with V3." \
-          "检测到旧版 LaunchAgent: $plist。和 V3 共用机器人前请先卸载。")"
+          "检测到旧版 LaunchAgent: ${plist}。和 V3 共用机器人前请先卸载。")"
         found=1
       fi
     done
@@ -138,7 +138,7 @@ detect_legacy_remnants() {
     if [ -f "$hook_file" ] && grep -q 'walkcode hook' "$hook_file" 2>/dev/null; then
       warn "$(msg \
         "Legacy hook config detected: $hook_file. Replace it with walkcode native hook for V3 TUI observation." \
-        "检测到旧版 hook 配置: $hook_file。V3 TUI 观测应改为 walkcode native hook。")"
+        "检测到旧版 hook 配置: ${hook_file}。V3 TUI 观测应改为 walkcode native hook。")"
       found=1
     fi
   done
@@ -165,7 +165,7 @@ detect_legacy_remnants() {
       if grep -q 'FEISHU_' "$env_path" 2>/dev/null; then
         warn "$(msg \
           "Legacy FEISHU_* env detected: $env_path. V3 uses TELEGRAM_* or LARK_* and a dedicated state path." \
-          "检测到旧版 FEISHU_* env: $env_path。V3 使用 TELEGRAM_* 或 LARK_*，且需要独立 state path。")"
+          "检测到旧版 FEISHU_* env: ${env_path}。V3 使用 TELEGRAM_* 或 LARK_*，且需要独立 state path。")"
         found=1
       fi
     done
@@ -203,7 +203,7 @@ main() {
   info "$(msg "Installation complete." "安装完成。")"
   if is_zh; then
     echo "  后续步骤:"
-    echo "  1. 编辑 $ENV_FILE，填写 TELEGRAM_BOT_TOKEN 和 WALKCODE_AGENT"
+    echo "  1. 编辑 ${ENV_FILE}，填写 TELEGRAM_BOT_TOKEN 和 WALKCODE_AGENT"
     echo "  2. 运行: WALKCODE_ENV_FILE=$ENV_FILE walkcode native doctor"
     echo "  3. 如果在仓库 checkout 中，运行模块检查: python scripts/channel_native_debug.py --env-file $ENV_FILE runtime"
     echo "  4. 启动: WALKCODE_ENV_FILE=$ENV_FILE walkcode native serve"
