@@ -17,6 +17,7 @@ Everything uses the local bare remote, so nothing touches the network.
 """
 
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -77,7 +78,13 @@ if [ -n "${FAKE_LAUNCHCTL_LOG:-}" ]; then
   printf '%s\n' "$*" >> "$FAKE_LAUNCHCTL_LOG"
 fi
 case "${1:-}" in
-  list) echo '{ "PID" = 4242; };' ;;
+  list)
+    if [ -n "${FAKE_LAUNCHCTL_LIST:-}" ]; then
+      printf '%s\n' "$FAKE_LAUNCHCTL_LIST"
+    else
+      echo '{ "PID" = 4242; };'
+    fi
+    ;;
   *) : ;;
 esac
 """
@@ -294,6 +301,46 @@ class UpgradeGateTests(_ScriptGateBase):
         self.assertIn("gui/", content)
         self.assertIn("com.walkcode.telegram-claude", content)
         self.assertIn("com.walkcode.telegram-codex", content)
+
+    def test_empty_labels_auto_discovers_loaded_runtimes_excluding_taps(self):
+        # 2026-07-14 v0.13.1 upgrade: empty WALKCODE_V3_LAUNCHD_LABELS left
+        # all five instances running the old version. Empty env must fall
+        # back to loaded com.walkcode.* labels, never touching tap-* proxies
+        # (they carry live Claude API traffic).
+        log = self.tmp / "launchctl.log"
+        walkdir = self.home / ".walkcode"
+        walkdir.mkdir(parents=True, exist_ok=True)
+        (walkdir / "a-claude.env").write_text("WALKCODE_CHANNEL=lark\n")
+        listing = "\n".join(
+            [
+                "1\t0\tcom.walkcode.a-claude",
+                "2\t0\tcom.walkcode.tap-a",
+                "3\t0\tcom.apple.foo",
+            ]
+        )
+        r = self._run("upgrade.sh", extra_env=self._upgrade_env(
+            FAKE_LAUNCHCTL_LOG=str(log),
+            FAKE_LAUNCHCTL_LIST=listing,
+        ))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        kicks = [l for l in log.read_text().splitlines() if "kickstart" in l]
+        self.assertTrue(any("com.walkcode.a-claude" in l for l in kicks), kicks)
+        self.assertFalse(any("tap-a" in l for l in kicks), kicks)
+        self.assertFalse(any("com.apple.foo" in l for l in kicks), kicks)
+        # doctor runs bound to the discovered instance's env file
+        self.assertIn("native doctor ok", r.stdout + r.stderr)
+
+    def test_shell_scripts_brace_vars_before_cjk(self):
+        # macOS bash 3.2 misparses `$VAR` glued to a CJK character as part of
+        # the variable name ("ENV_FILE?: unbound variable" under set -u) —
+        # every expansion followed by CJK text must use ${VAR}.
+        pat = re.compile(r"\$[A-Za-z_][A-Za-z0-9_]*[　-〿一-鿿＀-￯]")
+        for script in (UPGRADE_SH, RELEASE_SH, INSTALL_SH):
+            for lineno, line in enumerate(script.read_text().splitlines(), 1):
+                self.assertIsNone(
+                    pat.search(line),
+                    f"{script.name}:{lineno} unbraced var before CJK: {line.strip()}",
+                )
 
     def test_upgrade_blocks_legacy_remnants(self):
         hooks = self.home / ".codex" / "hooks.json"

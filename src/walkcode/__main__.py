@@ -147,6 +147,32 @@ def _install_codex_hooks(_args) -> None:
     cmd_install_hooks(_args)
 
 
+def _parse_launchd_labels(listing: str) -> list[str]:
+    """Pick V3 runtime labels out of `launchctl list` output.
+
+    com.walkcode.tap-* is excluded on purpose: the debug proxies carry live
+    Claude API traffic, kickstarting them would sever every local session's
+    in-flight request.
+    """
+    labels = []
+    for line in listing.splitlines():
+        parts = line.split()
+        name = parts[-1] if parts else ""
+        if name.startswith("com.walkcode.") and not name.startswith("com.walkcode.tap-"):
+            labels.append(name)
+    return sorted(set(labels))
+
+
+def _discover_v3_launchd_labels() -> list[str]:
+    try:
+        result = subprocess.run(
+            ["launchctl", "list"], capture_output=True, text=True, timeout=10
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    return _parse_launchd_labels(result.stdout or "")
+
+
 def cmd_upgrade(_args) -> None:
     current = _current_version()
     print(f"Current version: {current}")
@@ -174,18 +200,37 @@ def cmd_upgrade(_args) -> None:
         for item in os.environ.get("WALKCODE_V3_LAUNCHD_LABELS", "").split(",")
         if item.strip()
     ]
+    if not labels:
+        labels = _discover_v3_launchd_labels()
+        if labels:
+            print(
+                "WALKCODE_V3_LAUNCHD_LABELS is empty; restarting discovered labels: "
+                + ", ".join(labels)
+            )
     if labels:
         uid = os.getuid()
         for label in labels:
             _run(f"launchctl kickstart -k gui/{uid}/{shlex.quote(label)}")
     else:
-        print("WALKCODE_V3_LAUNCHD_LABELS is empty; no V3 runtime was restarted.")
+        print(
+            "WALKCODE_V3_LAUNCHD_LABELS is empty and no loaded com.walkcode.* "
+            "service was found; no V3 runtime was restarted."
+        )
 
-    doctor = "walkcode native doctor"
     env_file = os.environ.get("WALKCODE_ENV_FILE")
     if env_file:
-        doctor = f"WALKCODE_ENV_FILE={shlex.quote(env_file)} {doctor}"
-    _run(doctor)
+        _run(f"WALKCODE_ENV_FILE={shlex.quote(env_file)} walkcode native doctor")
+    else:
+        # A bare doctor without an env file only reports a config error; bind
+        # each restarted instance to its own env file instead.
+        ran_doctor = False
+        for label in labels:
+            label_env = Path.home() / ".walkcode" / (label.removeprefix("com.walkcode.") + ".env")
+            if label_env.is_file():
+                _run(f"WALKCODE_ENV_FILE={shlex.quote(str(label_env))} walkcode native doctor")
+                ran_doctor = True
+        if not ran_doctor:
+            _run("walkcode native doctor")
     print("Upgrade complete.")
 
 

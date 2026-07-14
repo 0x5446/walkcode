@@ -4,9 +4,9 @@ version: 1.0.0
 description: >
   WalkCode V3 发布与本地升级编排（带门禁，全自动）。先 release 再 upgrade：release =
   bump 版本 + 跑测试 + deep-review skill 过关(无 Critical) + 合并 main + 打 tag + 建 GitHub
-  Release；upgrade = 安装最新 V3 CLI + 重启 WALKCODE_V3_LAUNCHD_LABELS 指定的 native runtime
-  + walkcode native doctor 验证。触发：发版、release、上线、ship、cut a release、升级
-  walkcode、部署 walkcode、bump 版本。
+  Release；upgrade = 安装最新 V3 CLI + 重启 native runtime（WALKCODE_V3_LAUNCHD_LABELS
+  优先，为空自动发现已加载 com.walkcode.*、排除 tap-*）+ walkcode native doctor 验证。
+  触发：发版、release、上线、ship、cut a release、升级 walkcode、部署 walkcode、bump 版本。
 metadata:
   scripts: ["release.sh", "upgrade.sh"]
 ---
@@ -22,9 +22,11 @@ metadata:
 - **门禁**：单测必须全绿、deep-review skill 必须过且**无 Critical**，才能合并 PR。
   Review 门禁由 deep-review skill 执行；不要用普通 `codex review` / `claude review` 替代。
 - **tag 打在合并后的 `main`**，不在分支上发版。
-- **V3 launchd 实例显式列出**：只重启 `WALKCODE_V3_LAUNCHD_LABELS` 中的
-  native runtime，例如 `com.walkcode.telegram-claude,com.walkcode.telegram-codex`。
-  不重启旧 `walkcode serve/start` daemon。
+- **V3 launchd 实例显式优先、自动兜底**：设置了 `WALKCODE_V3_LAUNCHD_LABELS`
+  就只重启其中的 native runtime（例如
+  `com.walkcode.telegram-claude,com.walkcode.telegram-codex`）；为空时自动重启
+  已加载的 `com.walkcode.*` 服务，但**永不碰 `com.walkcode.tap-*`**（tap 代理
+  承载本机 Claude 会话的实时 API 流量）。不重启旧 `walkcode serve/start` daemon。
 - **旧版残留是阻断项**：旧 LaunchAgent、`walkcode hook`、shell wrapper source、
   `FEISHU_*` env 存在时先清理；不要带着残留进入 upgrade 或真实 E2E。
 - **一个 runtime 一个身份**：一份 env 只能有一个 `WALKCODE_CHANNEL`、一个
@@ -50,8 +52,9 @@ metadata:
    - 安装最新 Release。
    - 不写 legacy `walkcode hook`，不安装 tmux wrapper。
    - 发现旧 LaunchAgent、old hook、shell wrapper、`FEISHU_*` env 会直接失败。
-   - 只 kickstart `WALKCODE_V3_LAUNCHD_LABELS`。
-   - 运行 `walkcode native doctor`；真实验收继续跑模块 gate：
+   - kickstart `WALKCODE_V3_LAUNCHD_LABELS`；为空时自动发现已加载的
+     `com.walkcode.*`（排除 `tap-*`）。
+   - 对每个重启的实例按其 env 文件运行 `walkcode native doctor`；真实验收继续跑模块 gate：
      `config`、`runtime`、`state`、`outbox`、`agent`、`telegram`、必要时
      `agent-smoke --live`。
    - 并发升级被目录锁挡住。

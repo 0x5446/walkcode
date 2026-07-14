@@ -2,9 +2,11 @@
 set -euo pipefail
 
 # WalkCode V3 upgrade primitive.
-# It upgrades the CLI package and restarts only explicitly configured V3
-# launchd labels. It does not install legacy hooks, tmux wrappers, or restart
-# old `walkcode serve/start` daemons.
+# It upgrades the CLI package and restarts the V3 launchd runtimes:
+# WALKCODE_V3_LAUNCHD_LABELS when set, otherwise the loaded com.walkcode.*
+# services (com.walkcode.tap-* debug proxies are never touched — they carry
+# live Claude API traffic). It does not install legacy hooks, tmux wrappers,
+# or restart old `walkcode serve/start` daemons.
 #
 # Usage:
 #   ./upgrade.sh [--dry-run]
@@ -136,20 +138,40 @@ detect_legacy_remnants() {
   return "$found"
 }
 
-restart_v3_labels() {
-  if [ -z "$LABELS_RAW" ]; then
-    warn "$(msg \
-      "WALKCODE_V3_LAUNCHD_LABELS is empty; no runtime was restarted." \
-      "WALKCODE_V3_LAUNCHD_LABELS 为空；未重启任何 runtime。")"
-    return
-  fi
+discover_v3_labels() {
+  # Loaded com.walkcode.* services are the V3 runtimes. tap-* is excluded on
+  # purpose: the debug proxies carry live Claude API traffic, kickstarting
+  # them would sever every local session's in-flight request.
+  launchctl list 2>/dev/null | awk '{print $NF}' \
+    | grep -E '^com\.walkcode\.' | grep -v '^com\.walkcode\.tap-' | sort || true
+}
 
+RESTARTED_LABELS=()
+
+restart_v3_labels() {
   local label
-  IFS=',' read -r -a labels <<< "$LABELS_RAW"
+  local -a labels=()
+  if [ -n "$LABELS_RAW" ]; then
+    IFS=',' read -r -a labels <<< "$LABELS_RAW"
+  else
+    while IFS= read -r label; do
+      [ -n "$label" ] && labels+=("$label")
+    done < <(discover_v3_labels)
+    if [ "${#labels[@]}" -eq 0 ]; then
+      warn "$(msg \
+        "WALKCODE_V3_LAUNCHD_LABELS is empty and no loaded com.walkcode.* service was found; no runtime was restarted." \
+        "WALKCODE_V3_LAUNCHD_LABELS 为空且未发现已加载的 com.walkcode.* 服务；未重启任何 runtime。")"
+      return
+    fi
+    info "$(msg \
+      "WALKCODE_V3_LAUNCHD_LABELS is empty; restarting discovered labels: ${labels[*]}" \
+      "WALKCODE_V3_LAUNCHD_LABELS 为空；重启自动发现的实例: ${labels[*]}")"
+  fi
   for label in "${labels[@]}"; do
     label="$(echo "$label" | xargs)"
     [ -n "$label" ] || continue
     run launchctl kickstart -k "gui/$UID_NUM/$label"
+    RESTARTED_LABELS+=("$label")
   done
 }
 
@@ -179,13 +201,42 @@ run uv tool install --python "$PYTHON_SPEC" --with claude-agent-sdk --with lark-
 
 restart_v3_labels
 
-if command -v walkcode >/dev/null 2>&1; then
+doctor_one() {
+  # NB: braces on ${...} inside the zh message are load-bearing — macOS
+  # bash 3.2 misparses `$VAR` immediately followed by a CJK character as part
+  # of the variable name ("ENV_FILE?: unbound variable" under set -u).
+  local env_file="$1"
   if $DRY_RUN; then
-    echo "  [dry-run] WALKCODE_ENV_FILE=$ENV_FILE walkcode native doctor"
+    echo "  [dry-run] WALKCODE_ENV_FILE=$env_file walkcode native doctor"
+    return
+  fi
+  WALKCODE_ENV_FILE="$env_file" walkcode native doctor || warn "$(msg \
+    "native doctor failed; check ${env_file} before starting the runtime." \
+    "native doctor 失败；启动 runtime 前请检查 ${env_file}。")"
+}
+
+if command -v walkcode >/dev/null 2>&1; then
+  if [ -n "${WALKCODE_ENV_FILE:-}" ]; then
+    doctor_one "$ENV_FILE"
+  elif [ "${#RESTARTED_LABELS[@]}" -gt 0 ]; then
+    # One doctor per restarted instance, bound to its own env file — a bare
+    # doctor without WALKCODE_ENV_FILE only reports a config error.
+    for label in ${RESTARTED_LABELS[@]+"${RESTARTED_LABELS[@]}"}; do
+      label_env="$HOME/.walkcode/${label#com.walkcode.}.env"
+      if [ -f "$label_env" ]; then
+        doctor_one "$label_env"
+      else
+        warn "$(msg \
+          "no env file for ${label} (expected ${label_env}); doctor skipped." \
+          "${label} 没有对应 env 文件（应为 ${label_env}）；跳过 doctor。")"
+      fi
+    done
+  elif [ -f "$ENV_FILE" ]; then
+    doctor_one "$ENV_FILE"
   else
-    WALKCODE_ENV_FILE="$ENV_FILE" walkcode native doctor || warn "$(msg \
-      "native doctor failed; check $ENV_FILE before starting the runtime." \
-      "native doctor 失败；启动 runtime 前请检查 $ENV_FILE。")"
+    warn "$(msg \
+      "no runtime restarted and default env file missing; run WALKCODE_ENV_FILE=<env> walkcode native doctor manually." \
+      "未重启任何 runtime 且默认 env 文件不存在；请手动运行 WALKCODE_ENV_FILE=<env> walkcode native doctor。")"
   fi
 fi
 
