@@ -292,6 +292,26 @@ class LarkRuntimeTests(_LarkRuntimeHarness):
         )
         self.assertEqual(len(runtime.state.sessions.list_sessions(channel_kind="lark")), 1)
 
+    def test_redelivered_event_is_dropped_before_root_card(self):
+        # Feishu re-pushes un-acked events with the same event_id (WS drop
+        # before ack). The duplicate must be rejected before the new-session
+        # root card / echo are placed, or every redelivery leaves an extra
+        # topic card stuck at "starting" with no session behind it.
+        runtime, api, transport = self._runtime()
+
+        first = asyncio.run(runtime.process_lark_event(self._message_payload()))
+        cards_after_first = len([m for m, _ in api.calls if m == "sendCard"])
+        redelivery = asyncio.run(runtime.process_lark_event(self._message_payload()))
+
+        self.assertTrue(first.accepted)
+        self.assertFalse(redelivery.accepted)
+        self.assertEqual(redelivery.reason, BlockedReason.DUPLICATE_INBOUND)
+        self.assertEqual(
+            len([m for m, _ in api.calls if m == "sendCard"]), cards_after_first
+        )
+        self.assertEqual([turn.text for turn in transport.submitted_turns], ["run tests"])
+        self.assertEqual(len(runtime.state.sessions.list_sessions(channel_kind="lark")), 1)
+
     def test_chat_allowlist_blocks_unknown_chat(self):
         runtime, api, transport = self._runtime(
             env_extra={"LARK_ALLOWED_CHAT_IDS": "oc_allowed"}
@@ -343,6 +363,25 @@ class LarkRuntimeTests(_LarkRuntimeHarness):
         self.assertTrue(api.calls)
         sent_view = api.calls[-1][1]["view"]
         self.assertIn("Active sessions", sent_view.get("text", ""))
+
+    def test_redelivered_command_event_is_not_rerun(self):
+        # Local command branches never reach the orchestrator's ledger, so
+        # they record the event themselves — a Feishu redelivery of the same
+        # event_id must not re-send the reply.
+        runtime, api, transport = self._runtime()
+
+        first = asyncio.run(
+            runtime.process_lark_event(self._message_payload(text="/status"))
+        )
+        calls_after_first = len(api.calls)
+        redelivery = asyncio.run(
+            runtime.process_lark_event(self._message_payload(text="/status"))
+        )
+
+        self.assertTrue(first.accepted)
+        self.assertFalse(redelivery.accepted)
+        self.assertEqual(redelivery.reason, BlockedReason.DUPLICATE_INBOUND)
+        self.assertEqual(len(api.calls), calls_after_first)
 
     def test_unknown_slash_outside_session_gets_error_text(self):
         runtime, api, transport = self._runtime()

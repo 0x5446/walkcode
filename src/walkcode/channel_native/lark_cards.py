@@ -381,14 +381,19 @@ def _takeover_progress_card(view: dict[str, Any]) -> dict[str, Any]:
         "terminating_external_tui": "正在停止 TUI 进程…",
         "resuming_structured": "正在接管会话…",
         "submitting_blocked_input": "正在发送你的消息…",
+        "submitted_blocked_input": "接管完成，消息已发出，等待回复（首个回复可能需要几分钟）。",
         "completed": "接管完成，可以直接在这个话题里发消息了。",
         "failed": "接管失败",
     }
     text = labels.get(phase, "接管进行中…")
     reason = str(view.get("reason", "") or "")
-    if reason and phase != "completed":
+    if reason and phase not in ("completed", "submitted_blocked_input"):
         text = f"{text}\n**原因**: {escape_lark_md(_inline(reason))}"
-    template = "green" if phase == "completed" else ("red" if phase == "failed" else "grey")
+    template = (
+        "green"
+        if phase in ("completed", "submitted_blocked_input")
+        else ("red" if phase == "failed" else "grey")
+    )
     return _card_message("🔁 接管进度", template, [_md_div(text)])
 
 

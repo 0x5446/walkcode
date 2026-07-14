@@ -887,14 +887,24 @@ def _estimate_context_tokens(usage: dict[str, Any]) -> int:
     return total
 
 
-def _context_window_limit(model: str, used: int = 0) -> int:
+def _context_window_limit(model: str, used: int = 0, usage: dict[str, Any] | None = None) -> int:
     """Estimated context window for display.
 
-    Assistant events report dated ids without the [1m] routing marker, so a
-    long-context session's marker is lost once the live id overwrites
-    session.model. Bump the estimate when observed usage already exceeds the
-    default window — better an upgraded limit than a >100% readout.
+    An explicit window reported by the agent wins (codex token_count records
+    carry model_context_window; claude never reports one). Otherwise fall
+    back to the claude-family heuristic: assistant events report dated ids
+    without the [1m] routing marker, so a long-context session's marker is
+    lost once the live id overwrites session.model. Bump the estimate when
+    observed usage already exceeds the default window — better an upgraded
+    limit than a >100% readout.
     """
+    if isinstance(usage, dict):
+        try:
+            explicit = int(usage.get("model_context_window", 0) or 0)
+        except (TypeError, ValueError):
+            explicit = 0
+        if explicit > 0:
+            return explicit
     limit = 1_000_000 if "[1m]" in model else 200_000
     if used > limit:
         limit = 1_000_000
@@ -3289,6 +3299,14 @@ class InboundLedger:
         self._in_progress[event_id] = now + self._ttl
         return True
 
+    def seen(self, event_id: str) -> bool:
+        """Read-only duplicate probe: True while the event is in progress or
+        completed within the TTL. Unlike start(), never claims the event, so
+        callers can screen redeliveries early and still let the real handler
+        own the start/complete/fail lifecycle."""
+        self._expire(self._now())
+        return event_id in self._completed or event_id in self._in_progress
+
     def complete(self, event_id: str) -> None:
         self._in_progress.pop(event_id, None)
         self._completed[event_id] = self._now() + self._ttl
@@ -4028,6 +4046,9 @@ def render_view_text(view_model: dict[str, Any]) -> str:
             "terminating_external_tui": "Stopping the TUI session...",
             "resuming_structured": "Taking over the session...",
             "submitting_blocked_input": "Sending your message...",
+            "submitted_blocked_input": (
+                "Takeover completed. Message sent; waiting for the reply."
+            ),
             "failed": "Takeover failed",
         }
         if phase == "completed":
@@ -7339,7 +7360,9 @@ class Orchestrator:
             ),
             context_used=_estimate_context_tokens(session.last_usage),
             context_limit=_context_window_limit(
-                session.model, _estimate_context_tokens(session.last_usage)
+                session.model,
+                _estimate_context_tokens(session.last_usage),
+                session.last_usage,
             ),
         )
         view["reason"] = reason
@@ -8332,6 +8355,20 @@ class Orchestrator:
                     idempotency_key=f"takeover_submit_failed:{takeover_id}",
                 )
                 return SubmitResult(False, "submit_failed", blocked_input_id=blocked_input_id)
+            # Terminal state for the take-over-and-send path. Without it the
+            # thread ends at "sending your message..." and a slow first model
+            # response reads as a dead takeover; the reply itself can lag by
+            # minutes (client-side request timeout is 10 minutes).
+            await self._send_session_view(
+                updated,
+                ViewModelFactory.takeover_progress(
+                    takeover_id=takeover_id,
+                    blocked_input_id=blocked_input_id,
+                    phase="submitted_blocked_input",
+                    summary=summary,
+                ),
+                idempotency_key=f"takeover_submitted:{takeover_id}",
+            )
             await self._drain_events(updated, transport, handle)
             await self.refresh_session_status_card(updated)
             return SubmitResult(True, blocked_input_id=blocked_input_id)

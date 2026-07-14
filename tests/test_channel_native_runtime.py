@@ -4078,6 +4078,142 @@ class TranscriptModelBackfillTests(unittest.TestCase):
             "",
         )
 
+    def test_claude_transcript_yields_model_and_usage(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            transcript = Path(tmp) / "t.jsonl"
+            transcript.write_text(
+                "\n".join(
+                    [
+                        json.dumps(
+                            {
+                                "type": "assistant",
+                                "message": {
+                                    "model": "claude-fable-5",
+                                    "usage": {
+                                        "input_tokens": 12,
+                                        "cache_read_input_tokens": 50000,
+                                        "output_tokens": 300,
+                                    },
+                                },
+                            }
+                        ),
+                        json.dumps({"type": "assistant", "message": {"model": "<synthetic>"}}),
+                    ]
+                )
+            )
+            model, usage = runtime_module._transcript_meta_from_payload(
+                {"transcript_path": str(transcript)}
+            )
+            self.assertEqual(model, "claude-fable-5")
+            self.assertEqual(usage["cache_read_input_tokens"], 50000)
+
+    def test_codex_rollout_yields_model_and_usage_with_window(self):
+        # codex rollout schema: model on turn_context, usage on token_count
+        # event_msg records (the status card showed 模型/上下文 as "—" before
+        # these were parsed).
+        with tempfile.TemporaryDirectory() as tmp:
+            rollout = Path(tmp) / "rollout.jsonl"
+            rollout.write_text(
+                "\n".join(
+                    [
+                        json.dumps({"type": "session_meta", "payload": {"cwd": "/x"}}),
+                        json.dumps(
+                            {"type": "turn_context", "payload": {"model": "gpt-5.6-sol"}}
+                        ),
+                        json.dumps(
+                            {
+                                "type": "event_msg",
+                                "payload": {
+                                    "type": "token_count",
+                                    "info": {
+                                        "total_token_usage": {"input_tokens": 10860725},
+                                        "last_token_usage": {
+                                            "input_tokens": 63679,
+                                            "cached_input_tokens": 60000,
+                                            "output_tokens": 622,
+                                        },
+                                        "model_context_window": 353400,
+                                    },
+                                },
+                            }
+                        ),
+                        json.dumps({"type": "response_item", "payload": {}}),
+                    ]
+                )
+            )
+            model, usage = runtime_module._transcript_meta_from_payload(
+                {"transcript_path": str(rollout)}
+            )
+            self.assertEqual(model, "gpt-5.6-sol")
+            # cached_input_tokens is a subset of input_tokens: must not be kept
+            self.assertEqual(
+                usage,
+                {
+                    "input_tokens": 63679,
+                    "output_tokens": 622,
+                    "model_context_window": 353400,
+                },
+            )
+
+    def test_codex_token_count_edge_inputs_are_safe(self):
+        # token_count records arrive with whatever codex emits: info may be
+        # missing, None, empty, or lack the context window — none of these
+        # may raise or produce a bogus usage dict.
+        f = runtime_module._codex_token_count_usage
+        self.assertEqual(f(None), {})
+        self.assertEqual(f({}), {})
+        self.assertEqual(f({"last_token_usage": None}), {})
+        self.assertEqual(f({"last_token_usage": {}}), {})
+        self.assertEqual(f({"last_token_usage": {"input_tokens": "bogus"}}), {})
+        self.assertEqual(
+            f({"last_token_usage": {"input_tokens": 100, "output_tokens": 7}}),
+            {"input_tokens": 100, "output_tokens": 7},
+        )
+
+    def test_rollout_tail_truncated_line_is_skipped(self):
+        # A >64KB rollout is tail-read from a seek that lands mid-line; the
+        # resulting half-JSON fragment must be skipped, not abort parsing.
+        with tempfile.TemporaryDirectory() as tmp:
+            rollout = Path(tmp) / "rollout.jsonl"
+            padding = json.dumps({"type": "response_item", "payload": {"blob": "x" * 70000}})
+            rollout.write_text(
+                "\n".join(
+                    [
+                        padding,
+                        json.dumps({"type": "turn_context", "payload": {"model": "gpt-5.6-sol"}}),
+                        json.dumps(
+                            {
+                                "type": "event_msg",
+                                "payload": {
+                                    "type": "token_count",
+                                    "info": {
+                                        "last_token_usage": {"input_tokens": 5, "output_tokens": 3}
+                                    },
+                                },
+                            }
+                        ),
+                    ]
+                )
+            )
+            self.assertGreater(rollout.stat().st_size, 65536)
+            model, usage = runtime_module._transcript_meta_from_payload(
+                {"transcript_path": str(rollout)}
+            )
+            self.assertEqual(model, "gpt-5.6-sol")
+            # no model_context_window in the record → usage carries none
+            self.assertEqual(usage, {"input_tokens": 5, "output_tokens": 3})
+
+    def test_context_window_limit_prefers_agent_reported_window(self):
+        from walkcode.channel_native import _context_window_limit
+
+        self.assertEqual(
+            _context_window_limit("gpt-5.6-sol", 64000, {"model_context_window": 353400}),
+            353400,
+        )
+        # no explicit window → claude-family heuristic unchanged
+        self.assertEqual(_context_window_limit("claude-fable-5", 64000, {}), 200_000)
+        self.assertEqual(_context_window_limit("claude-sonnet-5[1m]", 0, None), 1_000_000)
+
 
 
 
