@@ -2,7 +2,10 @@
 
 Date: 2026-06-28
 
-Status: Accepted
+Status: Superseded by ADR 0052 (claude_headless in serve mode reuses the live
+worker when its persistent event pump is alive; the unconditional
+IDLE-⇒-resume path below remains the fallback for pump-less sessions,
+`serve --once`, and non-persistent transports)
 
 ## Context
 

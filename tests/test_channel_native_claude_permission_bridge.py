@@ -149,6 +149,21 @@ def _client_class(**attrs):
     return type("ScriptedClient", (_ScriptedClient,), dict(attrs))
 
 
+async def _wait_agent_output(orch):
+    """Wait for relay completion in either mode (ADR 0052).
+
+    defer_event_drain=True + real ClaudeHeadlessTransport now runs the
+    persistent event pump instead of per-turn background drains; the fake
+    clients only implement receive_response, so the pump task ends when the
+    scripted turn finishes and can be awaited like the old drains.
+    """
+    tasks = list(orch._background_event_drains) + [
+        entry.task for entry in orch._event_pumps.values()
+    ]
+    if tasks:
+        await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=5.0)
+
+
 async def _drive(transport, handle, decide):
     """Iterate the bridged stream, invoking ``decide`` when a request floats."""
     collected = []
@@ -539,14 +554,14 @@ class PermissionBridgeOrchestratorTests(unittest.TestCase):
                 await asyncio.sleep(0)
             self.assertIsNotNone(card, "permission card never floated")
             token = next(a["token"] for a in card["actions"] if a["action"] == "allow")
+            # Capture the client before waiting: the pump reaps _clients when
+            # the (single-turn fake) stream ends.
+            handle_id = session.transport_ref["handle_id"]
+            client = transport._clients[handle_id]
             await orch.handle_inbound_event(
                 self._callback(token), agent_transport_kind="claude_headless", cwd="/tmp/project"
             )
-            drains = list(orch._background_event_drains)
-            if drains:
-                await asyncio.wait_for(asyncio.gather(*drains), timeout=5.0)
-            handle_id = session.transport_ref["handle_id"]
-            client = transport._clients[handle_id]
+            await _wait_agent_output(orch)
             return session, client
 
         session, client = asyncio.run(scenario())
@@ -581,14 +596,12 @@ class PermissionBridgeOrchestratorTests(unittest.TestCase):
             await orch.handle_inbound_event(
                 self._callback(set_token), agent_transport_kind="claude_headless", cwd="/tmp/project"
             )
+            client = transport._clients[session.transport_ref["handle_id"]]
             submit_token = card["submit"]["token"]
             await orch.handle_inbound_event(
                 self._callback(submit_token), agent_transport_kind="claude_headless", cwd="/tmp/project"
             )
-            drains = list(orch._background_event_drains)
-            if drains:
-                await asyncio.wait_for(asyncio.gather(*drains), timeout=5.0)
-            client = transport._clients[session.transport_ref["handle_id"]]
+            await _wait_agent_output(orch)
             return client
 
         client = asyncio.run(scenario())
@@ -655,6 +668,7 @@ class BridgeBypassAndStaleWorkerTests(PermissionBridgeOrchestratorTests):
             result = await orch.handle_inbound_event(
                 self._callback(submit_token), agent_transport_kind="claude_headless", cwd="/tmp/project"
             )
+            await orch.stop_all_event_pumps()
             return channel, result
 
         channel, result = asyncio.run(scenario())
@@ -699,6 +713,7 @@ class BridgeBypassAndStaleWorkerTests(PermissionBridgeOrchestratorTests):
             result = await orch.handle_inbound_event(
                 self._callback(token), agent_transport_kind="claude_headless", cwd="/tmp/project"
             )
+            await orch.stop_all_event_pumps()
             return channel, result
 
         channel, result = asyncio.run(scenario())
@@ -751,6 +766,7 @@ class BridgeBypassAndStaleWorkerTests(PermissionBridgeOrchestratorTests):
                 )
             except RuntimeError:
                 raised = True
+            await orch.stop_all_event_pumps()
             return channel, raised
 
         channel, raised = asyncio.run(scenario())
@@ -778,6 +794,7 @@ class BridgeBypassAndStaleWorkerTests(PermissionBridgeOrchestratorTests):
                 generation=session.generation,
                 ack_message_id="m-user-1",
             )
+            await orch.stop_all_event_pumps()
             return channel
 
         channel = asyncio.run(scenario())

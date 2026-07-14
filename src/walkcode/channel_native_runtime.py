@@ -1581,6 +1581,16 @@ class ChannelNativeRuntime:
                     self.last_lark_event_error = ""
         finally:
             await self._stop_telegram_maintenance_tasks(maintenance_tasks)
+            # Stop pumps BEFORE restoring defer_event_drain: a submit racing
+            # this teardown must not pair a live pump with a synchronous
+            # drain (two consumers on one stream, ADR 0052).
+            try:
+                await self.orchestrator.stop_all_event_pumps()
+            except Exception as exc:
+                print(
+                    f"event pump teardown error: {type(exc).__name__}: {exc}",
+                    file=sys.stderr,
+                )
             self.orchestrator.defer_event_drain = previous_defer_event_drain
 
     async def _place_telegram_new_session(
@@ -1827,6 +1837,15 @@ class ChannelNativeRuntime:
                     self.last_telegram_poll_error = ""
         finally:
             await self._stop_telegram_maintenance_tasks(maintenance_tasks)
+            # Same ordering contract as serve_lark_ws: pumps down before the
+            # per-turn drain mode returns (ADR 0052).
+            try:
+                await self.orchestrator.stop_all_event_pumps()
+            except Exception as exc:
+                print(
+                    f"event pump teardown error: {type(exc).__name__}: {exc}",
+                    file=sys.stderr,
+                )
             self.orchestrator.defer_event_drain = previous_defer_event_drain
 
     def _start_telegram_maintenance_tasks(self) -> list[asyncio.Task[None]]:
@@ -1895,7 +1914,10 @@ class ChannelNativeRuntime:
                     # any blocked can_use_tool Future died with the previous
                     # process, and active turns can't be resumed. IDLE (and
                     # error-recoverable) sessions stay — the resume path
-                    # revives them on the next inbound message.
+                    # revives them on the next inbound message. (ADR 0052: the
+                    # event-pump registry is in-memory only, so after a restart
+                    # these IDLE sessions read as pump-less and deterministically
+                    # take that resume branch.)
                     if session.lifecycle_state not in {
                         "ACTIVE",
                         "WAITING_PERMISSION",

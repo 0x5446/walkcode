@@ -40,6 +40,14 @@ WalkCode V3 是 channel-native 的 Coding Agent runtime。它把 IM 当成一等
 每次 takeover / 终端 resume 都是 fork 语义（新 session id，walkcode 按
 血缘跟踪、话题不变）。
 
+headless 会话的 worker 是**常驻进程 + 常驻事件泵**（ADR 0052）：turn 结束后
+进程与事件流都不销毁，后续消息复用同一进程；Claude 后台任务（Workflow、
+后台 Bash、subagent）完成时自发产出的结果会**自动推回话题**，不需要用户追问。
+worker 死亡后下一条消息按 `agent_session_id` resume 新进程。回收保证的边界：
+close / claim / 泵收尾 / serve 退出会对**当前 runtime 进程内注册的** worker
+调用 `disconnect`；runtime 自身退出（含异常退出）时靠 SDK 的 atexit SIGTERM
+兜底清掉子进程。
+
 ## 双端同步：终端与 IM 共驾同一个 Claude 会话
 
 Claude 会话以 daemon-native 方式运行时（手动 `claude --bg` 启动后 attach，
