@@ -1313,6 +1313,21 @@ class ChannelNativeRuntime:
         inbound = channel.parse_event(payload)
         if not self._lark_chat_allowed(inbound.chat_id, is_callback=inbound.callback is not None):
             return SubmitResult(False, BlockedReason.UNAUTHORIZED)
+        # Feishu re-pushes un-acked events with the same event_id (e.g. when
+        # the WS connection dies before the ack goes out). The orchestrator's
+        # ledger check inside handle_inbound_event runs too late for this
+        # handler: the new-session root card, the echo reply and the command
+        # branches below all fire first, so a redelivery would leave a zombie
+        # topic card stuck at "starting". Drop known event_ids before any
+        # side effect. "lark:" is the degenerate id of a payload without an
+        # event_id — never treat those as duplicates of each other.
+        ledger = self.state.inbound_ledger
+        if (
+            ledger is not None
+            and inbound.event_id != "lark:"
+            and ledger.seen(inbound.event_id)
+        ):
+            return SubmitResult(False, BlockedReason.DUPLICATE_INBOUND)
         if inbound.callback is None:
             if not self._lark_sender_allowed(inbound.sender_id):
                 return SubmitResult(False, BlockedReason.UNAUTHORIZED)
@@ -1992,13 +2007,21 @@ class ChannelNativeRuntime:
                 self.save_state()
                 return SubmitResult(True, "unobserved_tui_hook")
             if session.status != "stopped":
-                # Backfill the model for TUI-observed sessions (status card
-                # shows "—" otherwise); re-read on turn stop so a mid-session
-                # /model switch lands eventually without per-event file IO.
-                if not session.model or hook_type == "stop" or _tui_hook_stops_session(hook_type):
-                    transcript_model = _transcript_model_from_payload(payload)
+                # Backfill model + context usage for TUI-observed sessions
+                # (status card shows "模型: — 上下文: —" otherwise); re-read on
+                # turn stop so a mid-session /model switch and the growing
+                # context land eventually without per-event file IO.
+                if (
+                    not session.model
+                    or not session.last_usage
+                    or hook_type == "stop"
+                    or _tui_hook_stops_session(hook_type)
+                ):
+                    transcript_model, transcript_usage = _transcript_meta_from_payload(payload)
                     if transcript_model and transcript_model != session.model:
                         session.model = transcript_model
+                    if transcript_usage and transcript_usage != session.last_usage:
+                        session.last_usage = dict(transcript_usage)
                 await self._send_tui_hook_output(session, hook_type=hook_type, payload=payload)
         except Exception:
             if ledger_started:
@@ -4727,16 +4750,24 @@ def _payload_hook_event_name(payload: dict[str, Any]) -> str:
 
 
 def _transcript_model_from_payload(payload: dict[str, Any]) -> str:
-    """Read the live model slug from the transcript a hook payload points at.
+    return _transcript_meta_from_payload(payload)[0]
 
-    TUI-observed sessions have no other model source: the daemon's job record
-    and state patches carry tempo/detail/needs but no model (live-verified
-    2026-07), and hook payloads themselves don't include one. The transcript's
-    latest assistant record does. Tail-read keeps it cheap on long sessions.
+
+def _transcript_meta_from_payload(payload: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    """Read model slug + last-turn usage from the transcript a hook points at.
+
+    TUI-observed sessions have no other source for either: the daemon's job
+    record and state patches carry tempo/detail/needs but no model
+    (live-verified 2026-07), and hook payloads themselves include neither.
+    Claude transcripts carry both on assistant records (message.model /
+    message.usage); codex rollouts carry the model on turn_context records
+    (payload.model) and usage on token_count event_msg records
+    (last_token_usage + model_context_window). Tail-read keeps it cheap on
+    long sessions.
     """
     path = str(payload.get("transcript_path", "") or "")
     if not path:
-        return ""
+        return "", {}
     try:
         transcript = Path(path).expanduser()
         # The path comes from an (unauthenticated) hook payload: refuse
@@ -4744,13 +4775,15 @@ def _transcript_model_from_payload(payload: dict[str, Any]) -> str:
         # path can't block the event loop or read unboundedly.
         info = transcript.stat()
         if not stat.S_ISREG(info.st_mode):
-            return ""
+            return "", {}
         with transcript.open("rb") as fh:
             if info.st_size > 65536:
                 fh.seek(-65536, os.SEEK_END)
             tail = fh.read(65536).decode("utf-8", "replace")
     except OSError:
-        return ""
+        return "", {}
+    model = ""
+    usage: dict[str, Any] = {}
     for line in reversed(tail.splitlines()):
         line = line.strip()
         if not line.startswith("{"):
@@ -4761,11 +4794,57 @@ def _transcript_model_from_payload(payload: dict[str, Any]) -> str:
             continue
         message = record.get("message")
         if isinstance(message, dict):
-            model = str(message.get("model", "") or "")
+            record_model = str(message.get("model", "") or "")
             # "<synthetic>" marks CLI-generated filler messages, not the model.
-            if model and not model.startswith("<"):
-                return model
-    return ""
+            if record_model.startswith("<"):
+                continue
+            if not model and record_model:
+                model = record_model
+            if not usage:
+                record_usage = message.get("usage")
+                if isinstance(record_usage, dict) and record_usage:
+                    usage = dict(record_usage)
+        record_type = str(record.get("type", "") or "")
+        record_payload = record.get("payload")
+        if isinstance(record_payload, dict):
+            if not model and record_type == "turn_context":
+                model = str(record_payload.get("model", "") or "")
+            if (
+                not usage
+                and record_type == "event_msg"
+                and str(record_payload.get("type", "") or "") == "token_count"
+            ):
+                usage = _codex_token_count_usage(record_payload.get("info"))
+        if model and usage:
+            break
+    return model, usage
+
+
+def _codex_token_count_usage(info: Any) -> dict[str, Any]:
+    """Shape a codex token_count record into the shared usage dict.
+
+    Only input/output of the last turn are kept (cached_input_tokens is a
+    subset of input_tokens — summing it would double-count); the explicit
+    model_context_window rides along for the status card's limit display.
+    """
+    if not isinstance(info, dict):
+        return {}
+    last = info.get("last_token_usage")
+    if not isinstance(last, dict) or not last:
+        return {}
+    try:
+        usage: dict[str, Any] = {
+            "input_tokens": int(last.get("input_tokens", 0) or 0),
+            "output_tokens": int(last.get("output_tokens", 0) or 0),
+        }
+        window = int(info.get("model_context_window", 0) or 0)
+    except (TypeError, ValueError):
+        return {}
+    if not usage["input_tokens"] and not usage["output_tokens"]:
+        return {}
+    if window:
+        usage["model_context_window"] = window
+    return usage
 
 
 def _normalize_tui_hook_type(value: str) -> str:

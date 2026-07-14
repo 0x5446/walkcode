@@ -579,8 +579,18 @@ class TakeoverOrchestratorTests(unittest.TestCase):
         self.assertEqual(updated.transport_kind, "fake-transport")
         self.assertEqual(updated.generation, 1)
         self.assertEqual([turn.text for turn in transport.submitted_turns], ["run tests"])
+        # The thread must end in a terminal state: submitting... followed by
+        # the green "message sent" card once submit_turn returns.
+        progress_phases = [
+            item["view"]["phase"]
+            for item in channel.sent_views
+            if item["view"].get("type") == "takeover_progress"
+        ]
+        self.assertEqual(
+            progress_phases[-2:], ["submitting_blocked_input", "submitted_blocked_input"]
+        )
         self.assertEqual(channel.sent_views[-1]["view"]["type"], "takeover_progress")
-        self.assertEqual(channel.sent_views[-1]["view"]["phase"], "submitting_blocked_input")
+        self.assertEqual(channel.sent_views[-1]["view"]["phase"], "submitted_blocked_input")
 
     def test_successful_takeover_marks_old_generation_hitl_stale(self):
         orchestrator, channel, transport, session = _setup(
