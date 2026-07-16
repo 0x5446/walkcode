@@ -5,6 +5,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 from walkcode.channel_native import (
@@ -199,6 +200,95 @@ class LarkAdapterTests(unittest.TestCase):
             [a.source_id for a in event.attachments], ["img_key_1", "img_key_2"]
         )
 
+    def test_parse_post_locale_wrapped_body(self):
+        # The send-side API (and legacy events) wrap the post body under a
+        # locale key; receiving that shape must not parse to empty either.
+        adapter = LarkChannelAdapter(LarkBotApi(caller=lambda *_: {}))
+        event = adapter.parse_event(
+            {
+                "event_id": "evt-post-locale",
+                "event": {
+                    "message": {
+                        "message_id": "om_post",
+                        "chat_id": "oc_chat",
+                        "message_type": "post",
+                        "content": json.dumps(
+                            {
+                                "zh_cn": {
+                                    "title": "标题",
+                                    "content": [
+                                        [{"tag": "img", "image_key": "img_locale_key"}],
+                                        [{"tag": "text", "text": "带语言层的正文"}],
+                                    ],
+                                }
+                            },
+                            ensure_ascii=False,
+                        ),
+                    },
+                    "sender": {"sender_id": {"open_id": "ou_user"}},
+                },
+            }
+        )
+
+        self.assertEqual(event.text, "标题\n带语言层的正文")
+        self.assertEqual([a.source_id for a in event.attachments], ["img_locale_key"])
+
+    def test_parse_post_malformed_segments_are_tolerated(self):
+        adapter = LarkChannelAdapter(LarkBotApi(caller=lambda *_: {}))
+        event = adapter.parse_event(
+            {
+                "event_id": "evt-post-bad",
+                "event": {
+                    "message": {
+                        "message_id": "om_post",
+                        "chat_id": "oc_chat",
+                        "message_type": "post",
+                        "content": json.dumps(
+                            {
+                                "title": "",
+                                "content": [
+                                    "not-a-paragraph",
+                                    [{"tag": "text", "text": "正常段"}, "not-a-segment", 42],
+                                    {"tag": "img", "image_key": "ignored"},
+                                    [{"tag": "img", "image_key": "img_ok"}],
+                                ],
+                            },
+                            ensure_ascii=False,
+                        ),
+                    },
+                    "sender": {"sender_id": {"open_id": "ou_user"}},
+                },
+            }
+        )
+
+        self.assertEqual(event.text, "正常段")
+        self.assertEqual([a.source_id for a in event.attachments], ["img_ok"])
+
+    def test_parse_post_attachments_are_capped_with_trace(self):
+        adapter = LarkChannelAdapter(LarkBotApi(caller=lambda *_: {}))
+        cap = LarkChannelAdapter._MAX_POST_ATTACHMENTS
+        paragraphs = [[{"tag": "img", "image_key": f"img_{i}"}] for i in range(cap + 2)]
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            event = adapter.parse_event(
+                {
+                    "event_id": "evt-post-flood",
+                    "event": {
+                        "message": {
+                            "message_id": "om_post",
+                            "chat_id": "oc_chat",
+                            "message_type": "post",
+                            "content": json.dumps({"title": "", "content": paragraphs}),
+                        },
+                        "sender": {"sender_id": {"open_id": "ou_user"}},
+                    },
+                }
+            )
+
+        self.assertEqual(len(event.attachments), cap)
+        self.assertEqual(event.attachments[-1].source_id, f"img_{cap - 1}")
+        self.assertIn("walkcode degrade=post_attachments_truncated", stderr.getvalue())
+
     def test_parse_card_callback_short_token(self):
         adapter = LarkChannelAdapter(LarkBotApi(caller=lambda *_: {}))
         event = adapter.parse_event(
@@ -300,6 +390,23 @@ class LarkOrchestratorTests(unittest.TestCase):
         self.assertTrue(result.accepted)
         self.assertEqual([turn.text for turn in transport.submitted_turns], ["run tests"])
         self.assertIn("done", channel.rendered_text())
+
+
+class InboundMessageTypeTests(unittest.TestCase):
+    def test_lark_shape_reports_message_type(self):
+        inbound = SimpleNamespace(
+            raw={"event": {"message": {"message_type": "share_chat"}}}
+        )
+        self.assertEqual(runtime_module._inbound_message_type(inbound), "share_chat")
+
+    def test_telegram_shape_reports_payload_key(self):
+        inbound = SimpleNamespace(
+            raw={"update_id": 7, "message": {"message_id": 1, "sticker": {"file_id": "s1"}}}
+        )
+        self.assertEqual(runtime_module._inbound_message_type(inbound), "sticker")
+
+    def test_unknown_shape_reports_empty(self):
+        self.assertEqual(runtime_module._inbound_message_type(SimpleNamespace(raw=None)), "")
 
 
 class _LarkRuntimeHarness(unittest.TestCase):
@@ -419,6 +526,43 @@ class LarkRuntimeTests(_LarkRuntimeHarness):
         self.assertEqual(len(downloads), 1)
         self.assertEqual(downloads[0]["file_key"], "img_v3_key")
         self.assertEqual(downloads[0]["type"], "image")
+
+    def test_post_media_attachment_downloads_as_file(self):
+        runtime, api, transport = self._runtime()
+        payload = {
+            "event_id": "evt-post-media",
+            "event": {
+                "message": {
+                    "message_id": "om_media",
+                    "root_id": "",
+                    "chat_id": "oc_chat",
+                    "message_type": "post",
+                    "content": json.dumps(
+                        {
+                            "title": "",
+                            "content": [
+                                [{"tag": "media", "file_key": "file_v3_key", "mime_type": "video/mp4"}],
+                                [{"tag": "text", "text": "看下这段视频"}],
+                            ],
+                        },
+                        ensure_ascii=False,
+                    ),
+                },
+                "sender": {"sender_id": {"open_id": "ou_user"}},
+            },
+        }
+
+        with mock.patch.dict(
+            "os.environ", {"WALKCODE_DOWNLOAD_DIR": str(Path(self._tmp.name) / "downloads")}
+        ):
+            result = asyncio.run(runtime.process_lark_event(payload))
+
+        self.assertTrue(result.accepted)
+        self.assertEqual([turn.text for turn in transport.submitted_turns], ["看下这段视频"])
+        downloads = [p for m, p in api.calls if m == "downloadResource"]
+        self.assertEqual(len(downloads), 1)
+        self.assertEqual(downloads[0]["file_key"], "file_v3_key")
+        self.assertEqual(downloads[0]["type"], "file")
 
     def test_unparseable_inbound_is_ignored_with_degrade_trace(self):
         runtime, api, transport = self._runtime()

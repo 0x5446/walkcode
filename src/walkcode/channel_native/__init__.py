@@ -4756,7 +4756,7 @@ class LarkChannelAdapter:
         if isinstance(content, dict):
             if "text" in content:
                 return str(content["text"])
-            if isinstance(content.get("content"), list):
+            if cls._post_bodies(content):
                 # post (rich text): the mobile "image + caption" send. Prose
                 # and image keys live nested inside paragraph segments, not in
                 # top-level fields — a flat read would yield "" and get the
@@ -4767,20 +4767,39 @@ class LarkChannelAdapter:
             return ""
         return str(content or "")
 
-    @staticmethod
-    def _post_paragraphs(content: dict[str, Any]) -> list[list[dict[str, Any]]]:
-        """Paragraph rows of a post (rich text) body, defensively typed.
+    # Post attachments are unbounded user input; cap what a single rich-text
+    # message may fan out into downloads so one blast cannot wedge the inbound
+    # loop on Lark API calls and disk writes.
+    _MAX_POST_ATTACHMENTS = 10
 
-        Post content arrives as ``{"title": ..., "content": [[segment, ...],
-        ...]}`` where each segment is a ``{"tag": ...}`` dict (text / a / at /
-        img / media / emotion / code_block / hr / md).
+    @staticmethod
+    def _post_bodies(content: dict[str, Any]) -> list[dict[str, Any]]:
+        """Post (rich text) bodies of a decoded message content dict.
+
+        Receive events carry the flat shape ``{"title": ..., "content":
+        [[segment, ...], ...]}``; the send-side API (and legacy events) wraps
+        the same body under locale keys like ``{"zh_cn": {...}}``. Accept
+        both so a valid post can never parse to empty and get dropped.
         """
-        body = content.get("content")
-        if not isinstance(body, list):
-            return []
+        if isinstance(content.get("content"), list):
+            return [content]
+        return [
+            value
+            for value in content.values()
+            if isinstance(value, dict) and isinstance(value.get("content"), list)
+        ]
+
+    @classmethod
+    def _post_paragraphs(cls, content: dict[str, Any]) -> list[list[dict[str, Any]]]:
+        """Paragraph rows across all post bodies, defensively typed.
+
+        Each segment is a ``{"tag": ...}`` dict (text / a / at / img / media /
+        emotion / code_block / hr / md).
+        """
         return [
             [segment for segment in paragraph if isinstance(segment, dict)]
-            for paragraph in body
+            for body in cls._post_bodies(content)
+            for paragraph in body["content"]
             if isinstance(paragraph, list)
         ]
 
@@ -4805,7 +4824,7 @@ class LarkChannelAdapter:
 
     @classmethod
     def _parse_post_text(cls, content: dict[str, Any]) -> str:
-        lines = [str(content.get("title", "") or "")]
+        lines = [str(body.get("title", "") or "") for body in cls._post_bodies(content)]
         for paragraph in cls._post_paragraphs(content):
             lines.append("".join(cls._post_segment_text(segment) for segment in paragraph))
         return "\n".join(line for line in lines if line.strip())
@@ -4837,13 +4856,14 @@ class LarkChannelAdapter:
                         source_message_id=message_id,
                     )
                 )
+        post_refs: list[AttachmentRef] = []
         for paragraph in cls._post_paragraphs(content):
             for segment in paragraph:
                 tag = str(segment.get("tag", "") or "")
                 segment_image_key = str(segment.get("image_key", "") or "")
                 segment_file_key = str(segment.get("file_key", "") or "")
                 if tag == "img" and segment_image_key:
-                    attachments.append(
+                    post_refs.append(
                         AttachmentRef(
                             source_id=segment_image_key,
                             mime="image/*",
@@ -4851,13 +4871,22 @@ class LarkChannelAdapter:
                         )
                     )
                 elif tag == "media" and segment_file_key:
-                    attachments.append(
+                    post_refs.append(
                         AttachmentRef(
                             source_id=segment_file_key,
                             mime=str(segment.get("mime_type", "") or ""),
                             source_message_id=message_id,
                         )
                     )
+        if len(post_refs) > cls._MAX_POST_ATTACHMENTS:
+            _log_degrade(
+                "post_attachments_truncated",
+                message_id=message_id,
+                kept=cls._MAX_POST_ATTACHMENTS,
+                total=len(post_refs),
+            )
+            post_refs = post_refs[: cls._MAX_POST_ATTACHMENTS]
+        attachments.extend(post_refs)
         return attachments
 
     @staticmethod

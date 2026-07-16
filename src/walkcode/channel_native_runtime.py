@@ -4740,13 +4740,40 @@ def _telegram_message_is_empty(inbound: Any) -> bool:
     )
 
 
+# One content key per kind in a Telegram message payload; used to name what
+# the parser failed to understand when a message is dropped as empty.
+_TELEGRAM_PAYLOAD_KEYS = (
+    "text",
+    "photo",
+    "document",
+    "sticker",
+    "voice",
+    "audio",
+    "video",
+    "video_note",
+    "animation",
+    "contact",
+    "location",
+    "venue",
+    "poll",
+    "dice",
+)
+
+
 def _inbound_message_type(inbound: Any) -> str:
     raw = getattr(inbound, "raw", None)
     if not isinstance(raw, dict):
         return ""
     event = raw.get("event") if isinstance(raw.get("event"), dict) else {}
     message = event.get("message") if isinstance(event.get("message"), dict) else {}
-    return str(message.get("message_type", "") or message.get("msg_type", "") or "")
+    lark_type = str(message.get("message_type", "") or message.get("msg_type", "") or "")
+    if lark_type:
+        return lark_type
+    tg_message = raw.get("message") if isinstance(raw.get("message"), dict) else {}
+    for key in _TELEGRAM_PAYLOAD_KEYS:
+        if key in tg_message:
+            return key
+    return ""
 
 
 def _ignore_empty_inbound(inbound: Any) -> SubmitResult:
