@@ -4614,6 +4614,18 @@ class LarkChannelAdapter:
             message_id = str(message.get("message_id", "") or "")
             root = root_id or message_id
             content = self._decode_content(message.get("content", ""))
+            text = self._parse_message_text(content)
+            attachments = self._attachments_from_message(message, content)
+            overflow = self._post_attachment_overflow(content)
+            if overflow:
+                # Truncation must be visible to the agent and the user, not
+                # just the operator log — otherwise the turn silently runs on
+                # partial input.
+                note = (
+                    f"[消息共 {overflow + self._MAX_POST_ATTACHMENTS} 个附件，"
+                    f"超出上限，仅保留前 {self._MAX_POST_ATTACHMENTS} 个]"
+                )
+                text = f"{text}\n{note}" if text.strip() else note
             return InboundEvent(
                 event_id=f"lark:{event_id}",
                 channel_kind="lark",
@@ -4624,8 +4636,8 @@ class LarkChannelAdapter:
                 root_message_id=root,
                 sender_id=str(sender_id.get("open_id", "") or event.get("open_id", "")),
                 sender_display=str(sender.get("sender_type", "") or ""),
-                text=self._parse_message_text(content),
-                attachments=self._attachments_from_message(message, content),
+                text=text,
+                attachments=attachments,
                 raw=payload,
             )
         action = event.get("action", {})
@@ -4830,6 +4842,26 @@ class LarkChannelAdapter:
         return "\n".join(line for line in lines if line.strip())
 
     @classmethod
+    def _post_attachment_segments(cls, content: dict[str, Any]) -> list[dict[str, Any]]:
+        """img / media segments of a post body that reference a downloadable key."""
+        segments: list[dict[str, Any]] = []
+        for paragraph in cls._post_paragraphs(content):
+            for segment in paragraph:
+                tag = str(segment.get("tag", "") or "")
+                if tag == "img" and segment.get("image_key"):
+                    segments.append(segment)
+                elif tag == "media" and segment.get("file_key"):
+                    segments.append(segment)
+        return segments
+
+    @classmethod
+    def _post_attachment_overflow(cls, content: Any) -> int:
+        """How many post attachments the cap dropped (0 when under the cap)."""
+        if not isinstance(content, dict):
+            return 0
+        return max(0, len(cls._post_attachment_segments(content)) - cls._MAX_POST_ATTACHMENTS)
+
+    @classmethod
     def _attachments_from_message(cls, message: dict[str, Any], content: Any) -> list[AttachmentRef]:
         if not isinstance(content, dict):
             return []
@@ -4856,37 +4888,32 @@ class LarkChannelAdapter:
                         source_message_id=message_id,
                     )
                 )
-        post_refs: list[AttachmentRef] = []
-        for paragraph in cls._post_paragraphs(content):
-            for segment in paragraph:
-                tag = str(segment.get("tag", "") or "")
-                segment_image_key = str(segment.get("image_key", "") or "")
-                segment_file_key = str(segment.get("file_key", "") or "")
-                if tag == "img" and segment_image_key:
-                    post_refs.append(
-                        AttachmentRef(
-                            source_id=segment_image_key,
-                            mime="image/*",
-                            source_message_id=message_id,
-                        )
-                    )
-                elif tag == "media" and segment_file_key:
-                    post_refs.append(
-                        AttachmentRef(
-                            source_id=segment_file_key,
-                            mime=str(segment.get("mime_type", "") or ""),
-                            source_message_id=message_id,
-                        )
-                    )
-        if len(post_refs) > cls._MAX_POST_ATTACHMENTS:
+        post_segments = cls._post_attachment_segments(content)
+        if len(post_segments) > cls._MAX_POST_ATTACHMENTS:
             _log_degrade(
                 "post_attachments_truncated",
                 message_id=message_id,
                 kept=cls._MAX_POST_ATTACHMENTS,
-                total=len(post_refs),
+                total=len(post_segments),
             )
-            post_refs = post_refs[: cls._MAX_POST_ATTACHMENTS]
-        attachments.extend(post_refs)
+            post_segments = post_segments[: cls._MAX_POST_ATTACHMENTS]
+        for segment in post_segments:
+            if str(segment.get("tag", "") or "") == "img":
+                attachments.append(
+                    AttachmentRef(
+                        source_id=str(segment["image_key"]),
+                        mime="image/*",
+                        source_message_id=message_id,
+                    )
+                )
+            else:
+                attachments.append(
+                    AttachmentRef(
+                        source_id=str(segment["file_key"]),
+                        mime=str(segment.get("mime_type", "") or ""),
+                        source_message_id=message_id,
+                    )
+                )
         return attachments
 
     @staticmethod

@@ -95,6 +95,8 @@ class LarkAdapterTests(unittest.TestCase):
     def test_parse_post_message_extracts_caption_and_image(self):
         # msg_type=post is how mobile Feishu sends "image + caption" as one
         # message; prose and image keys are nested in paragraph segments.
+        # Deliberately uses the "msg_type" field name (the incident shape),
+        # not "message_type" — both aliases must stay supported.
         adapter = LarkChannelAdapter(LarkBotApi(caller=lambda *_: {}))
         event = adapter.parse_event(
             {
@@ -104,7 +106,7 @@ class LarkAdapterTests(unittest.TestCase):
                         "message_id": "om_post",
                         "root_id": "om_root",
                         "chat_id": "oc_chat",
-                        "message_type": "post",
+                        "msg_type": "post",
                         "content": json.dumps(
                             {
                                 "title": "",
@@ -164,8 +166,8 @@ class LarkAdapterTests(unittest.TestCase):
             "发布计划\n看下 这个文档 (https://example.com/doc)@Bob\nprint(1)",
         )
         self.assertEqual(
-            [(a.source_id, a.mime) for a in event.attachments],
-            [("file_v3_key", "")],
+            [(a.source_id, a.mime, a.source_message_id) for a in event.attachments],
+            [("file_v3_key", "", "om_post")],
         )
 
     def test_parse_post_image_only_message_is_not_empty(self):
@@ -288,6 +290,10 @@ class LarkAdapterTests(unittest.TestCase):
         self.assertEqual(len(event.attachments), cap)
         self.assertEqual(event.attachments[-1].source_id, f"img_{cap - 1}")
         self.assertIn("walkcode degrade=post_attachments_truncated", stderr.getvalue())
+        # Truncation is surfaced to the agent/user via the turn text, not
+        # only the operator log.
+        self.assertIn(f"共 {cap + 2} 个附件", event.text)
+        self.assertIn(f"仅保留前 {cap} 个", event.text)
 
     def test_parse_card_callback_short_token(self):
         adapter = LarkChannelAdapter(LarkBotApi(caller=lambda *_: {}))
@@ -399,6 +405,10 @@ class InboundMessageTypeTests(unittest.TestCase):
         )
         self.assertEqual(runtime_module._inbound_message_type(inbound), "share_chat")
 
+    def test_lark_msg_type_alias_is_supported(self):
+        inbound = SimpleNamespace(raw={"event": {"message": {"msg_type": "post"}}})
+        self.assertEqual(runtime_module._inbound_message_type(inbound), "post")
+
     def test_telegram_shape_reports_payload_key(self):
         inbound = SimpleNamespace(
             raw={"update_id": 7, "message": {"message_id": 1, "sticker": {"file_id": "s1"}}}
@@ -494,7 +504,8 @@ class LarkRuntimeTests(_LarkRuntimeHarness):
                     "message_id": "om_post",
                     "root_id": "",
                     "chat_id": "oc_chat",
-                    "message_type": "post",
+                    # incident field name: receive events carry msg_type
+                    "msg_type": "post",
                     "content": json.dumps(
                         {
                             "title": "",
@@ -563,6 +574,7 @@ class LarkRuntimeTests(_LarkRuntimeHarness):
         self.assertEqual(len(downloads), 1)
         self.assertEqual(downloads[0]["file_key"], "file_v3_key")
         self.assertEqual(downloads[0]["type"], "file")
+        self.assertEqual(downloads[0]["message_id"], "om_media")
 
     def test_unparseable_inbound_is_ignored_with_degrade_trace(self):
         runtime, api, transport = self._runtime()
