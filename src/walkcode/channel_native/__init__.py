@@ -4751,18 +4751,67 @@ class LarkChannelAdapter:
         except json.JSONDecodeError:
             return content
 
-    @staticmethod
-    def _parse_message_text(content: Any) -> str:
+    @classmethod
+    def _parse_message_text(cls, content: Any) -> str:
         if isinstance(content, dict):
             if "text" in content:
                 return str(content["text"])
+            if isinstance(content.get("content"), list):
+                # post (rich text): the mobile "image + caption" send. Prose
+                # and image keys live nested inside paragraph segments, not in
+                # top-level fields — a flat read would yield "" and get the
+                # message dropped as empty.
+                return cls._parse_post_text(content)
             if "title" in content:
                 return str(content["title"])
             return ""
         return str(content or "")
 
     @staticmethod
-    def _attachments_from_message(message: dict[str, Any], content: Any) -> list[AttachmentRef]:
+    def _post_paragraphs(content: dict[str, Any]) -> list[list[dict[str, Any]]]:
+        """Paragraph rows of a post (rich text) body, defensively typed.
+
+        Post content arrives as ``{"title": ..., "content": [[segment, ...],
+        ...]}`` where each segment is a ``{"tag": ...}`` dict (text / a / at /
+        img / media / emotion / code_block / hr / md).
+        """
+        body = content.get("content")
+        if not isinstance(body, list):
+            return []
+        return [
+            [segment for segment in paragraph if isinstance(segment, dict)]
+            for paragraph in body
+            if isinstance(paragraph, list)
+        ]
+
+    @staticmethod
+    def _post_segment_text(segment: dict[str, Any]) -> str:
+        tag = str(segment.get("tag", "") or "")
+        if tag == "at":
+            name = str(segment.get("user_name", "") or segment.get("user_id", "") or "")
+            return f"@{name}" if name else ""
+        if tag == "a":
+            label = str(segment.get("text", "") or "")
+            href = str(segment.get("href", "") or "")
+            if label and href and label != href:
+                return f"{label} ({href})"
+            return label or href
+        if tag in {"img", "media"}:
+            # Pictures and videos surface as attachments, not prose.
+            return ""
+        # text / md / code_block carry prose in "text"; unknown future tags
+        # degrade to their "text" field instead of vanishing.
+        return str(segment.get("text", "") or "")
+
+    @classmethod
+    def _parse_post_text(cls, content: dict[str, Any]) -> str:
+        lines = [str(content.get("title", "") or "")]
+        for paragraph in cls._post_paragraphs(content):
+            lines.append("".join(cls._post_segment_text(segment) for segment in paragraph))
+        return "\n".join(line for line in lines if line.strip())
+
+    @classmethod
+    def _attachments_from_message(cls, message: dict[str, Any], content: Any) -> list[AttachmentRef]:
         if not isinstance(content, dict):
             return []
         message_id = str(message.get("message_id", ""))
@@ -4788,6 +4837,27 @@ class LarkChannelAdapter:
                         source_message_id=message_id,
                     )
                 )
+        for paragraph in cls._post_paragraphs(content):
+            for segment in paragraph:
+                tag = str(segment.get("tag", "") or "")
+                segment_image_key = str(segment.get("image_key", "") or "")
+                segment_file_key = str(segment.get("file_key", "") or "")
+                if tag == "img" and segment_image_key:
+                    attachments.append(
+                        AttachmentRef(
+                            source_id=segment_image_key,
+                            mime="image/*",
+                            source_message_id=message_id,
+                        )
+                    )
+                elif tag == "media" and segment_file_key:
+                    attachments.append(
+                        AttachmentRef(
+                            source_id=segment_file_key,
+                            mime=str(segment.get("mime_type", "") or ""),
+                            source_message_id=message_id,
+                        )
+                    )
         return attachments
 
     @staticmethod
