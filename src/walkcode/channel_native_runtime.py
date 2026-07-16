@@ -1008,7 +1008,7 @@ class ChannelNativeRuntime:
         if unknown_slash:
             inbound = replace(inbound, text=_telegram_agent_command_text(self.config.agent, inbound.text))
         if _telegram_message_is_empty(inbound):
-            return SubmitResult(True, "empty_message_ignored")
+            return _ignore_empty_inbound(inbound)
         transport_kind = self.config.agent_transport_kind
         inbound = await self._place_telegram_new_session(channel, inbound)
         await self._send_telegram_processing_action(channel, inbound)
@@ -1361,7 +1361,7 @@ class ChannelNativeRuntime:
                     text=raw_text[: len(raw_text) - len(stripped)] + stripped[1:],
                 )
                 if _telegram_message_is_empty(inbound):
-                    return SubmitResult(True, "empty_message_ignored")
+                    return _ignore_empty_inbound(inbound)
                 inbound = await self._place_lark_new_session(channel, inbound)
                 result = await self.orchestrator.handle_inbound_event(
                     inbound,
@@ -1410,7 +1410,7 @@ class ChannelNativeRuntime:
                     inbound, text=_telegram_agent_command_text(self.config.agent, inbound.text)
                 )
             if _telegram_message_is_empty(inbound):
-                return SubmitResult(True, "empty_message_ignored")
+                return _ignore_empty_inbound(inbound)
             inbound = await self._place_lark_new_session(channel, inbound)
         result = await self.orchestrator.handle_inbound_event(
             inbound,
@@ -4738,6 +4738,63 @@ def _telegram_message_is_empty(inbound: Any) -> bool:
     return not str(getattr(inbound, "text", "") or "").strip() and not list(
         getattr(inbound, "attachments", []) or []
     )
+
+
+# One content key per kind in a Telegram message payload; used to name what
+# the parser failed to understand when a message is dropped as empty.
+_TELEGRAM_PAYLOAD_KEYS = (
+    "text",
+    "photo",
+    "document",
+    "sticker",
+    "voice",
+    "audio",
+    "video",
+    "video_note",
+    "animation",
+    "contact",
+    "location",
+    "venue",
+    "poll",
+    "dice",
+)
+
+
+def _inbound_message_type(inbound: Any) -> str:
+    raw = getattr(inbound, "raw", None)
+    if not isinstance(raw, dict):
+        return ""
+    event = raw.get("event") if isinstance(raw.get("event"), dict) else {}
+    message = event.get("message") if isinstance(event.get("message"), dict) else {}
+    lark_type = str(message.get("message_type", "") or message.get("msg_type", "") or "")
+    if lark_type:
+        return lark_type
+    tg_message = raw.get("message") if isinstance(raw.get("message"), dict) else {}
+    for key in _TELEGRAM_PAYLOAD_KEYS:
+        if key in tg_message:
+            return key
+    return ""
+
+
+def _ignore_empty_inbound(inbound: Any) -> SubmitResult:
+    """Confirm-and-drop for messages that parse to no text and no attachments.
+
+    Quiet toward the user (an empty message needs no reply), never toward the
+    operator: a payload the parser doesn't understand also lands here, and
+    without a trace the visible symptom is "the bot ignored me" with no
+    evidence in the ledger, the outbox, or the agent transcript.
+    """
+    from .channel_native import _log_degrade
+
+    _log_degrade(
+        "empty_inbound_ignored",
+        channel=getattr(inbound, "channel_kind", ""),
+        event_id=getattr(inbound, "event_id", ""),
+        chat_id=getattr(inbound, "chat_id", ""),
+        message_id=getattr(inbound, "message_id", ""),
+        message_type=_inbound_message_type(inbound) or "unknown",
+    )
+    return SubmitResult(True, "empty_message_ignored")
 
 
 def _agent_selector_rejected_message(*, configured_agent: str, requested_agent: str) -> str:
