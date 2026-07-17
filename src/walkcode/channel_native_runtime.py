@@ -1902,12 +1902,26 @@ class ChannelNativeRuntime:
                         "WAITING_USER",
                         "INTERRUPTED",
                     }:
+                        if session.background_tasks:
+                            # ADR 0052: an IDLE session can carry a background
+                            # task ledger — but those subagents lived inside
+                            # the previous process's worker and died with it.
+                            # Clear the ledger or the status card shows
+                            # phantom "background running" forever.
+                            session.background_tasks = []
+                            session.last_progress_at = self._now()
+                            session.last_progress_event = "background.abandoned_on_restart"
+                            try:
+                                await self.orchestrator.refresh_session_status_card(session)
+                            except Exception:
+                                pass
                         continue
                     session.status = "stopped"
                     session.lifecycle_state = "STOPPED"
                     session.stop_reason = "runtime_restart"
                     session.writer_lease = None
                     session.writer_owner = WriterOwner(kind="none")
+                    session.background_tasks = []
                     session.last_progress_at = self._now()
                     session.last_progress_event = "orchestrator.runtime_restart_settled"
                     settled += 1
@@ -4241,6 +4255,10 @@ def _build_transports(config: ChannelNativeConfig) -> dict[str, AgentTransport]:
             config_dir=claude_options.get("config_dir"),
             anthropic_base_url=claude_options.get("anthropic_base_url"),
             permission_mode=claude_options.get("permission_mode"),
+            settle_grace_seconds=float(claude_options.get("settle_grace_seconds", 5.0)),
+            background_wait_ceiling_seconds=float(
+                claude_options.get("background_wait_ceiling_seconds", 3600.0)
+            ),
         )
         # Multi-UI sync (ADR 0046): the daemon transport rides alongside the
         # headless one — reply/subscribe against TUI-owned daemon workers.
