@@ -298,6 +298,9 @@ def _health_card(view: dict[str, Any]) -> dict[str, Any]:
     detail_bits = []
     if view.get("lifecycle_state"):
         detail_bits.append(f"**阶段**: {view['lifecycle_state']}")
+    background_tasks = int(view.get("background_tasks", 0) or 0)
+    if background_tasks:
+        detail_bits.append(f"**后台**: {background_tasks} 个任务进行中")
     if view.get("writer_owner"):
         detail_bits.append(f"**写者**: {view['writer_owner']}")
     if view.get("last_progress_event"):

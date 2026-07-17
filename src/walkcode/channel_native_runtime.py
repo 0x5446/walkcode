@@ -4241,6 +4241,10 @@ def _build_transports(config: ChannelNativeConfig) -> dict[str, AgentTransport]:
             config_dir=claude_options.get("config_dir"),
             anthropic_base_url=claude_options.get("anthropic_base_url"),
             permission_mode=claude_options.get("permission_mode"),
+            settle_grace_seconds=float(claude_options.get("settle_grace_seconds", 5.0)),
+            background_wait_ceiling_seconds=float(
+                claude_options.get("background_wait_ceiling_seconds", 3600.0)
+            ),
         )
         # Multi-UI sync (ADR 0046): the daemon transport rides alongside the
         # headless one — reply/subscribe against TUI-owned daemon workers.
