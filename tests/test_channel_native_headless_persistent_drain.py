@@ -264,6 +264,8 @@ class PersistentStreamTests(unittest.TestCase):
             cls = _stream_client_class()
             transport = _transport(cls)
             handle = await transport.launch_session(cwd="/tmp/p", session_id="s1")
+            # Short injection hold: this test asserts ledger accounting only.
+            transport._NOTIFICATION_FOLLOWUP_GRACE = 0.1
             await transport.submit_turn(handle, TurnInput(text="go"), "k1")
             client = transport._clients[handle.handle_id]
             collected: list = []
@@ -314,6 +316,8 @@ class PersistentStreamTests(unittest.TestCase):
             cls = _stream_client_class()
             transport = _transport(cls)
             handle = await transport.launch_session(cwd="/tmp/p", session_id="s1")
+            # Short injection hold: this test asserts ledger accounting only.
+            transport._NOTIFICATION_FOLLOWUP_GRACE = 0.1
             await transport.submit_turn(handle, TurnInput(text="go"), "k1")
             client = transport._clients[handle.handle_id]
             collected: list = []
@@ -692,11 +696,11 @@ class DeepReviewRegressionTests(unittest.TestCase):
         self.assertIn("迟到的完整计划", texts)
 
     def test_settle_race_submit_falls_back_to_resume(self):
-        # handle_is_live() lies (simulating the check passing just before the
-        # listener detached the handle): submit_turn must raise
+        # handle_supports_reuse() lies (simulating the check passing just
+        # before the listener detached the handle): submit_turn must raise
         # TransportUnavailable and the orchestrator must recover via resume.
         class _RacingTransport(ClaudeHeadlessTransport):
-            def handle_is_live(self, handle_id):
+            def handle_supports_reuse(self, handle_id):
                 return True
 
         async def scenario():
@@ -812,6 +816,119 @@ class DeepReviewRegressionTests(unittest.TestCase):
         self.assertEqual(session.status, "stopped")
         self.assertEqual(session.lifecycle_state, "STOPPED")
         self.assertTrue(client.disconnected)
+
+    def test_bare_terminal_task_updated_holds_for_injected_turn(self):
+        # Round-2 Critical: a terminal task_updated (no task_notification at
+        # all) drains the ledger between turns; settle must still wait the
+        # injection window for the CLI's follow-up turn.
+        async def scenario():
+            cls = _stream_client_class()
+            transport = _transport(cls, grace=0.05)
+            handle = await transport.launch_session(cwd="/tmp/p", session_id="s1")
+            transport._NOTIFICATION_FOLLOWUP_GRACE = 1.0
+            await transport.submit_turn(handle, TurnInput(text="go"), "k1")
+            client = transport._clients[handle.handle_id]
+            collected: list = []
+            consumer = asyncio.create_task(_consume(transport, handle, collected))
+            client.feed(_task_started("t1", "研究"))
+            client.feed(_result("稍等"))
+            client.feed(_task_updated("t1", status="completed"))
+            await asyncio.sleep(0.4)
+            self.assertFalse(consumer.done(), "settled before the injected turn despite ledger drain")
+            client.feed(_assistant("task_updated 之后的完整计划"))
+            client.feed(_result("task_updated 之后的完整计划"))
+            await asyncio.wait_for(consumer, timeout=5.0)
+            return collected
+
+        events = asyncio.run(scenario())
+        texts = [e.payload.get("text", "") for e in events if e.type == AgentEventType.TURN_DELTA]
+        self.assertIn("task_updated 之后的完整计划", texts)
+
+    def test_statusless_notification_clears_ledger(self):
+        # A task_notification without a status field still means "this agent
+        # stopped": the ledger entry must clear instead of waiting for the
+        # ceiling to fire a false alarm.
+        active: dict = {}
+        is_task, changed, subtype = ClaudeHeadlessTransport._apply_task_message(
+            _task_started("t1", "研究"), active
+        )
+        self.assertEqual((is_task, changed, subtype), (True, True, "task_started"))
+        is_task, changed, subtype = ClaudeHeadlessTransport._apply_task_message(
+            _sdk_message("TaskNotificationMessage", task_id="t1", status=""), active
+        )
+        self.assertEqual((is_task, changed, subtype), (True, True, "task_notification"))
+        self.assertEqual(active, {})
+
+    def test_legacy_single_turn_client_second_submit_resumes(self):
+        # A legacy client (receive_response only, no receive_messages) has no
+        # session-level listener: the second submit must resume a fresh worker
+        # instead of reusing the stale one.
+        class _LegacyClient:
+            instances: list = []
+
+            def __init__(self, options=None):
+                self.options = options
+                self.queries: list = []
+                type(self).instances.append(self)
+
+            async def connect(self, prompt=None):
+                return None
+
+            async def query(self, prompt, session_id="default"):
+                self.queries.append(prompt)
+
+            async def receive_response(self):
+                yield {"content": [{"type": "text", "text": "legacy reply"}]}
+                yield {"type": "result", "result": "legacy reply", "session_id": "agent-legacy"}
+
+        _LegacyClient.instances = []
+
+        async def scenario():
+            transport = ClaudeHeadlessTransport(sdk_loader=lambda: _make_sdk(_LegacyClient))
+            channel = FakeChannelAdapter(
+                "telegram",
+                ChannelCapabilities(
+                    thread_context=True,
+                    editable_message=True,
+                    interactive_message=True,
+                    interactive_update=True,
+                    private_callback_ack=True,
+                    toast_or_ephemeral_notice=True,
+                    force_reply=True,
+                    attachment_download=True,
+                    forum_or_topic=True,
+                    max_text_chars=4096,
+                    max_callback_payload_bytes=64,
+                ),
+            )
+            orch = Orchestrator(
+                sessions=SessionRegistry(),
+                interactions=InteractionStore(),
+                outbox=DurableOutbox(),
+                channels={"telegram": channel},
+                transports={"claude_headless": transport},
+                authz=AuthorizationStore(),
+                defer_event_drain=True,
+            )
+            owner = ActorRef("telegram", "owner", "Owner")
+            binding = ChannelBinding("telegram", "bot", "chat", "topic", "root")
+            session = await orch.start_session(binding, "claude_headless", "/tmp/p", owner)
+            await orch.submit_user_input(
+                session.session_id, TurnInput(text="one"), actor=owner, generation=session.generation
+            )
+            drains = list(orch._background_event_drains)
+            if drains:
+                await asyncio.wait_for(asyncio.gather(*drains), timeout=5.0)
+            await orch.submit_user_input(
+                session.session_id, TurnInput(text="two"), actor=owner, generation=session.generation
+            )
+            drains = list(orch._background_event_drains)
+            if drains:
+                await asyncio.wait_for(asyncio.gather(*drains), timeout=5.0)
+            return _LegacyClient.instances
+
+        instances = asyncio.run(scenario())
+        self.assertEqual(len(instances), 2, "legacy client must be resumed, not reused")
 
     def test_ceiling_leaves_session_idle_not_error(self):
         async def scenario():

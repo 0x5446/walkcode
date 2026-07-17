@@ -1902,12 +1902,26 @@ class ChannelNativeRuntime:
                         "WAITING_USER",
                         "INTERRUPTED",
                     }:
+                        if session.background_tasks:
+                            # ADR 0052: an IDLE session can carry a background
+                            # task ledger — but those subagents lived inside
+                            # the previous process's worker and died with it.
+                            # Clear the ledger or the status card shows
+                            # phantom "background running" forever.
+                            session.background_tasks = []
+                            session.last_progress_at = self._now()
+                            session.last_progress_event = "background.abandoned_on_restart"
+                            try:
+                                await self.orchestrator.refresh_session_status_card(session)
+                            except Exception:
+                                pass
                         continue
                     session.status = "stopped"
                     session.lifecycle_state = "STOPPED"
                     session.stop_reason = "runtime_restart"
                     session.writer_lease = None
                     session.writer_owner = WriterOwner(kind="none")
+                    session.background_tasks = []
                     session.last_progress_at = self._now()
                     session.last_progress_event = "orchestrator.runtime_restart_settled"
                     settled += 1

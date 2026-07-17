@@ -5445,8 +5445,23 @@ class ClaudeHeadlessTransport:
         note = f"[用户发送了附件，已下载到本地，可用 Read 工具查看]\n{refs}"
         return f"{text}\n\n{note}" if text.strip() else note
 
+    def handle_supports_reuse(self, handle_id: str) -> bool:
+        """True when the handle's worker can accept another turn in place.
+
+        Only session-level (receive_messages) clients qualify: a legacy
+        single-turn client left in the registry must go through resume, or its
+        second turn would be submitted into a worker nobody listens to.
+        """
+        client = self._clients.get(handle_id) if handle_id else None
+        return client is not None and getattr(client, "receive_messages", None) is not None
+
     async def events(self, handle: TransportHandle):
-        client = self._clients[handle.handle_id]
+        client = self._clients.get(handle.handle_id)
+        if client is None:
+            # The worker was closed (settle, shutdown) between the submit and
+            # this drain starting; a typed error lets the caller treat it as
+            # a benign race instead of crashing on KeyError.
+            raise TransportUnavailable("claude headless worker is gone (settled or restarted)")
         bridge = self._bridges.get(handle.handle_id)
         if bridge is not None or getattr(client, "receive_messages", None) is not None:
             # Session-level listener (gated on stream capability, not on the
@@ -5578,9 +5593,27 @@ class ClaudeHeadlessTransport:
                                     )
                                 },
                             )
+                            # Close the synthetic warning turn (same rule as
+                            # the ceiling path) so the ended stream is not
+                            # misread as a mid-turn failure.
+                            yield AgentEvent(AgentEventType.TURN_COMPLETED, {"message": ""})
                             yield AgentEvent(
                                 AgentEventType.BACKGROUND_TASKS,
                                 {"count": 0, "tasks": [], "abandoned": abandoned, "reason": "worker_eof"},
+                            )
+                        elif bridge is not None and bridge.has_any_pending():
+                            # The worker died while a question/permission card
+                            # was still waiting for the human: without a
+                            # visible signal the session parks in WAITING_*
+                            # with a card that can never be answered.
+                            yield AgentEvent(
+                                AgentEventType.SESSION_ERROR,
+                                {
+                                    "message": (
+                                        "代理进程在等待你回答时退出了，上面的卡片已失效；"
+                                        "直接回复即可继续。"
+                                    )
+                                },
                             )
                     break
                 timeout = self._stream_wait_timeout(
@@ -5591,6 +5624,7 @@ class ClaudeHeadlessTransport:
                     quiet_since=quiet_since,
                     injection_hold_until=injection_hold_until,
                 )
+                pending_before_wait = bridge is not None and bridge.has_any_pending()
                 wait_set = {task for task in (msg_task, queue_task) if task is not None}
                 done, _pending = await asyncio.wait(
                     wait_set,
@@ -5604,6 +5638,12 @@ class ClaudeHeadlessTransport:
                         bridge is not None and bridge.has_any_pending()
                     ):
                         continue
+                    if pending_before_wait:
+                        # A human decision resolved during this wait; the time
+                        # spent waiting on the human is not "quiet time" — the
+                        # ceiling/grace clocks restart from the answer.
+                        quiet_since = time.monotonic()
+                        continue
                     if not active_tasks and time.monotonic() < injection_hold_until:
                         # A notification just drained the ledger; its injected
                         # follow-up turn may still be on the way.
@@ -5616,8 +5656,7 @@ class ClaudeHeadlessTransport:
                     if active_tasks:
                         count = len(active_tasks)
                         titles = "、".join(
-                            str(task.get("description") or task.get("task_id") or "?")
-                            for task in list(active_tasks.values())[:3]
+                            self._safe_task_label(task) for task in list(active_tasks.values())[:3]
                         )
                         _log_degrade(
                             "headless_background_wait_ceiling",
@@ -5670,11 +5709,16 @@ class ClaudeHeadlessTransport:
                     message, active_tasks
                 )
                 if is_task_message:
-                    if task_subtype == "task_notification" and not turn_open:
-                        # Between turns, a notification predicts a CLI-injected
-                        # follow-up turn — hold off settle for it. Mid-turn
-                        # notifications don't: the follow-up is the very turn
-                        # that is already streaming.
+                    if not turn_open and (
+                        task_subtype == "task_notification"
+                        or (ledger_changed and not active_tasks)
+                    ):
+                        # Between turns, a notification — or ANY task event
+                        # that just drained the ledger (a bare terminal
+                        # task_updated, an empty background_tasks_changed) —
+                        # predicts a CLI-injected follow-up turn: hold off
+                        # settle for it. Mid-turn events don't: the follow-up
+                        # is the very turn that is already streaming.
                         injection_hold_until = time.monotonic() + max(
                             self.settle_grace_seconds, self._NOTIFICATION_FOLLOWUP_GRACE
                         )
@@ -5728,6 +5772,14 @@ class ClaudeHeadlessTransport:
                 await self._disconnect_client(handle.handle_id, closing_client)
             elif settled or stream_failed:
                 await self._close_handle_client(handle.handle_id)
+
+    @staticmethod
+    def _safe_task_label(task: dict[str, Any]) -> str:
+        """Task descriptions come from the SDK stream, not from WalkCode:
+        flatten whitespace and cap length before embedding them in a
+        system-voiced channel warning."""
+        raw = str(task.get("description") or task.get("task_id") or "?")
+        return re.sub(r"\s+", " ", raw).strip()[:40] or "?"
 
     def _turn_in_flight(self, handle: TransportHandle, turn_open: bool, last_result_at: float) -> bool:
         if turn_open:
@@ -5866,6 +5918,11 @@ class ClaudeHeadlessTransport:
             patch = _field("patch")
             if isinstance(patch, dict):
                 status = str(patch.get("status", "") or "")
+        if not status and subtype == "task_notification":
+            # A notification IS the "this agent stopped" signal; one without a
+            # status field must still settle the ledger entry or the task
+            # lingers until the wait ceiling fires a false alarm.
+            status = "completed"
         if status in cls._TERMINAL_TASK_STATUSES:
             return True, active_tasks.pop(task_id, None) is not None, subtype
         if status in {"running", "pending"} and task_id not in active_tasks:
@@ -5951,10 +6008,14 @@ class ClaudeHeadlessTransport:
         bridge = self._bridges.pop(handle.handle_id, None)
         if bridge is not None:
             bridge.fail_pending_default_deny(reason="shutdown")
-        result = await self._call_client_control(handle, "shutdown", mode, state="stopped")
-        # The real SDK client has no shutdown() control method; disconnecting
-        # here is what actually reaps the worker process instead of leaking it.
-        await self._close_handle_client(handle.handle_id)
+        try:
+            result = await self._call_client_control(handle, "shutdown", mode, state="stopped")
+        finally:
+            # The real SDK client has no shutdown() control method;
+            # disconnecting here is what actually reaps the worker process
+            # instead of leaking it — even when a client-provided shutdown
+            # method raised.
+            await self._close_handle_client(handle.handle_id)
         if not result.accepted and result.reason in {
             BlockedReason.NOT_FOUND,
             BlockedReason.CAPABILITY_DISABLED,
@@ -7747,6 +7808,21 @@ class Orchestrator:
                 await self._drain_events(session, transport, handle)
                 await self.refresh_session_status_card(session)
             except Exception as exc:
+                if (
+                    session.status == "stopped"
+                    or str(session.transport_ref.get("handle_id", "")) != handle.handle_id
+                ):
+                    # The session was closed, taken over, or moved to a fresh
+                    # worker while this listener was still winding down; a
+                    # stale drain's failure must not error-mark the successor.
+                    _log_degrade(
+                        "event_drain_failed_after_replacement",
+                        session_id=session.session_id,
+                        handle_id=handle.handle_id,
+                        error=exc,
+                        drop=True,
+                    )
+                    return
                 session.last_progress_at = self._now()
                 session.last_progress_event = "turn.event_drain_failed"
                 session.lifecycle_state = "ERROR_RECOVERABLE"
@@ -7796,15 +7872,18 @@ class Orchestrator:
         # Persistent-listener reuse: an IDLE headless session whose worker is
         # still alive (listening for background subagents) accepts the next
         # turn directly — resuming here would fork a SECOND process off the
-        # same agent session and orphan the listener.
+        # same agent session and orphan the listener. Only IDLE qualifies:
+        # ERROR_RECOVERABLE means the previous submit or stream broke, and
+        # recovery must go through a fresh worker, not the suspect one.
+        # Legacy single-turn clients never qualify (handle_supports_reuse).
         handle_id = str(session.transport_ref.get("handle_id", ""))
-        handle_is_live = getattr(transport, "handle_is_live", None)
-        if handle_id and callable(handle_is_live):
+        supports_reuse = getattr(transport, "handle_supports_reuse", None)
+        if session.lifecycle_state == "IDLE" and handle_id and callable(supports_reuse):
             try:
-                live = bool(handle_is_live(handle_id))
+                reusable = bool(supports_reuse(handle_id))
             except Exception:
-                live = False
-            if live:
+                reusable = False
+            if reusable:
                 return self.sessions.acquire_structured_writer(
                     session.session_id,
                     transport_kind=session.transport_kind,
@@ -7921,6 +8000,9 @@ class Orchestrator:
         session.stop_reason = reason
         session.writer_lease = None
         session.writer_owner = WriterOwner(kind="none")
+        # The worker (and its subagents) die with the close; a stopped card
+        # must not keep advertising background work.
+        session.background_tasks = []
         await self.refresh_session_status_card(session)
         return ControlResult(True, state="stopped")
 
@@ -9583,12 +9665,18 @@ class Orchestrator:
             if (
                 session.generation != expected_generation
                 or session.transport_kind != expected_transport_kind
+                or session.status == "stopped"
             ):
+                # Ownership fence (generation/transport moved) — and closed
+                # sessions: a shutdown mid-listen still delivers the stream's
+                # tail events (EOF warning, synthetic completion), which must
+                # not flip a STOPPED session's lifecycle back to IDLE/ACTIVE.
                 _log_degrade(
                     "event_drain_ownership_moved",
                     session_id=session.session_id,
                     expected_generation=expected_generation,
                     current_generation=session.generation,
+                    session_status=session.status,
                 )
                 return
             saw_any_event = True

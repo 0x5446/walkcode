@@ -56,6 +56,10 @@ Status: Accepted; implemented
    的竞态保护）∧ 账本空 ∧ bridge 无 pending HITL ∧ 静默满
    `WALKCODE_CLAUDE_SETTLE_GRACE`（默认 5s）→ 关闭并注销 worker client，
    下条消息经 `--resume` 满上下文重连。EOF（进程死亡）同样触发清理。
+   补充窗口：回合间任何**清空账本的终结事件**（notification、裸终结态
+   task_updated、空表 background_tasks_changed）都预示 CLI 会注入后续回合，
+   settle 需额外等一个有界注入窗（内置 30s，取与 grace 的较大值）；有 HITL
+   待答时等待按 60s 有界复查而非无限挂起，答复后静默计时从答复时刻重算。
 4. **硬超时**：账本非空但流上零流量达 `WALKCODE_CLAUDE_BG_WAIT_CEILING`
    （默认 3600s，0 关闭）→ 先发可见警告（"仍有 N 个后台任务无进展，停止
    等待"）再 settle。绝不静默放弃。
