@@ -288,6 +288,9 @@ class PersistentStreamTests(unittest.TestCase):
             cls = _stream_client_class()
             transport = _transport(cls)
             handle = await transport.launch_session(cwd="/tmp/p", session_id="s1")
+            # Keep the injected-turn hold short: this test only asserts ledger
+            # accounting, not the injection window (covered elsewhere).
+            transport._NOTIFICATION_FOLLOWUP_GRACE = 0.1
             await transport.submit_turn(handle, TurnInput(text="go"), "k1")
             client = transport._clients[handle.handle_id]
             collected: list = []
@@ -586,6 +589,285 @@ class OrchestratorPersistentDrainTests(unittest.TestCase):
         self.assertNotEqual(first_handle, second_handle)
         self.assertEqual(len(cls.instances), 2)
         self.assertTrue(any("resumed answer" in text for text in self._sent_texts(channel)))
+
+
+class DeepReviewRegressionTests(unittest.TestCase):
+    """Fixes adopted from the v0.14.0 deep-review round (all VERIFIED)."""
+
+    def test_dict_user_message_is_not_echoed_as_agent_text(self):
+        converted = ClaudeHeadlessTransport._convert_sdk_message(
+            {"type": "user", "role": "user", "content": "<task-notification>t1</task-notification>"}
+        )
+        events = converted if isinstance(converted, list) else ([] if converted is None else [converted])
+        self.assertFalse(
+            any(e.type == AgentEventType.TURN_DELTA for e in events),
+            f"dict user message leaked as agent text: {events}",
+        )
+
+    def test_submit_failure_clears_pending_turn_marker(self):
+        class _BrokenQueryClient(_stream_client_class()):
+            async def query(self, prompt, session_id="default"):
+                raise RuntimeError("submit boom")
+
+        async def scenario():
+            transport = ClaudeHeadlessTransport(sdk_loader=lambda: _make_sdk(_BrokenQueryClient))
+            handle = await transport.launch_session(cwd="/tmp/p", session_id="s1")
+            with self.assertRaises(RuntimeError):
+                await transport.submit_turn(handle, TurnInput(text="hi"), "k1")
+            # A failed submit must not leave a "turn in flight" marker that
+            # blocks settle forever.
+            self.assertNotIn(handle.handle_id, transport._last_submit_at)
+
+        asyncio.run(scenario())
+
+    def test_stream_exception_unregisters_broken_worker(self):
+        class _ExplodingStreamClient(_stream_client_class()):
+            async def receive_messages(self):
+                yield _assistant("ok")
+                raise RuntimeError("stream boom")
+
+        async def scenario():
+            transport = _transport(_ExplodingStreamClient)
+            handle = await transport.launch_session(cwd="/tmp/p", session_id="s1")
+            await transport.submit_turn(handle, TurnInput(text="go"), "k1")
+            collected: list = []
+            with self.assertRaises(RuntimeError):
+                await _consume(transport, handle, collected)
+            # The broken worker must be unregistered so the next submit
+            # resumes a fresh process instead of reusing the dead connection.
+            self.assertFalse(transport.handle_is_live(handle.handle_id))
+
+        asyncio.run(scenario())
+
+    def test_worker_eof_with_pending_tasks_warns_and_clears_ledger(self):
+        async def scenario():
+            cls = _stream_client_class()
+            transport = _transport(cls, grace=5.0)
+            handle = await transport.launch_session(cwd="/tmp/p", session_id="s1")
+            await transport.submit_turn(handle, TurnInput(text="go"), "k1")
+            client = transport._clients[handle.handle_id]
+            collected: list = []
+            consumer = asyncio.create_task(_consume(transport, handle, collected))
+            client.feed(_task_started("t1", "研究"))
+            client.feed(_result("稍等"))
+            client.feed_eof()
+            await asyncio.wait_for(consumer, timeout=5.0)
+            return transport, handle, collected
+
+        transport, handle, events = asyncio.run(scenario())
+        texts = [e.payload.get("text", "") for e in events if e.type == AgentEventType.TURN_DELTA]
+        self.assertTrue(any("后台任务未完成" in text for text in texts), texts)
+        ledger = [e for e in events if e.type == AgentEventType.BACKGROUND_TASKS]
+        self.assertEqual(ledger[-1].payload["count"], 0)
+        self.assertEqual(ledger[-1].payload.get("abandoned"), 1)
+        self.assertFalse(transport.handle_is_live(handle.handle_id))
+
+    def test_notification_before_slow_injected_turn_does_not_settle(self):
+        # A terminal task_notification empties the ledger, but the CLI's
+        # injected follow-up turn may land later than the settle grace; the
+        # listener must hold on for the bounded injection window.
+        async def scenario():
+            cls = _stream_client_class()
+            transport = _transport(cls, grace=0.05)
+            handle = await transport.launch_session(cwd="/tmp/p", session_id="s1")
+            transport._NOTIFICATION_FOLLOWUP_GRACE = 1.0
+            await transport.submit_turn(handle, TurnInput(text="go"), "k1")
+            client = transport._clients[handle.handle_id]
+            collected: list = []
+            consumer = asyncio.create_task(_consume(transport, handle, collected))
+            client.feed(_task_started("t1", "研究"))
+            client.feed(_result("稍等"))
+            client.feed(_task_notification("t1", "completed"))
+            # Well past the settle grace, still inside the injection window.
+            await asyncio.sleep(0.4)
+            self.assertFalse(consumer.done(), "listener settled before the injected turn arrived")
+            client.feed(_user("<task-notification><task-id>t1</task-id></task-notification>"))
+            client.feed(_assistant("迟到的完整计划"))
+            client.feed(_result("迟到的完整计划"))
+            await asyncio.wait_for(consumer, timeout=5.0)
+            return collected
+
+        events = asyncio.run(scenario())
+        texts = [e.payload.get("text", "") for e in events if e.type == AgentEventType.TURN_DELTA]
+        self.assertIn("迟到的完整计划", texts)
+
+    def test_settle_race_submit_falls_back_to_resume(self):
+        # handle_is_live() lies (simulating the check passing just before the
+        # listener detached the handle): submit_turn must raise
+        # TransportUnavailable and the orchestrator must recover via resume.
+        class _RacingTransport(ClaudeHeadlessTransport):
+            def handle_is_live(self, handle_id):
+                return True
+
+        async def scenario():
+            cls = _stream_client_class()
+            transport = _RacingTransport(
+                sdk_loader=lambda: _make_sdk(cls),
+                settle_grace_seconds=0.05,
+                background_wait_ceiling_seconds=30.0,
+            )
+            channel = FakeChannelAdapter(
+                "telegram",
+                ChannelCapabilities(
+                    thread_context=True,
+                    editable_message=True,
+                    interactive_message=True,
+                    interactive_update=True,
+                    private_callback_ack=True,
+                    toast_or_ephemeral_notice=True,
+                    force_reply=True,
+                    attachment_download=True,
+                    forum_or_topic=True,
+                    max_text_chars=4096,
+                    max_callback_payload_bytes=64,
+                ),
+            )
+            orch = Orchestrator(
+                sessions=SessionRegistry(),
+                interactions=InteractionStore(),
+                outbox=DurableOutbox(),
+                channels={"telegram": channel},
+                transports={"claude_headless": transport},
+                authz=AuthorizationStore(),
+                defer_event_drain=True,
+            )
+            owner = ActorRef("telegram", "owner", "Owner")
+            binding = ChannelBinding("telegram", "bot", "chat", "topic", "root")
+            session = await orch.start_session(binding, "claude_headless", "/tmp/p", owner)
+            await orch.submit_user_input(
+                session.session_id, TurnInput(text="one"), actor=owner, generation=session.generation
+            )
+            client = transport._clients[session.transport_ref["handle_id"]]
+            client.feed(_assistant("first"))
+            client.feed(_result("first", session_id="agent-1"))
+            # Let the listener settle so the old handle is really gone while
+            # handle_is_live keeps claiming it is alive.
+            await _wait_until(lambda: not transport._clients)
+            result = await orch.submit_user_input(
+                session.session_id, TurnInput(text="two"), actor=owner, generation=session.generation
+            )
+            new_client = transport._clients[session.transport_ref["handle_id"]]
+            new_client.feed(_assistant("recovered"))
+            new_client.feed(_result("recovered", session_id="agent-1"))
+            drains = list(orch._background_event_drains)
+            if drains:
+                await asyncio.wait_for(asyncio.gather(*drains), timeout=5.0)
+            return cls, result
+
+        cls, result = asyncio.run(scenario())
+        self.assertTrue(result.accepted)
+        self.assertEqual(len(cls.instances), 2)
+
+    def test_close_session_marks_stopped_with_sdk_shaped_client(self):
+        # The real SDK client has no shutdown() control method; closing the
+        # session must still succeed and mark it stopped.
+        async def scenario():
+            cls = _stream_client_class()
+            transport = _transport(cls, grace=5.0)
+            channel = FakeChannelAdapter(
+                "telegram",
+                ChannelCapabilities(
+                    thread_context=True,
+                    editable_message=True,
+                    interactive_message=True,
+                    interactive_update=True,
+                    private_callback_ack=True,
+                    toast_or_ephemeral_notice=True,
+                    force_reply=True,
+                    attachment_download=True,
+                    forum_or_topic=True,
+                    max_text_chars=4096,
+                    max_callback_payload_bytes=64,
+                ),
+            )
+            orch = Orchestrator(
+                sessions=SessionRegistry(),
+                interactions=InteractionStore(),
+                outbox=DurableOutbox(),
+                channels={"telegram": channel},
+                transports={"claude_headless": transport},
+                defer_event_drain=True,
+            )
+            owner = ActorRef("telegram", "owner", "Owner")
+            binding = ChannelBinding("telegram", "bot", "chat", "topic", "root")
+            session = await orch.start_session(binding, "claude_headless", "/tmp/p", owner)
+            await orch.submit_user_input(
+                session.session_id, TurnInput(text="one"), actor=owner, generation=session.generation
+            )
+            client = transport._clients[session.transport_ref["handle_id"]]
+            client.feed(_assistant("hi"))
+            client.feed(_result("hi", session_id="agent-1"))
+            await _wait_until(lambda: session.lifecycle_state == "IDLE")
+            result = await orch.close_session(
+                session.session_id, actor=owner, reason="user_requested"
+            )
+            client.feed_eof()
+            drains = list(orch._background_event_drains)
+            if drains:
+                await asyncio.wait_for(asyncio.gather(*drains), timeout=5.0)
+            return result, session, client
+
+        result, session, client = asyncio.run(scenario())
+        self.assertTrue(result.accepted)
+        self.assertEqual(session.status, "stopped")
+        self.assertEqual(session.lifecycle_state, "STOPPED")
+        self.assertTrue(client.disconnected)
+
+    def test_ceiling_leaves_session_idle_not_error(self):
+        async def scenario():
+            cls = _stream_client_class()
+            transport = _transport(cls, grace=0.05, ceiling=0.3)
+            channel = FakeChannelAdapter(
+                "telegram",
+                ChannelCapabilities(
+                    thread_context=True,
+                    editable_message=True,
+                    interactive_message=True,
+                    interactive_update=True,
+                    private_callback_ack=True,
+                    toast_or_ephemeral_notice=True,
+                    force_reply=True,
+                    attachment_download=True,
+                    forum_or_topic=True,
+                    max_text_chars=4096,
+                    max_callback_payload_bytes=64,
+                ),
+            )
+            orch = Orchestrator(
+                sessions=SessionRegistry(),
+                interactions=InteractionStore(),
+                outbox=DurableOutbox(),
+                channels={"telegram": channel},
+                transports={"claude_headless": transport},
+                authz=AuthorizationStore(),
+                defer_event_drain=True,
+            )
+            owner = ActorRef("telegram", "owner", "Owner")
+            binding = ChannelBinding("telegram", "bot", "chat", "topic", "root")
+            session = await orch.start_session(binding, "claude_headless", "/tmp/p", owner)
+            await orch.submit_user_input(
+                session.session_id, TurnInput(text="go"), actor=owner, generation=session.generation
+            )
+            client = transport._clients[session.transport_ref["handle_id"]]
+            client.feed(_assistant("稍等"))
+            client.feed(_task_started("t1", "永不回来的调研"))
+            client.feed(_result("稍等", session_id="agent-1"))
+            drains = list(orch._background_event_drains)
+            if drains:
+                await asyncio.wait_for(asyncio.gather(*drains), timeout=10.0)
+            texts = []
+            for item in channel.sent_views:
+                view = item.get("view", {})
+                if view.get("type") in {"turn_delta", "turn_completed"}:
+                    texts.append(str(view.get("text") or view.get("message") or ""))
+            return session, texts
+
+        session, texts = asyncio.run(scenario())
+        # The ceiling is a deliberate settle, not a broken stream: the session
+        # must end IDLE with an empty ledger and a visible warning.
+        self.assertEqual(session.lifecycle_state, "IDLE")
+        self.assertEqual(session.background_tasks, [])
+        self.assertTrue(any("后台任务等待超时" in text for text in texts), texts)
 
 
 class HeadlessSettleConfigTests(unittest.TestCase):

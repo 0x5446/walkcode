@@ -5341,24 +5341,53 @@ class ClaudeHeadlessTransport:
         """True while this handle's worker client is still attached."""
         return bool(handle_id) and handle_id in self._clients
 
-    async def _close_handle_client(self, handle_id: str) -> None:
+    def _unregister_handle(self, handle_id: str) -> tuple[Any, Any]:
+        """Synchronously detach a handle from all registries.
+
+        Must stay await-free: the settle path calls this at the decision point
+        so a concurrent submit immediately sees handle_is_live() == False and
+        raises TransportUnavailable (triggering the resume fallback) instead of
+        writing into a worker that is about to be disconnected.
+        """
         client = self._clients.pop(handle_id, None)
         bridge = self._bridges.pop(handle_id, None)
         self._last_submit_at.pop(handle_id, None)
         for session_id, mapped in list(self._session_handles.items()):
             if mapped == handle_id:
                 self._session_handles.pop(session_id, None)
-        if bridge is not None:
-            bridge.fail_pending_default_deny(reason="worker_closed")
+        return client, bridge
+
+    async def _disconnect_client(self, handle_id: str, client: Any) -> None:
         if client is None:
             return
         for method_name in ("disconnect", "stop", "close"):
             method = getattr(client, method_name, None)
             if method is None:
                 continue
-            with contextlib.suppress(Exception):
+            try:
                 await _maybe_await(method())
-            return
+                return
+            except Exception as exc:
+                # Keep trying the remaining close methods; a swallowed failure
+                # here would leave an invisible zombie process.
+                _log_degrade(
+                    "headless_worker_close_failed",
+                    handle_id=handle_id,
+                    method=method_name,
+                    error=exc,
+                    fallback="try_next_close_method",
+                )
+        _log_degrade(
+            "headless_worker_close_exhausted",
+            handle_id=handle_id,
+            drop=True,
+        )
+
+    async def _close_handle_client(self, handle_id: str) -> None:
+        client, bridge = self._unregister_handle(handle_id)
+        if bridge is not None:
+            bridge.fail_pending_default_deny(reason="worker_closed")
+        await self._disconnect_client(handle_id, client)
 
     async def submit_turn(
         self,
@@ -5372,23 +5401,35 @@ class ClaudeHeadlessTransport:
             # between the caller's liveness check and this submit. Raising the
             # typed error lets the orchestrator fall back to a fresh resume.
             raise TransportUnavailable("claude headless worker is gone (settled or restarted)")
+        previous_submit_at = self._last_submit_at.get(handle.handle_id)
         self._last_submit_at[handle.handle_id] = time.monotonic()
-        submit = getattr(client, "submit", None)
-        if submit is not None:
-            await _maybe_await(submit(turn))
-            return
-
-        query = getattr(client, "query", None)
-        if query is None:
-            raise CapabilityUnsupported("Claude headless turn submission is not available")
-        # query(text) has no attachment channel, so downloaded files are named
-        # by absolute path in the prompt for Claude to open with Read. Without
-        # this an attachment-only message reaches Claude as empty text.
-        text = self._compose_turn_text(turn)
         try:
-            await _maybe_await(query(text, session_id="default"))
-        except TypeError:
-            await _maybe_await(query(text))
+            submit = getattr(client, "submit", None)
+            if submit is not None:
+                await _maybe_await(submit(turn))
+                return
+
+            query = getattr(client, "query", None)
+            if query is None:
+                raise CapabilityUnsupported("Claude headless turn submission is not available")
+            # query(text) has no attachment channel, so downloaded files are
+            # named by absolute path in the prompt for Claude to open with
+            # Read. Without this an attachment-only message reaches Claude as
+            # empty text.
+            text = self._compose_turn_text(turn)
+            try:
+                await _maybe_await(query(text, session_id="default"))
+            except TypeError:
+                await _maybe_await(query(text))
+        except BaseException:
+            # A failed submit must not leave a "turn in flight" marker behind:
+            # the persistent listener would wait for a turn that never started
+            # and never settle.
+            if previous_submit_at is None:
+                self._last_submit_at.pop(handle.handle_id, None)
+            else:
+                self._last_submit_at[handle.handle_id] = previous_submit_at
+            raise
 
     @staticmethod
     def _compose_turn_text(turn: TurnInput) -> str:
@@ -5407,15 +5448,18 @@ class ClaudeHeadlessTransport:
     async def events(self, handle: TransportHandle):
         client = self._clients[handle.handle_id]
         bridge = self._bridges.get(handle.handle_id)
-        if bridge is not None:
-            # can_use_tool bridging is active: stream events so mid-turn
-            # permission / AskUserQuestion cards float before the turn ends.
-            # The returned async iterator is a session-level listener: it does
-            # NOT stop at the first turn's result — background subagents keep
-            # opening new turns (task notifications), and their messages must
-            # reach the channel. It ends only when the session settles (no open
-            # turn, task ledger empty, no pending HITL, quiet grace elapsed),
-            # when the background-wait ceiling fires, or when the worker dies.
+        if bridge is not None or getattr(client, "receive_messages", None) is not None:
+            # Session-level listener (gated on stream capability, not on the
+            # permission bridge — a bridge-less client with receive_messages
+            # must not fall into the collect-until-EOF path below, which would
+            # hang on a persistent stream). With a bridge, mid-turn permission
+            # / AskUserQuestion cards float before the turn ends. The stream
+            # does NOT stop at the first turn's result — background subagents
+            # keep opening new turns (task notifications), and their messages
+            # must reach the channel. It ends only when the session settles
+            # (no open turn, task ledger empty, no pending HITL, quiet grace
+            # elapsed), when the background-wait ceiling fires, or when the
+            # worker dies.
             return self._bridged_event_stream(handle, client, bridge)
 
         events = getattr(client, "events", None)
@@ -5425,8 +5469,6 @@ class ClaudeHeadlessTransport:
 
         receiver = getattr(client, "receive_response", None)
         if receiver is None:
-            receiver = getattr(client, "receive_messages", None)
-        if receiver is None:
             raise CapabilityUnsupported("Claude headless event stream is not available")
 
         sdk_messages = await self._collect_client_items(receiver())
@@ -5435,7 +5477,21 @@ class ClaudeHeadlessTransport:
             converted.extend(self._convert_sdk_message_to_events(message))
         return converted
 
-    async def _bridged_event_stream(self, handle: TransportHandle, client: Any, bridge: _ClaudePermissionBridge):
+    # A terminal task_notification predicts a CLI-injected follow-up turn; the
+    # listener must not settle before the injection had a fair chance to land
+    # (bounded, so a notification with no follow-up cannot hang the stream).
+    _NOTIFICATION_FOLLOWUP_GRACE = 30.0
+    # With a HITL decision pending the wait is bounded to this recheck period
+    # instead of infinite: a resolve() only completes a Future and does not
+    # wake the stream, so the loop must re-derive its state periodically.
+    _PENDING_DECISION_RECHECK_SECONDS = 60.0
+
+    async def _bridged_event_stream(
+        self,
+        handle: TransportHandle,
+        client: Any,
+        bridge: _ClaudePermissionBridge | None,
+    ):
         """Yield SDK events while concurrently floating bridge permission events.
 
         The SDK message stream and the bridge's permission queue are awaited
@@ -5474,22 +5530,58 @@ class ClaudeHeadlessTransport:
             raise CapabilityUnsupported("Claude headless event stream is not available")
         stream_iter = receiver().__aiter__()
         msg_task: asyncio.Future | None = asyncio.ensure_future(stream_iter.__anext__())
-        queue_task: asyncio.Future = asyncio.ensure_future(bridge.next_event())
+        queue_task: asyncio.Future | None = (
+            asyncio.ensure_future(bridge.next_event()) if bridge is not None else None
+        )
         active_tasks: dict[str, dict[str, Any]] = {}
         turn_open = True
         last_result_at = float("-inf")
         # Base for the background-wait ceiling: reset by any stream traffic.
         quiet_since = time.monotonic()
+        # Non-zero after a terminal task_notification: hold off settle until
+        # the CLI-injected follow-up turn had a fair chance to appear.
+        injection_hold_until = 0.0
         settled = False
+        stream_failed = False
+        # (client, bridge) captured by the synchronous unregister at the settle
+        # decision point; disconnected in finally.
+        closing: tuple[Any, Any] | None = None
         try:
             while True:
                 if msg_task is None:
                     # SDK stream is exhausted (worker exited, or a legacy
                     # single-turn receiver finished). Flush any residual
                     # floated permission events, then stop.
-                    for event in bridge.drain_ready_events():
-                        yield event
+                    if bridge is not None:
+                        for event in bridge.drain_ready_events():
+                            yield event
                     settled = persistent
+                    if persistent:
+                        closing = self._unregister_handle(handle.handle_id)
+                        if active_tasks:
+                            # The worker died with subagents still on the books:
+                            # say so visibly and clear the session ledger, or
+                            # the status card would show phantom background
+                            # work forever.
+                            abandoned = len(active_tasks)
+                            _log_degrade(
+                                "headless_worker_eof_with_background_tasks",
+                                handle_id=handle.handle_id,
+                                pending_tasks=abandoned,
+                            )
+                            yield AgentEvent(
+                                AgentEventType.TURN_DELTA,
+                                {
+                                    "text": (
+                                        f"⚠️ 代理进程已退出，仍有 {abandoned} 个后台任务未完成，"
+                                        "它们的结果不会自动送达。你可以直接回复继续对话。"
+                                    )
+                                },
+                            )
+                            yield AgentEvent(
+                                AgentEventType.BACKGROUND_TASKS,
+                                {"count": 0, "tasks": [], "abandoned": abandoned, "reason": "worker_eof"},
+                            )
                     break
                 timeout = self._stream_wait_timeout(
                     persistent=persistent,
@@ -5497,17 +5589,30 @@ class ClaudeHeadlessTransport:
                     active_tasks=active_tasks,
                     bridge=bridge,
                     quiet_since=quiet_since,
+                    injection_hold_until=injection_hold_until,
                 )
+                wait_set = {task for task in (msg_task, queue_task) if task is not None}
                 done, _pending = await asyncio.wait(
-                    {msg_task, queue_task},
+                    wait_set,
                     return_when=asyncio.FIRST_COMPLETED,
                     timeout=timeout,
                 )
                 if not done:
                     # Quiet period elapsed. Re-derive the state (a submit may
                     # have raced in) and either settle or fire the ceiling.
-                    if self._turn_in_flight(handle, turn_open, last_result_at) or bridge.has_any_pending():
+                    if self._turn_in_flight(handle, turn_open, last_result_at) or (
+                        bridge is not None and bridge.has_any_pending()
+                    ):
                         continue
+                    if not active_tasks and time.monotonic() < injection_hold_until:
+                        # A notification just drained the ledger; its injected
+                        # follow-up turn may still be on the way.
+                        continue
+                    # Point of no return: detach the handle synchronously
+                    # BEFORE any further await/yield, so a racing submit gets
+                    # TransportUnavailable (and the resume fallback) instead of
+                    # writing into a worker that is about to close.
+                    closing = self._unregister_handle(handle.handle_id)
                     if active_tasks:
                         count = len(active_tasks)
                         titles = "、".join(
@@ -5531,13 +5636,17 @@ class ClaudeHeadlessTransport:
                                 )
                             },
                         )
+                        # Close the synthetic warning turn so the drain does
+                        # not read the ended stream as a mid-turn failure and
+                        # flip the session to ERROR_RECOVERABLE.
+                        yield AgentEvent(AgentEventType.TURN_COMPLETED, {"message": ""})
                         yield AgentEvent(
                             AgentEventType.BACKGROUND_TASKS,
                             {"count": 0, "tasks": [], "abandoned": count},
                         )
                     settled = True
                     break
-                if queue_task in done:
+                if queue_task is not None and queue_task in done:
                     floated = queue_task.result()
                     queue_task = asyncio.ensure_future(bridge.next_event())
                     if floated is not None:
@@ -5548,10 +5657,27 @@ class ClaudeHeadlessTransport:
                 except StopAsyncIteration:
                     msg_task = None
                     continue
+                except Exception:
+                    # A broken stream means a broken worker: unregister it so
+                    # the next submit resumes a fresh process instead of
+                    # reusing the dead connection, then let the drain runner
+                    # surface the error.
+                    stream_failed = True
+                    raise
                 msg_task = asyncio.ensure_future(stream_iter.__anext__())
                 quiet_since = time.monotonic()
-                is_task_message, ledger_changed = self._apply_task_message(message, active_tasks)
+                is_task_message, ledger_changed, task_subtype = self._apply_task_message(
+                    message, active_tasks
+                )
                 if is_task_message:
+                    if task_subtype == "task_notification" and not turn_open:
+                        # Between turns, a notification predicts a CLI-injected
+                        # follow-up turn — hold off settle for it. Mid-turn
+                        # notifications don't: the follow-up is the very turn
+                        # that is already streaming.
+                        injection_hold_until = time.monotonic() + max(
+                            self.settle_grace_seconds, self._NOTIFICATION_FOLLOWUP_GRACE
+                        )
                     # Every ledger beat (including task_progress no-ops) is
                     # surfaced: it refreshes session liveness and the status
                     # card's "空闲（后台 N 个任务）" line without channel text.
@@ -5576,8 +5702,13 @@ class ClaudeHeadlessTransport:
                     # comes and the worker would never settle.
                     turn_open = False
                     last_result_at = time.monotonic()
+                    # A completed turn IS the follow-up the hold was waiting
+                    # for (or supersedes it); keeping the hold would only
+                    # delay settle.
+                    injection_hold_until = 0.0
                 elif events or self._is_turn_traffic(message):
                     turn_open = True
+                    injection_hold_until = 0.0
         finally:
             for task in (msg_task, queue_task):
                 if task is not None and not task.done():
@@ -5586,12 +5717,16 @@ class ClaudeHeadlessTransport:
                         await task
             # Fail-safe: unblock any callback still awaiting a decision so the
             # SDK's spawned task returns (deny) instead of leaking.
-            bridge.fail_pending_default_deny()
-            if settled:
-                # Off duty: no open turn, no background work, nothing pending
-                # (or the worker already exited). Close and unregister the
-                # worker so the process is reclaimed; the next user message
-                # resumes it via --resume with full context.
+            if bridge is not None:
+                bridge.fail_pending_default_deny()
+            if closing is not None:
+                # Off duty: the handle was already detached at the decision
+                # point; only the process disconnect remains.
+                closing_client, closing_bridge = closing
+                if closing_bridge is not None:
+                    closing_bridge.fail_pending_default_deny(reason="worker_closed")
+                await self._disconnect_client(handle.handle_id, closing_client)
+            elif settled or stream_failed:
                 await self._close_handle_client(handle.handle_id)
 
     def _turn_in_flight(self, handle: TransportHandle, turn_open: bool, last_result_at: float) -> bool:
@@ -5607,21 +5742,27 @@ class ClaudeHeadlessTransport:
         persistent: bool,
         turn_open: bool,
         active_tasks: dict[str, dict[str, Any]],
-        bridge: _ClaudePermissionBridge,
+        bridge: _ClaudePermissionBridge | None,
         quiet_since: float,
+        injection_hold_until: float = 0.0,
     ) -> float | None:
         """How long the next stream wait may block before a settle check.
 
-        None means wait indefinitely: mid-turn silence (long tool runs,
-        thinking) and pending human decisions have their own watchdogs and must
-        not be second-guessed here.
+        None means wait indefinitely — only for mid-turn silence (long tool
+        runs, thinking), which has its own health watchdog. A pending human
+        decision waits in bounded rechecks instead: resolve() completes a
+        Future without waking this loop, so an infinite wait could outlive the
+        answer and freeze the ceiling clock.
         """
         if not persistent:
             return None
-        if turn_open or bridge.has_any_pending():
+        if turn_open:
             return None
+        if bridge is not None and bridge.has_any_pending():
+            return self._PENDING_DECISION_RECHECK_SECONDS
         if not active_tasks:
-            return max(self.settle_grace_seconds, 0.1)
+            hold = injection_hold_until - time.monotonic()
+            return max(self.settle_grace_seconds, hold, 0.1)
         if self.background_wait_ceiling_seconds <= 0:
             return None
         remaining = self.background_wait_ceiling_seconds - (time.monotonic() - quiet_since)
@@ -5640,11 +5781,11 @@ class ClaudeHeadlessTransport:
         cls,
         message: Any,
         active_tasks: dict[str, dict[str, Any]],
-    ) -> tuple[bool, bool]:
+    ) -> tuple[bool, bool, str]:
         """Fold a background-task lifecycle message into the ledger.
 
-        Returns (is_task_message, ledger_changed). Rules verified against
-        claude-agent-sdk 0.2.x + CLI 2.1.x:
+        Returns (is_task_message, ledger_changed, subtype). Rules verified
+        against claude-agent-sdk 0.2.x + CLI 2.1.x:
 
         - task_started adds; task_notification OR task_updated with a terminal
           status (completed/failed/stopped/killed) removes — not every
@@ -5660,9 +5801,12 @@ class ClaudeHeadlessTransport:
         data: Any = None
         if isinstance(message, dict):
             if str(message.get("type", "")) != "system":
-                return False, False
+                return False, False, ""
             subtype = str(message.get("subtype", "") or "")
-            data = message
+            # Dict-shaped system messages may nest their payload under "data"
+            # (raw stream shape); merge so _field sees both layouts.
+            nested = message.get("data")
+            data = {**message, **nested} if isinstance(nested, dict) else message
         else:
             class_name = message.__class__.__name__
             if class_name == "TaskStartedMessage":
@@ -5677,11 +5821,11 @@ class ClaudeHeadlessTransport:
                 subtype = str(getattr(message, "subtype", "") or "")
                 data = getattr(message, "data", None)
             if subtype not in cls._TASK_SYSTEM_SUBTYPES:
-                return False, False
+                return False, False, ""
             if data is None:
                 data = message
         if subtype not in cls._TASK_SYSTEM_SUBTYPES:
-            return False, False
+            return False, False, ""
 
         def _field(name: str) -> Any:
             if isinstance(data, dict):
@@ -5691,7 +5835,7 @@ class ClaudeHeadlessTransport:
         if subtype == "background_tasks_changed":
             tasks_field = _field("tasks")
             if not isinstance(tasks_field, list):
-                return True, False
+                return True, False, subtype
             rebuilt: dict[str, dict[str, Any]] = {}
             for entry in tasks_field:
                 if isinstance(entry, dict) and entry.get("task_id"):
@@ -5703,34 +5847,34 @@ class ClaudeHeadlessTransport:
             changed = set(rebuilt) != set(active_tasks)
             active_tasks.clear()
             active_tasks.update(rebuilt)
-            return True, changed
+            return True, changed, subtype
 
         task_id = str(_field("task_id") or "")
         if not task_id:
-            return True, False
+            return True, False, subtype
         if subtype == "task_started":
             changed = task_id not in active_tasks
             active_tasks[task_id] = {
                 "task_id": task_id,
                 "description": str(_field("description") or ""),
             }
-            return True, changed
+            return True, changed, subtype
         if subtype == "task_progress":
-            return True, False
+            return True, False, subtype
         status = str(_field("status") or "")
         if not status and subtype == "task_updated":
             patch = _field("patch")
             if isinstance(patch, dict):
                 status = str(patch.get("status", "") or "")
         if status in cls._TERMINAL_TASK_STATUSES:
-            return True, active_tasks.pop(task_id, None) is not None
+            return True, active_tasks.pop(task_id, None) is not None, subtype
         if status in {"running", "pending"} and task_id not in active_tasks:
             active_tasks[task_id] = {
                 "task_id": task_id,
                 "description": str(_field("description") or ""),
             }
-            return True, True
-        return True, False
+            return True, True, subtype
+        return True, False, subtype
 
     @staticmethod
     def _is_turn_traffic(message: Any) -> bool:
@@ -5811,6 +5955,16 @@ class ClaudeHeadlessTransport:
         # The real SDK client has no shutdown() control method; disconnecting
         # here is what actually reaps the worker process instead of leaking it.
         await self._close_handle_client(handle.handle_id)
+        if not result.accepted and result.reason in {
+            BlockedReason.NOT_FOUND,
+            BlockedReason.CAPABILITY_DISABLED,
+        }:
+            # Idempotent close: the worker is gone (already settled, or the
+            # real SDK client simply has no shutdown() control method) and the
+            # disconnect above did the actual work. Reporting failure here
+            # would leave close_session() unable to mark the session stopped —
+            # "process dead, session forever running".
+            return ControlResult(True, state="stopped")
         return result
 
     async def set_model(self, handle: TransportHandle, model: str) -> ControlResult:
@@ -6119,7 +6273,7 @@ class ClaudeHeadlessTransport:
         if "content" in message and not tool_block_message:
             events = cls._extract_sdk_tool_events(message.get("content"))
         text = "" if tool_block_message else cls._extract_sdk_text(message.get("content"))
-        if text:
+        if text and not cls._is_user_role_message(message):
             events.append(AgentEvent(AgentEventType.TURN_DELTA, {"text": text}))
         if "result" in message or message.get("type") == "result":
             payload: dict[str, Any] = {"message": str(message.get("result", ""))}
@@ -6136,6 +6290,14 @@ class ClaudeHeadlessTransport:
 
     @staticmethod
     def _is_user_role_message(message: Any) -> bool:
+        if isinstance(message, dict):
+            # Dict-shaped stream messages mark the role as "role" or "type";
+            # both must be filtered or injected <task-notification> turns leak
+            # to the channel as agent text.
+            return "user" in {
+                str(message.get("role", "") or ""),
+                str(message.get("type", "") or ""),
+            }
         if message.__class__.__name__ == "UserMessage":
             return True
         return str(getattr(message, "role", "") or "") == "user"
@@ -7981,8 +8143,15 @@ class Orchestrator:
         if message_id and channel.capabilities().editable_message:
             try:
                 edited = await channel.edit_view(binding, message_id, view)
-            except Exception:
+            except Exception as exc:
                 edited = False
+                _log_degrade(
+                    "status_card_edit_failed",
+                    session_id=session.session_id,
+                    message_id=message_id,
+                    error=exc,
+                    fallback="send_new_card",
+                )
             if edited:
                 self._status_card_fingerprints[session.session_id] = fingerprint
                 await self._sync_readonly_topic_state(session)
@@ -7990,7 +8159,16 @@ class Orchestrator:
             binding.health_message_id = ""
         try:
             new_message_id = await channel.send_view(binding, view)
-        except Exception:
+        except Exception as exc:
+            # The status card is the only surface where "idle but background
+            # tasks running" shows up; a silent drop here would make that
+            # state undiagnosable.
+            _log_degrade(
+                "status_card_send_failed",
+                session_id=session.session_id,
+                error=exc,
+                drop=True,
+            )
             return
         if new_message_id:
             binding.health_message_id = str(new_message_id)
@@ -8927,7 +9105,15 @@ class Orchestrator:
                 ),
                 idempotency_key=f"takeover_submitted:{takeover_id}",
             )
-            await self._drain_events(updated, transport, handle)
+            if self.defer_event_drain:
+                # Serve mode holds the ingress lock here; the session-level
+                # listener can now outlive the turn by hours (background
+                # subagents, wait ceiling), so a synchronous drain would block
+                # every subsequent inbound event. Same deferral rule as
+                # submit_user_input.
+                self._start_background_event_drain(updated.session_id, transport, handle)
+            else:
+                await self._drain_events(updated, transport, handle)
             await self.refresh_session_status_card(updated)
             return SubmitResult(True, blocked_input_id=blocked_input_id)
         except TakeoverError as exc:
