@@ -1127,6 +1127,88 @@ class TakeoverInjectedTurnRegressionTests(unittest.TestCase):
         self.assertTrue(any("没有得到任何响应" in text for text in texts), texts)
         self.assertFalse(transport.handle_is_live(handle.handle_id))
 
+    def test_injected_turn_with_assistant_text_does_not_consume_submit(self):
+        # Round-2 review Critical: the notification-predicted injected turn
+        # usually streams assistant text; that must not reclassify it as a
+        # user turn whose result consumes the queued submit.
+        async def scenario():
+            cls = _stream_client_class()
+            transport = _transport(cls, grace=0.05)
+            handle = await transport.launch_session(cwd="/tmp/p", session_id="s1")
+            transport._NOTIFICATION_FOLLOWUP_GRACE = 1.0
+            await transport.submit_turn(handle, TurnInput(text="yes"), "k1")
+            client = transport._clients[handle.handle_id]
+            collected: list = []
+            consumer = asyncio.create_task(_consume(transport, handle, collected))
+            client.feed(_task_notification("t9", "stopped"))
+            client.feed(_assistant("注入回合的正文"))
+            client.feed(_result("注入回合的正文", session_id="agent-1"))
+            await asyncio.sleep(0.4)
+            self.assertFalse(consumer.done(), "injected turn with text consumed the queued submit")
+            client.feed(_assistant("yes 的真正回复"))
+            client.feed(_result("yes 的真正回复", session_id="agent-1"))
+            await asyncio.wait_for(consumer, timeout=5.0)
+            return collected
+
+        events = asyncio.run(scenario())
+        texts = [e.payload.get("text", "") for e in events if e.type == AgentEventType.TURN_DELTA]
+        self.assertIn("yes 的真正回复", texts)
+
+    def test_fresh_submit_gets_full_pending_window_despite_quiet_background(self):
+        # Round-2 review Critical: the pending-turn ceiling must clock from
+        # the submit, not from the last stream traffic — a fresh submit after
+        # a long-quiet background task must not be killed instantly.
+        async def scenario():
+            cls = _stream_client_class()
+            transport = _transport(cls, grace=0.05, ceiling=0.4)
+            handle = await transport.launch_session(cwd="/tmp/p", session_id="s1")
+            await transport.submit_turn(handle, TurnInput(text="one"), "k1")
+            client = transport._clients[handle.handle_id]
+            collected: list = []
+            consumer = asyncio.create_task(_consume(transport, handle, collected))
+            client.feed(_assistant("first"))
+            client.feed(_task_started("t1", "长静默任务"))
+            client.feed(_result("first", session_id="agent-1"))
+            # Background quiet for most of the ceiling window.
+            await asyncio.sleep(0.3)
+            self.assertFalse(consumer.done())
+            await transport.submit_turn(handle, TurnInput(text="two"), "k2")
+            # Under the bug the inherited quiet clock kills this submit almost
+            # immediately; with the fix it gets its own full window.
+            await asyncio.sleep(0.2)
+            self.assertFalse(consumer.done(), "fresh submit was killed by inherited quiet clock")
+            client.feed(_assistant("second reply"))
+            client.feed(_task_notification("t1", "completed"))
+            client.feed(_result("second reply", session_id="agent-1"))
+            await asyncio.wait_for(consumer, timeout=5.0)
+            return collected
+
+        events = asyncio.run(scenario())
+        texts = [e.payload.get("text", "") for e in events if e.type == AgentEventType.TURN_DELTA]
+        self.assertIn("second reply", texts)
+
+    def test_bare_result_after_expired_injection_window_consumes_submit(self):
+        # Residual from the sticky prediction: if the predicted injected turn
+        # never comes, a later bare-result user turn must still settle.
+        async def scenario():
+            cls = _stream_client_class()
+            transport = _transport(cls, grace=0.05)
+            handle = await transport.launch_session(cwd="/tmp/p", session_id="s1")
+            transport._NOTIFICATION_FOLLOWUP_GRACE = 0.2
+            await transport.submit_turn(handle, TurnInput(text="one"), "k1")
+            client = transport._clients[handle.handle_id]
+            collected: list = []
+            consumer = asyncio.create_task(_consume(transport, handle, collected))
+            client.feed(_task_notification("t1", "stopped"))
+            # Let the injection window lapse with no injected turn.
+            await asyncio.sleep(0.4)
+            client.feed(_result("bare result of the real turn", session_id="agent-1"))
+            await asyncio.wait_for(consumer, timeout=5.0)
+            return transport, handle
+
+        transport, handle = asyncio.run(scenario())
+        self.assertFalse(transport.handle_is_live(handle.handle_id))
+
     def test_mid_turn_steering_submit_survives_current_turn_result(self):
         # A submit issued while a turn is streaming (queued steering input):
         # the CURRENT turn's result predates the submit and must not consume

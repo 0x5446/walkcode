@@ -5268,6 +5268,9 @@ class ClaudeHeadlessTransport:
         # suspend at arbitrary points, so time comparison mis-credited results
         # to queued submits (2026-07-18 takeover incident + review round).
         self._pending_turns: dict[str, int] = {}
+        # handle_id -> monotonic time of the latest submit; feeds ONLY the
+        # pending-turn ceiling clock (see submit_turn).
+        self._last_submit_monotonic: dict[str, float] = {}
 
     def capabilities(self) -> TransportCapabilities:
         available = self._available()
@@ -5357,6 +5360,7 @@ class ClaudeHeadlessTransport:
         client = self._clients.pop(handle_id, None)
         bridge = self._bridges.pop(handle_id, None)
         self._pending_turns.pop(handle_id, None)
+        self._last_submit_monotonic.pop(handle_id, None)
         for session_id, mapped in list(self._session_handles.items()):
             if mapped == handle_id:
                 self._session_handles.pop(session_id, None)
@@ -5407,6 +5411,10 @@ class ClaudeHeadlessTransport:
             # typed error lets the orchestrator fall back to a fresh resume.
             raise TransportUnavailable("claude headless worker is gone (settled or restarted)")
         self._pending_turns[handle.handle_id] = self._pending_turns.get(handle.handle_id, 0) + 1
+        # Timestamp for the pending-turn ceiling clock ONLY (never for result
+        # attribution): a fresh submit must get the full ceiling even when the
+        # stream has already been quiet for a long time (background tasks).
+        self._last_submit_monotonic[handle.handle_id] = time.monotonic()
         try:
             submit = getattr(client, "submit", None)
             if submit is not None:
@@ -5568,6 +5576,12 @@ class ClaudeHeadlessTransport:
         # injected turns interleave), and a counter also represents several
         # queued submits at once.
         current_turn_injected = False
+        # Sticky prediction: a between-turns notification announces that the
+        # NEXT turn will be CLI-injected — regardless of its opening traffic
+        # (the injected turn usually streams assistant text, which must not
+        # reclassify it as a user turn). Expires with the injection window if
+        # no turn materializes.
+        injected_turn_expected = False
         # Base for the background-wait ceiling: reset by any stream traffic.
         quiet_since = time.monotonic()
         # Non-zero after a terminal task_notification: hold off settle until
@@ -5644,6 +5658,7 @@ class ClaudeHeadlessTransport:
                     quiet_since=quiet_since,
                     injection_hold_until=injection_hold_until,
                     pending_turns=self._pending_turns.get(handle.handle_id, 0),
+                    pending_submitted_at=self._last_submit_monotonic.get(handle.handle_id, 0.0),
                 )
                 pending_before_wait = bridge is not None and bridge.has_any_pending()
                 wait_set = {task for task in (msg_task, queue_task) if task is not None}
@@ -5663,14 +5678,27 @@ class ClaudeHeadlessTransport:
                         # ceiling/grace clocks restart from the answer.
                         quiet_since = time.monotonic()
                         continue
+                    if injected_turn_expected and time.monotonic() >= injection_hold_until:
+                        # The predicted injected turn never materialized; drop
+                        # the prediction so the next real turn's result can
+                        # account for a queued submit again.
+                        injected_turn_expected = False
                     pending_submits = self._pending_turns.get(handle.handle_id, 0)
                     if pending_submits > 0:
                         # A submitted turn has produced nothing yet. Keep
-                        # waiting up to the ceiling; past it, give up loudly
-                        # instead of holding the worker open forever.
+                        # waiting up to the ceiling — measured from the LATER
+                        # of last stream traffic and the latest submit (a
+                        # fresh submit must get the full window even when
+                        # background tasks were already long quiet) — past
+                        # it, give up loudly instead of holding the worker
+                        # open forever.
+                        pending_clock = max(
+                            quiet_since,
+                            self._last_submit_monotonic.get(handle.handle_id, quiet_since),
+                        )
                         if (
                             self.background_wait_ceiling_seconds <= 0
-                            or time.monotonic() - quiet_since < self.background_wait_ceiling_seconds
+                            or time.monotonic() - pending_clock < self.background_wait_ceiling_seconds
                         ):
                             continue
                         closing = self._unregister_handle(handle.handle_id)
@@ -5690,6 +5718,14 @@ class ClaudeHeadlessTransport:
                             },
                         )
                         yield AgentEvent(AgentEventType.TURN_COMPLETED, {"message": ""})
+                        if active_tasks:
+                            # This close also abandons the background ledger;
+                            # clear it or the status card keeps advertising
+                            # tasks nobody is listening for.
+                            yield AgentEvent(
+                                AgentEventType.BACKGROUND_TASKS,
+                                {"count": 0, "tasks": [], "abandoned": len(active_tasks)},
+                            )
                         settled = True
                         break
                     if not active_tasks and time.monotonic() < injection_hold_until:
@@ -5765,13 +5801,14 @@ class ClaudeHeadlessTransport:
                         # that just drained the ledger (a bare terminal
                         # task_updated, an empty background_tasks_changed) —
                         # predicts a CLI-injected follow-up turn: hold off
-                        # settle for it, and mark the upcoming turn as
+                        # settle for it, and stickily mark the NEXT turn as
                         # injected so its result cannot account for a queued
-                        # user submit (typed TaskNotificationMessage carries
-                        # no user-role opening traffic, so the injected flag
-                        # must be set here). Mid-turn events don't: the
-                        # follow-up is the very turn already streaming.
-                        current_turn_injected = True
+                        # user submit. Sticky on purpose: the injected turn
+                        # usually opens with assistant text, which must not
+                        # reclassify it as a user turn (review round 2).
+                        # Mid-turn events don't: the follow-up is the very
+                        # turn already streaming.
+                        injected_turn_expected = True
                         injection_hold_until = time.monotonic() + max(
                             self.settle_grace_seconds, self._NOTIFICATION_FOLLOWUP_GRACE
                         )
@@ -5800,8 +5837,17 @@ class ClaudeHeadlessTransport:
                     # An error result also closes the turn — without this the
                     # stream would wait forever for a completion that never
                     # comes and the worker would never settle.
+                    result_is_injected = current_turn_injected or (
+                        # A bare result with no opening traffic while an
+                        # injected turn is predicted (window still live):
+                        # attribute it to the injected turn, not to a queued
+                        # submit.
+                        not turn_open
+                        and injected_turn_expected
+                        and time.monotonic() < injection_hold_until
+                    )
                     turn_open = False
-                    if not current_turn_injected:
+                    if not result_is_injected:
                         # A non-injected turn completed: it accounts for one
                         # submitted turn. Injected turns (notification
                         # replays) never do — the queued user turn is still
@@ -5812,16 +5858,21 @@ class ClaudeHeadlessTransport:
                         else:
                             self._pending_turns.pop(handle.handle_id, None)
                     current_turn_injected = False
-                    # A completed turn IS the follow-up the hold was waiting
-                    # for (or supersedes it); keeping the hold would only
-                    # delay settle.
+                    # Whatever turn just closed satisfies (or supersedes) the
+                    # injected-turn prediction and the hold window; keeping
+                    # either would only delay settle.
+                    injected_turn_expected = False
                     injection_hold_until = 0.0
                 elif events or self._is_turn_traffic(message):
                     if not turn_open:
-                        # Opening traffic classifies the turn: a stream
-                        # user-role message means CLI-injected (submitted
-                        # prompts are never echoed back on the stream).
-                        current_turn_injected = self._is_user_role_message(message)
+                        # Classify the opening turn: a predicted injected turn
+                        # stays injected regardless of traffic type; otherwise
+                        # a stream user-role message means CLI-injected
+                        # (submitted prompts are never echoed on the stream).
+                        current_turn_injected = injected_turn_expected or self._is_user_role_message(
+                            message
+                        )
+                        injected_turn_expected = False
                     turn_open = True
                     injection_hold_until = 0.0
                 for event in events:
@@ -5864,6 +5915,7 @@ class ClaudeHeadlessTransport:
         quiet_since: float,
         injection_hold_until: float = 0.0,
         pending_turns: int = 0,
+        pending_submitted_at: float = 0.0,
     ) -> float | None:
         """How long the next stream wait may block before a settle check.
 
@@ -5883,7 +5935,11 @@ class ClaudeHeadlessTransport:
         if pending_turns > 0:
             if self.background_wait_ceiling_seconds <= 0:
                 return None
-            remaining = self.background_wait_ceiling_seconds - (time.monotonic() - quiet_since)
+            # Fresh submits get the full window even if the stream was
+            # already long quiet (background tasks): clock from the later of
+            # last traffic and last submit.
+            pending_clock = max(quiet_since, pending_submitted_at)
+            remaining = self.background_wait_ceiling_seconds - (time.monotonic() - pending_clock)
             return max(remaining, 0.1)
         if not active_tasks:
             hold = injection_hold_until - time.monotonic()
