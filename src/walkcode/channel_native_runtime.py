@@ -3261,10 +3261,14 @@ class ChannelNativeRuntime:
             if session.status == "stopped":
                 if not (
                     _session_is_external_tui_takeover_candidate(session)
-                    or _tui_hook_has_external_tui_process_identity(transport_kind, payload)
+                    or _tui_hook_has_live_tui_process(transport_kind, payload)
                 ):
-                    # No TUI stamp on the record AND no live-process proof in
-                    # the hook: a late hook for a genuinely dead session.
+                    # No TUI stamp on the record AND no *currently-live* TUI
+                    # process behind the hook: a late/stale hook for a
+                    # genuinely dead session. A command-string snapshot alone
+                    # is not proof (a deferred hook replayed across a restart
+                    # may describe an exited process) — the pid must still be
+                    # running.
                     return session
                 # Revive. The record-stamp check alone is not enough: a
                 # takeover rewrites transport_kind/transport_ref and the
@@ -5181,6 +5185,34 @@ def _tui_hook_has_external_tui_process_identity(transport_kind: str, payload: di
     if transport_kind == "codex_app_server":
         return any(_command_is_codex_tui_process(command) for command in commands)
     return True
+
+
+def _tui_hook_has_live_tui_process(transport_kind: str, payload: dict[str, Any]) -> bool:
+    """Stricter than identity: a matching TUI process must still be RUNNING now.
+
+    Reviving a swept-stopped session on a mere command-string snapshot is
+    unsafe — a deferred hook replayed across a restart carries a snapshot of a
+    process that may have exited, falsely reviving a dead session (writer
+    points at a gone terminal, card shows phantom running, input re-blocks into
+    takeover). Requiring a live pid makes a genuinely-live TUI's hook revive
+    while a stale one does not. Entries without pids can't be verified, so they
+    do not count as live proof.
+    """
+    for entry in _tui_hook_process_tree_entries(payload):
+        try:
+            pid = int(entry.get("pid") or 0)
+        except (TypeError, ValueError):
+            continue
+        if pid <= 1:
+            continue
+        command = str(entry.get("command", "") or "")
+        if transport_kind == "claude_headless" and not _command_is_claude_tui_process(command):
+            continue
+        if transport_kind == "codex_app_server" and not _command_is_codex_tui_process(command):
+            continue
+        if LocalProcessController._pid_running(pid):
+            return True
+    return False
 
 
 def _tui_hook_process_tree_commands(payload: dict[str, Any]) -> list[str]:

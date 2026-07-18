@@ -3588,18 +3588,28 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
             session.writer_lease = None
             old_generation = session.generation
 
-            result = asyncio.run(
-                runtime.process_tui_hook(
-                    hook_type="PostToolUse",
-                    agent="claude",
-                    payload={
-                        "session_id": "claude-session-1",
-                        "cwd": tmp,
-                        "tool_name": "Bash",
-                        "_walkcode_hook_process_tree": ["/usr/local/bin/claude"],
-                    },
+            # Live proof: a real running pid whose recorded command looks like
+            # a claude TUI. Revival must require the pid still be alive, not
+            # just a command-string snapshot (deep-review v0.14.2 hardening).
+            live = subprocess.Popen(["sleep", "60"])
+            self.addCleanup(lambda: (live.kill(), live.wait(timeout=2.0)))
+            try:
+                result = asyncio.run(
+                    runtime.process_tui_hook(
+                        hook_type="PostToolUse",
+                        agent="claude",
+                        payload={
+                            "session_id": "claude-session-1",
+                            "cwd": tmp,
+                            "tool_name": "Bash",
+                            "_walkcode_hook_process_tree_entries": [
+                                {"pid": live.pid, "ppid": 1, "command": "/usr/local/bin/claude"},
+                            ],
+                        },
+                    )
                 )
-            )
+            finally:
+                pass
 
             self.assertTrue(result.accepted)
             updated = JsonFileStateStore(state_path).load().sessions.get(session.session_id)
@@ -3609,6 +3619,72 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
             self.assertIsNotNone(updated.writer_owner)
             self.assertEqual(updated.writer_owner.kind, "external_tui")
             self.assertEqual(updated.generation, old_generation + 1)
+
+    def test_stale_deferred_hook_with_dead_pid_does_not_revive_session(self):
+        # deep-review v0.14.2 Warning (multi-dimension): a deferred hook
+        # replayed across a restart carries a command-string snapshot of a
+        # process that has since exited. It must NOT revive a genuinely dead
+        # session — the pid is checked for liveness, and a dead pid fails.
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = str(Path(tmp) / "state.json")
+            cfg = ChannelNativeConfig.from_env(
+                {
+                    "WALKCODE_CHANNEL": "telegram",
+                    "TELEGRAM_BOT_TOKEN": "fake",
+                    "WALKCODE_AGENT": "claude",
+                    "TELEGRAM_ALLOWED_CHAT_IDS": "123",
+                    "WALKCODE_STATE_PATH": state_path,
+                    "WALKCODE_CWD": tmp,
+                }
+            )
+            api = _FakeTelegramApi()
+            runtime = ChannelNativeRuntime.from_config(
+                cfg,
+                telegram_api=api,
+                transports={"claude_headless": FakeAgentTransport("claude_headless", _transport_caps())},
+            )
+            session = runtime.state.sessions.create_structured_session(
+                binding=ChannelBinding(
+                    channel_kind="telegram",
+                    account_id="bot",
+                    chat_id="123",
+                    root_message_id="3",
+                ),
+                transport_kind="claude_headless",
+                transport_ref={"handle_id": "h1", "agent_session_id": "claude-session-1"},
+                cwd=tmp,
+                owner=ActorRef("telegram", "456", "Ada"),
+            )
+            session.status = "stopped"
+            session.lifecycle_state = "STOPPED"
+            session.stop_reason = "runtime_restart"
+            session.writer_owner = None
+            session.writer_lease = None
+
+            # A pid that is guaranteed dead: spawn and reap it.
+            dead = subprocess.Popen(["sleep", "0.01"])
+            dead_pid = dead.pid
+            dead.wait(timeout=2.0)
+
+            result = asyncio.run(
+                runtime.process_tui_hook(
+                    hook_type="PostToolUse",
+                    agent="claude",
+                    payload={
+                        "session_id": "claude-session-1",
+                        "cwd": tmp,
+                        "tool_name": "Bash",
+                        "_walkcode_hook_process_tree_entries": [
+                            {"pid": dead_pid, "ppid": 1, "command": "/usr/local/bin/claude"},
+                        ],
+                    },
+                )
+            )
+
+            self.assertTrue(result.accepted)
+            updated = JsonFileStateStore(state_path).load().sessions.get(session.session_id)
+            self.assertEqual(updated.status, "stopped")
+            self.assertEqual(updated.stop_reason, "runtime_restart")
 
     def test_late_hook_without_process_identity_still_leaves_stopped_session_alone(self):
         # Counterpart guard: a late hook with NO live-process proof must not
