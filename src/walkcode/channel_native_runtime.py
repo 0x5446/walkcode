@@ -3259,8 +3259,20 @@ class ChannelNativeRuntime:
         if existing_id:
             session = self.state.sessions.get(existing_id)
             if session.status == "stopped":
-                if not _session_is_external_tui_takeover_candidate(session):
+                if not (
+                    _session_is_external_tui_takeover_candidate(session)
+                    or _tui_hook_has_external_tui_process_identity(transport_kind, payload)
+                ):
+                    # No TUI stamp on the record AND no live-process proof in
+                    # the hook: a late hook for a genuinely dead session.
                     return session
+                # Revive. The record-stamp check alone is not enough: a
+                # takeover rewrites transport_kind/transport_ref and the
+                # restart sweep clears writer_owner, stripping every TUI
+                # stamp — while the TUI process itself may still be alive and
+                # hooking (live incident 2026-07-19: mirror went permanently
+                # silent). A hook that carries a live TUI process identity is
+                # sufficient proof by itself.
                 session.generation += 1
                 session.status = "running"
                 session.stop_reason = ""
