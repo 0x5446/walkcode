@@ -3604,7 +3604,11 @@ class FakeExternalTuiController:
         return ControlResult(True, state="terminated")
 
 
-_TERMINATE_SESSION_ID_RE = re.compile(r"--session-id[ =]([0-9a-fA-F-]{8,64})")
+# Claude spells the session id on argv as either --session-id or --resume
+# (resumed TUIs use the latter). Matching only --session-id missed
+# self-respawning `--resume <id>` agents, so their workers were never swept
+# (2026-07-19 incident).
+_TERMINATE_SESSION_ID_RE = re.compile(r"--(?:session-id|resume)[ =]([0-9a-fA-F-]{8,64})")
 
 
 def _terminate_ref_session_id(ref: dict[str, Any]) -> str:
@@ -3686,11 +3690,18 @@ class LocalProcessController:
             return ControlResult(True, state="killed")
         return ControlResult(False, "process_still_running")
 
-    @staticmethod
-    def _pids_for_session(session_id: str) -> list[int]:
+    @classmethod
+    def _pids_for_session(cls, session_id: str) -> list[int]:
+        # Claude spells the session on argv several ways depending on how it
+        # was launched — `--session-id <id>` for daemon workers, `--resume
+        # <id>` / `resume=<id>` for resumed TUIs. Matching only one spelling
+        # (the original `session-id` bug) missed self-respawning `--resume`
+        # agents entirely, so terminate never killed them. The bare id is the
+        # robust catch-all: walkcode's own serve/tap processes never carry a
+        # session id on argv, so this does not match self.
         try:
             result = subprocess.run(
-                ["pgrep", "-f", f"session-id {session_id}"],
+                ["pgrep", "-f", session_id],
                 capture_output=True,
                 text=True,
                 timeout=2,
@@ -3698,12 +3709,25 @@ class LocalProcessController:
         except Exception:
             return []
         pids: list[int] = []
+        self_pid = os.getpid()
         for token in result.stdout.split():
             try:
-                pids.append(int(token))
+                pid = int(token)
             except ValueError:
                 continue
+            if pid > 1 and pid != self_pid:
+                pids.append(pid)
         return pids
+
+    async def session_alive(self, ref: dict[str, Any]) -> bool:
+        """True if any live process still holds this session (post-terminate
+        respawn detection). Best-effort; excludes this process."""
+        session_id = _terminate_ref_session_id(ref)
+        if not session_id:
+            return False
+        return await asyncio.to_thread(
+            lambda: any(self._pid_running(p) for p in self._pids_for_session(session_id))
+        )
 
     def _wait_exited(self, pid: int) -> bool:
         deadline = time.monotonic() + self.timeout
@@ -9301,6 +9325,39 @@ class Orchestrator:
                         termination.reason or "external_tui_termination_failed",
                         blocked_input_id=blocked_input_id,
                     )
+                # Respawn guard (2026-07-19 incident): terminate reported
+                # success because it killed the recorded pid, but a
+                # self-respawning terminal agent immediately relaunches
+                # `claude --resume <id>`, re-claims the session, and fences
+                # out this takeover's reply — leaving a doomed headless worker
+                # double-attached to the live session file. Confirm the
+                # session actually stayed dead; if it came back, this session
+                # cannot be taken over by kill-and-resume — abort honestly
+                # (roll back the resumed worker) instead of faking success.
+                if await self._external_tui_session_respawned(controller, terminate_ref or {}):
+                    self.sessions.fail_takeover(takeover_id, reason="external_tui_still_running")
+                    await self._rollback_resumed_takeover_handle(transport, resumed_handle)
+                    _log_degrade(
+                        "takeover_external_tui_respawned",
+                        session_id=session.session_id,
+                        takeover_id=takeover_id,
+                    )
+                    await self._send_session_view(
+                        session,
+                        ViewModelFactory.takeover_progress(
+                            takeover_id=takeover_id,
+                            blocked_input_id=blocked_input_id,
+                            phase="failed",
+                            summary=summary,
+                            reason="external_tui_still_running",
+                        ),
+                        idempotency_key=f"takeover_respawned:{takeover_id}",
+                    )
+                    return SubmitResult(
+                        False,
+                        "external_tui_still_running",
+                        blocked_input_id=blocked_input_id,
+                    )
             self.sessions.complete_takeover(
                 takeover_id,
                 transport_kind=transport_kind,
@@ -9528,6 +9585,31 @@ class Orchestrator:
                     error=f"{type(exc).__name__}: {exc}",
                 )
         return stale_requests
+
+    @staticmethod
+    async def _external_tui_session_respawned(
+        controller: Any,
+        terminate_ref: dict[str, Any],
+    ) -> bool:
+        """Bounded post-terminate poll: did the terminal session come back?
+
+        A self-respawning agent relaunches within a beat of the kill; polling
+        briefly catches it. A controller without session_alive() (e.g. tests /
+        non-process controllers) cannot report respawn — treat as not
+        respawned so ordinary TUI takeovers are unaffected.
+        """
+        probe = getattr(controller, "session_alive", None)
+        if probe is None:
+            return False
+        for delay in (0.0, 0.2, 0.4):
+            if delay:
+                await asyncio.sleep(delay)
+            try:
+                if await probe(terminate_ref):
+                    return True
+            except Exception:
+                return False
+        return False
 
     @staticmethod
     async def _rollback_resumed_takeover_handle(transport: AgentTransport, handle: TransportHandle) -> None:

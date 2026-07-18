@@ -399,6 +399,108 @@ class TakeoverProcessControlTests(unittest.TestCase):
         self.assertEqual(transport.shutdown_calls, ["takeover_rollback"])
         self.assertEqual(transport.submitted_turns, [])
 
+    def test_terminate_sweeps_resume_spelled_session_worker(self):
+        # Regression (2026-07-19 incident): a resumed TUI carries the session
+        # on argv as `--resume <id>`, not `--session-id <id>`. The original
+        # scan matched only the latter, so terminate never killed the real
+        # worker. The bare-id scan must catch the `--resume` spelling too.
+        session_id = "beefbeef-1111-4000-8000-abcdefabcdef"
+        pty_host = subprocess.Popen(["sleep", "60"])
+        worker = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(60)", f"--resume {session_id}"]
+        )
+        try:
+            import time as _time
+
+            _time.sleep(0.2)
+            controller = LocalProcessController(timeout=2.0)
+            result = asyncio.run(
+                controller.terminate(
+                    {
+                        "pid": pty_host.pid,
+                        "allow_terminate": True,
+                        "command": f"claude --resume {session_id}",
+                    },
+                    reason="test",
+                )
+            )
+            self.assertTrue(result.accepted)
+            worker.wait(timeout=2.0)
+            self.assertIsNotNone(worker.returncode)
+        finally:
+            for proc in (pty_host, worker):
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.wait(timeout=2.0)
+
+    def test_session_alive_detects_live_resume_process(self):
+        session_id = "d00dd00d-2222-4000-8000-0badc0de0bad"
+        worker = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(60)", f"--resume {session_id}"]
+        )
+        try:
+            import time as _time
+
+            _time.sleep(0.2)
+            controller = LocalProcessController(timeout=2.0)
+            ref = {"command": f"claude --resume {session_id}"}
+            self.assertTrue(asyncio.run(controller.session_alive(ref)))
+            worker.terminate()
+            worker.wait(timeout=2.0)
+            self.assertFalse(asyncio.run(controller.session_alive(ref)))
+        finally:
+            if worker.poll() is None:
+                worker.kill()
+                worker.wait(timeout=2.0)
+
+    def test_respawning_tui_aborts_takeover_without_double_attach(self):
+        # The self-respawning terminal agent: terminate reports success (it
+        # killed the recorded pid) but session_alive keeps returning True.
+        # Takeover must abort honestly, roll back the resumed worker, and not
+        # submit — no doomed double-attached headless worker, no fake success.
+        class _RespawningController(FakeExternalTuiController):
+            async def session_alive(self, ref):
+                return True
+
+        controller = _RespawningController("fake-process")
+        orchestrator, channel, transport, _controller, session = _setup(
+            terminate_ref={"controller_kind": "fake-process", "process_ref": {"pid": 123}},
+            controller=controller,
+        )
+        asyncio.run(
+            orchestrator.submit_user_input(
+                session.session_id,
+                TurnInput(text="run tests"),
+                actor=_actor(),
+                generation=session.generation,
+            )
+        )
+        result = asyncio.run(
+            orchestrator.handle_inbound_event(
+                _callback(_action_token(channel, "takeover_and_send")),
+                agent_transport_kind="fake-transport",
+                cwd="/tmp/project",
+            )
+        )
+
+        updated = orchestrator.sessions.get(session.session_id)
+        tx = next(iter(orchestrator.sessions.to_dict()["takeovers"].values()))
+        blocked = next(iter(updated.blocked_inputs.values()))
+        self.assertFalse(result.accepted)
+        self.assertEqual(result.reason, "external_tui_still_running")
+        self.assertEqual(tx["phase"], TakeoverPhase.FAILED)
+        # Resumed worker was rolled back; the user's message was NOT submitted
+        # onto the still-live session.
+        self.assertEqual(transport.shutdown_calls, ["takeover_rollback"])
+        self.assertEqual(transport.submitted_turns, [])
+        # Writer stays with the still-live TUI; the blocked input is retained.
+        self.assertEqual(updated.writer_owner.kind, "external_tui")
+        self.assertEqual(blocked.state, "blocked")
+        # Card flips to a terminal result; the failed-phase card precedes it.
+        self.assertEqual(channel.sent_views[-1]["view"]["type"], "decision_result")
+        self.assertEqual(channel.sent_views[-2]["view"]["phase"], "failed")
+        self.assertEqual(channel.sent_views[-2]["view"]["reason"], "external_tui_still_running")
+
 
 if __name__ == "__main__":
     unittest.main()
