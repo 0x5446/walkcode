@@ -5414,6 +5414,7 @@ class ClaudeHeadlessTransport:
         # Timestamp for the pending-turn ceiling clock ONLY (never for result
         # attribution): a fresh submit must get the full ceiling even when the
         # stream has already been quiet for a long time (background tasks).
+        previous_submit_ts = self._last_submit_monotonic.get(handle.handle_id)
         self._last_submit_monotonic[handle.handle_id] = time.monotonic()
         try:
             submit = getattr(client, "submit", None)
@@ -5436,12 +5437,18 @@ class ClaudeHeadlessTransport:
         except BaseException:
             # A failed submit must not leave a "turn in flight" marker behind:
             # the persistent listener would wait for a turn that never started
-            # and never settle.
+            # and never settle. The ceiling timestamp also rolls back — a
+            # failed attempt must not extend an OLDER pending submit's
+            # timeout window (review round 3).
             remaining = self._pending_turns.get(handle.handle_id, 1) - 1
             if remaining > 0:
                 self._pending_turns[handle.handle_id] = remaining
             else:
                 self._pending_turns.pop(handle.handle_id, None)
+            if previous_submit_ts is None:
+                self._last_submit_monotonic.pop(handle.handle_id, None)
+            else:
+                self._last_submit_monotonic[handle.handle_id] = previous_submit_ts
             raise
 
     @staticmethod
@@ -5603,6 +5610,10 @@ class ClaudeHeadlessTransport:
                             yield event
                     settled = persistent
                     if persistent:
+                        # Capture BEFORE unregistering clears it: submits that
+                        # never produced any stream traffic died with the
+                        # worker and must not vanish silently.
+                        pending_lost = self._pending_turns.get(handle.handle_id, 0)
                         closing = self._unregister_handle(handle.handle_id)
                         if active_tasks:
                             # The worker died with subagents still on the books:
@@ -5643,6 +5654,27 @@ class ClaudeHeadlessTransport:
                                     "message": (
                                         "代理进程在等待你回答时退出了，上面的卡片已失效；"
                                         "直接回复即可继续。"
+                                    )
+                                },
+                            )
+                        if pending_lost > 0:
+                            # Last (lifecycle-wise it must win over any
+                            # synthetic completion above): the worker exited
+                            # before producing a single message for an
+                            # accepted submit. Silence here = the session
+                            # stuck on ACTIVE forever with the user's message
+                            # gone (review round 3, 6-dimension consensus).
+                            _log_degrade(
+                                "headless_worker_eof_with_pending_turns",
+                                handle_id=handle.handle_id,
+                                pending_turns=pending_lost,
+                            )
+                            yield AgentEvent(
+                                AgentEventType.SESSION_ERROR,
+                                {
+                                    "message": (
+                                        "代理进程在生成回复前退出了，你刚发送的消息没有被处理；"
+                                        "请重发一次。"
                                     )
                                 },
                             )
@@ -5866,10 +5898,18 @@ class ClaudeHeadlessTransport:
                 elif events or self._is_turn_traffic(message):
                     if not turn_open:
                         # Classify the opening turn: a predicted injected turn
-                        # stays injected regardless of traffic type; otherwise
+                        # stays injected regardless of traffic type — but the
+                        # prediction must be checked against its window HERE
+                        # (the pending-turn wait sleeps on the long ceiling
+                        # and won't wake at window expiry), or a real reply
+                        # arriving after expiry is still misclassified and
+                        # its result never accounts for the submit. Otherwise
                         # a stream user-role message means CLI-injected
                         # (submitted prompts are never echoed on the stream).
-                        current_turn_injected = injected_turn_expected or self._is_user_role_message(
+                        prediction_live = (
+                            injected_turn_expected and time.monotonic() < injection_hold_until
+                        )
+                        current_turn_injected = prediction_live or self._is_user_role_message(
                             message
                         )
                         injected_turn_expected = False
@@ -6189,7 +6229,15 @@ class ClaudeHeadlessTransport:
         method = getattr(client, method_name, None)
         if method is None:
             return ControlResult(False, BlockedReason.CAPABILITY_DISABLED)
-        await _maybe_await(method(*args))
+        try:
+            await _maybe_await(method(*args))
+        except TypeError:
+            if not args:
+                raise
+            # Signature drift tolerance: the real SDK's interrupt() takes no
+            # arguments while ours forwards a reason — retry bare instead of
+            # failing the control call.
+            await _maybe_await(method())
         return ControlResult(True, state=state)
 
     def _available(self) -> bool:
@@ -8677,15 +8725,17 @@ class Orchestrator:
             if delay:
                 await asyncio.sleep(delay)
             try:
-                await channel.edit_view(binding, inbound.message_id, view)
-                return
+                if await channel.edit_view(binding, inbound.message_id, view):
+                    return
+                # A False return is a failure too (adapter refused the edit):
+                # treating it as success left live buttons on settled cards.
             except Exception as exc:
                 last_exc = exc
         _log_degrade(
             "decided_card_flip_failed",
             kind=kind,
             message_id=inbound.message_id,
-            error=f"{type(last_exc).__name__}: {last_exc}" if last_exc else "unknown",
+            error=f"{type(last_exc).__name__}: {last_exc}" if last_exc else "edit_view returned False",
         )
 
     async def _notify_interaction_delivery_failure(
@@ -8901,23 +8951,32 @@ class Orchestrator:
                 actor=actor,
             )
             takeover_action = str((decision.decision or {}).get("action", ""))
-            if takeover_result.accepted or takeover_result.reason == "keep_readonly":
-                # A settled takeover prompt must stop showing a live button
-                # (same rule as permission / ask cards): flip it to a terminal
-                # result so it can't be double-clicked. Failures keep the card
-                # interactive so the user can retry.
+            # The button token was consumed the moment it was clicked, so the
+            # card must ALWAYS flip to a terminal state — leaving a live
+            # button after a failure invites clicks that can never succeed
+            # (review round 3). Failures flip to a failure notice that points
+            # at the recovery path (send a new message → fresh prompt).
+            if takeover_result.accepted or takeover_result.reason in {
+                "keep_readonly",
+                TakeoverPhase.MANUAL_ONLY,
+            }:
                 detail = {
                     "takeover_and_send": "已接管会话并发送消息",
                     "request_takeover": "已接管会话",
                     "keep_readonly": "保持只读，本条输入已取消",
                     "manual_instructions": "已发送手动接管指引",
                 }.get(takeover_action, "")
-                await self._flip_decided_card(
-                    inbound,
-                    kind="takeover",
-                    action=takeover_action or "takeover",
-                    detail=detail,
+            else:
+                detail = (
+                    f"接管未完成（{takeover_result.reason or 'failed'}）。"
+                    "本卡片已失效；重新发送一条消息可再次触发接管。"
                 )
+            await self._flip_decided_card(
+                inbound,
+                kind="takeover",
+                action=takeover_action or "takeover",
+                detail=detail,
+            )
             return takeover_result
         if decision.accepted and ctx.kind == "model_choice":
             model = str((decision.decision or {}).get("action", ""))

@@ -196,8 +196,11 @@ class ResumeBoundaryTests(unittest.TestCase):
         blocked = next(iter(updated.blocked_inputs.values()))
         self.assertFalse(result.accepted)
         self.assertEqual(result.reason, "resume_failed")
-        self.assertEqual(channel.sent_views[-1]["view"]["type"], "takeover_progress")
-        self.assertEqual(channel.sent_views[-1]["view"]["phase"], "failed")
+        # The clicked takeover card is now always flipped to a terminal
+        # decision_result at the end; the informative view precedes it.
+        self.assertEqual(channel.sent_views[-1]["view"]["type"], "decision_result")
+        self.assertEqual(channel.sent_views[-2]["view"]["type"], "takeover_progress")
+        self.assertEqual(channel.sent_views[-2]["view"]["phase"], "failed")
         self.assertEqual(tx["phase"], TakeoverPhase.FAILED)
         self.assertEqual(updated.writer_owner.kind, "external_tui")
         self.assertEqual(blocked.state, "blocked")

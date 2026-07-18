@@ -1209,6 +1209,75 @@ class TakeoverInjectedTurnRegressionTests(unittest.TestCase):
         transport, handle = asyncio.run(scenario())
         self.assertFalse(transport.handle_is_live(handle.handle_id))
 
+    def test_worker_death_before_any_traffic_yields_visible_error(self):
+        # Round-3 review (6-dimension consensus): a submit accepted and then
+        # the worker dies before producing a single stream message — that
+        # must surface as a SESSION_ERROR, not silence + ACTIVE forever.
+        async def scenario():
+            cls = _stream_client_class()
+            transport = _transport(cls, grace=0.05)
+            handle = await transport.launch_session(cwd="/tmp/p", session_id="s1")
+            await transport.submit_turn(handle, TurnInput(text="hi"), "k1")
+            client = transport._clients[handle.handle_id]
+            collected: list = []
+            consumer = asyncio.create_task(_consume(transport, handle, collected))
+            client.feed_eof()
+            await asyncio.wait_for(consumer, timeout=5.0)
+            return transport, handle, collected
+
+        transport, handle, events = asyncio.run(scenario())
+        errors = [e for e in events if e.type == AgentEventType.SESSION_ERROR]
+        self.assertTrue(errors, "worker death with a pending submit was silent")
+        self.assertIn("没有被处理", str(errors[-1].payload.get("message", "")))
+        self.assertFalse(transport.handle_is_live(handle.handle_id))
+
+    def test_reply_with_text_after_expired_prediction_consumes_submit(self):
+        # Round-3 review Critical: prediction expiry must be evaluated at
+        # turn-classification time (the pending wait sleeps on the ceiling and
+        # never wakes at window expiry).
+        async def scenario():
+            cls = _stream_client_class()
+            transport = _transport(cls, grace=0.05)
+            handle = await transport.launch_session(cwd="/tmp/p", session_id="s1")
+            transport._NOTIFICATION_FOLLOWUP_GRACE = 0.2
+            await transport.submit_turn(handle, TurnInput(text="one"), "k1")
+            client = transport._clients[handle.handle_id]
+            collected: list = []
+            consumer = asyncio.create_task(_consume(transport, handle, collected))
+            client.feed(_task_notification("t1", "stopped"))
+            # Window lapses with no injected turn; then the REAL reply opens
+            # with assistant text.
+            await asyncio.sleep(0.4)
+            client.feed(_assistant("real reply"))
+            client.feed(_result("real reply", session_id="agent-1"))
+            await asyncio.wait_for(consumer, timeout=5.0)
+            return transport, handle
+
+        transport, handle = asyncio.run(scenario())
+        self.assertFalse(transport.handle_is_live(handle.handle_id))
+
+    def test_interrupt_tolerates_argless_sdk_signature(self):
+        # The real SDK's interrupt() takes no arguments; forwarding a reason
+        # must not fail the control call.
+        class _ArglessInterruptClient(_stream_client_class()):
+            def __init__(self, options=None):
+                super().__init__(options)
+                self.interrupted = False
+
+            async def interrupt(self):
+                self.interrupted = True
+
+        async def scenario():
+            transport = _transport(_ArglessInterruptClient)
+            handle = await transport.launch_session(cwd="/tmp/p", session_id="s1")
+            client = transport._clients[handle.handle_id]
+            result = await transport.interrupt(handle, "user_requested")
+            return result, client
+
+        result, client = asyncio.run(scenario())
+        self.assertTrue(result.accepted)
+        self.assertTrue(client.interrupted)
+
     def test_mid_turn_steering_submit_survives_current_turn_result(self):
         # A submit issued while a turn is streaming (queued steering input):
         # the CURRENT turn's result predates the submit and must not consume

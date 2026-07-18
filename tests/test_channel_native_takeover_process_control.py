@@ -316,7 +316,10 @@ class TakeoverProcessControlTests(unittest.TestCase):
         tx = next(iter(orchestrator.sessions.to_dict()["takeovers"].values()))
         self.assertFalse(result.accepted)
         self.assertEqual(result.reason, TakeoverPhase.MANUAL_ONLY)
-        self.assertEqual(channel.sent_views[-1]["view"]["type"], "manual_only")
+        # The clicked takeover card is now always flipped to a terminal
+        # decision_result at the end; the informative view precedes it.
+        self.assertEqual(channel.sent_views[-1]["view"]["type"], "decision_result")
+        self.assertEqual(channel.sent_views[-2]["view"]["type"], "manual_only")
         self.assertEqual(updated.writer_owner.kind, "external_tui")
         self.assertEqual(tx["phase"], TakeoverPhase.MANUAL_ONLY)
         self.assertEqual(transport.resume_specs, [])
@@ -348,7 +351,10 @@ class TakeoverProcessControlTests(unittest.TestCase):
 
         self.assertFalse(result.accepted)
         self.assertEqual(result.reason, TakeoverPhase.MANUAL_ONLY)
-        self.assertEqual(channel.sent_views[-1]["view"]["type"], "manual_only")
+        # The clicked takeover card is now always flipped to a terminal
+        # decision_result at the end; the informative view precedes it.
+        self.assertEqual(channel.sent_views[-1]["view"]["type"], "decision_result")
+        self.assertEqual(channel.sent_views[-2]["view"]["type"], "manual_only")
         self.assertEqual(controller.terminate_calls, [])
         self.assertEqual(transport.resume_specs, [])
         self.assertEqual(transport.shutdown_calls, [])
@@ -381,8 +387,11 @@ class TakeoverProcessControlTests(unittest.TestCase):
         blocked = next(iter(updated.blocked_inputs.values()))
         self.assertFalse(result.accepted)
         self.assertEqual(result.reason, "external_tui_termination_failed")
-        self.assertEqual(channel.sent_views[-1]["view"]["type"], "takeover_progress")
-        self.assertEqual(channel.sent_views[-1]["view"]["phase"], "failed")
+        # The clicked takeover card is now always flipped to a terminal
+        # decision_result at the end; the informative view precedes it.
+        self.assertEqual(channel.sent_views[-1]["view"]["type"], "decision_result")
+        self.assertEqual(channel.sent_views[-2]["view"]["type"], "takeover_progress")
+        self.assertEqual(channel.sent_views[-2]["view"]["phase"], "failed")
         self.assertEqual(tx["phase"], TakeoverPhase.FAILED)
         self.assertEqual(updated.writer_owner.kind, "external_tui")
         self.assertEqual(blocked.state, "blocked")

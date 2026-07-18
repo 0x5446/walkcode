@@ -62,7 +62,9 @@ Status: Accepted; implemented
    待答时等待按 60s 有界复查而非无限挂起，答复后静默计时从答复时刻重算。
 4. **硬超时**：账本非空但流上零流量达 `WALKCODE_CLAUDE_BG_WAIT_CEILING`
    （默认 3600s，0 关闭）→ 先发可见警告（"仍有 N 个后台任务无进展，停止
-   等待"）再 settle。绝不静默放弃。
+   等待"）再 settle。绝不静默放弃。同一上限也约束**已提交但零响应的用户
+   回合**（从提交时刻起算，v0.14.1）：到点发"消息未得到响应"警告后关闭，
+   不做后台专属预算理解。
 5. **活 worker 复用**：IDLE/ERROR_RECOVERABLE submit 时若 handle 的 client
    仍在（监听中），直接在原 client 上 `query`，不再 fork 第二个 `--resume`
    进程；每个 handle 至多一个 drain。settle 与 submit 的竞态由
