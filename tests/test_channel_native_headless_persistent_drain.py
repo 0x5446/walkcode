@@ -987,6 +987,75 @@ class DeepReviewRegressionTests(unittest.TestCase):
         self.assertTrue(any("后台任务等待超时" in text for text in texts), texts)
 
 
+class TakeoverInjectedTurnRegressionTests(unittest.TestCase):
+    """2026-07-18 live incident: after a takeover, the resume fork auto-runs a
+    stopped-task notification turn FIRST; its result must not account for the
+    user's submitted turn, or settle kills the worker while that turn is still
+    silently queued (the user's "yes" never got a reply)."""
+
+    def test_injected_turn_result_does_not_consume_submit_marker(self):
+        async def scenario():
+            cls = _stream_client_class()
+            transport = _transport(cls, grace=0.05)
+            handle = await transport.launch_session(cwd="/tmp/p", session_id="s1")
+            # Takeover ordering: the blocked input is submitted BEFORE the
+            # listener attaches (defer_event_drain).
+            await transport.submit_turn(handle, TurnInput(text="yes"), "k1")
+            client = transport._clients[handle.handle_id]
+            collected: list = []
+            consumer = asyncio.create_task(_consume(transport, handle, collected))
+            # The CLI runs the injected notification turn first: opening
+            # traffic is a stream user message, then its result lands.
+            client.feed(_user("<task-notification><task-id>t9</task-id><status>stopped</status></task-notification>"))
+            client.feed(_result("旧回合收尾", session_id="agent-1"))
+            # Well past the grace: the submitted "yes" turn has produced no
+            # stream traffic yet, but the listener must stay on duty.
+            await asyncio.sleep(0.4)
+            self.assertFalse(
+                consumer.done(),
+                "settle fired while the submitted turn was still queued (incident regression)",
+            )
+            client.feed(_assistant("yes 的真正回复"))
+            client.feed(_result("yes 的真正回复", session_id="agent-1"))
+            await asyncio.wait_for(consumer, timeout=5.0)
+            return transport, handle, client, collected
+
+        transport, handle, client, events = asyncio.run(scenario())
+        texts = [e.payload.get("text", "") for e in events if e.type == AgentEventType.TURN_DELTA]
+        self.assertIn("yes 的真正回复", texts)
+        # After the REAL submitted turn completed, settle proceeds normally.
+        self.assertTrue(client.disconnected)
+        self.assertFalse(transport.handle_is_live(handle.handle_id))
+
+    def test_mid_turn_steering_submit_survives_current_turn_result(self):
+        # A submit issued while a turn is streaming (queued steering input):
+        # the CURRENT turn's result predates the submit and must not consume
+        # its marker either.
+        async def scenario():
+            cls = _stream_client_class()
+            transport = _transport(cls, grace=0.05)
+            handle = await transport.launch_session(cwd="/tmp/p", session_id="s1")
+            await transport.submit_turn(handle, TurnInput(text="one"), "k1")
+            client = transport._clients[handle.handle_id]
+            collected: list = []
+            consumer = asyncio.create_task(_consume(transport, handle, collected))
+            client.feed(_assistant("第一回合进行中"))
+            await _wait_until(lambda: len(collected) >= 1)
+            # Steering submit while turn one is still open.
+            await transport.submit_turn(handle, TurnInput(text="two"), "k2")
+            client.feed(_result("第一回合结果", session_id="agent-1"))
+            await asyncio.sleep(0.3)
+            self.assertFalse(consumer.done(), "settle fired while the steering turn was queued")
+            client.feed(_assistant("第二回合回复"))
+            client.feed(_result("第二回合回复", session_id="agent-1"))
+            await asyncio.wait_for(consumer, timeout=5.0)
+            return collected
+
+        events = asyncio.run(scenario())
+        texts = [e.payload.get("text", "") for e in events if e.type == AgentEventType.TURN_DELTA]
+        self.assertIn("第二回合回复", texts)
+
+
 class HeadlessSettleConfigTests(unittest.TestCase):
     def test_settle_and_ceiling_env_keys_parse(self):
         from walkcode.channel_native import _configured_agent_options

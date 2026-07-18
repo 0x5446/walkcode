@@ -5549,8 +5549,22 @@ class ClaudeHeadlessTransport:
             asyncio.ensure_future(bridge.next_event()) if bridge is not None else None
         )
         active_tasks: dict[str, dict[str, Any]] = {}
-        turn_open = True
+        turn_open = False
         last_result_at = float("-inf")
+        # Submit-marker attribution (live-confirmed 2026-07-18 takeover
+        # incident): a result may only "consume" the pending-submit marker if
+        # it plausibly belongs to the submitted turn. Two guards:
+        # - turn_started_at: a turn that began before the submit (mid-turn
+        #   steering) cannot account for it;
+        # - current_turn_injected: a turn whose opening traffic is a stream
+        #   user message is CLI-initiated (task-notification replay etc.) —
+        #   submitted prompts are never echoed back on the stream — so its
+        #   result cannot account for the submit either. Without this, a
+        #   resume fork's auto-run notification turn clears the marker while
+        #   the submitted turn is still silently queued, and settle kills the
+        #   worker before that turn ever streams.
+        turn_started_at = time.monotonic()
+        current_turn_injected = False
         # Base for the background-wait ceiling: reset by any stream traffic.
         quiet_since = time.monotonic()
         # Non-zero after a terminal task_notification: hold off settle until
@@ -5745,12 +5759,23 @@ class ClaudeHeadlessTransport:
                     # stream would wait forever for a completion that never
                     # comes and the worker would never settle.
                     turn_open = False
-                    last_result_at = time.monotonic()
+                    if not current_turn_injected and turn_started_at >= self._last_submit_at.get(
+                        handle.handle_id, float("-inf")
+                    ):
+                        # This result plausibly belongs to the submitted turn,
+                        # so the submit is accounted for. A result from an
+                        # older or CLI-injected turn must NOT clear the
+                        # marker: the submitted turn is still queued behind it.
+                        last_result_at = time.monotonic()
+                    current_turn_injected = False
                     # A completed turn IS the follow-up the hold was waiting
                     # for (or supersedes it); keeping the hold would only
                     # delay settle.
                     injection_hold_until = 0.0
                 elif events or self._is_turn_traffic(message):
+                    if not turn_open:
+                        turn_started_at = time.monotonic()
+                        current_turn_injected = self._is_user_role_message(message)
                     turn_open = True
                     injection_hold_until = 0.0
         finally:
