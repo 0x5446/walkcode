@@ -620,7 +620,7 @@ class DeepReviewRegressionTests(unittest.TestCase):
                 await transport.submit_turn(handle, TurnInput(text="hi"), "k1")
             # A failed submit must not leave a "turn in flight" marker that
             # blocks settle forever.
-            self.assertNotIn(handle.handle_id, transport._last_submit_at)
+            self.assertNotIn(handle.handle_id, transport._pending_turns)
 
         asyncio.run(scenario())
 
@@ -985,6 +985,379 @@ class DeepReviewRegressionTests(unittest.TestCase):
         self.assertEqual(session.lifecycle_state, "IDLE")
         self.assertEqual(session.background_tasks, [])
         self.assertTrue(any("后台任务等待超时" in text for text in texts), texts)
+
+
+class TakeoverInjectedTurnRegressionTests(unittest.TestCase):
+    """2026-07-18 live incident: after a takeover, the resume fork auto-runs a
+    stopped-task notification turn FIRST; its result must not account for the
+    user's submitted turn, or settle kills the worker while that turn is still
+    silently queued (the user's "yes" never got a reply)."""
+
+    def test_injected_turn_result_does_not_consume_submit_marker(self):
+        async def scenario():
+            cls = _stream_client_class()
+            transport = _transport(cls, grace=0.05)
+            handle = await transport.launch_session(cwd="/tmp/p", session_id="s1")
+            # Takeover ordering: the blocked input is submitted BEFORE the
+            # listener attaches (defer_event_drain).
+            await transport.submit_turn(handle, TurnInput(text="yes"), "k1")
+            client = transport._clients[handle.handle_id]
+            collected: list = []
+            consumer = asyncio.create_task(_consume(transport, handle, collected))
+            # The CLI runs the injected notification turn first: opening
+            # traffic is a stream user message, then its result lands.
+            client.feed(_user("<task-notification><task-id>t9</task-id><status>stopped</status></task-notification>"))
+            client.feed(_result("旧回合收尾", session_id="agent-1"))
+            # Well past the grace: the submitted "yes" turn has produced no
+            # stream traffic yet, but the listener must stay on duty.
+            await asyncio.sleep(0.4)
+            self.assertFalse(
+                consumer.done(),
+                "settle fired while the submitted turn was still queued (incident regression)",
+            )
+            client.feed(_assistant("yes 的真正回复"))
+            client.feed(_result("yes 的真正回复", session_id="agent-1"))
+            await asyncio.wait_for(consumer, timeout=5.0)
+            return transport, handle, client, collected
+
+        transport, handle, client, events = asyncio.run(scenario())
+        texts = [e.payload.get("text", "") for e in events if e.type == AgentEventType.TURN_DELTA]
+        self.assertIn("yes 的真正回复", texts)
+        # After the REAL submitted turn completed, settle proceeds normally.
+        self.assertTrue(client.disconnected)
+        self.assertFalse(transport.handle_is_live(handle.handle_id))
+
+    def test_typed_notification_with_bare_result_does_not_consume_submit(self):
+        # Review round G2: the stopped-task notification can arrive as a typed
+        # TaskNotificationMessage (no user-role opening traffic) followed by a
+        # bare result; that result must not account for the queued submit.
+        async def scenario():
+            cls = _stream_client_class()
+            transport = _transport(cls, grace=0.05)
+            handle = await transport.launch_session(cwd="/tmp/p", session_id="s1")
+            transport._NOTIFICATION_FOLLOWUP_GRACE = 0.1
+            await transport.submit_turn(handle, TurnInput(text="yes"), "k1")
+            client = transport._clients[handle.handle_id]
+            collected: list = []
+            consumer = asyncio.create_task(_consume(transport, handle, collected))
+            client.feed(_task_notification("t9", "stopped"))
+            client.feed(_result("旧回合收尾", session_id="agent-1"))
+            await asyncio.sleep(0.4)
+            self.assertFalse(consumer.done(), "typed notification result consumed the queued submit")
+            client.feed(_assistant("yes 的真正回复"))
+            client.feed(_result("yes 的真正回复", session_id="agent-1"))
+            await asyncio.wait_for(consumer, timeout=5.0)
+            return collected
+
+        events = asyncio.run(scenario())
+        texts = [e.payload.get("text", "") for e in events if e.type == AgentEventType.TURN_DELTA]
+        self.assertIn("yes 的真正回复", texts)
+
+    def test_result_only_turn_on_reused_worker_still_settles(self):
+        # Review round G3a: a reused listener gets a second submit whose turn
+        # emits ONLY a result (no assistant/user traffic first). The counter
+        # must still be consumed — a stuck marker would hold the worker open
+        # forever.
+        async def scenario():
+            cls = _stream_client_class()
+            transport = _transport(cls, grace=0.05)
+            handle = await transport.launch_session(cwd="/tmp/p", session_id="s1")
+            await transport.submit_turn(handle, TurnInput(text="one"), "k1")
+            client = transport._clients[handle.handle_id]
+            collected: list = []
+            consumer = asyncio.create_task(_consume(transport, handle, collected))
+            client.feed(_assistant("first"))
+            client.feed(_result("first", session_id="agent-1"))
+            await _wait_until(lambda: any(e.type == AgentEventType.TURN_COMPLETED for e in collected))
+            # Reuse: second submit, then a bare result with no other traffic.
+            await transport.submit_turn(handle, TurnInput(text="two"), "k2")
+            client.feed(_result("second (result only)", session_id="agent-1"))
+            await asyncio.wait_for(consumer, timeout=5.0)
+            return transport, handle
+
+        transport, handle = asyncio.run(scenario())
+        self.assertFalse(transport.handle_is_live(handle.handle_id))
+
+    def test_two_queued_submits_need_two_results(self):
+        # Review round G3b: two user messages queued back-to-back — the first
+        # reply must not settle the listener while the second is still queued.
+        async def scenario():
+            cls = _stream_client_class()
+            transport = _transport(cls, grace=0.05)
+            handle = await transport.launch_session(cwd="/tmp/p", session_id="s1")
+            await transport.submit_turn(handle, TurnInput(text="one"), "k1")
+            await transport.submit_turn(handle, TurnInput(text="two"), "k2")
+            client = transport._clients[handle.handle_id]
+            collected: list = []
+            consumer = asyncio.create_task(_consume(transport, handle, collected))
+            client.feed(_assistant("回复一"))
+            client.feed(_result("回复一", session_id="agent-1"))
+            await asyncio.sleep(0.3)
+            self.assertFalse(consumer.done(), "settled with the second submit still queued")
+            client.feed(_assistant("回复二"))
+            client.feed(_result("回复二", session_id="agent-1"))
+            await asyncio.wait_for(consumer, timeout=5.0)
+            return collected
+
+        events = asyncio.run(scenario())
+        texts = [e.payload.get("text", "") for e in events if e.type == AgentEventType.TURN_DELTA]
+        self.assertIn("回复二", texts)
+
+    def test_unanswered_submit_hits_ceiling_with_visible_warning(self):
+        # A submit that never produces any stream traffic must not hold the
+        # worker open forever: past the ceiling the listener warns and closes.
+        async def scenario():
+            cls = _stream_client_class()
+            transport = _transport(cls, grace=0.05, ceiling=0.3)
+            handle = await transport.launch_session(cwd="/tmp/p", session_id="s1")
+            await transport.submit_turn(handle, TurnInput(text="one"), "k1")
+            client = transport._clients[handle.handle_id]
+            collected: list = []
+            consumer = asyncio.create_task(_consume(transport, handle, collected))
+            client.feed(_assistant("first"))
+            client.feed(_result("first", session_id="agent-1"))
+            await _wait_until(lambda: any(e.type == AgentEventType.TURN_COMPLETED for e in collected))
+            # Second submit gets NO response at all.
+            await transport.submit_turn(handle, TurnInput(text="two"), "k2")
+            await asyncio.wait_for(consumer, timeout=5.0)
+            return transport, handle, collected
+
+        transport, handle, events = asyncio.run(scenario())
+        texts = [e.payload.get("text", "") for e in events if e.type == AgentEventType.TURN_DELTA]
+        self.assertTrue(any("没有得到任何响应" in text for text in texts), texts)
+        self.assertFalse(transport.handle_is_live(handle.handle_id))
+
+    def test_injected_turn_with_assistant_text_does_not_consume_submit(self):
+        # Round-2 review Critical: the notification-predicted injected turn
+        # usually streams assistant text; that must not reclassify it as a
+        # user turn whose result consumes the queued submit.
+        async def scenario():
+            cls = _stream_client_class()
+            transport = _transport(cls, grace=0.05)
+            handle = await transport.launch_session(cwd="/tmp/p", session_id="s1")
+            transport._NOTIFICATION_FOLLOWUP_GRACE = 1.0
+            await transport.submit_turn(handle, TurnInput(text="yes"), "k1")
+            client = transport._clients[handle.handle_id]
+            collected: list = []
+            consumer = asyncio.create_task(_consume(transport, handle, collected))
+            client.feed(_task_notification("t9", "stopped"))
+            client.feed(_assistant("注入回合的正文"))
+            client.feed(_result("注入回合的正文", session_id="agent-1"))
+            await asyncio.sleep(0.4)
+            self.assertFalse(consumer.done(), "injected turn with text consumed the queued submit")
+            client.feed(_assistant("yes 的真正回复"))
+            client.feed(_result("yes 的真正回复", session_id="agent-1"))
+            await asyncio.wait_for(consumer, timeout=5.0)
+            return collected
+
+        events = asyncio.run(scenario())
+        texts = [e.payload.get("text", "") for e in events if e.type == AgentEventType.TURN_DELTA]
+        self.assertIn("yes 的真正回复", texts)
+
+    def test_fresh_submit_gets_full_pending_window_despite_quiet_background(self):
+        # Round-2 review Critical: the pending-turn ceiling must clock from
+        # the submit, not from the last stream traffic — a fresh submit after
+        # a long-quiet background task must not be killed instantly.
+        async def scenario():
+            cls = _stream_client_class()
+            transport = _transport(cls, grace=0.05, ceiling=0.4)
+            handle = await transport.launch_session(cwd="/tmp/p", session_id="s1")
+            await transport.submit_turn(handle, TurnInput(text="one"), "k1")
+            client = transport._clients[handle.handle_id]
+            collected: list = []
+            consumer = asyncio.create_task(_consume(transport, handle, collected))
+            client.feed(_assistant("first"))
+            client.feed(_task_started("t1", "长静默任务"))
+            client.feed(_result("first", session_id="agent-1"))
+            # Background quiet for most of the ceiling window.
+            await asyncio.sleep(0.3)
+            self.assertFalse(consumer.done())
+            await transport.submit_turn(handle, TurnInput(text="two"), "k2")
+            # Under the bug the inherited quiet clock kills this submit almost
+            # immediately; with the fix it gets its own full window.
+            await asyncio.sleep(0.2)
+            self.assertFalse(consumer.done(), "fresh submit was killed by inherited quiet clock")
+            client.feed(_assistant("second reply"))
+            client.feed(_task_notification("t1", "completed"))
+            client.feed(_result("second reply", session_id="agent-1"))
+            await asyncio.wait_for(consumer, timeout=5.0)
+            return collected
+
+        events = asyncio.run(scenario())
+        texts = [e.payload.get("text", "") for e in events if e.type == AgentEventType.TURN_DELTA]
+        self.assertIn("second reply", texts)
+
+    def test_bare_result_after_expired_injection_window_consumes_submit(self):
+        # Residual from the sticky prediction: if the predicted injected turn
+        # never comes, a later bare-result user turn must still settle.
+        async def scenario():
+            cls = _stream_client_class()
+            transport = _transport(cls, grace=0.05)
+            handle = await transport.launch_session(cwd="/tmp/p", session_id="s1")
+            transport._NOTIFICATION_FOLLOWUP_GRACE = 0.2
+            await transport.submit_turn(handle, TurnInput(text="one"), "k1")
+            client = transport._clients[handle.handle_id]
+            collected: list = []
+            consumer = asyncio.create_task(_consume(transport, handle, collected))
+            client.feed(_task_notification("t1", "stopped"))
+            # Let the injection window lapse with no injected turn.
+            await asyncio.sleep(0.4)
+            client.feed(_result("bare result of the real turn", session_id="agent-1"))
+            await asyncio.wait_for(consumer, timeout=5.0)
+            return transport, handle
+
+        transport, handle = asyncio.run(scenario())
+        self.assertFalse(transport.handle_is_live(handle.handle_id))
+
+    def test_worker_death_before_any_traffic_yields_visible_error(self):
+        # Round-3 review (6-dimension consensus): a submit accepted and then
+        # the worker dies before producing a single stream message — that
+        # must surface as a SESSION_ERROR, not silence + ACTIVE forever.
+        async def scenario():
+            cls = _stream_client_class()
+            transport = _transport(cls, grace=0.05)
+            handle = await transport.launch_session(cwd="/tmp/p", session_id="s1")
+            await transport.submit_turn(handle, TurnInput(text="hi"), "k1")
+            client = transport._clients[handle.handle_id]
+            collected: list = []
+            consumer = asyncio.create_task(_consume(transport, handle, collected))
+            client.feed_eof()
+            await asyncio.wait_for(consumer, timeout=5.0)
+            return transport, handle, collected
+
+        transport, handle, events = asyncio.run(scenario())
+        errors = [e for e in events if e.type == AgentEventType.SESSION_ERROR]
+        self.assertTrue(errors, "worker death with a pending submit was silent")
+        self.assertIn("没有被处理", str(errors[-1].payload.get("message", "")))
+        self.assertFalse(transport.handle_is_live(handle.handle_id))
+
+    def test_reply_with_text_after_expired_prediction_consumes_submit(self):
+        # Round-3 review Critical: prediction expiry must be evaluated at
+        # turn-classification time (the pending wait sleeps on the ceiling and
+        # never wakes at window expiry).
+        async def scenario():
+            cls = _stream_client_class()
+            transport = _transport(cls, grace=0.05)
+            handle = await transport.launch_session(cwd="/tmp/p", session_id="s1")
+            transport._NOTIFICATION_FOLLOWUP_GRACE = 0.2
+            await transport.submit_turn(handle, TurnInput(text="one"), "k1")
+            client = transport._clients[handle.handle_id]
+            collected: list = []
+            consumer = asyncio.create_task(_consume(transport, handle, collected))
+            client.feed(_task_notification("t1", "stopped"))
+            # Window lapses with no injected turn; then the REAL reply opens
+            # with assistant text.
+            await asyncio.sleep(0.4)
+            client.feed(_assistant("real reply"))
+            client.feed(_result("real reply", session_id="agent-1"))
+            await asyncio.wait_for(consumer, timeout=5.0)
+            return transport, handle
+
+        transport, handle = asyncio.run(scenario())
+        self.assertFalse(transport.handle_is_live(handle.handle_id))
+
+    def test_legacy_zero_traffic_eof_with_pending_submit_yields_error(self):
+        # Adversarial-verify residual: the legacy (receive_response-only)
+        # path must also surface a lost submit instead of ending silently.
+        class _DeadLegacyClient:
+            def __init__(self, options=None):
+                self.options = options
+
+            async def connect(self, prompt=None):
+                return None
+
+            async def query(self, prompt, session_id="default"):
+                return None
+
+            async def receive_response(self):
+                return
+                yield  # pragma: no cover — makes this an empty async generator
+
+        async def scenario():
+            transport = ClaudeHeadlessTransport(sdk_loader=lambda: _make_sdk(_DeadLegacyClient))
+            handle = await transport.launch_session(cwd="/tmp/p", session_id="s1")
+            await transport.submit_turn(handle, TurnInput(text="hi"), "k1")
+            collected: list = []
+            await _consume(transport, handle, collected)
+            return collected
+
+        events = asyncio.run(scenario())
+        errors = [e for e in events if e.type == AgentEventType.SESSION_ERROR]
+        self.assertTrue(errors, "legacy zero-traffic EOF with a pending submit was silent")
+
+    def test_internal_typeerror_from_control_method_is_not_swallowed(self):
+        # Signature binding (not try/except) decides the call shape: a
+        # TypeError raised INSIDE the method must propagate, not trigger a
+        # silent second bare invocation.
+        class _BuggyInterruptClient(_stream_client_class()):
+            def __init__(self, options=None):
+                super().__init__(options)
+                self.calls = 0
+
+            async def interrupt(self, reason):
+                self.calls += 1
+                raise TypeError("internal bug")
+
+        async def scenario():
+            transport = _transport(_BuggyInterruptClient)
+            handle = await transport.launch_session(cwd="/tmp/p", session_id="s1")
+            client = transport._clients[handle.handle_id]
+            with self.assertRaises(TypeError):
+                await transport.interrupt(handle, "user_requested")
+            return client
+
+        client = asyncio.run(scenario())
+        self.assertEqual(client.calls, 1, "internal TypeError triggered a hidden retry")
+
+    def test_interrupt_tolerates_argless_sdk_signature(self):
+        # The real SDK's interrupt() takes no arguments; forwarding a reason
+        # must not fail the control call.
+        class _ArglessInterruptClient(_stream_client_class()):
+            def __init__(self, options=None):
+                super().__init__(options)
+                self.interrupted = False
+
+            async def interrupt(self):
+                self.interrupted = True
+
+        async def scenario():
+            transport = _transport(_ArglessInterruptClient)
+            handle = await transport.launch_session(cwd="/tmp/p", session_id="s1")
+            client = transport._clients[handle.handle_id]
+            result = await transport.interrupt(handle, "user_requested")
+            return result, client
+
+        result, client = asyncio.run(scenario())
+        self.assertTrue(result.accepted)
+        self.assertTrue(client.interrupted)
+
+    def test_mid_turn_steering_submit_survives_current_turn_result(self):
+        # A submit issued while a turn is streaming (queued steering input):
+        # the CURRENT turn's result predates the submit and must not consume
+        # its marker either.
+        async def scenario():
+            cls = _stream_client_class()
+            transport = _transport(cls, grace=0.05)
+            handle = await transport.launch_session(cwd="/tmp/p", session_id="s1")
+            await transport.submit_turn(handle, TurnInput(text="one"), "k1")
+            client = transport._clients[handle.handle_id]
+            collected: list = []
+            consumer = asyncio.create_task(_consume(transport, handle, collected))
+            client.feed(_assistant("第一回合进行中"))
+            await _wait_until(lambda: len(collected) >= 1)
+            # Steering submit while turn one is still open.
+            await transport.submit_turn(handle, TurnInput(text="two"), "k2")
+            client.feed(_result("第一回合结果", session_id="agent-1"))
+            await asyncio.sleep(0.3)
+            self.assertFalse(consumer.done(), "settle fired while the steering turn was queued")
+            client.feed(_assistant("第二回合回复"))
+            client.feed(_result("第二回合回复", session_id="agent-1"))
+            await asyncio.wait_for(consumer, timeout=5.0)
+            return collected
+
+        events = asyncio.run(scenario())
+        texts = [e.payload.get("text", "") for e in events if e.type == AgentEventType.TURN_DELTA]
+        self.assertIn("第二回合回复", texts)
 
 
 class HeadlessSettleConfigTests(unittest.TestCase):

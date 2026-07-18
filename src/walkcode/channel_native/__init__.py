@@ -5260,9 +5260,17 @@ class ClaudeHeadlessTransport:
         # worker instead of leaking it, and the orchestrator can reuse a live
         # worker instead of forking a second --resume process.
         self._session_handles: dict[str, str] = {}
-        # handle_id -> monotonic time of the last submit: a turn submitted but
-        # not yet visible on the stream must block settle (grace race).
-        self._last_submit_at: dict[str, float] = {}
+        # handle_id -> count of submitted turns not yet accounted for by a
+        # stream result. Counter semantics (not a timestamp): each submit_turn
+        # increments; the listener decrements when a NON-injected turn
+        # completes. Timestamps proved un-attributable — a result can belong
+        # to a CLI-injected turn or to an earlier turn, and generator yields
+        # suspend at arbitrary points, so time comparison mis-credited results
+        # to queued submits (2026-07-18 takeover incident + review round).
+        self._pending_turns: dict[str, int] = {}
+        # handle_id -> monotonic time of the latest submit; feeds ONLY the
+        # pending-turn ceiling clock (see submit_turn).
+        self._last_submit_monotonic: dict[str, float] = {}
 
     def capabilities(self) -> TransportCapabilities:
         available = self._available()
@@ -5351,7 +5359,8 @@ class ClaudeHeadlessTransport:
         """
         client = self._clients.pop(handle_id, None)
         bridge = self._bridges.pop(handle_id, None)
-        self._last_submit_at.pop(handle_id, None)
+        self._pending_turns.pop(handle_id, None)
+        self._last_submit_monotonic.pop(handle_id, None)
         for session_id, mapped in list(self._session_handles.items()):
             if mapped == handle_id:
                 self._session_handles.pop(session_id, None)
@@ -5401,8 +5410,13 @@ class ClaudeHeadlessTransport:
             # between the caller's liveness check and this submit. Raising the
             # typed error lets the orchestrator fall back to a fresh resume.
             raise TransportUnavailable("claude headless worker is gone (settled or restarted)")
-        previous_submit_at = self._last_submit_at.get(handle.handle_id)
-        self._last_submit_at[handle.handle_id] = time.monotonic()
+        self._pending_turns[handle.handle_id] = self._pending_turns.get(handle.handle_id, 0) + 1
+        # Timestamp for the pending-turn ceiling clock ONLY (never for result
+        # attribution): a fresh submit must get the full ceiling even when the
+        # stream has already been quiet for a long time (background tasks).
+        previous_submit_ts = self._last_submit_monotonic.get(handle.handle_id)
+        this_submit_ts = time.monotonic()
+        self._last_submit_monotonic[handle.handle_id] = this_submit_ts
         try:
             submit = getattr(client, "submit", None)
             if submit is not None:
@@ -5424,11 +5438,22 @@ class ClaudeHeadlessTransport:
         except BaseException:
             # A failed submit must not leave a "turn in flight" marker behind:
             # the persistent listener would wait for a turn that never started
-            # and never settle.
-            if previous_submit_at is None:
-                self._last_submit_at.pop(handle.handle_id, None)
+            # and never settle. The ceiling timestamp also rolls back — a
+            # failed attempt must not extend an OLDER pending submit's
+            # timeout window (review round 3).
+            remaining = self._pending_turns.get(handle.handle_id, 1) - 1
+            if remaining > 0:
+                self._pending_turns[handle.handle_id] = remaining
             else:
-                self._last_submit_at[handle.handle_id] = previous_submit_at
+                self._pending_turns.pop(handle.handle_id, None)
+            if self._last_submit_monotonic.get(handle.handle_id) == this_submit_ts:
+                # CAS-style rollback: only undo OUR write — an interleaved
+                # concurrent submit that succeeded after us must keep its own
+                # (newer) clock.
+                if previous_submit_ts is None:
+                    self._last_submit_monotonic.pop(handle.handle_id, None)
+                else:
+                    self._last_submit_monotonic[handle.handle_id] = previous_submit_ts
             raise
 
     @staticmethod
@@ -5549,8 +5574,26 @@ class ClaudeHeadlessTransport:
             asyncio.ensure_future(bridge.next_event()) if bridge is not None else None
         )
         active_tasks: dict[str, dict[str, Any]] = {}
-        turn_open = True
-        last_result_at = float("-inf")
+        turn_open = False
+        # Submit accounting (live-confirmed 2026-07-18 takeover incident +
+        # review round): each submit_turn increments _pending_turns; the
+        # result of a NON-injected turn decrements it. A turn is "injected"
+        # (CLI-initiated: notification replay after a takeover resume, etc.)
+        # when its opening stream traffic is a user-role message — submitted
+        # prompts are never echoed back on the stream — or when a
+        # task_notification arrives between turns and predicts one. Injected
+        # turns never account for submits, so a queued user turn can't be
+        # mis-credited and killed by settle. Counters, not timestamps: results
+        # are un-attributable by time (generator yields suspend arbitrarily,
+        # injected turns interleave), and a counter also represents several
+        # queued submits at once.
+        current_turn_injected = False
+        # Sticky prediction: a between-turns notification announces that the
+        # NEXT turn will be CLI-injected — regardless of its opening traffic
+        # (the injected turn usually streams assistant text, which must not
+        # reclassify it as a user turn). Expires with the injection window if
+        # no turn materializes.
+        injected_turn_expected = False
         # Base for the background-wait ceiling: reset by any stream traffic.
         quiet_since = time.monotonic()
         # Non-zero after a terminal task_notification: hold off settle until
@@ -5571,6 +5614,12 @@ class ClaudeHeadlessTransport:
                         for event in bridge.drain_ready_events():
                             yield event
                     settled = persistent
+                    # Capture BEFORE unregistering clears it: submits that
+                    # never produced any stream traffic died with the worker
+                    # and must not vanish silently — on the legacy
+                    # (receive_response) path too, where a zero-traffic EOF
+                    # equally means the turn is gone.
+                    pending_lost = self._pending_turns.get(handle.handle_id, 0)
                     if persistent:
                         closing = self._unregister_handle(handle.handle_id)
                         if active_tasks:
@@ -5615,14 +5664,42 @@ class ClaudeHeadlessTransport:
                                     )
                                 },
                             )
+                    if pending_lost > 0:
+                        # Last (lifecycle-wise it must win over any synthetic
+                        # completion above): the worker/stream ended before
+                        # producing a single message for an accepted submit.
+                        # Silence here = the session stuck on ACTIVE forever
+                        # with the user's message gone (review round 3,
+                        # 6-dimension consensus; legacy path included per the
+                        # adversarial verify pass).
+                        _log_degrade(
+                            "headless_worker_eof_with_pending_turns",
+                            handle_id=handle.handle_id,
+                            pending_turns=pending_lost,
+                            persistent=persistent,
+                        )
+                        yield AgentEvent(
+                            AgentEventType.SESSION_ERROR,
+                            {
+                                "message": (
+                                    "代理进程在生成回复前退出了，你刚发送的消息没有被处理；"
+                                    "请重发一次。"
+                                )
+                            },
+                        )
                     break
                 timeout = self._stream_wait_timeout(
                     persistent=persistent,
-                    turn_open=self._turn_in_flight(handle, turn_open, last_result_at),
+                    # Raw turn state on purpose: unaccounted submits must NOT
+                    # map to an infinite wait — they get the bounded ceiling
+                    # via pending_turns below.
+                    turn_open=turn_open,
                     active_tasks=active_tasks,
                     bridge=bridge,
                     quiet_since=quiet_since,
                     injection_hold_until=injection_hold_until,
+                    pending_turns=self._pending_turns.get(handle.handle_id, 0),
+                    pending_submitted_at=self._last_submit_monotonic.get(handle.handle_id, 0.0),
                 )
                 pending_before_wait = bridge is not None and bridge.has_any_pending()
                 wait_set = {task for task in (msg_task, queue_task) if task is not None}
@@ -5634,9 +5711,7 @@ class ClaudeHeadlessTransport:
                 if not done:
                     # Quiet period elapsed. Re-derive the state (a submit may
                     # have raced in) and either settle or fire the ceiling.
-                    if self._turn_in_flight(handle, turn_open, last_result_at) or (
-                        bridge is not None and bridge.has_any_pending()
-                    ):
+                    if turn_open or (bridge is not None and bridge.has_any_pending()):
                         continue
                     if pending_before_wait:
                         # A human decision resolved during this wait; the time
@@ -5644,6 +5719,56 @@ class ClaudeHeadlessTransport:
                         # ceiling/grace clocks restart from the answer.
                         quiet_since = time.monotonic()
                         continue
+                    if injected_turn_expected and time.monotonic() >= injection_hold_until:
+                        # The predicted injected turn never materialized; drop
+                        # the prediction so the next real turn's result can
+                        # account for a queued submit again.
+                        injected_turn_expected = False
+                    pending_submits = self._pending_turns.get(handle.handle_id, 0)
+                    if pending_submits > 0:
+                        # A submitted turn has produced nothing yet. Keep
+                        # waiting up to the ceiling — measured from the LATER
+                        # of last stream traffic and the latest submit (a
+                        # fresh submit must get the full window even when
+                        # background tasks were already long quiet) — past
+                        # it, give up loudly instead of holding the worker
+                        # open forever.
+                        pending_clock = max(
+                            quiet_since,
+                            self._last_submit_monotonic.get(handle.handle_id, quiet_since),
+                        )
+                        if (
+                            self.background_wait_ceiling_seconds <= 0
+                            or time.monotonic() - pending_clock < self.background_wait_ceiling_seconds
+                        ):
+                            continue
+                        closing = self._unregister_handle(handle.handle_id)
+                        _log_degrade(
+                            "headless_pending_turn_ceiling",
+                            handle_id=handle.handle_id,
+                            pending_turns=pending_submits,
+                            ceiling_seconds=self.background_wait_ceiling_seconds,
+                        )
+                        yield AgentEvent(
+                            AgentEventType.TURN_DELTA,
+                            {
+                                "text": (
+                                    f"⚠️ 已提交的消息在 {int(self.background_wait_ceiling_seconds)} 秒内"
+                                    "没有得到任何响应，已停止本次会话监听。直接回复可重新拉起会话。"
+                                )
+                            },
+                        )
+                        yield AgentEvent(AgentEventType.TURN_COMPLETED, {"message": ""})
+                        if active_tasks:
+                            # This close also abandons the background ledger;
+                            # clear it or the status card keeps advertising
+                            # tasks nobody is listening for.
+                            yield AgentEvent(
+                                AgentEventType.BACKGROUND_TASKS,
+                                {"count": 0, "tasks": [], "abandoned": len(active_tasks)},
+                            )
+                        settled = True
+                        break
                     if not active_tasks and time.monotonic() < injection_hold_until:
                         # A notification just drained the ledger; its injected
                         # follow-up turn may still be on the way.
@@ -5717,8 +5842,14 @@ class ClaudeHeadlessTransport:
                         # that just drained the ledger (a bare terminal
                         # task_updated, an empty background_tasks_changed) —
                         # predicts a CLI-injected follow-up turn: hold off
-                        # settle for it. Mid-turn events don't: the follow-up
-                        # is the very turn that is already streaming.
+                        # settle for it, and stickily mark the NEXT turn as
+                        # injected so its result cannot account for a queued
+                        # user submit. Sticky on purpose: the injected turn
+                        # usually opens with assistant text, which must not
+                        # reclassify it as a user turn (review round 2).
+                        # Mid-turn events don't: the follow-up is the very
+                        # turn already streaming.
+                        injected_turn_expected = True
                         injection_hold_until = time.monotonic() + max(
                             self.settle_grace_seconds, self._NOTIFICATION_FOLLOWUP_GRACE
                         )
@@ -5735,8 +5866,11 @@ class ClaudeHeadlessTransport:
                     )
                     continue
                 events = self._convert_sdk_message_to_events(message)
-                for event in events:
-                    yield event
+                # Advance ALL turn/accounting state BEFORE yielding: the
+                # generator suspends at yield while the orchestrator awaits
+                # (cards, outbox), and a submit racing into that window must
+                # observe consistent state (review round: yield-suspension
+                # made time-based attribution unsound).
                 if any(
                     event.type in {AgentEventType.TURN_COMPLETED, AgentEventType.SESSION_ERROR}
                     for event in events
@@ -5744,15 +5878,54 @@ class ClaudeHeadlessTransport:
                     # An error result also closes the turn — without this the
                     # stream would wait forever for a completion that never
                     # comes and the worker would never settle.
+                    result_is_injected = current_turn_injected or (
+                        # A bare result with no opening traffic while an
+                        # injected turn is predicted (window still live):
+                        # attribute it to the injected turn, not to a queued
+                        # submit.
+                        not turn_open
+                        and injected_turn_expected
+                        and time.monotonic() < injection_hold_until
+                    )
                     turn_open = False
-                    last_result_at = time.monotonic()
-                    # A completed turn IS the follow-up the hold was waiting
-                    # for (or supersedes it); keeping the hold would only
-                    # delay settle.
+                    if not result_is_injected:
+                        # A non-injected turn completed: it accounts for one
+                        # submitted turn. Injected turns (notification
+                        # replays) never do — the queued user turn is still
+                        # behind them.
+                        pending = self._pending_turns.get(handle.handle_id, 0)
+                        if pending > 1:
+                            self._pending_turns[handle.handle_id] = pending - 1
+                        else:
+                            self._pending_turns.pop(handle.handle_id, None)
+                    current_turn_injected = False
+                    # Whatever turn just closed satisfies (or supersedes) the
+                    # injected-turn prediction and the hold window; keeping
+                    # either would only delay settle.
+                    injected_turn_expected = False
                     injection_hold_until = 0.0
                 elif events or self._is_turn_traffic(message):
+                    if not turn_open:
+                        # Classify the opening turn: a predicted injected turn
+                        # stays injected regardless of traffic type — but the
+                        # prediction must be checked against its window HERE
+                        # (the pending-turn wait sleeps on the long ceiling
+                        # and won't wake at window expiry), or a real reply
+                        # arriving after expiry is still misclassified and
+                        # its result never accounts for the submit. Otherwise
+                        # a stream user-role message means CLI-injected
+                        # (submitted prompts are never echoed on the stream).
+                        prediction_live = (
+                            injected_turn_expected and time.monotonic() < injection_hold_until
+                        )
+                        current_turn_injected = prediction_live or self._is_user_role_message(
+                            message
+                        )
+                        injected_turn_expected = False
                     turn_open = True
                     injection_hold_until = 0.0
+                for event in events:
+                    yield event
         finally:
             for task in (msg_task, queue_task):
                 if task is not None and not task.done():
@@ -5781,13 +5954,6 @@ class ClaudeHeadlessTransport:
         raw = str(task.get("description") or task.get("task_id") or "?")
         return re.sub(r"\s+", " ", raw).strip()[:40] or "?"
 
-    def _turn_in_flight(self, handle: TransportHandle, turn_open: bool, last_result_at: float) -> bool:
-        if turn_open:
-            return True
-        # A turn submitted after the last observed result has not surfaced on
-        # the stream yet; settling now would kill it (submit/settle race).
-        return self._last_submit_at.get(handle.handle_id, float("-inf")) > last_result_at
-
     def _stream_wait_timeout(
         self,
         *,
@@ -5797,6 +5963,8 @@ class ClaudeHeadlessTransport:
         bridge: _ClaudePermissionBridge | None,
         quiet_since: float,
         injection_hold_until: float = 0.0,
+        pending_turns: int = 0,
+        pending_submitted_at: float = 0.0,
     ) -> float | None:
         """How long the next stream wait may block before a settle check.
 
@@ -5804,7 +5972,8 @@ class ClaudeHeadlessTransport:
         runs, thinking), which has its own health watchdog. A pending human
         decision waits in bounded rechecks instead: resolve() completes a
         Future without waking this loop, so an infinite wait could outlive the
-        answer and freeze the ceiling clock.
+        answer and freeze the ceiling clock. Unaccounted submits wait up to
+        the background ceiling, never forever.
         """
         if not persistent:
             return None
@@ -5812,6 +5981,15 @@ class ClaudeHeadlessTransport:
             return None
         if bridge is not None and bridge.has_any_pending():
             return self._PENDING_DECISION_RECHECK_SECONDS
+        if pending_turns > 0:
+            if self.background_wait_ceiling_seconds <= 0:
+                return None
+            # Fresh submits get the full window even if the stream was
+            # already long quiet (background tasks): clock from the later of
+            # last traffic and last submit.
+            pending_clock = max(quiet_since, pending_submitted_at)
+            remaining = self.background_wait_ceiling_seconds - (time.monotonic() - pending_clock)
+            return max(remaining, 0.1)
         if not active_tasks:
             hold = injection_hold_until - time.monotonic()
             return max(self.settle_grace_seconds, hold, 0.1)
@@ -6060,7 +6238,19 @@ class ClaudeHeadlessTransport:
         method = getattr(client, method_name, None)
         if method is None:
             return ControlResult(False, BlockedReason.CAPABILITY_DISABLED)
-        await _maybe_await(method(*args))
+        call_args = args
+        if args:
+            # Signature drift tolerance decided UP FRONT (the real SDK's
+            # interrupt() takes no arguments while ours forwards a reason).
+            # Binding beats try/except-TypeError: a retry would double-invoke
+            # the method and mask TypeErrors raised inside its body.
+            try:
+                inspect.signature(method).bind(*args)
+            except TypeError:
+                call_args = ()
+            except (ValueError, RuntimeError):
+                pass  # unintrospectable callable: keep the declared args
+        await _maybe_await(method(*call_args))
         return ControlResult(True, state=state)
 
     def _available(self) -> bool:
@@ -8548,15 +8738,17 @@ class Orchestrator:
             if delay:
                 await asyncio.sleep(delay)
             try:
-                await channel.edit_view(binding, inbound.message_id, view)
-                return
+                if await channel.edit_view(binding, inbound.message_id, view):
+                    return
+                # A False return is a failure too (adapter refused the edit):
+                # treating it as success left live buttons on settled cards.
             except Exception as exc:
                 last_exc = exc
         _log_degrade(
             "decided_card_flip_failed",
             kind=kind,
             message_id=inbound.message_id,
-            error=f"{type(last_exc).__name__}: {last_exc}" if last_exc else "unknown",
+            error=f"{type(last_exc).__name__}: {last_exc}" if last_exc else "edit_view returned False",
         )
 
     async def _notify_interaction_delivery_failure(
@@ -8765,12 +8957,54 @@ class Orchestrator:
                     detail=_format_ask_answers(ctx),
                 )
         if decision.accepted and ctx.kind == "takeover":
-            return await self._handle_takeover_decision(
-                session,
-                ctx,
-                decision,
-                actor=actor,
+            takeover_action = str((decision.decision or {}).get("action", ""))
+            try:
+                takeover_result = await self._handle_takeover_decision(
+                    session,
+                    ctx,
+                    decision,
+                    actor=actor,
+                )
+            except Exception:
+                # Unexpected failure (e.g. the TUI terminate step raising a
+                # non-TakeoverError): the button token is already consumed, so
+                # the card must still flip to a terminal state before the
+                # error propagates — otherwise it keeps inviting clicks that
+                # can never succeed.
+                await self._flip_decided_card(
+                    inbound,
+                    kind="takeover",
+                    action=takeover_action or "takeover",
+                    detail="接管过程中出错。本卡片已失效；重新发送一条消息可再次触发接管。",
+                )
+                raise
+            # The button token was consumed the moment it was clicked, so the
+            # card must ALWAYS flip to a terminal state — leaving a live
+            # button after a failure invites clicks that can never succeed
+            # (review round 3). Failures flip to a failure notice that points
+            # at the recovery path (send a new message → fresh prompt).
+            if takeover_result.accepted or takeover_result.reason in {
+                "keep_readonly",
+                TakeoverPhase.MANUAL_ONLY,
+            }:
+                detail = {
+                    "takeover_and_send": "已接管会话并发送消息",
+                    "request_takeover": "已接管会话",
+                    "keep_readonly": "保持只读，本条输入已取消",
+                    "manual_instructions": "已发送手动接管指引",
+                }.get(takeover_action, "")
+            else:
+                detail = (
+                    f"接管未完成（{takeover_result.reason or 'failed'}）。"
+                    "本卡片已失效；重新发送一条消息可再次触发接管。"
+                )
+            await self._flip_decided_card(
+                inbound,
+                kind="takeover",
+                action=takeover_action or "takeover",
+                detail=detail,
             )
+            return takeover_result
         if decision.accepted and ctx.kind == "model_choice":
             model = str((decision.decision or {}).get("action", ""))
             result = await self.set_session_model(session.session_id, actor=actor, model=model)
@@ -9666,17 +9900,20 @@ class Orchestrator:
                 session.generation != expected_generation
                 or session.transport_kind != expected_transport_kind
                 or session.status == "stopped"
+                or str(session.transport_ref.get("handle_id", "")) != handle.handle_id
             ):
-                # Ownership fence (generation/transport moved) — and closed
-                # sessions: a shutdown mid-listen still delivers the stream's
-                # tail events (EOF warning, synthetic completion), which must
-                # not flip a STOPPED session's lifecycle back to IDLE/ACTIVE.
+                # Ownership fence (generation/transport moved) — plus closed
+                # sessions and handle replacement: a shutdown or a resume to a
+                # fresh worker mid-listen still delivers the OLD stream's tail
+                # events (EOF warning, synthetic completion, pending-lost
+                # error), which must not overwrite the successor's lifecycle.
                 _log_degrade(
                     "event_drain_ownership_moved",
                     session_id=session.session_id,
                     expected_generation=expected_generation,
                     current_generation=session.generation,
                     session_status=session.status,
+                    drain_handle=handle.handle_id,
                 )
                 return
             saw_any_event = True

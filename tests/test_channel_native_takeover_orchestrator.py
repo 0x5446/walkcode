@@ -502,7 +502,10 @@ class TakeoverOrchestratorTests(unittest.TestCase):
         tx = next(iter(orchestrator.sessions.to_dict()["takeovers"].values()))
         self.assertFalse(result.accepted)
         self.assertEqual(result.reason, TakeoverPhase.MANUAL_ONLY)
-        self.assertEqual(channel.sent_views[-1]["view"]["type"], "manual_only")
+        # The clicked takeover card is now always flipped to a terminal
+        # decision_result at the end; the informative view precedes it.
+        self.assertEqual(channel.sent_views[-1]["view"]["type"], "decision_result")
+        self.assertEqual(channel.sent_views[-2]["view"]["type"], "manual_only")
         self.assertEqual(tx["phase"], TakeoverPhase.MANUAL_ONLY)
         self.assertEqual(updated.writer_owner.kind, "external_tui")
         self.assertEqual(transport.submitted_turns, [])
@@ -535,8 +538,11 @@ class TakeoverOrchestratorTests(unittest.TestCase):
 
         self.assertFalse(result.accepted)
         self.assertEqual(result.reason, BlockedReason.CAPABILITY_DISABLED)
-        self.assertEqual(channel.sent_views[-1]["view"]["type"], "takeover_progress")
-        self.assertEqual(channel.sent_views[-1]["view"]["phase"], "failed")
+        # The clicked takeover card is now always flipped to a terminal
+        # decision_result at the end; the informative view precedes it.
+        self.assertEqual(channel.sent_views[-1]["view"]["type"], "decision_result")
+        self.assertEqual(channel.sent_views[-2]["view"]["type"], "takeover_progress")
+        self.assertEqual(channel.sent_views[-2]["view"]["phase"], "failed")
         self.assertEqual(transport.submitted_turns, [])
 
     def test_successful_takeover_submits_blocked_input_once(self):
@@ -589,8 +595,16 @@ class TakeoverOrchestratorTests(unittest.TestCase):
         self.assertEqual(
             progress_phases[-2:], ["submitting_blocked_input", "submitted_blocked_input"]
         )
-        self.assertEqual(channel.sent_views[-1]["view"]["type"], "takeover_progress")
-        self.assertEqual(channel.sent_views[-1]["view"]["phase"], "submitted_blocked_input")
+        # After success the clicked takeover prompt is flipped to a terminal
+        # decision_result card (no live button left to double-click); the last
+        # progress card before it is the green "message sent" state.
+        self.assertEqual(channel.sent_views[-1]["view"]["type"], "decision_result")
+        self.assertEqual(channel.sent_views[-1]["view"]["action"], "takeover_and_send")
+        progress_views = [
+            item["view"] for item in channel.sent_views
+            if item["view"].get("type") == "takeover_progress"
+        ]
+        self.assertEqual(progress_views[-1]["phase"], "submitted_blocked_input")
 
     def test_successful_takeover_marks_old_generation_hitl_stale(self):
         orchestrator, channel, transport, session = _setup(
