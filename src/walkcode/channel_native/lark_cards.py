@@ -390,13 +390,7 @@ def _takeover_progress_card(view: dict[str, Any]) -> dict[str, Any]:
     }
     text = labels.get(phase, "接管进行中…")
     reason = str(view.get("reason", "") or "")
-    if phase == "failed" and reason == "external_tui_still_running":
-        # Self-respawning terminal agent: kill-and-resume takeover can't win.
-        text = (
-            "接管失败：终端会话仍在运行（关掉后又自动重启），无法从这里接管。\n"
-            "请直接在终端里操作，或先彻底结束终端会话再试。"
-        )
-    elif reason and phase not in ("completed", "submitted_blocked_input"):
+    if reason and phase not in ("completed", "submitted_blocked_input"):
         text = f"{text}\n**原因**: {escape_lark_md(_inline(reason))}"
     template = (
         "green"
