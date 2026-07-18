@@ -1256,6 +1256,59 @@ class TakeoverInjectedTurnRegressionTests(unittest.TestCase):
         transport, handle = asyncio.run(scenario())
         self.assertFalse(transport.handle_is_live(handle.handle_id))
 
+    def test_legacy_zero_traffic_eof_with_pending_submit_yields_error(self):
+        # Adversarial-verify residual: the legacy (receive_response-only)
+        # path must also surface a lost submit instead of ending silently.
+        class _DeadLegacyClient:
+            def __init__(self, options=None):
+                self.options = options
+
+            async def connect(self, prompt=None):
+                return None
+
+            async def query(self, prompt, session_id="default"):
+                return None
+
+            async def receive_response(self):
+                return
+                yield  # pragma: no cover — makes this an empty async generator
+
+        async def scenario():
+            transport = ClaudeHeadlessTransport(sdk_loader=lambda: _make_sdk(_DeadLegacyClient))
+            handle = await transport.launch_session(cwd="/tmp/p", session_id="s1")
+            await transport.submit_turn(handle, TurnInput(text="hi"), "k1")
+            collected: list = []
+            await _consume(transport, handle, collected)
+            return collected
+
+        events = asyncio.run(scenario())
+        errors = [e for e in events if e.type == AgentEventType.SESSION_ERROR]
+        self.assertTrue(errors, "legacy zero-traffic EOF with a pending submit was silent")
+
+    def test_internal_typeerror_from_control_method_is_not_swallowed(self):
+        # Signature binding (not try/except) decides the call shape: a
+        # TypeError raised INSIDE the method must propagate, not trigger a
+        # silent second bare invocation.
+        class _BuggyInterruptClient(_stream_client_class()):
+            def __init__(self, options=None):
+                super().__init__(options)
+                self.calls = 0
+
+            async def interrupt(self, reason):
+                self.calls += 1
+                raise TypeError("internal bug")
+
+        async def scenario():
+            transport = _transport(_BuggyInterruptClient)
+            handle = await transport.launch_session(cwd="/tmp/p", session_id="s1")
+            client = transport._clients[handle.handle_id]
+            with self.assertRaises(TypeError):
+                await transport.interrupt(handle, "user_requested")
+            return client
+
+        client = asyncio.run(scenario())
+        self.assertEqual(client.calls, 1, "internal TypeError triggered a hidden retry")
+
     def test_interrupt_tolerates_argless_sdk_signature(self):
         # The real SDK's interrupt() takes no arguments; forwarding a reason
         # must not fail the control call.

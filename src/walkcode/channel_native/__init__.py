@@ -5415,7 +5415,8 @@ class ClaudeHeadlessTransport:
         # attribution): a fresh submit must get the full ceiling even when the
         # stream has already been quiet for a long time (background tasks).
         previous_submit_ts = self._last_submit_monotonic.get(handle.handle_id)
-        self._last_submit_monotonic[handle.handle_id] = time.monotonic()
+        this_submit_ts = time.monotonic()
+        self._last_submit_monotonic[handle.handle_id] = this_submit_ts
         try:
             submit = getattr(client, "submit", None)
             if submit is not None:
@@ -5445,10 +5446,14 @@ class ClaudeHeadlessTransport:
                 self._pending_turns[handle.handle_id] = remaining
             else:
                 self._pending_turns.pop(handle.handle_id, None)
-            if previous_submit_ts is None:
-                self._last_submit_monotonic.pop(handle.handle_id, None)
-            else:
-                self._last_submit_monotonic[handle.handle_id] = previous_submit_ts
+            if self._last_submit_monotonic.get(handle.handle_id) == this_submit_ts:
+                # CAS-style rollback: only undo OUR write — an interleaved
+                # concurrent submit that succeeded after us must keep its own
+                # (newer) clock.
+                if previous_submit_ts is None:
+                    self._last_submit_monotonic.pop(handle.handle_id, None)
+                else:
+                    self._last_submit_monotonic[handle.handle_id] = previous_submit_ts
             raise
 
     @staticmethod
@@ -5609,11 +5614,13 @@ class ClaudeHeadlessTransport:
                         for event in bridge.drain_ready_events():
                             yield event
                     settled = persistent
+                    # Capture BEFORE unregistering clears it: submits that
+                    # never produced any stream traffic died with the worker
+                    # and must not vanish silently — on the legacy
+                    # (receive_response) path too, where a zero-traffic EOF
+                    # equally means the turn is gone.
+                    pending_lost = self._pending_turns.get(handle.handle_id, 0)
                     if persistent:
-                        # Capture BEFORE unregistering clears it: submits that
-                        # never produced any stream traffic died with the
-                        # worker and must not vanish silently.
-                        pending_lost = self._pending_turns.get(handle.handle_id, 0)
                         closing = self._unregister_handle(handle.handle_id)
                         if active_tasks:
                             # The worker died with subagents still on the books:
@@ -5657,27 +5664,29 @@ class ClaudeHeadlessTransport:
                                     )
                                 },
                             )
-                        if pending_lost > 0:
-                            # Last (lifecycle-wise it must win over any
-                            # synthetic completion above): the worker exited
-                            # before producing a single message for an
-                            # accepted submit. Silence here = the session
-                            # stuck on ACTIVE forever with the user's message
-                            # gone (review round 3, 6-dimension consensus).
-                            _log_degrade(
-                                "headless_worker_eof_with_pending_turns",
-                                handle_id=handle.handle_id,
-                                pending_turns=pending_lost,
-                            )
-                            yield AgentEvent(
-                                AgentEventType.SESSION_ERROR,
-                                {
-                                    "message": (
-                                        "代理进程在生成回复前退出了，你刚发送的消息没有被处理；"
-                                        "请重发一次。"
-                                    )
-                                },
-                            )
+                    if pending_lost > 0:
+                        # Last (lifecycle-wise it must win over any synthetic
+                        # completion above): the worker/stream ended before
+                        # producing a single message for an accepted submit.
+                        # Silence here = the session stuck on ACTIVE forever
+                        # with the user's message gone (review round 3,
+                        # 6-dimension consensus; legacy path included per the
+                        # adversarial verify pass).
+                        _log_degrade(
+                            "headless_worker_eof_with_pending_turns",
+                            handle_id=handle.handle_id,
+                            pending_turns=pending_lost,
+                            persistent=persistent,
+                        )
+                        yield AgentEvent(
+                            AgentEventType.SESSION_ERROR,
+                            {
+                                "message": (
+                                    "代理进程在生成回复前退出了，你刚发送的消息没有被处理；"
+                                    "请重发一次。"
+                                )
+                            },
+                        )
                     break
                 timeout = self._stream_wait_timeout(
                     persistent=persistent,
@@ -6229,15 +6238,19 @@ class ClaudeHeadlessTransport:
         method = getattr(client, method_name, None)
         if method is None:
             return ControlResult(False, BlockedReason.CAPABILITY_DISABLED)
-        try:
-            await _maybe_await(method(*args))
-        except TypeError:
-            if not args:
-                raise
-            # Signature drift tolerance: the real SDK's interrupt() takes no
-            # arguments while ours forwards a reason — retry bare instead of
-            # failing the control call.
-            await _maybe_await(method())
+        call_args = args
+        if args:
+            # Signature drift tolerance decided UP FRONT (the real SDK's
+            # interrupt() takes no arguments while ours forwards a reason).
+            # Binding beats try/except-TypeError: a retry would double-invoke
+            # the method and mask TypeErrors raised inside its body.
+            try:
+                inspect.signature(method).bind(*args)
+            except TypeError:
+                call_args = ()
+            except (ValueError, RuntimeError):
+                pass  # unintrospectable callable: keep the declared args
+        await _maybe_await(method(*call_args))
         return ControlResult(True, state=state)
 
     def _available(self) -> bool:
@@ -8944,13 +8957,27 @@ class Orchestrator:
                     detail=_format_ask_answers(ctx),
                 )
         if decision.accepted and ctx.kind == "takeover":
-            takeover_result = await self._handle_takeover_decision(
-                session,
-                ctx,
-                decision,
-                actor=actor,
-            )
             takeover_action = str((decision.decision or {}).get("action", ""))
+            try:
+                takeover_result = await self._handle_takeover_decision(
+                    session,
+                    ctx,
+                    decision,
+                    actor=actor,
+                )
+            except Exception:
+                # Unexpected failure (e.g. the TUI terminate step raising a
+                # non-TakeoverError): the button token is already consumed, so
+                # the card must still flip to a terminal state before the
+                # error propagates — otherwise it keeps inviting clicks that
+                # can never succeed.
+                await self._flip_decided_card(
+                    inbound,
+                    kind="takeover",
+                    action=takeover_action or "takeover",
+                    detail="接管过程中出错。本卡片已失效；重新发送一条消息可再次触发接管。",
+                )
+                raise
             # The button token was consumed the moment it was clicked, so the
             # card must ALWAYS flip to a terminal state — leaving a live
             # button after a failure invites clicks that can never succeed
@@ -9873,17 +9900,20 @@ class Orchestrator:
                 session.generation != expected_generation
                 or session.transport_kind != expected_transport_kind
                 or session.status == "stopped"
+                or str(session.transport_ref.get("handle_id", "")) != handle.handle_id
             ):
-                # Ownership fence (generation/transport moved) — and closed
-                # sessions: a shutdown mid-listen still delivers the stream's
-                # tail events (EOF warning, synthetic completion), which must
-                # not flip a STOPPED session's lifecycle back to IDLE/ACTIVE.
+                # Ownership fence (generation/transport moved) — plus closed
+                # sessions and handle replacement: a shutdown or a resume to a
+                # fresh worker mid-listen still delivers the OLD stream's tail
+                # events (EOF warning, synthetic completion, pending-lost
+                # error), which must not overwrite the successor's lifecycle.
                 _log_degrade(
                     "event_drain_ownership_moved",
                     session_id=session.session_id,
                     expected_generation=expected_generation,
                     current_generation=session.generation,
                     session_status=session.status,
+                    drain_handle=handle.handle_id,
                 )
                 return
             saw_any_event = True
