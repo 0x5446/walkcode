@@ -16,8 +16,10 @@ import uuid
 import inspect
 import html
 import json
+import math
 import os
 import re
+import shlex
 import sys
 import tempfile
 import urllib.error
@@ -244,6 +246,15 @@ class ChannelNativeConfig:
     # invisible continue turn so the agent re-asks and the channel gets a
     # fresh answerable card. "off" is the escape hatch.
     handoff_continue: str = "auto"
+    # ADR 0053: ownership decisions (TUI handback / sentinel kill) only trust
+    # hooks whose capture stamp is within this window. Parsed from the MERGED
+    # env (WALKCODE_ENV_FILE included) — reading os.environ directly silently
+    # ignored the value in launchd deployments (deep-review cluster E).
+    tui_hook_fresh_seconds: float = 60.0
+    # Kill switch for the post-takeover remnant sentinel. Disable to fall back
+    # to notify-only if the sentinel ever misbehaves in production, without a
+    # redeploy/rollback.
+    tui_sentinel_enabled: bool = True
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> "ChannelNativeConfig":
@@ -274,6 +285,24 @@ class ChannelNativeConfig:
             raise ChannelConfigError(
                 f"invalid WALKCODE_HANDOFF_CONTINUE: {handoff_continue}; use auto or off"
             )
+        fresh_raw = str(source.get("WALKCODE_TUI_HOOK_FRESH_SECONDS") or "").strip()
+        tui_hook_fresh_seconds = 60.0
+        if fresh_raw:
+            try:
+                parsed_fresh = float(fresh_raw)
+            except ValueError:
+                raise ChannelConfigError(
+                    f"invalid WALKCODE_TUI_HOOK_FRESH_SECONDS: {fresh_raw}; must be a positive number"
+                )
+            # Reject inf/nan: `inf > 0` is True, which would make every stale
+            # hook permanently "fresh" and disable the whole gate (round-2).
+            if not math.isfinite(parsed_fresh) or parsed_fresh <= 0:
+                raise ChannelConfigError(
+                    f"invalid WALKCODE_TUI_HOOK_FRESH_SECONDS: {fresh_raw}; must be a finite positive number"
+                )
+            tui_hook_fresh_seconds = parsed_fresh
+        sentinel_raw = str(source.get("WALKCODE_TUI_SENTINEL_ENABLED") or "").strip().lower()
+        tui_sentinel_enabled = sentinel_raw not in {"0", "false", "off", "no"}
         return cls(
             channel=channel,
             agent=agent,
@@ -289,6 +318,8 @@ class ChannelNativeConfig:
                 if item.strip()
             ),
             handoff_continue=handoff_continue or "auto",
+            tui_hook_fresh_seconds=tui_hook_fresh_seconds,
+            tui_sentinel_enabled=tui_sentinel_enabled,
         )
 
     @property
@@ -2963,6 +2994,31 @@ class ViewModelFactory:
         }
 
     @staticmethod
+    def tui_conflict_notice(
+        *,
+        kind: str,
+        session_id: str,
+        pid: int = 0,
+        command: str = "",
+        detail: str = "",
+    ) -> dict[str, Any]:
+        """Explicit channel notice for TUI-ownership events.
+
+        kind:
+          - "handback": a live TUI (re)claimed the session; channel mirrors read-only.
+          - "remnant_terminated": the post-takeover sentinel killed a surviving TUI process.
+          - "remnant_detected": a surviving TUI was seen but could not be terminated.
+        """
+        return {
+            "type": "tui_conflict_notice",
+            "kind": kind,
+            "session_id": session_id,
+            "pid": int(pid or 0),
+            "command": command,
+            "detail": detail,
+        }
+
+    @staticmethod
     def manual_only(
         *,
         takeover_id: str,
@@ -3604,12 +3660,159 @@ class FakeExternalTuiController:
         return ControlResult(True, state="terminated")
 
 
-_TERMINATE_SESSION_ID_RE = re.compile(r"--session-id[ =]([0-9a-fA-F-]{8,64})")
+# Both real-world TUI attach forms carry the session id on argv:
+#   claude --session-id <id>   (daemon-managed session worker)
+#   claude --resume <id>       (interactive resume from the shell)
+# A bare `claude` + in-TUI /resume carries NO id and can never be found by
+# argv scanning — that gap is closed by the post-takeover hook sentinel in
+# channel_native_runtime, not by widening this regex further.
+_TERMINATE_SESSION_ID_RE = re.compile(r"--(?:session-id|resume)[ =]([0-9a-fA-F-]{8,64})")
 
 
 def _terminate_ref_session_id(ref: dict[str, Any]) -> str:
     match = _TERMINATE_SESSION_ID_RE.search(str(ref.get("command", "") or ""))
     return match.group(1) if match else ""
+
+
+def _command_executable_basename(command: str) -> str:
+    try:
+        parts = shlex.split(str(command or ""))
+    except ValueError:
+        parts = str(command or "").split()
+    if not parts:
+        return ""
+    return Path(parts[0]).name
+
+
+def _command_is_claude_headless_sdk_process(command: str) -> bool:
+    value = str(command or "")
+    if not value:
+        return False
+    if "claude_agent_sdk" in value and "_bundled/claude" in value:
+        return True
+    return "claude" in value and "--input-format stream-json" in value and "--output-format stream-json" in value
+
+
+def _command_is_claude_tui_process(command: str) -> bool:
+    value = str(command or "")
+    if not value or _command_is_claude_headless_sdk_process(value):
+        return False
+    return _command_executable_basename(value) in {"claude", "claude-code"}
+
+
+def _command_is_codex_app_server_process(command: str) -> bool:
+    # Any `codex app-server ...` form is a walkcode-managed internal process,
+    # not a user TUI: the stdio client uses `--stdio`, the managed daemon uses
+    # `app-server daemon [start]`. Match on the PARSED subcommand, not a bare
+    # substring — `codex "explain app-server"` is a real user TUI and a bare
+    # substring test misclassified it as internal (round-2 review), hiding its
+    # hooks. Matching only `--stdio` (the original) missed the daemon form and
+    # let the sentinel SIGTERM walkcode's own Codex service (round-1 cluster F).
+    value = str(command or "")
+    if _command_executable_basename(value) != "codex":
+        return False
+    try:
+        parts = shlex.split(value)
+    except ValueError:
+        parts = value.split()
+    return len(parts) >= 2 and parts[1] == "app-server"
+
+
+def _command_is_codex_tui_process(command: str) -> bool:
+    value = str(command or "")
+    if not value or _command_is_codex_app_server_process(value):
+        return False
+    return _command_executable_basename(value) == "codex"
+
+
+def _command_is_external_tui_process(command: str) -> bool:
+    return _command_is_claude_tui_process(command) or _command_is_codex_tui_process(command)
+
+
+@dataclass(frozen=True)
+class _ProcProbe:
+    """Three-state result of probing a pid's identity via `ps`.
+
+    Distinguishing "gone" from "error" is load-bearing (deep-review 2026-07-19
+    cluster C): collapsing a `ps` timeout / permission error / parse failure
+    into "process gone" is fail-open — it either kills a reused pid or disarms
+    a still-valid ledger entry. Callers MUST branch on all three states.
+
+    status:
+      - "ok":    process exists; `lstart` + `command` carry its identity
+      - "gone":  `ps` ran cleanly and the pid does not exist
+      - "error": probe could not be completed (timeout / exec error / unparsable)
+    """
+
+    status: str  # "ok" | "gone" | "error"
+    lstart: str = ""
+    command: str = ""
+
+
+def _probe_process(pid: int) -> _ProcProbe:
+    if pid <= 1:
+        return _ProcProbe("gone")
+    try:
+        result = subprocess.run(
+            ["ps", "-o", "stat=,lstart=,command=", "-p", str(pid)],
+            capture_output=True,
+            text=True,
+            timeout=1,
+        )
+    except Exception:
+        return _ProcProbe("error")
+    if result.returncode != 0:
+        # macOS/BSD `ps -p <pid>` exits 1 when the pid is absent — that is a
+        # clean "gone". Higher exit codes mean ps itself failed → "error".
+        return _ProcProbe("gone") if result.returncode == 1 else _ProcProbe("error")
+    line = result.stdout.strip("\n")
+    if not line.strip():
+        return _ProcProbe("gone")
+    # stat lstart(Www Mmm dd HH:MM:SS yyyy) command
+    match = re.match(
+        r"^\s*(\S+)\s+(\w{3}\s+\w{3}\s+\d{1,2}\s+[\d:]{8}\s+\d{4})\s+(.*)$",
+        line,
+        flags=re.DOTALL,
+    )
+    if match is None:
+        # Non-empty output we cannot parse is an error, not a "gone": failing
+        # open here would let a reused pid pass the identity gate.
+        return _ProcProbe("error")
+    stat = match.group(1)
+    # A zombie/defunct process is effectively gone: its pid lingers only until
+    # the parent reaps it. Treating it as "ok" would make _wait_exited spin
+    # until timeout on a process we just killed (it becomes a zombie first).
+    if stat.startswith("Z"):
+        return _ProcProbe("gone")
+    return _ProcProbe("ok", match.group(2).strip(), match.group(3).strip())
+
+
+def _proc_identity_matches(probe: _ProcProbe, expected_lstart: str, expected_command: str) -> bool:
+    """True if a live probe matches the recorded identity.
+
+    Empty expected fields are treated as "nothing to compare on that axis".
+    With no recorded identity at all, returns True (liveness-only; the caller
+    has already established the process is live).
+    """
+    expected_lstart = str(expected_lstart or "").strip()
+    expected_command = str(expected_command or "").strip()
+    if not expected_lstart and not expected_command:
+        return True
+    if expected_lstart and expected_lstart != probe.lstart:
+        return False
+    if expected_command and expected_command != probe.command:
+        return False
+    return True
+
+
+def _ps_lstart_command(pid: int) -> tuple[str, str] | None:
+    """Compatibility shim: identity tuple when the pid is live, else None.
+
+    Only for non-critical callers that genuinely cannot distinguish gone from
+    error. Termination and ledger-hygiene paths use `_probe_process` directly.
+    """
+    probe = _probe_process(pid)
+    return (probe.lstart, probe.command) if probe.status == "ok" else None
 
 
 class LocalProcessController:
@@ -3634,33 +3837,79 @@ class LocalProcessController:
             pid = int(ref.get("pid", 0) or 0)
         except (TypeError, ValueError):
             return ControlResult(False, "invalid_pid")
-        if pid <= 1 or pid == os.getpid():
-            return ControlResult(False, "invalid_pid")
         if not bool(ref.get("allow_terminate")):
             return ControlResult(False, "termination_not_authorized")
+        target_gone = bool(ref.get("target_gone"))
+        # Validate the primary pid up front on the non-target_gone path — before
+        # the scan — so a malformed ref still returns invalid_pid rather than a
+        # scan/auth error (round-3 verify: error-priority contract). target_gone
+        # deliberately skips this: its pid is known-dead and only the sweep runs.
+        if not target_gone and (pid <= 1 or pid == os.getpid()):
+            return ControlResult(False, "invalid_pid")
         # Claude Code >= 2.1.2xx runs TUI sessions as daemon-managed workers:
         # the hook-recorded pid is often just the pty host, and the session
         # keeps running in a `--session-id <id>` worker. Unless every process
         # of the session dies, headless resume is refused with "currently
-        # running as a background agent".
-        targets = [pid]
+        # running as a background agent". Scan FIRST: a scan failure must abort
+        # before any signal, or we kill the terminal then report failure and
+        # the takeover rolls back its fresh worker — leaving the user with no
+        # writer at all (round-2 cluster: Rollback).
         session_id = _terminate_ref_session_id(ref)
         if session_id:
-            targets.extend(self._pids_for_session(session_id))
-        targets = [
-            p for p in dict.fromkeys(targets) if p > 1 and p != os.getpid()
-        ]
+            status, triples = self._pids_for_session(session_id)
+            if status == "error":
+                return ControlResult(False, "session_scan_failed")
+        else:
+            triples = []
+        # Each target is (pid, expected_lstart, expected_command). Identity
+        # travels all the way to the signal so pid reuse never kills a stranger
+        # (cluster D). The recorded ref supplies its own capture-time identity;
+        # the sweep supplies scan-time identity per pid.
+        targets: list[tuple[int, str, str]] = []
+        if not target_gone:
+            # Primary pid already validated above. target_gone deliberately
+            # contributes no primary target — its pid is known dead/reused, so
+            # only the session sweep proceeds (round-3 EdgeState: a dead pid
+            # reused by the runtime itself must not abort the sweep).
+            targets.append((pid, str(ref.get("lstart", "") or ""), str(ref.get("command", "") or "")))
+        # Exclude the recorded (gone/reused) primary pid from the sweep too, so
+        # target_gone never routes a signal to it by another path.
+        triples = [t for t in triples if not (target_gone and t[0] == pid)]
+        targets.extend(triples)
+        seen: set[int] = set()
+        deduped: list[tuple[int, str, str]] = []
+        for tpid, ls, cmd in targets:
+            if tpid <= 1 or tpid == os.getpid() or tpid in seen:
+                continue
+            seen.add(tpid)
+            deduped.append((tpid, ls, cmd))
         final_state = "already_exited"
-        for target in targets:
-            result = self._kill_one(target)
+        for tpid, ls, cmd in deduped:
+            result = self._kill_one(tpid, ls, cmd)
             if not result.accepted:
                 return result
             if result.state != "already_exited":
                 final_state = result.state
         return ControlResult(True, state=final_state)
 
-    def _kill_one(self, pid: int) -> ControlResult:
-        if not self._pid_running(pid):
+    def _kill_one(self, pid: int, expected_lstart: str = "", expected_command: str = "") -> ControlResult:
+        probe = _probe_process(pid)
+        if probe.status == "gone":
+            return ControlResult(True, state="already_exited")
+        if probe.status == "error":
+            # Probe failure is not proof of death: refuse to signal rather than
+            # fail open onto a possibly-reused pid (deep-review cluster C).
+            _log_degrade("terminate_identity_probe_failed", pid=pid, phase="pre_sigterm")
+            return ControlResult(False, "identity_probe_failed")
+        if not _proc_identity_matches(probe, expected_lstart, expected_command):
+            # Live pid, but no longer the process we recorded → the original
+            # target already exited and the pid was reused. Do not kill it.
+            _log_degrade(
+                "terminate_stale_pid_skipped",
+                pid=pid,
+                recorded_command=expected_command,
+                current_command=probe.command,
+            )
             return ControlResult(True, state="already_exited")
         try:
             os.kill(pid, signal.SIGTERM)
@@ -3670,10 +3919,22 @@ class LocalProcessController:
             return ControlResult(False, "permission_denied")
         except OSError as exc:
             return ControlResult(False, str(exc))
-        if self._wait_exited(pid):
+        if self._wait_exited(pid, expected_lstart, expected_command):
             return ControlResult(True, state="terminated")
         if not self.kill_after_timeout:
             return ControlResult(False, "process_still_running")
+        # Re-verify identity before the harder SIGKILL: the wait window is
+        # exactly when the pid could have been reused by an unrelated process.
+        probe2 = _probe_process(pid)
+        if probe2.status == "gone":
+            return ControlResult(True, state="terminated")
+        if probe2.status == "error":
+            _log_degrade("terminate_identity_probe_failed", pid=pid, phase="pre_sigkill")
+            return ControlResult(False, "process_still_running")
+        if not _proc_identity_matches(probe2, expected_lstart, expected_command):
+            # Our target died during the wait and the pid was reused; the
+            # original is gone, which is what we wanted.
+            return ControlResult(True, state="terminated")
         try:
             os.kill(pid, signal.SIGKILL)
         except ProcessLookupError:
@@ -3682,33 +3943,82 @@ class LocalProcessController:
             return ControlResult(False, "permission_denied")
         except OSError as exc:
             return ControlResult(False, str(exc))
-        if self._wait_exited(pid):
+        if self._wait_exited(pid, expected_lstart, expected_command):
             return ControlResult(True, state="killed")
         return ControlResult(False, "process_still_running")
 
     @staticmethod
-    def _pids_for_session(session_id: str) -> list[int]:
+    def _pids_for_session(session_id: str) -> tuple[str, list[tuple[int, str, str]]]:
+        """Return ("ok"|"error", [(pid, lstart, command), ...]).
+
+        "error" means the pgrep scan itself failed (timeout / exec error) and
+        the caller must NOT treat the empty result as "no survivors". A clean
+        scan with zero matches is ("ok", []).
+        """
         try:
             result = subprocess.run(
-                ["pgrep", "-f", f"session-id {session_id}"],
+                ["pgrep", "-f", f"(session-id|resume)[= ]{session_id}"],
                 capture_output=True,
                 text=True,
                 timeout=2,
             )
         except Exception:
-            return []
+            return "error", []
+        # pgrep exit: 0 = matches, 1 = no matches. Anything else — including a
+        # NEGATIVE code when pgrep was signal-killed — is a scan error, not
+        # "no survivors" (round-2: negative rc fell through `> 1` as ok).
+        if result.returncode not in (0, 1):
+            return "error", []
         pids: list[int] = []
         for token in result.stdout.split():
             try:
                 pids.append(int(token))
             except ValueError:
                 continue
-        return pids
+        # Keep only genuine external TUI processes still bound to THIS session.
+        # The pgrep pattern also matches walkcode's own SDK workers
+        # (`_bundled/claude --resume=<id>`) — including the worker the takeover
+        # flow just resumed (resume runs BEFORE terminate by design; killing it
+        # was the v0.14.2 regression that forced revert 6c83ed9). And between
+        # pgrep and probe a pid can be reused by ANOTHER session's claude, so we
+        # re-extract the session id from the live command and require it match
+        # (round-2 concurrency#2).
+        safe: list[tuple[int, str, str]] = []
+        scan_error = False
+        for candidate in pids:
+            if candidate <= 1 or candidate == os.getpid():
+                continue
+            probe = _probe_process(candidate)
+            if probe.status == "error":
+                # Could not classify this pid — do not silently drop it, or a
+                # survivor we failed to probe reads as "no survivors".
+                scan_error = True
+                continue
+            if probe.status != "ok":
+                continue
+            if not _command_is_external_tui_process(probe.command):
+                continue
+            if _terminate_ref_session_id({"command": probe.command}) != session_id:
+                continue
+            safe.append((candidate, probe.lstart, probe.command))
+        return ("error" if scan_error else "ok"), safe
 
-    def _wait_exited(self, pid: int) -> bool:
+    def _wait_exited(self, pid: int, expected_lstart: str = "", expected_command: str = "") -> bool:
+        """True once the target is provably gone.
+
+        Three-state (round-2 cluster: false-success): a probe ERROR is NOT
+        "exited" — that would report a still-live terminal as terminated. Only
+        a clean "gone", or a live pid whose identity no longer matches (the
+        target died and the pid was reused), counts as exited.
+        """
         deadline = time.monotonic() + self.timeout
         while time.monotonic() < deadline:
-            if not self._pid_running(pid):
+            probe = _probe_process(pid)
+            if probe.status == "gone":
+                return True
+            if probe.status == "ok" and not _proc_identity_matches(
+                probe, expected_lstart, expected_command
+            ):
                 return True
             time.sleep(self.poll_interval)
         return False
@@ -3980,6 +4290,21 @@ def render_view_text(view_model: dict[str, Any]) -> str:
         # input is deduped upstream and never rendered as an echo).
         value = str(view_model.get("input", "") or "").strip()
         return f"⌨️ 终端输入\n\n{value}" if value else "⌨️ 终端输入"
+    if view_type == "tui_conflict_notice":
+        kind = str(view_model.get("kind", "") or "")
+        pid = int(view_model.get("pid", 0) or 0)
+        detail = str(view_model.get("detail", "") or "")
+        if kind == "handback":
+            rows = ["🖥️ 终端 TUI 已接回会话，本频道转为只读镜像。"]
+            rows.append("需要继续用频道驱动，请对新消息重新接管。")
+        elif kind == "remnant_terminated":
+            rows = [f"🧹 已终止终端进程 (pid {pid})：该会话由频道驱动，检测到终端进程双写，已清理。"]
+        else:
+            rows = [f"⚠️ 检测到终端进程 (pid {pid}) 与频道同时挂在该会话上，但未能终止。"]
+            rows.append("请在终端手动退出它，避免双写。")
+        if detail:
+            rows.append(detail)
+        return "\n".join(rows)
     if view_type == "tui_permission_notice":
         tool = str(view_model.get("tool_name", "") or "tool")
         summary = str(view_model.get("summary", "") or "")
@@ -9790,6 +10115,34 @@ class Orchestrator:
             idempotency_key=f"{session.session_id}:{session.generation}:{idempotency_key}",
         )
         await self._flush_outbox()
+
+    async def notify_tui_conflict(
+        self,
+        session: Session,
+        *,
+        kind: str,
+        pid: int = 0,
+        command: str = "",
+        detail: str = "",
+        dedupe_key: str = "",
+    ) -> None:
+        """Post an explicit TUI-ownership notice to the session's channel topic.
+
+        Silent ownership flips were the root of the 2026-07-19 takeover
+        incident ("接管完成" but no replies): the fence protected the data but
+        the user saw nothing. Every ownership-relevant TUI event now surfaces.
+        """
+        await self._send_session_view(
+            session,
+            ViewModelFactory.tui_conflict_notice(
+                kind=kind,
+                session_id=session.session_id,
+                pid=pid,
+                command=command,
+                detail=detail,
+            ),
+            idempotency_key=f"tui_conflict:{kind}:{dedupe_key or pid}",
+        )
 
     async def post_claude_gate_prompt(self, session_id: str, request: dict[str, Any]) -> bool:
         """Post a permission / AskUserQuestion card for a PreToolUse gate request.

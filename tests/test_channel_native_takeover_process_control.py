@@ -2,6 +2,7 @@ import asyncio
 import subprocess
 import sys
 import unittest
+import unittest.mock
 
 from walkcode.channel_native import (
     ActorRef,
@@ -174,16 +175,37 @@ class TakeoverProcessControlTests(unittest.TestCase):
 
             _time.sleep(0.2)
             controller = LocalProcessController(timeout=2.0)
-            result = asyncio.run(
-                controller.terminate(
-                    {
-                        "pid": pty_host.pid,
-                        "allow_terminate": True,
-                        "command": f"claude --bg-pty-host x -- claude --session-id {session_id} --resume y",
-                    },
-                    reason="test",
+            # ADR 0053: the kill path verifies pid identity (command must match
+            # the live process) via _probe_process, and the sweep keeps only
+            # external-TUI commands. These stand-ins are sleep/python, so patch
+            # the probe to present claude-shaped identities for them.
+            import walkcode.channel_native as cn
+
+            recorded_command = f"claude --bg-pty-host x -- claude --session-id {session_id} --resume y"
+            real_probe = cn._probe_process
+
+            def fake_probe(pid):
+                # Delegate to the real probe for LIVENESS (so _wait_exited sees
+                # the stand-ins actually die), only substituting the claude-
+                # shaped identity while they are alive.
+                real = real_probe(pid)
+                if pid == pty_host.pid and real.status == "ok":
+                    return cn._ProcProbe("ok", "Sun Jul 19 10:00:00 2026", recorded_command)
+                if pid == worker.pid and real.status == "ok":
+                    return cn._ProcProbe("ok", "Sun Jul 19 10:00:01 2026", f"claude --session-id {session_id}")
+                return real
+
+            with unittest.mock.patch.object(cn, "_probe_process", side_effect=fake_probe):
+                result = asyncio.run(
+                    controller.terminate(
+                        {
+                            "pid": pty_host.pid,
+                            "allow_terminate": True,
+                            "command": recorded_command,
+                        },
+                        reason="test",
+                    )
                 )
-            )
 
             self.assertTrue(result.accepted)
             pty_host.wait(timeout=2.0)

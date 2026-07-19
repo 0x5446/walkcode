@@ -2223,6 +2223,22 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
                 transports={"claude_headless": FakeAgentTransport("claude_headless", _transport_caps())},
             )
 
+            # ADR 0053 ledger hygiene disarms refs whose pid is dead at
+            # recording time — the stand-in pid must be a real live process.
+            # Double-fork so it reparents to pid 1: the internal-headless
+            # guard walks the pid's REAL ancestry, and when this suite runs
+            # inside a walkcode worker a plain Popen child would have
+            # `_bundled/claude` as an ancestor and get ignored as internal.
+            spawn = subprocess.run(
+                ["/bin/sh", "-c", "sleep 60 >/dev/null 2>&1 & echo $!"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            stand_in_pid = int(spawn.stdout.strip())
+            self.addCleanup(
+                lambda: subprocess.run(["kill", "-9", str(stand_in_pid)], capture_output=True)
+            )
             created = asyncio.run(
                 runtime.process_tui_hook(
                     hook_type="sync",
@@ -2232,7 +2248,7 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
                         "cwd": tmp,
                         "terminate_ref": {
                             "controller_kind": "process",
-                            "process_ref": {"pid": 123, "allow_terminate": True},
+                            "process_ref": {"pid": stand_in_pid, "allow_terminate": True},
                         },
                     },
                 )
@@ -2247,7 +2263,7 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
                         "message": "finished from TUI",
                         "terminate_ref": {
                             "controller_kind": "process",
-                            "process_ref": {"pid": 123, "allow_terminate": True},
+                            "process_ref": {"pid": stand_in_pid, "allow_terminate": True},
                         },
                     },
                 )
@@ -2538,6 +2554,52 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
             self.assertEqual(len(send_messages), 1)
             self.assertIn("WalkCode session: claude: TUI claude-session-1", send_messages[0]["text"])
             self.assertEqual(list(Path(f"{state_path}.tui-hooks.d").glob("*.json")), [])
+
+    def test_deferred_drain_archives_malformed_queue_entries(self):
+        # round-3: a non-dict item, or an entry with an unusable created_at,
+        # must be archived — not wedge the queue on retry, not slip through
+        # stampless and read as "fresh now".
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = str(Path(tmp) / "state.json")
+            cfg = ChannelNativeConfig.from_env(
+                {
+                    "WALKCODE_CHANNEL": "telegram",
+                    "TELEGRAM_BOT_TOKEN": "fake",
+                    "WALKCODE_AGENT": "claude",
+                    "TELEGRAM_ALLOWED_CHAT_IDS": "123",
+                    "WALKCODE_STATE_PATH": state_path,
+                    "WALKCODE_CWD": tmp,
+                }
+            )
+            api = _FakeTelegramApi()
+            runtime = ChannelNativeRuntime.from_config(
+                cfg,
+                telegram_api=api,
+                transports={"claude_headless": FakeAgentTransport("claude_headless", _transport_caps())},
+            )
+            qdir = Path(f"{state_path}.tui-hooks.d")
+            qdir.mkdir(parents=True, exist_ok=True)
+            # non-dict JSON (array) and a dict whose payload lacks a stamp and
+            # whose created_at is non-finite.
+            (qdir / "00-bad-array.json").write_text('["not","a","dict"]', encoding="utf-8")
+            (qdir / "01-bad-created.json").write_text(
+                json.dumps(
+                    {
+                        "id": "x",
+                        "created_at": "inf",
+                        "hook_type": "SessionStart",
+                        "agent": "claude",
+                        "payload": {"session_id": "claude-session-9", "cwd": tmp},
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            drained = asyncio.run(runtime.drain_deferred_tui_hooks())
+
+            self.assertEqual(drained, 0)
+            # both archived out of the live queue (no infinite retry wedge)
+            self.assertEqual(list(qdir.glob("*.json")), [])
 
     def test_deferred_tui_hook_filename_uses_nanosecond_order(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -3101,7 +3163,12 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
             self.assertEqual(updated.writer_owner.kind, "external_tui")
             self.assertEqual(updated.generation, 1)
             self.assertEqual(updated.transport_ref["resume_ref"]["agent_session_id"], "claude-session-1")
-            self.assertEqual([method for method, _payload in api.calls], [])
+            # ADR 0053: the orchestrator -> external_tui flip is no longer
+            # silent — an explicit handback notice reaches the channel.
+            sent = [method for method, _payload in api.calls]
+            self.assertEqual(sent, ["sendMessage"])
+            notice = next(payload for method, payload in api.calls if method == "sendMessage")
+            self.assertIn("接回", str(notice.get("text", "")))
 
     def test_tui_hook_claim_settles_pending_hitl_and_shuts_down_worker(self):
         # ADR 0051: claiming a structured session whose worker is blocked on
@@ -3460,7 +3527,7 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
             fake_ps = subprocess.CompletedProcess(
                 args=["ps"],
                 returncode=0,
-                stdout="222 1 claude --settings /Users/alpha/.claude/profiles/vertex.json\n",
+                stdout="222 1 Sun Jul 19 10:00:00 2026 claude --settings /Users/alpha/.claude/profiles/vertex.json\n",
                 stderr="",
             )
 
@@ -3588,12 +3655,24 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
             session.writer_lease = None
             old_generation = session.generation
 
-            # Live proof: a real running pid whose recorded command looks like
-            # a claude TUI. Revival must require the pid still be alive, not
-            # just a command-string snapshot (deep-review v0.14.2 hardening).
+            # Live proof: a real running pid whose CURRENT identity classifies
+            # as a claude TUI. Revival requires the pid still be alive AND still
+            # be a TUI (round-2: identity re-probe, not pid-only). The stand-in
+            # is a `sleep`, so present a claude identity for it while delegating
+            # liveness to the real process.
             live = subprocess.Popen(["sleep", "60"])
             self.addCleanup(lambda: (live.kill(), live.wait(timeout=2.0)))
-            try:
+            real_probe = runtime_module._probe_process
+
+            def fake_probe(pid):
+                from walkcode.channel_native import _ProcProbe as _PP
+
+                real = real_probe(pid)
+                if pid == live.pid and real.status == "ok":
+                    return _PP("ok", "Sun Jul 19 10:20:02 2026", "/usr/local/bin/claude")
+                return real
+
+            with patch.object(runtime_module, "_probe_process", side_effect=fake_probe):
                 result = asyncio.run(
                     runtime.process_tui_hook(
                         hook_type="PostToolUse",
@@ -3603,13 +3682,11 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
                             "cwd": tmp,
                             "tool_name": "Bash",
                             "_walkcode_hook_process_tree_entries": [
-                                {"pid": live.pid, "ppid": 1, "command": "/usr/local/bin/claude"},
+                                {"pid": live.pid, "ppid": 1, "lstart": "Sun Jul 19 10:20:02 2026", "command": "/usr/local/bin/claude"},
                             ],
                         },
                     )
                 )
-            finally:
-                pass
 
             self.assertTrue(result.accepted)
             updated = JsonFileStateStore(state_path).load().sessions.get(session.session_id)
@@ -4162,7 +4239,7 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
         fake_ps = subprocess.CompletedProcess(
             args=["ps"],
             returncode=0,
-            stdout="23831 23723 claude\n",
+            stdout="23831 23723 Sun Jul 19 10:00:00 2026 claude\n",
             stderr="",
         )
 
