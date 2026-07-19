@@ -48,6 +48,16 @@ from .channel_native import (
     LaunchSpec,
     LocalProcessController,
     Orchestrator,
+    _command_executable_basename,
+    _command_is_claude_headless_sdk_process,
+    _command_is_claude_tui_process,
+    _command_is_codex_app_server_process,
+    _command_is_codex_tui_process,
+    _command_is_external_tui_process,
+    _log_degrade,
+    _probe_process,
+    _proc_identity_matches,
+    _ps_lstart_command,
     OutboxDispatcher,
     ResumeSpec,
     SessionRegistry,
@@ -2006,6 +2016,16 @@ class ChannelNativeRuntime:
         payload: dict[str, Any],
         agent: str = "",
     ) -> SubmitResult:
+        # Belt-and-suspenders capture stamp: the CLI hook entry stamps this at
+        # ingress and the deferred drain backfills it from the queue entry's
+        # created_at, so by here every real hook already carries a truthful
+        # stamp. Defaulting to "now" only ever applies to a live in-process
+        # caller that skipped the CLI entry — treating "first seen now" as the
+        # capture time is correct for those and keeps the freshness gate from
+        # mis-reading them as unknown-age. Deferred replays are already stamped,
+        # so setdefault never overrides them into looking fresh.
+        if isinstance(payload, dict):
+            payload.setdefault("_walkcode_hook_captured_at", time.time())
         hook_type = _normalize_tui_hook_type(hook_type or _payload_hook_event_name(payload))
         if not hook_type:
             self.save_state()
@@ -2161,10 +2181,35 @@ class ChannelNativeRuntime:
             except Exception:
                 self._archive_bad_tui_hook(path)
                 continue
+            if not isinstance(item, dict):
+                # A JSON array/string parses fine but has no .get — archive it
+                # rather than let the AttributeError below break the drain and
+                # wedge the queue on retry (round-2 cluster).
+                self._archive_bad_tui_hook(path)
+                continue
             payload = item.get("payload", {})
             if not isinstance(payload, dict):
                 self._archive_bad_tui_hook(path)
                 continue
+            # Backfill the capture stamp for pre-0.14.3 queued payloads (which
+            # lack it) from the queue entry's own created_at, so a replayed
+            # hook is correctly judged stale by age instead of dodging the
+            # freshness gate as "age unknown" (deep-review cluster B). A queued
+            # entry with no usable created_at is malformed — archive it rather
+            # than let it reach processing stampless (where it would default to
+            # "fresh now" and could re-flip ownership).
+            if "_walkcode_hook_captured_at" not in payload:
+                import math
+
+                created_at = item.get("created_at")
+                try:
+                    created_at = float(created_at) if created_at is not None else None
+                except (TypeError, ValueError):
+                    created_at = None
+                if created_at is None or not math.isfinite(created_at) or created_at <= 0:
+                    self._archive_bad_tui_hook(path)
+                    continue
+                payload["_walkcode_hook_captured_at"] = created_at
             try:
                 async with self._ingress_lock:
                     result = await self.process_tui_hook(
@@ -3244,7 +3289,7 @@ class ChannelNativeRuntime:
         raw_hook_type = _payload_hook_event_name(payload)
         if raw_hook_type and _normalize_tui_hook_type(raw_hook_type) != hook_type:
             external_ref["raw_hook_type"] = raw_hook_type
-        terminate_ref = _tui_terminate_ref(payload)
+        terminate_ref = _enrich_terminate_ref(_tui_terminate_ref(payload))
         if terminate_ref:
             external_ref["terminate_ref"] = terminate_ref
         actor = ActorRef(
@@ -3259,9 +3304,12 @@ class ChannelNativeRuntime:
         if existing_id:
             session = self.state.sessions.get(existing_id)
             if session.status == "stopped":
+                # Off the event loop: the identity re-probe shells out to `ps`
+                # per entry and can block for seconds during a deferred drain,
+                # starving heartbeats and other channels (round-3 Concurrency).
                 if not (
                     _session_is_external_tui_takeover_candidate(session)
-                    or _tui_hook_has_live_tui_process(transport_kind, payload)
+                    or await asyncio.to_thread(_tui_hook_has_live_tui_process, transport_kind, payload)
                 ):
                     # No TUI stamp on the record AND no *currently-live* TUI
                     # process behind the hook: a late/stale hook for a
@@ -3269,6 +3317,11 @@ class ChannelNativeRuntime:
                     # is not proof (a deferred hook replayed across a restart
                     # may describe an exited process) — the pid must still be
                     # running.
+                    _log_degrade(
+                        "tui_revival_refused",
+                        session_id=session.session_id,
+                        hook_type=hook_type,
+                    )
                     return session
                 # Revive. The record-stamp check alone is not enough: a
                 # takeover rewrites transport_kind/transport_ref and the
@@ -3297,12 +3350,71 @@ class ChannelNativeRuntime:
                 return session
             if not session.writer_owner or session.writer_owner.kind != "external_tui":
                 if not _tui_hook_can_claim_existing_session(hook_type):
+                    # ADR 0053 sentinel: activity hooks (not session-start /
+                    # sync) from an external TUI while the orchestrator owns
+                    # the writer lease mean a TUI process survived a takeover
+                    # (bare `claude` argv is invisible to every scan — the
+                    # hook is the only way it ever reveals itself). Kill it
+                    # on fresh evidence; never flip ownership here.
+                    await self._sentinel_terminate_remnant_tui(
+                        session=session,
+                        hook_type=hook_type,
+                        payload=payload,
+                    )
+                    return None
+                # Guard the orchestrator -> external_tui flip (deep-review
+                # cluster B / concurrency#1). A claim may flip ownership only
+                # when it is recent evidence of a real terminal:
+                #   - fresh (capture stamp within the window) OR backed by a
+                #     live TUI process — a stale replay describing a dead pid
+                #     (the 2026-07-19 01:16 incident) satisfies neither and is
+                #     refused, which is what fenced out the fresh worker while
+                #     the card said "接管完成";
+                #   - AND not predating the current owner: a claim captured
+                #     before the takeover that installed this orchestrator owner
+                #     must not flip it back (concurrency#1 — the claim belongs to
+                #     a world that the takeover already superseded).
+                # Freshness (not a live-process probe) is the primary gate so a
+                # legitimate resume is never refused by a transient ps hiccup.
+                hook_age = _tui_hook_captured_age(payload)
+                fresh = hook_age is not None and hook_age <= self._tui_hook_fresh_seconds()
+                live_tui = await asyncio.to_thread(
+                    _tui_hook_has_live_tui_process, transport_kind, payload
+                )
+                captured_at = _payload_captured_at(payload)
+                owner_acquired_at = float(getattr(session.writer_owner, "acquired_at", 0.0) or 0.0)
+                predates_owner = (
+                    captured_at is not None
+                    and owner_acquired_at > 0
+                    and captured_at < owner_acquired_at
+                )
+                # Two independent gates (round-3: predates is unconditional):
+                #  - recency: the claim must be fresh OR backed by a live TUI
+                #    (a dead-pid replay satisfies neither → refused);
+                #  - ordering: the claim must NOT predate the current owner's
+                #    acquisition. A claim captured before the takeover installed
+                #    this owner describes a superseded world and must never flip
+                #    it back — even if the old terminal is somehow still alive
+                #    (that survivor is the sentinel's job to kill, not to hand
+                #    back to). A deliberate post-takeover resume fires a FRESH
+                #    SessionStart captured AFTER acquisition, so it is unaffected.
+                if (not (fresh or live_tui)) or predates_owner:
+                    _log_degrade(
+                        "tui_claim_refused",
+                        session_id=session.session_id,
+                        hook_type=hook_type,
+                        fresh=fresh,
+                        live_tui=live_tui,
+                        predates_owner=predates_owner,
+                        age_seconds=round(hook_age, 1) if hook_age is not None else -1.0,
+                    )
                     return None
                 # Capture the structured owner's identity BEFORE the handoff
                 # rewrites transport_kind/transport_ref: the worker shutdown
                 # and stale-HITL sweep below need the old handle (ADR 0051).
                 prior_generation = session.generation
                 prior_transport_kind = session.transport_kind
+                prior_owner_kind = session.writer_owner.kind if session.writer_owner else ""
                 prior_handle = Orchestrator._handle_for_session(session)
                 result = self.state.sessions.handoff_to_external_tui(
                     session.session_id,
@@ -3320,6 +3432,14 @@ class ChannelNativeRuntime:
                     prior_handle=prior_handle,
                     through_generation=prior_generation,
                 )
+                if prior_owner_kind == "orchestrator":
+                    # The flip used to be silent — the user's next channel
+                    # message just went nowhere. Make it explicit.
+                    await self.orchestrator.notify_tui_conflict(
+                        session,
+                        kind="handback",
+                        dedupe_key="handback",
+                    )
             else:
                 session.transport_ref.update(external_ref)
                 if session.writer_owner is not None:
@@ -3354,6 +3474,178 @@ class ChannelNativeRuntime:
         self._grant_tui_channel_owners(session.session_id, binding)
         await self.orchestrator.refresh_session_status_card(session)
         return session
+
+    def _tui_hook_fresh_seconds(self) -> float:
+        return self.config.tui_hook_fresh_seconds
+
+    def _tui_hook_is_fresh(self, payload: dict[str, Any]) -> bool:
+        age = _tui_hook_captured_age(payload)
+        return age is not None and age <= self._tui_hook_fresh_seconds()
+
+    def _tui_sentinel_enabled(self) -> bool:
+        return self.config.tui_sentinel_enabled
+
+    async def _sentinel_terminate_remnant_tui(
+        self,
+        *,
+        session,
+        hook_type: str,
+        payload: dict[str, Any],
+    ) -> None:
+        """Kill a TUI process that survived a takeover (ADR 0053).
+
+        Preconditions enforced here, not by the caller:
+        - the sentinel is enabled (WALKCODE_TUI_SENTINEL_ENABLED; kill switch);
+        - the orchestrator holds the writer lease — a live external TUI hooking
+          into an orchestrator-driven session is a double-writer conflict
+          whether or not an explicit takeover happened;
+        - the hook is FRESH (capture stamp within tui_hook_fresh_seconds): bare
+          `claude` argv carries no session identity, so only a seconds-old hook
+          proves the pid belongs to this session;
+        - the pid still matches the identity captured AT HOOK TIME (pid +
+          lstart + command), verified inside the controller right before each
+          signal — a reused pid is skipped, never killed (cluster D);
+        - the command classifies as an external TUI — never walkcode's own
+          `_bundled` SDK workers (revert 6c83ed9 lesson: the freshly resumed
+          worker must be untouchable).
+
+        Termination runs concurrently with a short per-signal timeout so a
+        hung process cannot pin the channel ingress lock for long (cluster G).
+        """
+        if not session.writer_owner or session.writer_owner.kind != "orchestrator":
+            return
+        if session.status == "stopped":
+            return
+        candidates = [
+            entry
+            for entry in _tui_hook_process_tree_entries(payload)
+            if _command_is_external_tui_process(str(entry.get("command", "") or ""))
+        ]
+        if not candidates:
+            return
+        if not self._tui_hook_is_fresh(payload):
+            _log_degrade(
+                "sentinel_skip_stale_tui_hook",
+                session_id=session.session_id,
+                hook_type=hook_type,
+                age_seconds=round(_tui_hook_captured_age(payload) or -1.0, 1),
+            )
+            return
+        own_pid = os.getpid()
+        targets: list[tuple[int, str, str]] = []
+        for entry in candidates:
+            command = str(entry.get("command", "") or "")
+            lstart = str(entry.get("lstart", "") or "")
+            try:
+                pid = int(entry.get("pid") or 0)
+            except (TypeError, ValueError):
+                continue
+            if pid <= 1 or pid == own_pid:
+                continue
+            targets.append((pid, lstart, command))
+        if not targets:
+            return
+        if not self._tui_sentinel_enabled():
+            # Kill switch: do NOT terminate, but do NOT stay silent either — a
+            # surviving double-writer with no notice is how the whole incident
+            # went unnoticed. Degrade to notify-only (round-2 cluster).
+            for pid, lstart, command in targets:
+                _log_degrade(
+                    "sentinel_disabled_remnant_detected",
+                    session_id=session.session_id,
+                    pid=pid,
+                )
+                await self.orchestrator.notify_tui_conflict(
+                    session,
+                    kind="remnant_detected",
+                    pid=pid,
+                    command=command,
+                    detail="哨兵已关闭（WALKCODE_TUI_SENTINEL_ENABLED），未自动终止。",
+                    dedupe_key=f"{pid}:{lstart}" if lstart else str(pid),
+                )
+            return
+        controller = self._sentinel_process_controller()
+
+        async def _terminate(target: tuple[int, str, str]):
+            pid, lstart, command = target
+            # The controller re-probes and compares (lstart, command) before
+            # each signal, so a pid reused since hook capture is skipped.
+            result = await controller.terminate(
+                {
+                    "pid": pid,
+                    "command": command,
+                    "lstart": lstart,
+                    "allow_terminate": True,
+                    "source": "tui_hook_sentinel",
+                },
+                "post_takeover_remnant_tui",
+            )
+            return pid, lstart, command, result
+
+        outcomes = await asyncio.gather(
+            *(_terminate(t) for t in targets), return_exceptions=True
+        )
+        # zip with targets so an exception (which loses the return tuple) is
+        # still paired with its target and surfaced as remnant_detected
+        # (round-2: a gather exception was logged but never notified).
+        for target, outcome in zip(targets, outcomes):
+            t_pid, t_lstart, t_command = target
+            if isinstance(outcome, Exception):
+                _log_degrade(
+                    "sentinel_terminate_exception",
+                    session_id=session.session_id,
+                    pid=t_pid,
+                    error=repr(outcome),
+                )
+                await self.orchestrator.notify_tui_conflict(
+                    session,
+                    kind="remnant_detected",
+                    pid=t_pid,
+                    command=t_command,
+                    detail=f"终止异常：{type(outcome).__name__}",
+                    dedupe_key=f"{t_pid}:{t_lstart}" if t_lstart else str(t_pid),
+                )
+                continue
+            pid, lstart, command, result = outcome
+            dedupe_key = f"{pid}:{lstart}" if lstart else str(pid)
+            if result.accepted and result.state in {"terminated", "killed"}:
+                _log_degrade(
+                    "sentinel_terminated_remnant_tui",
+                    session_id=session.session_id,
+                    pid=pid,
+                    state=result.state,
+                )
+                await self.orchestrator.notify_tui_conflict(
+                    session,
+                    kind="remnant_terminated",
+                    pid=pid,
+                    command=command,
+                    dedupe_key=dedupe_key,
+                )
+            elif not result.accepted:
+                # Includes identity_probe_failed: a candidate exists but we
+                # could not verify/kill it — surface it, do not stay silent.
+                _log_degrade(
+                    "sentinel_terminate_failed",
+                    session_id=session.session_id,
+                    pid=pid,
+                    reason=result.reason,
+                )
+                await self.orchestrator.notify_tui_conflict(
+                    session,
+                    kind="remnant_detected",
+                    pid=pid,
+                    command=command,
+                    detail=f"终止失败：{result.reason}",
+                    dedupe_key=dedupe_key,
+                )
+            # accepted + already_exited → remnant died on its own or the pid was
+            # reused (controller logged terminate_stale_pid_skipped); no notice.
+
+    def _sentinel_process_controller(self):
+        # Short per-signal timeout so a hung remnant cannot pin channel ingress
+        # (cluster G). Test seam: monkeypatched in unit tests to avoid signals.
+        return LocalProcessController(timeout=1.5)
 
     async def _refresh_loaded_tui_observed_bindings(self) -> None:
         if self._loaded_tui_observed_bindings_refreshed:
@@ -4154,6 +4446,10 @@ def run_native_cli(args) -> None:
         payload.setdefault("_walkcode_hook_process_tree_entries", _process_tree_entries(parent_pid, max_depth=4))
         payload.setdefault("_walkcode_hook_process_tree", _process_tree_commands(parent_pid, max_depth=4))
         payload.setdefault("_walkcode_infer_tui_pid", True)
+        # Capture-time stamp: ownership decisions (handoff / sentinel kill)
+        # must distinguish a hook fired seconds ago from a deferred-queue
+        # replay describing a world that no longer exists (ADR 0053).
+        payload.setdefault("_walkcode_hook_captured_at", time.time())
         if getattr(args, "gate", False):
             output = runtime.gate_tui_hook(
                 hook_type=args.hook_type,
@@ -5112,12 +5408,20 @@ def _tui_terminate_ref(payload: dict[str, Any]) -> dict[str, Any] | None:
         }
 
     if payload.get("_walkcode_infer_tui_pid"):
-        process_group_ref = _external_tui_process_ref_from_process_group(payload.get("_walkcode_hook_process_group"))
-        if process_group_ref is not None:
-            return {"controller_kind": "process", "process_ref": process_group_ref}
+        # Prefer the CAPTURED process tree (carries hook-time pid+lstart+command)
+        # over re-probing by process-group. The process-group path re-runs `ps`
+        # at CONSUME time, so for a deferred replay whose pgid was reused by a
+        # different same-command terminal it would record the new process's
+        # identity and enrich would re-endorse it (round-3 Critical). The
+        # captured snapshot is immune to that reuse window.
         captured_ref = _external_tui_process_ref_from_entries(_tui_hook_process_tree_entries(payload))
         if captured_ref is not None:
             return {"controller_kind": "process", "process_ref": captured_ref}
+        # Fallback only when the payload carries no captured tree (older hook
+        # binaries): best-effort process-group re-probe.
+        process_group_ref = _external_tui_process_ref_from_process_group(payload.get("_walkcode_hook_process_group"))
+        if process_group_ref is not None:
+            return {"controller_kind": "process", "process_ref": process_group_ref}
         process_ref = _infer_process_ref_from_hook_pid(payload.get("_walkcode_hook_pid"))
         if process_ref is not None:
             return {"controller_kind": "process", "process_ref": process_ref}
@@ -5157,12 +5461,16 @@ def _external_tui_process_ref_from_process_group(process_group_value: Any) -> di
         return None
     if pid <= 1 or pid == os.getpid():
         return None
-    return {
+    ref = {
         "pid": pid,
         "allow_terminate": True,
         "source": "native_hook_process_group",
         "command": command,
     }
+    lstart = str(entry.get("lstart", "") or "")
+    if lstart:
+        ref["lstart"] = lstart
+    return ref
 
 
 def _tui_hook_is_walkcode_headless_transport(transport_kind: str, payload: dict[str, Any]) -> bool:
@@ -5188,15 +5496,17 @@ def _tui_hook_has_external_tui_process_identity(transport_kind: str, payload: di
 
 
 def _tui_hook_has_live_tui_process(transport_kind: str, payload: dict[str, Any]) -> bool:
-    """Stricter than identity: a matching TUI process must still be RUNNING now.
+    """A matching TUI process must still be RUNNING now AND be the SAME process
+    the hook captured — not merely a live pid.
 
-    Reviving a swept-stopped session on a mere command-string snapshot is
-    unsafe — a deferred hook replayed across a restart carries a snapshot of a
-    process that may have exited, falsely reviving a dead session (writer
-    points at a gone terminal, card shows phantom running, input re-blocks into
-    takeover). Requiring a live pid makes a genuinely-live TUI's hook revive
-    while a stale one does not. Entries without pids can't be verified, so they
-    do not count as live proof.
+    Reviving/handing back on a bare pid-liveness check is unsafe: a deferred
+    replay's captured pid can be reused by any unrelated process, which would
+    read as "live TUI" and (a) falsely revive a dead session, or (b) let a
+    stale claim bypass the freshness / predates-owner gates and steal the
+    session (round-2 Critical). So we re-probe the pid and require its CURRENT
+    command still classify as this transport's TUI and match the captured
+    identity (lstart + command). Entries without pids, or whose live identity
+    no longer matches, do not count as live proof.
     """
     for entry in _tui_hook_process_tree_entries(payload):
         try:
@@ -5205,13 +5515,25 @@ def _tui_hook_has_live_tui_process(transport_kind: str, payload: dict[str, Any])
             continue
         if pid <= 1:
             continue
-        command = str(entry.get("command", "") or "")
-        if transport_kind == "claude_headless" and not _command_is_claude_tui_process(command):
+        captured_command = str(entry.get("command", "") or "")
+        if transport_kind == "claude_headless" and not _command_is_claude_tui_process(captured_command):
             continue
-        if transport_kind == "codex_app_server" and not _command_is_codex_tui_process(command):
+        if transport_kind == "codex_app_server" and not _command_is_codex_tui_process(captured_command):
             continue
-        if LocalProcessController._pid_running(pid):
-            return True
+        probe = _probe_process(pid)
+        if probe.status != "ok":
+            continue
+        # The pid must STILL be a TUI of this transport (not a reused pid now
+        # running something else)...
+        if transport_kind == "claude_headless" and not _command_is_claude_tui_process(probe.command):
+            continue
+        if transport_kind == "codex_app_server" and not _command_is_codex_tui_process(probe.command):
+            continue
+        # ...and match the captured identity. Empty captured lstart degrades to
+        # a command-only comparison (still far better than pid-only).
+        if not _proc_identity_matches(probe, str(entry.get("lstart", "") or ""), captured_command):
+            continue
+        return True
     return False
 
 
@@ -5233,6 +5555,111 @@ def _tui_hook_process_tree_commands(payload: dict[str, Any]) -> list[str]:
     return _process_tree_commands(process_ref.get("pid"), max_depth=4)
 
 
+def _payload_captured_at(payload: dict[str, Any]) -> float | None:
+    """The raw capture timestamp (epoch seconds), or None if absent/corrupt."""
+    import math
+
+    raw = payload.get("_walkcode_hook_captured_at")
+    if raw is None:
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(value) or value <= 0:
+        return None
+    return value
+
+
+def _tui_hook_captured_age(payload: dict[str, Any]) -> float | None:
+    """Seconds since the hook process captured this payload; None if unknown.
+
+    Deferred-queue replays keep their original capture stamp, so age tells a
+    live hook apart from a replayed description of a world that may be gone.
+    Payloads from pre-0.14.3 hook binaries lack the stamp -> None.
+    """
+    import math
+
+    try:
+        captured_at = float(payload.get("_walkcode_hook_captured_at") or 0.0)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(captured_at) or captured_at <= 0:
+        return None
+    now = time.time()
+    if captured_at > now + 1.0:
+        # A capture stamp in the future is corrupt/forged, not "0s old / fresh".
+        return None
+    return max(0.0, now - captured_at)
+
+
+# Freshness threshold + sentinel switch now live on ChannelNativeConfig
+# (parsed from the merged env incl. WALKCODE_ENV_FILE). See the runtime
+# methods _tui_hook_fresh_seconds / _tui_hook_is_fresh / _tui_sentinel_enabled.
+
+
+def _enrich_terminate_ref(terminate_ref: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Stamp identity (lstart) + recorded_at on a freshly inferred terminate ref.
+
+    Ledger hygiene (ADR 0053, revised after deep-review 2026-07-19):
+
+    - We NO LONGER strip `allow_terminate` for a dead / reused pid. Doing so
+      made the takeover predetect fall through to manual-only for the most
+      common case (user Ctrl+C'd the TUI) — a regression worse than the bug
+      it fixed (cluster A). The kill path's own three-state probe + identity
+      gate already refuses to signal a dead or reused pid, so leaving the ref
+      armed lets takeover proceed automatically (dead pid -> already_exited).
+
+    - A transient probe error must not mutate authorization at all (cluster C):
+      only stamp identity when the probe cleanly succeeds; record probe_state
+      for observability.
+    """
+    if not terminate_ref:
+        return terminate_ref
+    process_ref = terminate_ref.get("process_ref")
+    if not isinstance(process_ref, dict):
+        return terminate_ref
+    process_ref["recorded_at"] = time.time()
+    try:
+        pid = int(process_ref.get("pid") or 0)
+    except (TypeError, ValueError):
+        return terminate_ref
+    if pid <= 1:
+        return terminate_ref
+    probe = _probe_process(pid)
+    process_ref["probe_state"] = probe.status
+    if probe.status == "gone":
+        # Target already exited. Leave allow_terminate as-is: _terminate_sync
+        # sees target_gone and skips the pid (session sweep still runs), and
+        # takeover continues automatically instead of falling to manual-only.
+        process_ref["target_gone"] = True
+        return terminate_ref
+    if probe.status == "error":
+        # Cannot verify now; do not touch authorization or identity.
+        return terminate_ref
+    recorded_command = str(process_ref.get("command", "") or "").strip()
+    recorded_lstart = str(process_ref.get("lstart", "") or "").strip()
+    if recorded_command and recorded_command != probe.command:
+        # Live pid, different process → the recorded target is gone and the pid
+        # was reused. Mark target_gone so the kill path skips it entirely.
+        process_ref["target_gone"] = True
+        return terminate_ref
+    if recorded_lstart and recorded_lstart != probe.lstart:
+        # Same command but a different start time: the captured process exited
+        # and the pid was reused by another instance of the same program.
+        # COMPARE, never overwrite — overwriting with the fresh probe lstart
+        # would re-endorse the reused pid (round-2 Critical).
+        process_ref["target_gone"] = True
+        return terminate_ref
+    # Only fill identity that the capture stage did not already provide; keep
+    # the capture-time lstart authoritative.
+    if not recorded_lstart:
+        process_ref["lstart"] = probe.lstart
+    if not recorded_command:
+        process_ref["command"] = probe.command
+    return terminate_ref
+
+
 def _tui_hook_process_tree_entries(payload: dict[str, Any]) -> list[dict[str, Any]]:
     captured = payload.get("_walkcode_hook_process_tree_entries")
     if isinstance(captured, list):
@@ -5246,8 +5673,9 @@ def _tui_hook_process_tree_entries(payload: dict[str, Any]) -> list[dict[str, An
             except (TypeError, ValueError):
                 continue
             command = str(item.get("command", "") or "")
+            lstart = str(item.get("lstart", "") or "")
             if pid > 1 and command:
-                entries.append({"pid": pid, "ppid": ppid, "command": command})
+                entries.append({"pid": pid, "ppid": ppid, "lstart": lstart, "command": command})
         if entries:
             return entries
 
@@ -5270,12 +5698,19 @@ def _external_tui_process_ref_from_entries(entries: list[dict[str, Any]]) -> dic
         except (TypeError, ValueError):
             continue
         if pid > 1 and pid != os.getpid():
-            return {
+            ref = {
                 "pid": pid,
                 "allow_terminate": True,
                 "source": "native_hook_external_tui",
                 "command": command,
             }
+            # Carry the CAPTURE-time lstart so the identity gate is anchored to
+            # when the hook fired, not when the ref is later enriched/consumed
+            # (round-2 cluster: captured identity dropped -> reuse re-endorsed).
+            lstart = str(entry.get("lstart", "") or "")
+            if lstart:
+                ref["lstart"] = lstart
+            return ref
     return None
 
 
@@ -5292,7 +5727,7 @@ def _process_tree_entries(pid_value: Any, *, max_depth: int = 4) -> list[dict[st
         seen.add(pid)
         try:
             result = subprocess.run(
-                ["ps", "-o", "pid=,ppid=,command=", "-p", str(pid)],
+                ["ps", "-o", "pid=,ppid=,lstart=,command=", "-p", str(pid)],
                 capture_output=True,
                 text=True,
                 timeout=1,
@@ -5304,16 +5739,24 @@ def _process_tree_entries(pid_value: Any, *, max_depth: int = 4) -> list[dict[st
         line = result.stdout.strip()
         if not line:
             break
-        match = re.match(r"^\s*(\d+)\s+(\d+)\s+(.*)$", line, flags=re.DOTALL)
+        # pid ppid lstart(Www Mmm dd HH:MM:SS yyyy) command
+        match = re.match(
+            r"^\s*(\d+)\s+(\d+)\s+(\w{3}\s+\w{3}\s+\d{1,2}\s+[\d:]{8}\s+\d{4})\s+(.*)$",
+            line,
+            flags=re.DOTALL,
+        )
         if match is None:
             break
-        command = match.group(3)
+        lstart = match.group(3).strip()
+        command = match.group(4)
         try:
             current_pid = int(match.group(1))
             parent_pid = int(match.group(2))
         except ValueError:
             break
-        entries.append({"pid": current_pid, "ppid": parent_pid, "command": command})
+        # lstart captured at hook-fire time is the identity that lets the
+        # sentinel detect pid reuse between capture and consume (cluster D).
+        entries.append({"pid": current_pid, "ppid": parent_pid, "lstart": lstart, "command": command})
         pid = parent_pid
     return entries
 
@@ -5322,46 +5765,9 @@ def _process_tree_commands(pid_value: Any, *, max_depth: int = 4) -> list[str]:
     return [str(item.get("command", "")) for item in _process_tree_entries(pid_value, max_depth=max_depth)]
 
 
-def _command_is_external_tui_process(command: str) -> bool:
-    return _command_is_claude_tui_process(command) or _command_is_codex_tui_process(command)
-
-
-def _command_is_claude_headless_sdk_process(command: str) -> bool:
-    value = str(command or "")
-    if not value:
-        return False
-    if "claude_agent_sdk" in value and "_bundled/claude" in value:
-        return True
-    return "claude" in value and "--input-format stream-json" in value and "--output-format stream-json" in value
-
-
-def _command_is_claude_tui_process(command: str) -> bool:
-    value = str(command or "")
-    if not value or _command_is_claude_headless_sdk_process(value):
-        return False
-    return _command_executable_basename(value) in {"claude", "claude-code"}
-
-
-def _command_is_codex_app_server_process(command: str) -> bool:
-    value = str(command or "")
-    return "codex" in value and "app-server" in value and "--stdio" in value
-
-
-def _command_is_codex_tui_process(command: str) -> bool:
-    value = str(command or "")
-    if not value or _command_is_codex_app_server_process(value):
-        return False
-    return _command_executable_basename(value) == "codex"
-
-
-def _command_executable_basename(command: str) -> str:
-    try:
-        parts = shlex.split(str(command or ""))
-    except ValueError:
-        parts = str(command or "").split()
-    if not parts:
-        return ""
-    return Path(parts[0]).name
+# Command classifiers moved into walkcode.channel_native (imported above):
+# LocalProcessController needs them for the session sweep TUI filter, and the
+# import direction only allows runtime -> channel_native.
 
 
 def _infer_process_ref_from_hook_pid(hook_pid_value: Any) -> dict[str, Any] | None:

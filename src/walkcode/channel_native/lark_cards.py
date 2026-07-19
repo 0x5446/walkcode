@@ -430,6 +430,41 @@ _DECISION_LABELS = {
 }
 
 
+def _tui_conflict_notice_card(view: dict[str, Any]) -> dict[str, Any]:
+    kind = str(view.get("kind", "") or "")
+    pid = int(view.get("pid", 0) or 0)
+    detail = str(view.get("detail", "") or "")
+    extra = [_note(escape_lark_md(_clip(_inline(detail), 200, "...")))] if detail else []
+    if kind == "handback":
+        return _card_message(
+            "🖥️ 终端已接回会话",
+            "blue",
+            [
+                _md_div("终端 TUI 已重新接管这个会话，飞书转为**只读镜像**。"),
+                _note("需要继续用飞书驱动，请对新消息重新接管。"),
+                *extra,
+            ],
+        )
+    if kind == "remnant_terminated":
+        return _card_message(
+            "🧹 已清理终端进程",
+            "green",
+            [
+                _md_div(f"该会话由频道驱动，检测到终端进程 (pid {pid}) 双写，已终止以避免冲突。"),
+                *extra,
+            ],
+        )
+    return _card_message(
+        "⚠️ 检测到终端进程双写",
+        "orange",
+        [
+            _md_div(f"终端进程 (pid {pid}) 与频道同时挂在该会话上，但未能自动终止。"),
+            _note("请在终端手动退出它，避免双写。"),
+            *extra,
+        ],
+    )
+
+
 def _tui_permission_notice_card(view: dict[str, Any]) -> dict[str, Any]:
     tool = str(view.get("tool_name", "") or "工具")
     summary = str(view.get("summary", "") or "")
@@ -544,6 +579,7 @@ _CARD_RENDERERS = {
     "command_menu": _command_menu_card,
     "model_choice": _model_choice_card,
     "decision_result": _decision_result_card,
+    "tui_conflict_notice": _tui_conflict_notice_card,
     "tui_permission_notice": _tui_permission_notice_card,
 }
 
