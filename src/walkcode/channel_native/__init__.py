@@ -4493,7 +4493,9 @@ def render_view_text(view_model: dict[str, Any]) -> str:
                 text = str(entry.get("text", "") or "").strip()
                 if len(text) > 300:
                     text = text[:299] + "…"
-                rows.append(f"> {text}")
+                # Every physical line gets the quote prefix, or multi-line
+                # narration bleeds into the tool-status rows.
+                rows.extend(f"> {line}" for line in text.splitlines() if line.strip())
                 continue
             label = _status_label(str(entry.get("status", "") or "running"))
             row = f"Status: {label} — {entry.get('tool_name', '') or 'tool'}"
@@ -10671,6 +10673,7 @@ class Orchestrator:
             return
         if event.type in {
             AgentEventType.TURN_DELTA,
+            AgentEventType.TURN_NARRATION,
             AgentEventType.TOOL_STARTED,
             AgentEventType.TOOL_COMPLETED,
             AgentEventType.TOOL_FAILED,

@@ -52,3 +52,27 @@ Agent 在工具调用之间输出的叙述文本（"我现在要干嘛"）是长
   叙述消息，会被 stop 的游标快进吞掉（罕见：模型极少连续输出两条相邻
   文本消息）；codex 的 reasoning/中段消息本版未处理。
 - 叙述行随 burst seal 一起丢弃（transient，不持久化）。
+
+## Revision（发版前 deep-review 采纳，同版修复）
+
+两维审查报 1 High + 5 Medium + 2 Low，全部采纳：
+
+1. **High——游标必须绑定捕获时刻**：排水延迟（defer 队列 1s 节拍或积压）
+   下，"处理时读到 EOF"会把 hook 之后写入的回合末文本提成叙述行（随后
+   Stop 又发同一文本气泡=重复），或让 stop 快进吞掉下一回合开头的叙述。
+   修复：hook 捕获点（CLI 入口/进程内 ingress）盖 `_walkcode_transcript_size`
+   边界戳，排水与快进都以各自 hook 的边界为上限（无戳的旧队列条目退化为
+   处理时边界）。
+2. 文件身份：游标带 `(st_dev, st_ino)`，同路径原子替换成更大文件不再从旧
+   offset 续读（fstat 一致快照，消除 stat/open 窗口）。
+3. 读取上限 2 MiB/批；超上限的单行跳过（碎片 JSON 解析失败无害），游标
+   不会卡死。
+4. 首见即 stat 失败返回 None 游标、调用方不落盘——否则 (path,0) 会在文件
+   出现后整本回放。
+5. 游标表统一 LRU 写入口（每写重插+收缩到 512），advance 单调不回退
+   （乱序旧 hook 不会重发已镜像叙述）。
+6. `TURN_NARRATION` 纳入 ACTIVE 生命周期集合（与 open_turn 一致）。
+7. 文本渲染多行叙述逐行加 `> `。
+8. 残留（记录不修）：defer 队列 recent-first 调度在积压 >5 分钟时可能让同
+   会话的 Stop 先于旧工具 hook 处理——有捕获边界+单调 advance 后，后果从
+   "重复/乱序"降级为"漏一段叙述"；排队序保序是后续 defer 调度器的活。

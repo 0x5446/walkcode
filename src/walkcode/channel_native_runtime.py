@@ -684,10 +684,11 @@ class ChannelNativeRuntime:
         self._tui_hook_queue_dir = _tui_hook_queue_dir(self.state_store.path)
         self._ingress_lock = asyncio.Lock()
         self._drain_lock = asyncio.Lock()
-        # ADR 0055: per-session transcript read cursor (path, byte offset)
-        # for mirroring mid-turn narration; first sight fast-forwards to EOF
-        # so history is never replayed into the channel.
-        self._tui_transcript_cursors: dict[str, tuple[str, int]] = {}
+        # ADR 0055: per-session transcript read cursor (path, byte offset,
+        # (st_dev, st_ino)) for mirroring mid-turn narration; first sight
+        # fast-forwards to the hook's capture boundary so history is never
+        # replayed into the channel. LRU-capped at 512 sessions.
+        self._tui_transcript_cursors: dict[str, tuple[Any, ...]] = {}
         self._loaded_tui_observed_bindings_refreshed = False
         # PreToolUse gate bookkeeping (ADR 0046 v2): rid -> dispatch time for
         # pending requests already turned into cards, and per-session tools
@@ -2032,6 +2033,9 @@ class ChannelNativeRuntime:
         # so setdefault never overrides them into looking fresh.
         if isinstance(payload, dict):
             payload.setdefault("_walkcode_hook_captured_at", time.time())
+            # In-process callers that skipped the CLI entry get a "now"
+            # boundary — correct for them, same as the capture stamp above.
+            _stamp_transcript_size(payload)
         hook_type = _normalize_tui_hook_type(hook_type or _payload_hook_event_name(payload))
         if not hook_type:
             self.save_state()
@@ -3903,12 +3907,11 @@ class ChannelNativeRuntime:
         if not path:
             return []
         cursor = self._tui_transcript_cursors.get(session.session_id)
-        new_cursor, texts = await asyncio.to_thread(_read_transcript_narration, path, cursor)
-        self._tui_transcript_cursors[session.session_id] = new_cursor
-        if len(self._tui_transcript_cursors) > 512:
-            # Bounded bookkeeping: evict the oldest-tracked session rather
-            # than growing for the life of the process.
-            self._tui_transcript_cursors.pop(next(iter(self._tui_transcript_cursors)))
+        new_cursor, texts = await asyncio.to_thread(
+            _read_transcript_narration, path, cursor, _payload_transcript_boundary(payload)
+        )
+        if new_cursor is not None:
+            self._store_tui_narration_cursor(session.session_id, new_cursor)
         return texts
 
     def _advance_tui_narration_cursor(self, session, payload: dict[str, Any]) -> None:
@@ -3916,10 +3919,33 @@ class ChannelNativeRuntime:
         if not path:
             return
         try:
-            size = os.path.getsize(path)
+            info = os.stat(path)
         except OSError:
             return
-        self._tui_transcript_cursors[session.session_id] = (path, size)
+        boundary = _payload_transcript_boundary(payload)
+        offset = int(info.st_size) if boundary is None else max(0, min(boundary, int(info.st_size)))
+        file_key = (info.st_dev, info.st_ino)
+        prev = self._tui_transcript_cursors.get(session.session_id)
+        if (
+            prev is not None
+            and len(prev) >= 3
+            and prev[0] == path
+            and prev[2] == file_key
+        ):
+            # Advance is monotonic: an out-of-order (older) hook must not
+            # rewind the cursor and re-emit already-mirrored narration.
+            offset = max(offset, int(prev[1]))
+        self._store_tui_narration_cursor(session.session_id, (path, offset, file_key))
+
+    def _store_tui_narration_cursor(self, session_id: str, cursor: tuple[Any, ...]) -> None:
+        cursors = self._tui_transcript_cursors
+        # LRU: re-insert on every write so eviction hits the least recently
+        # ACTIVE session, and shrink until under the cap no matter which
+        # write path grew it.
+        cursors.pop(session_id, None)
+        cursors[session_id] = cursor
+        while len(cursors) > 512:
+            cursors.pop(next(iter(cursors)))
 
     async def _send_tui_hook_output(self, session, *, hook_type: str, payload: dict[str, Any]) -> None:
         tool_event = _tui_hook_tool_event(hook_type, payload)
@@ -4514,6 +4540,8 @@ def run_native_cli(args) -> None:
         # must distinguish a hook fired seconds ago from a deferred-queue
         # replay describing a world that no longer exists (ADR 0053).
         payload.setdefault("_walkcode_hook_captured_at", time.time())
+        # Capture-time transcript boundary for narration mirroring (ADR 0055).
+        _stamp_transcript_size(payload)
         if getattr(args, "gate", False):
             output = runtime.gate_tui_hook(
                 hook_type=args.hook_type,
@@ -5944,35 +5972,97 @@ def _tui_lark_chat_id(endpoint: ChannelEndpointConfig) -> str:
     return _tui_telegram_chat_id(endpoint)
 
 
+_TRANSCRIPT_READ_MAX_BYTES = 2 * 1024 * 1024
+
+
+def _payload_transcript_boundary(payload: dict[str, Any]) -> int | None:
+    """The transcript size stamped when the hook FIRED, if any (ADR 0055)."""
+    raw = payload.get("_walkcode_transcript_size")
+    if raw is None:
+        return None
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if value >= 0 else None
+
+
+def _stamp_transcript_size(payload: dict[str, Any]) -> None:
+    """Stamp the capture-time transcript byte size onto a hook payload.
+
+    The narration cursor must be bounded by what existed when the hook fired,
+    not when it is drained: a delayed drain would otherwise lift the
+    turn-final text (written after the last tool call) into a narration line
+    right before Stop sends the same text as a bubble.
+    """
+    if "_walkcode_transcript_size" in payload:
+        return
+    path = str(payload.get("transcript_path", "") or "")
+    if not path:
+        return
+    try:
+        payload["_walkcode_transcript_size"] = int(os.path.getsize(path))
+    except OSError:
+        return
+
+
 def _read_transcript_narration(
-    path: str, cursor: tuple[str, int] | None
-) -> tuple[tuple[str, int], list[str]]:
+    path: str,
+    cursor: tuple[Any, ...] | None,
+    boundary: int | None = None,
+) -> tuple[tuple[Any, ...] | None, list[str]]:
     """Read new assistant narration texts from a Claude transcript (ADR 0055).
 
-    ``cursor`` is (path, byte_offset) from the previous read. First sight of a
-    path — or a replaced/shrunk file — fast-forwards to EOF WITHOUT emitting:
-    replaying transcript history into the channel would spam the topic. Only
-    complete JSONL lines are consumed; a partially-written tail stays for the
-    next call. Sidechain (subagent) entries and non-text blocks are ignored.
+    ``cursor`` is (path, byte_offset, file_key) from the previous read, where
+    file_key is (st_dev, st_ino): a replaced file at the same path must not be
+    read from the old offset — its bytes there are history, and replaying
+    history into the channel is never acceptable. First sight of a file
+    fast-forwards to ``boundary`` (the transcript size stamped at hook fire
+    time) without emitting. ``boundary`` also caps every read: bytes written
+    after the hook fired belong to a later hook. Only complete JSONL lines
+    are consumed — a torn tail waits for the next call, but a single line
+    larger than the batch cap is skipped (its fragments fail JSON parsing
+    harmlessly) so the cursor cannot wedge. Returns (new_cursor, texts);
+    new_cursor is None when the file is unreadable and no prior cursor exists
+    (storing (path, 0) would replay the whole file once it appears).
     """
     try:
-        size = os.path.getsize(path)
+        fh = open(path, "rb")
     except OSError:
-        return (cursor if cursor is not None else (path, 0)), []
-    if cursor is None or cursor[0] != path or cursor[1] > size:
-        return (path, size), []
-    offset = cursor[1]
-    if offset >= size:
-        return (path, offset), []
-    try:
-        with open(path, "rb") as fh:
+        return cursor, []
+    with fh:
+        try:
+            info = os.fstat(fh.fileno())
+        except OSError:
+            return cursor, []
+        size = int(info.st_size)
+        file_key = (info.st_dev, info.st_ino)
+        limit = size if boundary is None else max(0, min(int(boundary), size))
+        stale_cursor = (
+            cursor is None
+            or len(cursor) < 3
+            or cursor[0] != path
+            or cursor[2] != file_key
+            or int(cursor[1]) > size
+        )
+        if stale_cursor:
+            return (path, limit, file_key), []
+        offset = int(cursor[1])
+        if offset >= limit:
+            return (path, offset, file_key), []
+        requested = min(limit - offset, _TRANSCRIPT_READ_MAX_BYTES)
+        try:
             fh.seek(offset)
-            blob = fh.read(size - offset)
-    except OSError:
-        return (path, offset), []
+            blob = fh.read(requested)
+        except OSError:
+            return (path, offset, file_key), []
     end = blob.rfind(b"\n")
     if end < 0:
-        return (path, offset), []
+        if (limit - offset) > len(blob):
+            # A single line bigger than the batch cap: skip past what we read
+            # so the cursor keeps moving instead of re-reading it forever.
+            return (path, offset + len(blob), file_key), []
+        return (path, offset, file_key), []
     consumed = blob[: end + 1]
     new_offset = offset + end + 1
     texts: list[str] = []
@@ -6002,7 +6092,7 @@ def _read_transcript_narration(
         text = "\n".join(part for part in parts if part).strip()
         if text:
             texts.append(text)
-    return (path, new_offset), texts
+    return (path, new_offset, file_key), texts
 
 
 def _tui_hook_text(hook_type: str, payload: dict[str, Any]) -> str:

@@ -238,6 +238,16 @@ class NarrationRenderingTests(unittest.TestCase):
         self.assertIn("> 先看下配置文件", text)
         self.assertIn("Read", text)
 
+    def test_text_renderer_quotes_every_line_of_multiline_narration(self):
+        view = {
+            "type": "tool_progress",
+            "lines": [{"kind": "narration", "text": "第一行\n第二行"}],
+        }
+        text = render_view_text(view)
+        self.assertIn("> 第一行", text)
+        self.assertIn("> 第二行", text)
+        self.assertNotIn("\n第二行\n", text + "\n")
+
 
 def _transcript_line(entry: dict) -> bytes:
     return (json.dumps(entry, ensure_ascii=False) + "\n").encode("utf-8")
@@ -264,7 +274,8 @@ class TranscriptNarrationReaderTests(unittest.TestCase):
         self._append(_transcript_line(_assistant_entry([{"type": "text", "text": "history"}])))
         cursor, texts = _read_transcript_narration(self.path, None)
         self.assertEqual(texts, [])
-        self.assertEqual(cursor, (self.path, os.path.getsize(self.path)))
+        self.assertEqual(cursor[0], self.path)
+        self.assertEqual(cursor[1], os.path.getsize(self.path))
 
     def test_incremental_append_yields_narration(self):
         cursor, _ = _read_transcript_narration(self.path, None)
@@ -334,12 +345,56 @@ class TranscriptNarrationReaderTests(unittest.TestCase):
             fh.write(_transcript_line(_assistant_entry([{"type": "text", "text": "new file"}]))[:10])
         cursor, texts = _read_transcript_narration(self.path, cursor)
         self.assertEqual(texts, [])
-        self.assertEqual(cursor, (self.path, os.path.getsize(self.path)))
+        self.assertEqual(cursor[1], os.path.getsize(self.path))
 
-    def test_missing_file_is_harmless(self):
+    def test_replaced_file_with_larger_size_is_not_read_from_old_offset(self):
+        # An atomic replace can leave a BIGGER file at the same path; reading
+        # it from the old offset would leak its history as live narration.
+        # The (st_dev, st_ino) identity in the cursor catches it.
+        self._append(_transcript_line(_assistant_entry([{"type": "text", "text": "old"}])))
+        cursor, _ = _read_transcript_narration(self.path, None)
+        replacement = self.path + ".new"
+        with open(replacement, "wb") as fh:
+            for i in range(5):
+                fh.write(_transcript_line(_assistant_entry([{"type": "text", "text": f"history-{i}"}])))
+        os.replace(replacement, self.path)
+        cursor, texts = _read_transcript_narration(self.path, cursor)
+        self.assertEqual(texts, [])
+        self.assertEqual(cursor[1], os.path.getsize(self.path))
+
+    def test_boundary_caps_read_at_hook_capture_time(self):
+        # Bytes written after the hook fired belong to a later hook: a
+        # delayed drain must not lift the turn-final text into the card (it
+        # is about to go out as the Stop bubble).
+        cursor, _ = _read_transcript_narration(self.path, None)
+        self._append(_transcript_line(_assistant_entry([{"type": "text", "text": "叙述"}])))
+        boundary = os.path.getsize(self.path)
+        self._append(_transcript_line(_assistant_entry([{"type": "text", "text": "回合末文本"}])))
+
+        cursor, texts = _read_transcript_narration(self.path, cursor, boundary)
+        self.assertEqual(texts, ["叙述"])
+        self.assertEqual(cursor[1], boundary)
+
+    def test_monster_line_does_not_wedge_cursor(self):
+        cursor, _ = _read_transcript_narration(self.path, None)
+        self._append(b'{"pad":"' + b"x" * (2 * 1024 * 1024 + 100_000) + b'"}\n')
+        self._append(_transcript_line(_assistant_entry([{"type": "text", "text": "after"}])))
+
+        texts: list[str] = []
+        for _ in range(6):  # bounded loop: each read must make progress
+            cursor, batch = _read_transcript_narration(self.path, cursor)
+            texts.extend(batch)
+            if cursor[1] >= os.path.getsize(self.path):
+                break
+        self.assertEqual(texts, ["after"])
+        self.assertEqual(cursor[1], os.path.getsize(self.path))
+
+    def test_missing_file_returns_no_cursor(self):
+        # Storing (path, 0) for an unreadable file would replay its entire
+        # history once it appears; the caller must get None and store nothing.
         cursor, texts = _read_transcript_narration("/nonexistent/transcript.jsonl", None)
         self.assertEqual(texts, [])
-        self.assertEqual(cursor, ("/nonexistent/transcript.jsonl", 0))
+        self.assertIsNone(cursor)
 
 
 if __name__ == "__main__":
