@@ -5736,6 +5736,21 @@ class ClaudeHeadlessTransport:
         self.background_wait_ceiling_seconds = background_wait_ceiling_seconds
         self._clients: dict[str, Any] = {}
         self._bridges: dict[str, _ClaudePermissionBridge] = {}
+        # handle_id -> (pid, lstart, command)：worker 进程的捕获时身份。
+        # 关闭 SDK client 不保证 CLI 进程退出（还挂着后台子进程的 worker 能
+        # 平安活过一次"成功"的 disconnect），残留进程占着 Claude Code 的
+        # 同会话单进程锁（终端 resume 秒退）且是潜在双写（2026-07-20 实锤：
+        # 一个会话攒了三个残留 worker）。关闭路径据此验尸、按身份升级清理。
+        self._worker_procs: dict[str, tuple[int, str, str]] = {}
+        # handle_id -> 单例验尸任务：shield 起来跑，调用方被取消也要跑完；
+        # 同一 handle 并发关闭共享同一个任务，不重复发信号。
+        self._exit_tasks: dict[str, asyncio.Task] = {}
+        # session_id -> 最近一次拉起的 worker handle：EOF 清算会先注销
+        # _session_handles，换代 resume 据此仍能等到旧进程死透再拉新的。
+        self._session_last_worker: dict[str, str] = {}
+        # session_id -> 串行锁：关旧→验尸→建新→登记→捕获必须原子，否则
+        # 并发 resume 双双越过闸门、各自拉起一个 worker（审查 R2 复现）。
+        self._session_locks: dict[str, asyncio.Lock] = {}
         # session_id -> live handle_id, so resume() can close the previous
         # worker instead of leaking it, and the orchestrator can reuse a live
         # worker instead of forking a second --resume process.
@@ -5773,21 +5788,30 @@ class ClaudeHeadlessTransport:
     async def launch_session(self, *, cwd: str, session_id: str) -> TransportHandle:
         return await self.launch(LaunchSpec(cwd=cwd, session_id=session_id))
 
+    def _session_lock(self, session_id: str) -> asyncio.Lock:
+        lock = self._session_locks.get(session_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._session_locks[session_id] = lock
+        return lock
+
     async def launch(self, spec: LaunchSpec) -> TransportHandle:
         if not self._available():
             raise TransportUnavailable("claude_agent_sdk is not installed or no client factory is configured")
-        client, bridge = self._create_client(spec)
-        await self._connect_client(client)
-        handle = TransportHandle(
-            handle_id=f"claude-{uuid.uuid4().hex}",
-            transport_kind=self.kind,
-            ref={"session_id": spec.session_id, "cwd": spec.cwd},
-        )
-        self._clients[handle.handle_id] = client
-        if bridge is not None:
-            self._bridges[handle.handle_id] = bridge
-        self._session_handles[spec.session_id] = handle.handle_id
-        return handle
+        async with self._session_lock(spec.session_id):
+            client, bridge = self._create_client(spec)
+            await self._connect_client(client)
+            handle = TransportHandle(
+                handle_id=f"claude-{uuid.uuid4().hex}",
+                transport_kind=self.kind,
+                ref={"session_id": spec.session_id, "cwd": spec.cwd},
+            )
+            self._clients[handle.handle_id] = client
+            if bridge is not None:
+                self._bridges[handle.handle_id] = bridge
+            self._session_handles[spec.session_id] = handle.handle_id
+            await self._capture_worker_proc(handle.handle_id, spec.session_id, client)
+            return handle
 
     async def resume(self, spec: ResumeSpec) -> TransportHandle:
         if not self._available():
@@ -5800,30 +5824,92 @@ class ClaudeHeadlessTransport:
         )
         if not resume_id:
             raise CapabilityUnsupported("Claude headless resume requires an agent session id")
-        # A resume replaces this session's worker: close the previous client
-        # (and its subprocess) instead of leaking it in _clients forever.
-        previous_handle_id = self._session_handles.get(spec.session_id, "")
-        if previous_handle_id:
-            await self._close_handle_client(previous_handle_id)
-        client, bridge = self._create_client(
-            LaunchSpec(cwd=spec.cwd, session_id=spec.session_id),
-            resume_id=resume_id,
-        )
-        resume = getattr(client, "resume", None)
-        if resume is not None:
-            await _maybe_await(resume(dict(spec.resume_ref)))
-        await self._connect_client(client)
-        resumed_session_id = resume_id or spec.session_id
-        handle = TransportHandle(
-            handle_id=f"claude-{uuid.uuid4().hex}",
-            transport_kind=self.kind,
-            ref={"session_id": resumed_session_id, "agent_session_id": resumed_session_id, "cwd": spec.cwd},
-        )
-        self._clients[handle.handle_id] = client
-        if bridge is not None:
-            self._bridges[handle.handle_id] = bridge
-        self._session_handles[spec.session_id] = handle.handle_id
-        return handle
+        # Close-old → verify-dead → create-new → register → capture must be
+        # ATOMIC per session: two concurrent resumes both slipping past the
+        # barrier would each spawn a worker (review R2 reproduced it).
+        async with self._session_lock(spec.session_id):
+            # A resume replaces this session's worker: close the previous
+            # client (and its subprocess) instead of leaking it forever.
+            previous_handle_id = self._session_handles.get(spec.session_id, "")
+            if previous_handle_id:
+                await self._close_handle_client(previous_handle_id)
+            # The EOF/settle path unregisters _session_handles BEFORE its
+            # disconnect+exit-verify runs (or that verify got cancelled): wait
+            # for the session's LAST KNOWN worker too.
+            lingering_handle_id = self._session_last_worker.get(spec.session_id, "")
+            if lingering_handle_id and lingering_handle_id != previous_handle_id:
+                await self._disconnect_client(lingering_handle_id, None)
+            # The barrier must end in a CONFIRMED terminal state. A record
+            # that survived (probe error / unkillable process) means the old
+            # worker may still hold the session file — spawning next to it
+            # recreates the double-writer incident. Refuse; the next message
+            # retries the whole ladder.
+            for blocked_handle in (previous_handle_id, lingering_handle_id):
+                if blocked_handle and blocked_handle in self._worker_procs:
+                    raise TransportUnavailable(
+                        "previous claude worker not confirmed dead; retry later"
+                    )
+            client, bridge = self._create_client(
+                LaunchSpec(cwd=spec.cwd, session_id=spec.session_id),
+                resume_id=resume_id,
+            )
+            resume = getattr(client, "resume", None)
+            if resume is not None:
+                await _maybe_await(resume(dict(spec.resume_ref)))
+            await self._connect_client(client)
+            resumed_session_id = resume_id or spec.session_id
+            handle = TransportHandle(
+                handle_id=f"claude-{uuid.uuid4().hex}",
+                transport_kind=self.kind,
+                ref={"session_id": resumed_session_id, "agent_session_id": resumed_session_id, "cwd": spec.cwd},
+            )
+            self._clients[handle.handle_id] = client
+            if bridge is not None:
+                self._bridges[handle.handle_id] = bridge
+            self._session_handles[spec.session_id] = handle.handle_id
+            await self._capture_worker_proc(handle.handle_id, spec.session_id, client)
+            return handle
+
+    @staticmethod
+    def _client_worker_pid(client: Any) -> int:
+        """Best-effort pid of the SDK client's CLI subprocess (0 if unknown)."""
+        transport = getattr(client, "_transport", None)
+        process = getattr(transport, "_process", None)
+        pid = getattr(process, "pid", None)
+        try:
+            value = int(pid) if pid is not None else 0
+        except (TypeError, ValueError):
+            return 0
+        return value if value > 1 else 0
+
+    async def _capture_worker_proc(self, handle_id: str, session_id: str, client: Any) -> None:
+        pid = self._client_worker_pid(client)
+        if not pid:
+            return
+        probe = None
+        for attempt in range(3):
+            if attempt:
+                await asyncio.sleep(0.2)
+            probe = await asyncio.to_thread(_probe_process, pid)
+            if probe.status != "error":
+                break
+        if probe is None or probe.status != "ok":
+            # Untracked worker == pre-ADR-0056 behavior for this one process
+            # (fail-closed: we never signal what we cannot identify). Loud in
+            # the logs so an environment where ps keeps failing is visible.
+            _log_degrade(
+                "headless_worker_capture_failed",
+                handle_id=handle_id,
+                pid=pid,
+                status=getattr(probe, "status", "none"),
+            )
+            return
+        if handle_id not in self._clients:
+            # Closed while we were probing: recording it now would resurrect
+            # tracking for a handle the close path already retired.
+            return
+        self._worker_procs[handle_id] = (pid, probe.lstart, probe.command)
+        self._session_last_worker[session_id] = handle_id
 
     def handle_is_live(self, handle_id: str) -> bool:
         """True while this handle's worker client is still attached."""
@@ -5847,30 +5933,152 @@ class ClaudeHeadlessTransport:
         return client, bridge
 
     async def _disconnect_client(self, handle_id: str, client: Any) -> None:
-        if client is None:
-            return
-        for method_name in ("disconnect", "stop", "close"):
-            method = getattr(client, method_name, None)
-            if method is None:
-                continue
-            try:
-                await _maybe_await(method())
-                return
-            except Exception as exc:
-                # Keep trying the remaining close methods; a swallowed failure
-                # here would leave an invisible zombie process.
+        closed = False
+        if client is not None:
+            for method_name in ("disconnect", "stop", "close"):
+                method = getattr(client, method_name, None)
+                if method is None:
+                    continue
+                try:
+                    await _maybe_await(method())
+                    closed = True
+                    break
+                except Exception as exc:
+                    # Keep trying the remaining close methods; a swallowed failure
+                    # here would leave an invisible zombie process.
+                    _log_degrade(
+                        "headless_worker_close_failed",
+                        handle_id=handle_id,
+                        method=method_name,
+                        error=exc,
+                        fallback="try_next_close_method",
+                    )
+            if not closed:
                 _log_degrade(
-                    "headless_worker_close_failed",
+                    "headless_worker_close_exhausted",
                     handle_id=handle_id,
-                    method=method_name,
-                    error=exc,
-                    fallback="try_next_close_method",
+                    drop=True,
                 )
-        _log_degrade(
-            "headless_worker_close_exhausted",
-            handle_id=handle_id,
-            drop=True,
-        )
+        # A "successful" close only closed the SDK-side pipes — verify the CLI
+        # process actually died, whether or not any close method worked. The
+        # verify runs as a per-handle SINGLETON task behind a shield: a
+        # cancelled caller must not disarm the cleanup, and concurrent closes
+        # of the same handle must not double-signal.
+        task = self._exit_tasks.get(handle_id)
+        if task is None or task.done():
+            task = asyncio.create_task(self._ensure_worker_process_exited(handle_id))
+            self._exit_tasks[handle_id] = task
+            task.add_done_callback(lambda _t, _h=handle_id: self._clear_exit_task(_h, _t))
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # A crashed verify must not replace/amplify the caller's own
+            # exception path (EOF finally, stream errors).
+            _log_degrade(
+                "headless_worker_exit_verify_crashed",
+                handle_id=handle_id,
+                error=exc,
+            )
+
+    def _clear_exit_task(self, handle_id: str, task: "asyncio.Task") -> None:
+        # Identity-conditional: an old task's late callback must not evict a
+        # NEWER task registered for the same handle (ABA race, review R2).
+        if self._exit_tasks.get(handle_id) is task:
+            self._exit_tasks.pop(handle_id, None)
+
+    def _resolve_worker_proc(self, handle_id: str) -> None:
+        """The worker reached a terminal state: retire its tracking records."""
+        self._worker_procs.pop(handle_id, None)
+        for session_id, mapped in list(self._session_last_worker.items()):
+            if mapped == handle_id:
+                self._session_last_worker.pop(session_id, None)
+
+    async def _ensure_worker_process_exited(self, handle_id: str) -> None:
+        """Verify the worker CLI process died after close; escalate if not.
+
+        A worker with lingering background children survives a clean
+        disconnect: the leftover keeps the Claude session file's
+        single-process lock (a terminal `claude --resume` exits on startup)
+        and remains a latent double-writer (live incident 2026-07-20: one
+        session accumulated three such leftovers). ADR 0053 identity rules
+        apply — never signal on a probe error or an identity mismatch (pid
+        reuse); a fresh healthy worker exits within the grace window and is
+        never signalled at all.
+        """
+        record = self._worker_procs.get(handle_id)
+        if record is None:
+            return
+        pid, lstart, command = record
+
+        async def _observe() -> str:
+            """gone | live | reused | error."""
+            probe = await asyncio.to_thread(_probe_process, pid)
+            if probe.status == "gone":
+                return "gone"
+            if probe.status == "error":
+                return "error"
+            if not _proc_identity_matches(probe, lstart, command):
+                return "reused"  # pid recycled: the worker IS gone
+            return "live"
+
+        def _finish(state: str) -> None:
+            if state in {"gone", "reused"}:
+                # Terminal: the worker no longer exists — retire the record.
+                self._resolve_worker_proc(handle_id)
+                return
+            # error / survived: KEEP the record so a later close attempt (the
+            # resume barrier, a retried shutdown) re-verifies instead of being
+            # permanently disarmed by one transient ps failure.
+            if state == "error":
+                _log_degrade(
+                    "headless_worker_exit_verify_failed",
+                    handle_id=handle_id,
+                    pid=pid,
+                )
+            else:
+                _log_degrade("headless_worker_survived_kill", handle_id=handle_id, pid=pid)
+
+        # Grace: a healthy CLI exits promptly once its pipes close.
+        deadline = time.monotonic() + 1.5
+        while True:
+            state = await _observe()
+            if state != "live":
+                _finish(state)
+                return
+            if time.monotonic() >= deadline:
+                break
+            await asyncio.sleep(0.25)
+        for sig, wait_seconds in ((signal.SIGTERM, 2.0), (signal.SIGKILL, 1.5)):
+            try:
+                os.kill(pid, sig)
+            except ProcessLookupError:
+                _finish("gone")
+                return
+            except OSError as exc:
+                _log_degrade(
+                    "headless_worker_kill_failed",
+                    handle_id=handle_id,
+                    pid=pid,
+                    error=exc,
+                )
+                return
+            _log_degrade(
+                "headless_worker_terminated_after_close",
+                handle_id=handle_id,
+                pid=pid,
+                signal=int(sig),
+            )
+            waited = 0.0
+            while waited < wait_seconds:
+                await asyncio.sleep(0.25)
+                waited += 0.25
+                state = await _observe()
+                if state != "live":
+                    _finish(state)
+                    return
+        _finish("survived")
 
     async def _close_handle_client(self, handle_id: str) -> None:
         client, bridge = self._unregister_handle(handle_id)
