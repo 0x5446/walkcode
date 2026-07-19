@@ -684,6 +684,11 @@ class ChannelNativeRuntime:
         self._tui_hook_queue_dir = _tui_hook_queue_dir(self.state_store.path)
         self._ingress_lock = asyncio.Lock()
         self._drain_lock = asyncio.Lock()
+        # ADR 0055: per-session transcript read cursor (path, byte offset,
+        # (st_dev, st_ino)) for mirroring mid-turn narration; first sight
+        # fast-forwards to the hook's capture boundary so history is never
+        # replayed into the channel. LRU-capped at 512 sessions.
+        self._tui_transcript_cursors: dict[str, tuple[Any, ...]] = {}
         self._loaded_tui_observed_bindings_refreshed = False
         # PreToolUse gate bookkeeping (ADR 0046 v2): rid -> dispatch time for
         # pending requests already turned into cards, and per-session tools
@@ -2028,6 +2033,9 @@ class ChannelNativeRuntime:
         # so setdefault never overrides them into looking fresh.
         if isinstance(payload, dict):
             payload.setdefault("_walkcode_hook_captured_at", time.time())
+            # In-process callers that skipped the CLI entry get a "now"
+            # boundary — correct for them, same as the capture stamp above.
+            _stamp_transcript_size(payload)
         hook_type = _normalize_tui_hook_type(hook_type or _payload_hook_event_name(payload))
         if not hook_type:
             self.save_state()
@@ -2150,6 +2158,11 @@ class ChannelNativeRuntime:
         created_at_ns = time.time_ns()
         queued_payload = dict(payload)
         queued_payload.setdefault("_walkcode_deferred_id", hook_id)
+        # Enqueue time IS capture time for direct defer callers; a drain
+        # minutes later must not treat the then-current transcript size as
+        # this hook's boundary (ADR 0055).
+        queued_payload.setdefault("_walkcode_hook_captured_at", created_at_ns / 1_000_000_000)
+        _stamp_transcript_size(queued_payload)
         queued = {
             "id": hook_id,
             "created_at": created_at_ns / 1_000_000_000,
@@ -3894,6 +3907,69 @@ class ChannelNativeRuntime:
                 SessionRole.OWNER,
             )
 
+    async def _drain_tui_narration(self, session, payload: dict[str, Any]) -> list[str]:
+        path = str(payload.get("transcript_path", "") or "")
+        if not path:
+            return []
+        cursor = self._tui_transcript_cursors.get(session.session_id)
+        new_cursor, texts = await asyncio.to_thread(
+            _read_transcript_narration, path, cursor, _payload_transcript_boundary(payload)
+        )
+        if new_cursor is not None:
+            self._store_tui_narration_cursor(session.session_id, new_cursor)
+        return texts
+
+    def _advance_tui_narration_cursor(self, session, payload: dict[str, Any]) -> None:
+        path = str(payload.get("transcript_path", "") or "")
+        if not path:
+            return
+        try:
+            info = os.stat(path)
+        except OSError:
+            return
+        size = int(info.st_size)
+        file_key = (int(info.st_dev), int(info.st_ino))
+        prev = self._tui_transcript_cursors.get(session.session_id)
+        prev_matches = (
+            prev is not None
+            and len(prev) >= 4
+            and prev[0] == path
+            and prev[2] == file_key
+        )
+        boundary = _payload_transcript_boundary(payload)
+        offset = size
+        if boundary is not None:
+            boundary_size, boundary_key = boundary
+            if boundary_key == file_key or (boundary_key is None and prev_matches):
+                offset = max(0, min(boundary_size, size))
+            # else: a boundary from a replaced file, or a size-only legacy
+            # boundary with no established cursor on THIS file — using it to
+            # position a fresh cursor could land mid-history (same hole the
+            # reader closed); EOF is the only safe advance ("never replay").
+        discarding = False
+        if prev_matches:
+            # Advance is monotonic: an out-of-order (older) hook must not
+            # rewind the cursor and re-emit already-mirrored narration.
+            if int(prev[1]) >= offset:
+                offset = int(prev[1])
+            # An in-progress over-long-line discard is preserved even across
+            # a forward jump: we cannot prove the jump crossed that line's
+            # real newline, and clearing the flag mid-line would hand the
+            # line's tail to the JSON parser. Worst case the reader drops
+            # one legit line after the jump — safe direction.
+            discarding = bool(prev[3])
+        self._store_tui_narration_cursor(session.session_id, (path, offset, file_key, discarding))
+
+    def _store_tui_narration_cursor(self, session_id: str, cursor: tuple[Any, ...]) -> None:
+        cursors = self._tui_transcript_cursors
+        # LRU: re-insert on every write so eviction hits the least recently
+        # ACTIVE session, and shrink until under the cap no matter which
+        # write path grew it.
+        cursors.pop(session_id, None)
+        cursors[session_id] = cursor
+        while len(cursors) > 512:
+            cursors.pop(next(iter(cursors)))
+
     async def _send_tui_hook_output(self, session, *, hook_type: str, payload: dict[str, Any]) -> None:
         tool_event = _tui_hook_tool_event(hook_type, payload)
         if tool_event is not None:
@@ -3911,6 +3987,13 @@ class ChannelNativeRuntime:
             view = self.orchestrator._event_to_view(session, tool_event)
             channel = self.channels.get(session.channel_binding.channel_kind) if session.channel_binding else None
             if channel is not None:
+                # ADR 0055: the narration that preceded this tool call is in
+                # the transcript but in NO hook payload — drain it onto the
+                # burst card ahead of the tool line it narrates.
+                for narration in await self._drain_tui_narration(session, payload):
+                    await self.orchestrator._upsert_tool_progress_view(
+                        session, channel, {"type": "turn_narration", "text": narration}
+                    )
                 await self.orchestrator._upsert_tool_progress_view(session, channel, view)
             if hook_type == "permission-request":
                 # v3 dual-surface: when this dialog already has an interactive
@@ -3931,6 +4014,10 @@ class ChannelNativeRuntime:
                     )
             return
         text = _tui_hook_text(hook_type, payload)
+        if hook_type in {"stop", "user-prompt-submit"}:
+            # The turn-final text goes out as its own bubble below; skipping
+            # the cursor past it keeps it from doubling as a narration line.
+            self._advance_tui_narration_cursor(session, payload)
         session.last_progress_at = self._now()
         session.last_progress_event = f"external_tui.{hook_type}"
         if not text:
@@ -4476,6 +4563,8 @@ def run_native_cli(args) -> None:
         # must distinguish a hook fired seconds ago from a deferred-queue
         # replay describing a world that no longer exists (ADR 0053).
         payload.setdefault("_walkcode_hook_captured_at", time.time())
+        # Capture-time transcript boundary for narration mirroring (ADR 0055).
+        _stamp_transcript_size(payload)
         if getattr(args, "gate", False):
             output = runtime.gate_tui_hook(
                 hook_type=args.hook_type,
@@ -5904,6 +5993,190 @@ def _tui_lark_chat_id(endpoint: ChannelEndpointConfig) -> str:
     # Same resolution rule as Telegram: explicit TUI chat wins, otherwise a
     # single-entry allowlist unambiguously names the observation chat.
     return _tui_telegram_chat_id(endpoint)
+
+
+_TRANSCRIPT_READ_MAX_BYTES = 2 * 1024 * 1024
+
+
+def _payload_transcript_boundary(
+    payload: dict[str, Any],
+) -> tuple[int, tuple[int, int] | None] | None:
+    """The (size, file identity) stamped when the hook FIRED, if any.
+
+    The identity ((st_dev, st_ino), when stamped by 0.14.6+) pins the size to
+    the file it was measured on — a boundary applied to a DIFFERENT file
+    would expose that file's history as live narration (ADR 0055 revision 2).
+    """
+    raw = payload.get("_walkcode_transcript_size")
+    if raw is None:
+        return None
+    try:
+        size = int(raw)
+    except (TypeError, ValueError):
+        return None
+    if size < 0:
+        return None
+    key_raw = payload.get("_walkcode_transcript_file_key")
+    key: tuple[int, int] | None = None
+    if isinstance(key_raw, (list, tuple)) and len(key_raw) == 2:
+        try:
+            key = (int(key_raw[0]), int(key_raw[1]))
+        except (TypeError, ValueError):
+            key = None
+    return size, key
+
+
+def _stamp_transcript_size(payload: dict[str, Any]) -> None:
+    """Stamp the capture-time transcript size AND file identity onto a hook.
+
+    The narration cursor must be bounded by what existed when the hook fired,
+    not when it is drained: a delayed drain would otherwise lift the
+    turn-final text (written after the last tool call) into a narration line
+    right before Stop sends the same text as a bubble. Size and identity are
+    taken from one fstat on an open handle so they cannot describe two
+    different files.
+    """
+    if "_walkcode_transcript_size" in payload:
+        return
+    path = str(payload.get("transcript_path", "") or "")
+    if not path:
+        return
+    try:
+        with open(path, "rb") as fh:
+            info = os.fstat(fh.fileno())
+    except OSError:
+        return
+    payload["_walkcode_transcript_size"] = int(info.st_size)
+    payload["_walkcode_transcript_file_key"] = [int(info.st_dev), int(info.st_ino)]
+
+
+def _read_transcript_narration(
+    path: str,
+    cursor: tuple[Any, ...] | None,
+    boundary: tuple[int, tuple[int, int] | None] | None = None,
+) -> tuple[tuple[Any, ...] | None, list[str]]:
+    """Read new assistant narration texts from a Claude transcript (ADR 0055).
+
+    ``cursor`` is (path, byte_offset, file_key, discarding) from the previous
+    read, where file_key is (st_dev, st_ino): a replaced file at the same
+    path must not be read from the old offset — its bytes there are history,
+    and replaying history into the channel is never acceptable. First sight
+    of a file fast-forwards WITHOUT emitting. ``boundary`` is the (size,
+    file identity) stamped at hook fire time; it caps every read (bytes
+    written after the hook fired belong to a later hook) but applies ONLY to
+    the file it was measured on — against a replaced file it is meaningless
+    and the call emits nothing. Only complete JSONL lines are consumed — a
+    torn tail waits for the next call, and a single line larger than the
+    batch cap flips ``discarding``: subsequent reads drop bytes until that
+    line's real newline, so no mid-line fragment ever reaches the JSON
+    parser. Returns (new_cursor, texts); new_cursor is None when the file is
+    unreadable and no prior cursor exists (storing (path, 0) would replay the
+    whole file once it appears).
+    """
+    try:
+        fh = open(path, "rb")
+    except OSError:
+        return cursor, []
+    with fh:
+        try:
+            info = os.fstat(fh.fileno())
+        except OSError:
+            return cursor, []
+        size = int(info.st_size)
+        file_key = (info.st_dev, info.st_ino)
+        boundary_size: int | None = None
+        boundary_key: tuple[int, int] | None = None
+        if boundary is not None:
+            boundary_size, boundary_key = boundary
+        boundary_foreign = boundary_key is not None and boundary_key != file_key
+        stale_cursor = (
+            cursor is None
+            or len(cursor) < 4
+            or cursor[0] != path
+            or cursor[2] != file_key
+            or int(cursor[1]) > size
+        )
+        if boundary_foreign:
+            # The hook was captured against a file that no longer exists at
+            # this path; its boundary says nothing about THIS file. Emit
+            # nothing — a later hook stamped on the current file drains. On
+            # first sight the current content is all pre-cursor history:
+            # skip it entirely.
+            if stale_cursor:
+                return (path, size, file_key, False), []
+            return (path, int(cursor[1]), file_key, bool(cursor[3])), []
+        limit = size if boundary_size is None else max(0, min(boundary_size, size))
+        if stale_cursor:
+            if boundary_size is not None and boundary_key is None:
+                # A size-only boundary (legacy payload) cannot prove which
+                # file it was measured on; positioning a FRESH cursor with it
+                # could land mid-history of a replaced file. Skip to EOF —
+                # degraded but safe ("never replay" beats "never miss").
+                return (path, size, file_key, False), []
+            return (path, limit, file_key, False), []
+        offset = int(cursor[1])
+        discarding = bool(cursor[3])
+        if offset >= limit:
+            return (path, offset, file_key, discarding), []
+        requested = min(limit - offset, _TRANSCRIPT_READ_MAX_BYTES)
+        try:
+            fh.seek(offset)
+            blob = fh.read(requested)
+        except OSError:
+            return (path, offset, file_key, discarding), []
+    base_offset = offset
+    if discarding:
+        # Finish dropping the over-long line BEFORE parsing anything: a
+        # mid-line fragment could otherwise parse as a valid JSON entry.
+        cut = blob.find(b"\n")
+        if cut < 0:
+            return (path, offset + len(blob), file_key, True), []
+        # Crossed the real newline: the rest of this batch parses normally
+        # in the SAME call (returning early would delay legit narration by
+        # one hook — or lose it to a following Stop advance).
+        blob = blob[cut + 1 :]
+        base_offset = offset + cut + 1
+    end = blob.rfind(b"\n")
+    if end < 0:
+        if base_offset == offset and (limit - offset) > len(blob):
+            # A FULL cap-sized window from a line start with no newline: the
+            # line is bigger than the batch cap. Skip what we read and keep
+            # discarding until its real newline, so the cursor cannot wedge
+            # and no fragment reaches the parser. (A window trimmed by the
+            # discard prefix is partial — it cannot prove over-long; the next
+            # read starts at the line start with a full window and decides.)
+            return (path, offset + len(blob), file_key, True), []
+        return (path, base_offset, file_key, False), []
+    consumed = blob[: end + 1]
+    new_offset = base_offset + end + 1
+    texts: list[str] = []
+    for raw in consumed.splitlines():
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            entry = json.loads(raw.decode("utf-8", errors="replace"))
+        except Exception:
+            continue
+        if not isinstance(entry, dict) or entry.get("isSidechain"):
+            continue
+        if str(entry.get("type", "")) != "assistant":
+            continue
+        message = entry.get("message")
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        parts = [
+            str(block.get("text", "") or "")
+            for block in content
+            if isinstance(block, dict) and block.get("type") == "text"
+        ]
+        text = "\n".join(part for part in parts if part).strip()
+        if text:
+            texts.append(text)
+    return (path, new_offset, file_key, False), texts
 
 
 def _tui_hook_text(hook_type: str, payload: dict[str, Any]) -> str:
