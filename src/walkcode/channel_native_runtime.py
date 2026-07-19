@@ -3987,12 +3987,19 @@ class ChannelNativeRuntime:
             view = self.orchestrator._event_to_view(session, tool_event)
             channel = self.channels.get(session.channel_binding.channel_kind) if session.channel_binding else None
             if channel is not None:
-                # ADR 0055: the narration that preceded this tool call is in
-                # the transcript but in NO hook payload — drain it onto the
-                # burst card ahead of the tool line it narrates.
+                # ADR 0055 (revision 2): the narration that preceded this tool
+                # call is in the transcript but in NO hook payload — drain it
+                # and post it as a plain message BEFORE the tool line, matching
+                # what headless sessions naturally show (user's call: no card).
                 for narration in await self._drain_tui_narration(session, payload):
-                    await self.orchestrator._upsert_tool_progress_view(
-                        session, channel, {"type": "turn_narration", "text": narration}
+                    self.orchestrator._seal_tool_progress_burst(session)
+                    session.last_event_seq += 1
+                    await self.orchestrator._send_session_view(
+                        session,
+                        {"type": "turn_delta", "text": narration},
+                        idempotency_key=(
+                            f"external_tui:narration:{session.generation}:{session.last_event_seq}"
+                        ),
                     )
                 await self.orchestrator._upsert_tool_progress_view(session, channel, view)
             if hook_type == "permission-request":
