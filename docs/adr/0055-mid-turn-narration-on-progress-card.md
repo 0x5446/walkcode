@@ -108,3 +108,25 @@ R4 终轮：advance 路径补上与 reader 同款的 keyless 边界封堵（无�
 游标时一律跳 EOF），并给"裁剪不满窗不判超限"补反例测试（近 cap 合法行
 不得被误丢）。四轮共报 1 High + 2 High(反例) + 若干 Medium，全部闭合或
 显式记录为残留。
+
+## Revision 2（v0.14.7）：headless 判定假设错误，线上无效
+
+v0.14.6 上线后现场验收失败：headless 会话完全没有 💬 行。实测 bundled
+CLI 的 stream-json——**每个 content block 是独立的 assistant 事件**
+（[thinking]、[text]、[tool_use] 各一条），text 与 tool_use 永远不同消息。
+"同消息含工具块"的叙述判定在真实流上一次都没触发（只在合成 fixture 上
+成立），中段文本仍走 TURN_DELTA 气泡。四轮 deep-review 均未发现——
+reviewer 审的是给定假设。教训与 ps locale 事故同构：**mock 形状 ≠ 生产
+形状，接外部数据流必须先实测一份真样本**。
+
+修复：叙述判定改为**顺序判定**，在事件泵里缓一拍——每段 turn_delta 悬置，
+由下一个事件决定归宿：
+- 后继是工具事件（或再来一段文本）→ 它是叙述 → 💬 上卡、不 seal；
+- 后继是 turn_completed / permission / ask_user / 错误 / 流结束 / 所有权
+  围栏退出 → 它是最终文本 → 原样发气泡（并沿用 turn_completed 去重与
+  seal 语义，位置与旧行为一致）；
+- background_tasks 账本节拍不决定归宿（它与真后继事件交错）。
+
+转换器里"同消息合装 → TURN_NARRATION"的路径保留为兼容兜底。codex 的
+agent_message 走同一个泵，顺带获得同样的叙述判定。TUI transcript 游标
+路径提取 text 条目不要求同条含工具块，天然兼容拆分形状，无需改动。

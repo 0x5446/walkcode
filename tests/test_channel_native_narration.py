@@ -31,6 +31,7 @@ from walkcode.channel_native import (
     Orchestrator,
     SessionRegistry,
     TransportCapabilities,
+    TurnInput,
     render_view_text,
 )
 from walkcode.channel_native.lark_cards import _tool_progress_card
@@ -94,7 +95,7 @@ def _orchestrator():
         orchestrator.start_session(_binding(), "claude_headless", "/tmp/project", _actor())
     )
     channel.sent_views.clear()
-    return orchestrator, channel, session
+    return orchestrator, transport, channel, session
 
 
 class SdkNarrationConversionTests(unittest.TestCase):
@@ -138,7 +139,7 @@ class SdkNarrationConversionTests(unittest.TestCase):
 
 class BurstCardNarrationTests(unittest.TestCase):
     def test_narration_then_tool_share_one_card_in_order(self):
-        orchestrator, channel, session = _orchestrator()
+        orchestrator, _transport, channel, session = _orchestrator()
 
         asyncio.run(
             orchestrator._upsert_tool_progress_view(
@@ -168,7 +169,7 @@ class BurstCardNarrationTests(unittest.TestCase):
         self.assertEqual(lines[1]["tool_name"], "Read")
 
     def test_empty_narration_is_dropped(self):
-        orchestrator, channel, session = _orchestrator()
+        orchestrator, _transport, channel, session = _orchestrator()
         asyncio.run(
             orchestrator._upsert_tool_progress_view(
                 session, channel, {"type": "turn_narration", "text": "   "}
@@ -177,7 +178,7 @@ class BurstCardNarrationTests(unittest.TestCase):
         self.assertEqual(channel.sent_views, [])
 
     def test_narration_is_truncated_into_card_state(self):
-        orchestrator, channel, session = _orchestrator()
+        orchestrator, _transport, channel, session = _orchestrator()
         asyncio.run(
             orchestrator._upsert_tool_progress_view(
                 session, channel, {"type": "turn_narration", "text": "x" * 2000}
@@ -187,7 +188,7 @@ class BurstCardNarrationTests(unittest.TestCase):
         self.assertEqual(len(lines[0]["text"]), 600)
 
     def test_seal_still_clears_narration_lines(self):
-        orchestrator, channel, session = _orchestrator()
+        orchestrator, _transport, channel, session = _orchestrator()
         asyncio.run(
             orchestrator._upsert_tool_progress_view(
                 session, channel, {"type": "turn_narration", "text": "narrate"}
@@ -197,6 +198,116 @@ class BurstCardNarrationTests(unittest.TestCase):
         binding = session.channel_binding
         self.assertNotIn("tool_progress_lines", binding.capabilities)
         self.assertNotIn("tool_progress_message_id", binding.capabilities)
+
+
+class PumpNarrationRoutingTests(unittest.TestCase):
+    """The live CLI streams each content block as its OWN assistant message,
+    so narration must be identified by ORDER (text followed by a tool event),
+    not by sharing a message with tool blocks."""
+
+    @staticmethod
+    def _run_turn(events):
+        orchestrator, transport, channel, session = _orchestrator()
+        transport._scripted_events = list(events)
+        result = asyncio.run(
+            orchestrator.submit_user_input(
+                session.session_id,
+                TurnInput(text="go"),
+                actor=_actor(),
+                generation=session.generation,
+            )
+        )
+        return result, channel
+
+    def test_text_before_tool_becomes_card_narration_not_bubble(self):
+        from walkcode.channel_native import AgentEvent
+
+        result, channel = self._run_turn(
+            [
+                AgentEvent(AgentEventType.TURN_DELTA, {"text": "先查一下日志"}),
+                AgentEvent(
+                    AgentEventType.TOOL_STARTED,
+                    {"tool_id": "t1", "tool_name": "Bash", "summary": "grep"},
+                ),
+                AgentEvent(
+                    AgentEventType.TOOL_COMPLETED,
+                    {"tool_id": "t1", "tool_name": "Bash"},
+                ),
+                AgentEvent(AgentEventType.TURN_DELTA, {"text": "搞定了"}),
+                AgentEvent(AgentEventType.TURN_COMPLETED, {"message": "搞定了"}),
+            ]
+        )
+        self.assertTrue(result.accepted)
+
+        narration_cards = [
+            v
+            for v in channel.sent_views
+            if v["view"].get("type") == "tool_progress"
+            and any(
+                line.get("kind") == "narration" and line.get("text") == "先查一下日志"
+                for line in v["view"].get("lines", [])
+                if isinstance(line, dict)
+            )
+        ]
+        self.assertTrue(narration_cards)  # narration landed on the burst card
+        # Narration precedes the tool line it narrates.
+        lines = narration_cards[-1]["view"]["lines"]
+        kinds = [line.get("kind", "tool") if isinstance(line, dict) else "?" for line in lines]
+        self.assertEqual(kinds[0], "narration")
+
+        bubbles = [v for v in channel.sent_views if v["view"].get("type") == "turn_delta"]
+        self.assertEqual([b["view"]["text"] for b in bubbles], ["搞定了"])  # final only, once
+        # And the identical result message stayed deduped.
+        completed = [v for v in channel.sent_views if v["view"].get("type") == "turn_completed"]
+        self.assertEqual(completed, [])
+
+    def test_final_text_without_tools_stays_a_bubble(self):
+        from walkcode.channel_native import AgentEvent
+
+        result, channel = self._run_turn(
+            [
+                AgentEvent(AgentEventType.TURN_DELTA, {"text": "纯文本回复"}),
+                AgentEvent(AgentEventType.TURN_COMPLETED, {"message": "纯文本回复"}),
+            ]
+        )
+        self.assertTrue(result.accepted)
+        bubbles = [v for v in channel.sent_views if v["view"].get("type") == "turn_delta"]
+        self.assertEqual([b["view"]["text"] for b in bubbles], ["纯文本回复"])
+        self.assertFalse(
+            [v for v in channel.sent_views if v["view"].get("type") == "tool_progress"]
+        )
+
+    def test_text_held_at_stream_end_is_delivered(self):
+        from walkcode.channel_native import AgentEvent
+
+        result, channel = self._run_turn(
+            [AgentEvent(AgentEventType.TURN_DELTA, {"text": "半截话"})]  # worker died mid-turn
+        )
+        self.assertTrue(result.accepted)
+        bubbles = [v for v in channel.sent_views if v["view"].get("type") == "turn_delta"]
+        self.assertEqual([b["view"]["text"] for b in bubbles], ["半截话"])
+
+    def test_consecutive_texts_first_becomes_narration(self):
+        from walkcode.channel_native import AgentEvent
+
+        result, channel = self._run_turn(
+            [
+                AgentEvent(AgentEventType.TURN_DELTA, {"text": "想了想"}),
+                AgentEvent(AgentEventType.TURN_DELTA, {"text": "最终答案"}),
+                AgentEvent(AgentEventType.TURN_COMPLETED, {"message": "最终答案"}),
+            ]
+        )
+        self.assertTrue(result.accepted)
+        bubbles = [v for v in channel.sent_views if v["view"].get("type") == "turn_delta"]
+        self.assertEqual([b["view"]["text"] for b in bubbles], ["最终答案"])
+        narration = [
+            line
+            for v in channel.sent_views
+            if v["view"].get("type") == "tool_progress"
+            for line in v["view"].get("lines", [])
+            if isinstance(line, dict) and line.get("kind") == "narration"
+        ]
+        self.assertTrue(any(line.get("text") == "想了想" for line in narration))
 
 
 class NarrationRenderingTests(unittest.TestCase):

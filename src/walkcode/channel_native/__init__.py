@@ -10466,6 +10466,39 @@ class Orchestrator:
         last_visible_text = ""
         saw_any_event = False
         open_turn = False
+        # ADR 0055 revision: the CLI streams every content block as its OWN
+        # assistant message, so a narration text and the tool_use it narrates
+        # NEVER share a message — "text + tool blocks together" can't identify
+        # narration on the live stream (it only fired on synthetic fixtures).
+        # Instead, hold each turn_delta one beat: the NEXT event decides its
+        # fate. Followed by a tool event → it was narration, join the burst
+        # card as a 💬 line. Followed by anything else (turn end, permission,
+        # error, stream EOF) → it was the final reply, emit the bubble.
+        pending_delta: tuple[str, str] | None = None  # (text, idempotency_key)
+
+        async def _flush_pending_delta(*, as_narration: bool) -> None:
+            nonlocal pending_delta, last_visible_text
+            if pending_delta is None:
+                return
+            text, idempotency_key = pending_delta
+            pending_delta = None
+            if as_narration:
+                await self._upsert_tool_progress_view(
+                    session, channel, {"type": "turn_narration", "text": text}
+                )
+                return
+            view = {"type": "turn_delta", "text": text}
+            self._seal_tool_progress_burst(session)
+            # The final result message usually repeats this text; recording it
+            # keeps the existing turn_completed dedup working.
+            last_visible_text = render_view_text(view)
+            self.outbox.enqueue(
+                channel_binding_key=session.channel_binding.key(),
+                view_model=view,
+                idempotency_key=idempotency_key,
+            )
+            await self._flush_outbox()
+
         async for event in self._iter_transport_events(transport, handle):
             if (
                 session.generation != expected_generation
@@ -10486,6 +10519,10 @@ class Orchestrator:
                     session_status=session.status,
                     drain_handle=handle.handle_id,
                 )
+                # Held text was produced before ownership moved; posting it
+                # late beats losing it (the old code had already posted it by
+                # this point).
+                await _flush_pending_delta(as_narration=False)
                 return
             saw_any_event = True
             # The stream now spans turns (background subagents re-open them),
@@ -10505,17 +10542,38 @@ class Orchestrator:
             view = self._event_to_view(session, event)
             session.last_event_seq += 1
             await self.refresh_session_status_card(session)
+            if view.get("type") == "turn_delta":
+                # An earlier held text followed by MORE text was clearly not
+                # the turn's last word — it was narration.
+                await _flush_pending_delta(as_narration=True)
+                text = str(view.get("text", "") or "")
+                if text.strip():
+                    pending_delta = (
+                        text,
+                        (
+                            f"{session.session_id}:{session.generation}:"
+                            f"{event.seq or session.last_event_seq}:{event.type}"
+                        ),
+                    )
+                continue
             if view.get("type") in {"tool_progress", "turn_narration"}:
                 # Narration joins the rolling burst card as a 💬 line — never
                 # a bubble, and it must NOT seal the burst (the tools it
                 # narrates land right after it).
+                await _flush_pending_delta(as_narration=True)
                 await self._upsert_tool_progress_view(session, channel, view)
                 continue
             if view.get("type") == "background_tasks":
                 # Ledger beat: status card is already refreshed above; it must
                 # not seal a tool burst (task_started lands right after the
-                # Agent tool_use line) nor produce channel text.
+                # Agent tool_use line) nor produce channel text. It must not
+                # decide a held text's fate either — the ledger interleaves
+                # with the true successor event.
                 continue
+            # Any other event decides a held text as FINAL (permission cards
+            # and ask-user prompts read better under the text that introduced
+            # them, same as the old immediate-emit order).
+            await _flush_pending_delta(as_narration=False)
             # Any non-tool event ends the burst — including an empty
             # turn-completed. Sealing must not depend on the event producing
             # visible text, or the next turn's tools edit last turn's card.
@@ -10535,6 +10593,9 @@ class Orchestrator:
                 ),
             )
             await self._flush_outbox()
+        # Stream ended with text still held (worker died before the result
+        # message): it was the last thing the agent said — deliver it.
+        await _flush_pending_delta(as_narration=False)
         if saw_any_event and open_turn and session.lifecycle_state == "ACTIVE":
             session.last_progress_at = self._now()
             session.last_progress_event = "turn.event_stream_incomplete"
