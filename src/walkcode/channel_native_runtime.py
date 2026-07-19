@@ -53,6 +53,7 @@ from .channel_native import (
     _command_is_claude_tui_process,
     _command_is_codex_app_server_process,
     _command_is_codex_tui_process,
+    _c_locale_env,
     _command_is_external_tui_process,
     _log_degrade,
     _probe_process,
@@ -5728,6 +5729,7 @@ def _process_tree_entries(pid_value: Any, *, max_depth: int = 4) -> list[dict[st
         try:
             result = subprocess.run(
                 ["ps", "-o", "pid=,ppid=,lstart=,command=", "-p", str(pid)],
+                env=_c_locale_env(),
                 capture_output=True,
                 text=True,
                 timeout=1,
@@ -5780,6 +5782,7 @@ def _infer_process_ref_from_hook_pid(hook_pid_value: Any) -> dict[str, Any] | No
     try:
         result = subprocess.run(
             ["ps", "-o", "ppid=", "-p", str(hook_pid)],
+            env=_c_locale_env(),
             capture_output=True,
             text=True,
             timeout=1,
@@ -6116,6 +6119,7 @@ def _process_ref_is_running(process_ref: dict[str, Any]) -> bool:
     try:
         result = subprocess.run(
             ["ps", "-o", "stat=", "-p", str(pid)],
+            env=_c_locale_env(),
             capture_output=True,
             text=True,
             timeout=1,

@@ -160,6 +160,30 @@ class ProbeTests(unittest.TestCase):
         with patch.object(cn.subprocess, "run", side_effect=boom):
             self.assertEqual(_probe_process(4242).status, "error")
 
+    def test_probe_survives_day_first_locale(self):
+        # Live regression 2026-07-19: LANG=en_SG.UTF-8 renders ps lstart as
+        # "Sun 19 Jul ..." (day first), which the v0.14.3 parser rejected —
+        # empty hook trees, probe errors, revival refused. ps must run with a
+        # pinned C locale regardless of the inherited environment.
+        pid = _spawn_detached_sleep()
+        self.addCleanup(lambda: subprocess.run(["kill", "-9", str(pid)], capture_output=True))
+        with patch.dict("os.environ", {"LANG": "en_SG.UTF-8", "LC_TIME": "en_SG.UTF-8", "LC_ALL": ""}):
+            probe = _probe_process(pid)
+        self.assertEqual(probe.status, "ok")
+        # C-locale shape: Www Mmm DD — month before day.
+        self.assertRegex(probe.lstart, r"^\w{3}\s+\w{3}\s+\d{1,2}\s")
+
+    def test_process_tree_entries_survive_day_first_locale(self):
+        from walkcode.channel_native_runtime import _process_tree_entries
+
+        pid = _spawn_detached_sleep()
+        self.addCleanup(lambda: subprocess.run(["kill", "-9", str(pid)], capture_output=True))
+        with patch.dict("os.environ", {"LANG": "en_SG.UTF-8", "LC_TIME": "en_SG.UTF-8", "LC_ALL": ""}):
+            entries = _process_tree_entries(pid, max_depth=1)
+        self.assertTrue(entries, "hook-side tree capture must not be locale-sensitive")
+        self.assertEqual(entries[0]["pid"], pid)
+        self.assertTrue(entries[0]["lstart"])
+
     def test_probe_zombie_is_gone(self):
         import walkcode.channel_native as cn
 
