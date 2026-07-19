@@ -85,6 +85,9 @@ class _WorkerCleanupBase(unittest.TestCase):
         return proc
 
     def _record(self, transport: ClaudeHeadlessTransport, handle_id: str, pid: int, session_id: str = "sess-1") -> None:
+        # Capture only records LIVE handles (guard against post-close
+        # resurrection), so mirror the real registration first.
+        transport._clients.setdefault(handle_id, object())
         asyncio.run(transport._capture_worker_proc(handle_id, session_id, _FakeClient(pid)))
         self.assertIn(handle_id, transport._worker_procs)
 
@@ -193,41 +196,118 @@ class WorkerExitVerificationTests(_WorkerCleanupBase):
 
 
 class ResumeBarrierTests(_WorkerCleanupBase):
+    @staticmethod
+    def _resume_spec() -> ResumeSpec:
+        return ResumeSpec(
+            cwd="/tmp", session_id="sess-1", resume_ref={"agent_session_id": "agent-1"}
+        )
+
     def test_resume_waits_for_lingering_worker_of_same_session(self):
         # EOF/settle already unregistered _session_handles while the old
         # worker still lives: resume must reach a terminal state for it
-        # BEFORE spawning the replacement (review P1: the new worker would
-        # otherwise hit the session lock / double-write next to it).
+        # BEFORE creating the replacement — moving the cleanup after the
+        # spawn must redden this (create-time probe pins the ORDER).
         proc = self._spawn()
         transport = _transport()
         self._record(transport, "h-old", proc.pid, session_id="sess-1")
         # _session_handles intentionally empty == already unregistered.
 
-        new_client = _FakeClient(0)
+        old_state_at_create: list = []
+
+        def _create(self_t, spec, resume_id=None):
+            old_state_at_create.append(_probe_process(proc.pid).status)
+            return (_FakeClient(0), None)
 
         async def _fake_connect(client, prompt=None):
             return None
 
         with (
             mock.patch.object(ClaudeHeadlessTransport, "_available", return_value=True),
-            mock.patch.object(
-                ClaudeHeadlessTransport, "_create_client", return_value=(new_client, None)
-            ),
+            mock.patch.object(ClaudeHeadlessTransport, "_create_client", _create),
             mock.patch.object(ClaudeHeadlessTransport, "_connect_client", _fake_connect),
         ):
-            handle = asyncio.run(
-                transport.resume(
-                    ResumeSpec(
-                        cwd="/tmp",
-                        session_id="sess-1",
-                        resume_ref={"agent_session_id": "agent-1"},
-                    )
-                )
-            )
+            handle = asyncio.run(transport.resume(self._resume_spec()))
 
         self.assertTrue(handle.handle_id)
-        self.assertEqual(_probe_process(proc.pid).status, "gone")  # barrier held
+        self.assertEqual(old_state_at_create, ["gone"])  # dead BEFORE spawn
         self.assertNotIn("h-old", transport._worker_procs)
+
+    def test_resume_refuses_when_old_worker_not_confirmed_dead(self):
+        # Probe errors keep the record non-terminal: spawning next to a
+        # possibly-alive worker recreates the incident — refuse instead.
+        from walkcode.channel_native import TransportUnavailable
+
+        transport = _transport()
+        transport._worker_procs["h-old"] = (4242, "Sun Jul 19 00:00:00 2026", "sleep 60")
+        transport._session_last_worker["sess-1"] = "h-old"
+
+        broken = mock.Mock(return_value=mock.Mock(status="error", lstart="", command=""))
+        with (
+            mock.patch("walkcode.channel_native._probe_process", broken),
+            mock.patch.object(ClaudeHeadlessTransport, "_available", return_value=True),
+        ):
+            with self.assertRaises(TransportUnavailable):
+                asyncio.run(transport.resume(self._resume_spec()))
+        self.assertIn("h-old", transport._worker_procs)  # kept for retry
+
+    def test_concurrent_resumes_serialize_to_one_live_client(self):
+        transport = _transport()
+        created: list = []
+
+        def _create(self_t, spec, resume_id=None):
+            client = _FakeClient(0)
+            created.append(client)
+            return (client, None)
+
+        async def _fake_connect(client, prompt=None):
+            await asyncio.sleep(0.05)  # widen the race window
+
+        async def _scenario():
+            await asyncio.gather(
+                transport.resume(self._resume_spec()),
+                transport.resume(self._resume_spec()),
+            )
+
+        with (
+            mock.patch.object(ClaudeHeadlessTransport, "_available", return_value=True),
+            mock.patch.object(ClaudeHeadlessTransport, "_create_client", _create),
+            mock.patch.object(ClaudeHeadlessTransport, "_connect_client", _fake_connect),
+        ):
+            asyncio.run(_scenario())
+
+        self.assertEqual(len(created), 2)
+        # Serialized: the second resume closed the first's client; exactly
+        # one live registration remains.
+        self.assertEqual(len(transport._clients), 1)
+        self.assertEqual(created[0].disconnect_calls + created[1].disconnect_calls, 1)
+
+
+class ExitTaskBookkeepingTests(unittest.TestCase):
+    def test_stale_done_callback_does_not_evict_newer_task(self):
+        transport = _transport()
+
+        async def _scenario():
+            old = asyncio.create_task(asyncio.sleep(0))
+            new = asyncio.create_task(asyncio.sleep(0))
+            transport._exit_tasks["h1"] = new
+            transport._clear_exit_task("h1", old)  # stale callback fires late
+            self.assertIs(transport._exit_tasks.get("h1"), new)
+            transport._clear_exit_task("h1", new)
+            self.assertNotIn("h1", transport._exit_tasks)
+            await asyncio.gather(old, new)
+
+        asyncio.run(_scenario())
+
+    def test_capture_after_close_does_not_resurrect_tracking(self):
+        transport = _transport()
+
+        async def _scenario():
+            # handle not in _clients == already closed while probing.
+            await transport._capture_worker_proc("h-closed", "sess-1", _FakeClient(os.getpid()))
+
+        asyncio.run(_scenario())
+        self.assertNotIn("h-closed", transport._worker_procs)
+        self.assertNotIn("sess-1", transport._session_last_worker)
 
 
 class WorkerPidExtractionTests(unittest.TestCase):
@@ -242,6 +322,7 @@ class WorkerPidExtractionTests(unittest.TestCase):
         )
         try:
             transport = _transport()
+            transport._clients["h1"] = object()  # capture only records live handles
             asyncio.run(transport._capture_worker_proc("h1", "sess-9", _FakeClient(proc.pid)))
             record = transport._worker_procs.get("h1")
             self.assertIsNotNone(record)

@@ -49,3 +49,19 @@ Status: Accepted; implemented
 - 残留：serve 自身崩溃时来不及验尸——依赖进程组随 serve 一起被 launchd
   终止（当日升级实测成立）；跨 serve 的历史孤儿不做全局清扫（无登记
   身份，杀之违反 fail-closed 原则）。
+
+## Revision（发版前两轮审查采纳）
+
+R1 三项 P1：①验尸改为按 handle 的单例后台任务并 shield——调用方（EOF
+清算/shutdown）被取消也照样跑完，同 handle 并发关闭共享任务不重复发信号；
+②记录只在终局（gone / pid 复用）清除，探测报错与 SIGKILL 未死时保留，
+后续关闭尝试能重新验尸；③resume 增加同会话闸门，等上一个已知 worker
+到达终态。另：拉起路径身份捕获异步化。
+
+R2 收口：①关旧→验尸→建新→登记→捕获整段加**同会话串行锁**（launch 与
+resume 都持锁），并发 resume 不再双双越过闸门各拉一个 worker；②闸门要不
+到"确认死亡"（记录仍在=探测报错/杀不死）时 resume 直接抛
+TransportUnavailable 拒绝拉新，下一条消息重试整个阶梯；③注销回调按任务
+身份条件删除（消 ABA 竞态）；④shield 会重抛验尸自身异常——在关闭路径
+隔离并打点，不放大/替换 EOF 原始异常；⑤捕获前确认 handle 仍登记在册，
+关闭后的迟到捕获不会复活跟踪记录。
