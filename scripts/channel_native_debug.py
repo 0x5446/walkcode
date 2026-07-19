@@ -797,8 +797,11 @@ async def _probe_outbox_dispatch() -> dict[str, Any]:
 
 def debug_runtime_processes(*, allow_channel_native: bool = False) -> dict[str, Any]:
     try:
+        from walkcode.channel_native import _c_locale_env
+
         result = subprocess.run(
             ["ps", "-axo", "pid=,ppid=,command="],
+            env=_c_locale_env(),
             check=False,
             capture_output=True,
             text=True,
