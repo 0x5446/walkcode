@@ -5736,6 +5736,12 @@ class ClaudeHeadlessTransport:
         self.background_wait_ceiling_seconds = background_wait_ceiling_seconds
         self._clients: dict[str, Any] = {}
         self._bridges: dict[str, _ClaudePermissionBridge] = {}
+        # handle_id -> (pid, lstart, command)：worker 进程的捕获时身份。
+        # 关闭 SDK client 不保证 CLI 进程退出（还挂着后台子进程的 worker 能
+        # 平安活过一次"成功"的 disconnect），残留进程占着 Claude Code 的
+        # 同会话单进程锁（终端 resume 秒退）且是潜在双写（2026-07-20 实锤：
+        # 一个会话攒了三个残留 worker）。关闭路径据此验尸、按身份升级清理。
+        self._worker_procs: dict[str, tuple[int, str, str]] = {}
         # session_id -> live handle_id, so resume() can close the previous
         # worker instead of leaking it, and the orchestrator can reuse a live
         # worker instead of forking a second --resume process.
@@ -5787,6 +5793,7 @@ class ClaudeHeadlessTransport:
         if bridge is not None:
             self._bridges[handle.handle_id] = bridge
         self._session_handles[spec.session_id] = handle.handle_id
+        self._capture_worker_proc(handle.handle_id, client)
         return handle
 
     async def resume(self, spec: ResumeSpec) -> TransportHandle:
@@ -5823,7 +5830,29 @@ class ClaudeHeadlessTransport:
         if bridge is not None:
             self._bridges[handle.handle_id] = bridge
         self._session_handles[spec.session_id] = handle.handle_id
+        self._capture_worker_proc(handle.handle_id, client)
         return handle
+
+    @staticmethod
+    def _client_worker_pid(client: Any) -> int:
+        """Best-effort pid of the SDK client's CLI subprocess (0 if unknown)."""
+        transport = getattr(client, "_transport", None)
+        process = getattr(transport, "_process", None)
+        pid = getattr(process, "pid", None)
+        try:
+            value = int(pid) if pid is not None else 0
+        except (TypeError, ValueError):
+            return 0
+        return value if value > 1 else 0
+
+    def _capture_worker_proc(self, handle_id: str, client: Any) -> None:
+        pid = self._client_worker_pid(client)
+        if not pid:
+            return
+        probe = _probe_process(pid)
+        if probe.status != "ok":
+            return
+        self._worker_procs[handle_id] = (pid, probe.lstart, probe.command)
 
     def handle_is_live(self, handle_id: str) -> bool:
         """True while this handle's worker client is still attached."""
@@ -5847,30 +5876,105 @@ class ClaudeHeadlessTransport:
         return client, bridge
 
     async def _disconnect_client(self, handle_id: str, client: Any) -> None:
-        if client is None:
-            return
-        for method_name in ("disconnect", "stop", "close"):
-            method = getattr(client, method_name, None)
-            if method is None:
-                continue
-            try:
-                await _maybe_await(method())
-                return
-            except Exception as exc:
-                # Keep trying the remaining close methods; a swallowed failure
-                # here would leave an invisible zombie process.
+        closed = False
+        if client is not None:
+            for method_name in ("disconnect", "stop", "close"):
+                method = getattr(client, method_name, None)
+                if method is None:
+                    continue
+                try:
+                    await _maybe_await(method())
+                    closed = True
+                    break
+                except Exception as exc:
+                    # Keep trying the remaining close methods; a swallowed failure
+                    # here would leave an invisible zombie process.
+                    _log_degrade(
+                        "headless_worker_close_failed",
+                        handle_id=handle_id,
+                        method=method_name,
+                        error=exc,
+                        fallback="try_next_close_method",
+                    )
+            if not closed:
                 _log_degrade(
-                    "headless_worker_close_failed",
+                    "headless_worker_close_exhausted",
                     handle_id=handle_id,
-                    method=method_name,
-                    error=exc,
-                    fallback="try_next_close_method",
+                    drop=True,
                 )
-        _log_degrade(
-            "headless_worker_close_exhausted",
-            handle_id=handle_id,
-            drop=True,
-        )
+        # A "successful" close only closed the SDK-side pipes — verify the CLI
+        # process actually died, whether or not any close method worked.
+        await self._ensure_worker_process_exited(handle_id)
+
+    async def _ensure_worker_process_exited(self, handle_id: str) -> None:
+        """Verify the worker CLI process died after close; escalate if not.
+
+        A worker with lingering background children survives a clean
+        disconnect: the leftover keeps the Claude session file's
+        single-process lock (a terminal `claude --resume` exits on startup)
+        and remains a latent double-writer (live incident 2026-07-20: one
+        session accumulated three such leftovers). ADR 0053 identity rules
+        apply — never signal on a probe error or an identity mismatch (pid
+        reuse); a fresh healthy worker exits within the grace window and is
+        never signalled at all.
+        """
+        record = self._worker_procs.pop(handle_id, None)
+        if record is None:
+            return
+        pid, lstart, command = record
+
+        async def _observe() -> str:
+            """gone | live | untouchable (probe error / identity moved)."""
+            probe = await asyncio.to_thread(_probe_process, pid)
+            if probe.status == "gone":
+                return "gone"
+            if probe.status == "error":
+                _log_degrade(
+                    "headless_worker_exit_verify_failed",
+                    handle_id=handle_id,
+                    pid=pid,
+                )
+                return "untouchable"
+            if not _proc_identity_matches(probe, lstart, command):
+                return "untouchable"  # pid reused: the worker IS gone
+            return "live"
+
+        # Grace: a healthy CLI exits promptly once its pipes close.
+        deadline = time.monotonic() + 1.5
+        while True:
+            state = await _observe()
+            if state != "live":
+                return
+            if time.monotonic() >= deadline:
+                break
+            await asyncio.sleep(0.25)
+        for sig, wait_seconds in ((signal.SIGTERM, 2.0), (signal.SIGKILL, 1.5)):
+            try:
+                os.kill(pid, sig)
+            except ProcessLookupError:
+                return
+            except OSError as exc:
+                _log_degrade(
+                    "headless_worker_kill_failed",
+                    handle_id=handle_id,
+                    pid=pid,
+                    error=exc,
+                )
+                return
+            _log_degrade(
+                "headless_worker_terminated_after_close",
+                handle_id=handle_id,
+                pid=pid,
+                signal=int(sig),
+            )
+            waited = 0.0
+            while waited < wait_seconds:
+                await asyncio.sleep(0.25)
+                waited += 0.25
+                state = await _observe()
+                if state != "live":
+                    return
+        _log_degrade("headless_worker_survived_kill", handle_id=handle_id, pid=pid)
 
     async def _close_handle_client(self, handle_id: str) -> None:
         client, bridge = self._unregister_handle(handle_id)
