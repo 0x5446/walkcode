@@ -1,0 +1,82 @@
+# ADR 0054: 频道消息复活被清扫的 headless 会话——接管减 kill
+
+Date: 2026-07-19
+
+Status: Accepted; implemented
+
+## Context
+
+每次 runtime 重启（发版升级、崩溃恢复），孤儿清扫把所有 headless 会话标为
+`stopped`（stop_reason=`runtime_restart`）。此后用户在飞书话题里发消息，
+一律死路："⚪ 这条消息没有提交：会话已结束。到根会话发新消息即可开新任务。"
+
+实锤事故：2026-07-19 v0.14.3 升级重启后，用户 17:58 给活跃话题发消息撞上
+死路，只能到终端手动 `claude --resume <id>` 续命。当天发版三次，即三次
+全量会话死亡。而 transcript 和 resume 凭据（agent_session_id / thread_id）
+在账本里完好——死路纯属没有代码路径，不是能力缺失。
+
+对照：外部 TUI 形态的 stopped 会话早就有出路（接管提示卡，authorize →
+resume → terminate → submit）。headless 会话需要的只是同一条链路去掉
+terminate——没有 TUI，无可 kill。
+
+## Decision
+
+`submit_user_input` 入口处，满足**全部**条件即复活后继续正常提交：
+
+1. `status == "stopped"` 且 `stop_reason ∈ {"runtime_restart", "revive_failed"}`
+   ——**只复活非自愿停止**。显式 `close_session` 的会话保持"拒绝后续
+   submit"的既有契约（有回归测试钉住）。
+2. 非外部 TUI 接管候选——带 TUI 印记的 stopped 会话继续走既有的
+   接管提示（用户知情同意），不被静默复活抢走。
+3. `_durable_resume_ref` 非空（claude_headless 要 agent_session_id，
+   codex_app_server 要 thread_id）且 transport 支持 `resume_after_complete`。
+
+复活动作（`SessionRegistry.revive_stopped_structured_session`）：
+generation +1（围栏一切残留 drain）、status=running、lifecycle=IDLE、
+清空 writer/lease/background_tasks。随后自然落入既有的
+`_ensure_writer_ready_for_submit` → `_resume_writer_for_submit`：resume 出
+新 worker、取写权、提交用户消息。本次 submit 使用复活后的新 generation。
+
+**失败回滚**（`mark_revive_failed`）：resume 未产出 worker 时立即回退
+`stopped` + `stop_reason="revive_failed"`，不留"账面 running 实际无人服务"
+的幻活记录。`revive_failed` 在允许名单里——下一条消息自动重试。
+
+## Consequences
+
+- 发版/重启不再杀死频道对话：用户像什么都没发生一样继续聊，第一条消息
+  自动拉起新 worker（代价是该消息的首响应多一次 resume 延迟）。
+- 显式关闭语义不变；TUI 接管语义不变（ADR 0051/0053 不受影响）。
+- 复活记 degrade 日志 `session_revived_by_channel`，可观测。
+- 残留：`外部 TUI 印记 + TUI 进程已死`的 stopped 会话仍走接管提示（多一次
+  点击）；因 v0.14.3 的 `target_gone` 该接管已是纯自动清杀，后续可评估把
+  这类也并入静默复活。
+
+## Revision（发版前 deep-review 采纳，同版修复）
+
+三维审查（correctness / concurrency / consistency）报 4 项 Warning，全部采纳：
+
+1. **代际围栏**：复活曾先于 `validate_submit`，旧代际的延迟提交可复活会话
+   并越过围栏写入。修复：复活前置条件加 `generation == session.generation`。
+2. **旧等待吞消息**：清扫时残留的 AskUserQuestion 自由文本等待会在
+   `handle_inbound_event` 里把复活消息当旧答案吃掉（永远到不了复活分支）。
+   修复：入站分流前，等待归属的会话已 stopped（或不存在）即退役该等待、
+   走正常路由；复活成功后同时 `clear_awaiting_other_for_session` 兜底。
+3. **话题内回复绕过复活**：回复消息的 binding key 带不同 root_message_id，
+   精确匹配落空后候选匹配排除全部 stopped 会话 → 新建会话而非复活。
+   修复：候选匹配纳入满足复活前置条件的 stopped 会话（仅限 thread 作用域）。
+4. **归档矛盾态**：已归档的异常停止会话可被复活成"运行但列表隐藏"。
+   修复：`revive_stopped_structured_session` 拒绝 `archived_at` 非零的会话。
+
+前置条件收敛为模块级 `_session_is_channel_revival_candidate()`，绑定解析与
+提交入口共用，避免两处漂移。并发维结论 SAFE（入站锁覆盖复活至提交）。
+
+第二轮增量复核抓到上述第 3 项修复自身引入的 High 回归：把可复活会话直接
+压进候选集合，会（a）同话题有活跃会话时误报歧义、（b）双 stopped 弹空
+chooser、（c）transport 未接线时把"新建会话"变成死路。终版改为**分层解析
++ 显式 opt-in**：`resolve_active_binding(key, revival_eligible=...)` 只有传入
+谓词的调用点才考虑复活候选，且作为第二层——活跃/接管候选优先且语义不变；
+复活层从不产生 chooser（多个可复活取 `last_progress_at` 最近者）；谓词由
+调用方提供（transport 已接线且 `resume_after_complete`）。未传谓词的调用点
+（takeover 命令、telegram 命令解析、话题创建、诊断以外）完全回到 0054 前
+语义。诊断预检 `_summarize_submit_gate` 同步：可复活会话报
+`submit_action="revive_stopped_session"`。第三轮复核确认无残留后合并。

@@ -75,6 +75,7 @@ from .channel_native import (
     WriterOwner,
     _agent_to_transport_kind,
     _external_claude_resume_ref,
+    _session_is_channel_revival_candidate,
     _session_is_external_tui_takeover_candidate,
 )
 from .channel_native import claude_gate
@@ -4227,7 +4228,9 @@ class ChannelNativeRuntime:
                 "submit_action": "empty_message_ignored",
                 "submit_blocked_reason": "",
             }
-        resolution = self.state.sessions.resolve_active_binding(inbound.binding_key())
+        resolution = self.state.sessions.resolve_active_binding(
+            inbound.binding_key(), revival_eligible=self._revival_transport_ready
+        )
         if resolution.reason:
             if resolution.reason == BlockedReason.AMBIGUOUS_SESSION:
                 return {
@@ -4256,6 +4259,18 @@ class ChannelNativeRuntime:
                     "submit_would_accept": False,
                     "submit_blocked_reason": authz.reason,
                 }
+        if _session_is_channel_revival_candidate(session) and self._revival_transport_ready(session):
+            # ADR 0054: the real submit path revives this session instead of
+            # dead-ending at SESSION_STOPPED — report it as submittable.
+            return {
+                "active_session_present": True,
+                "active_session_status": session.status,
+                "active_session_lifecycle": session.lifecycle_state,
+                "submit_would_accept": True,
+                "submit_action": "revive_stopped_session",
+                "submit_blocked_reason": "",
+                "submit_requires_resume": True,
+            }
         transport = self.transports.get(session.transport_kind)
         if session.lifecycle_state == "IDLE":
             if transport is None:
@@ -4342,6 +4357,16 @@ class ChannelNativeRuntime:
             "submit_would_accept": True,
             "submit_blocked_reason": "",
         }
+
+    def _revival_transport_ready(self, session) -> bool:
+        """Mirror of Orchestrator._revival_transport_ready for the doctor path."""
+        transport = self.transports.get(session.transport_kind)
+        if transport is None:
+            return False
+        try:
+            return bool(transport.capabilities().resume_after_complete)
+        except Exception:
+            return False
 
     def _summarize_new_session_gate(self, transport_kind: str | None = None) -> dict[str, Any]:
         selected_transport = transport_kind or self.config.agent_transport_kind

@@ -907,6 +907,48 @@ def _session_is_external_tui_takeover_candidate(session: Session) -> bool:
     return any(str(ref.get("source", "")) == "native_tui_hook" for ref in refs)
 
 
+_STRUCTURED_TRANSPORT_KINDS = frozenset({"claude_headless", "codex_app_server"})
+_CHANNEL_REVIVAL_STOP_REASONS = frozenset({"runtime_restart", "revive_failed"})
+
+
+def _durable_resume_ref(session: Session) -> dict[str, Any]:
+    """The transport ref if it carries enough identity to resume, else {}."""
+    ref = dict(session.transport_ref)
+    if session.transport_kind == "claude_headless":
+        agent_session_id = str(
+            ref.get("agent_session_id")
+            or ref.get("claude_session_id")
+            or ""
+        )
+        if not agent_session_id:
+            return {}
+        ref["agent_session_id"] = agent_session_id
+        return ref
+    if session.transport_kind == "codex_app_server" and not ref.get("thread_id"):
+        return {}
+    return ref
+
+
+def _session_is_channel_revival_candidate(session: Session) -> bool:
+    """ADR 0054 preconditions, shared by binding resolution and submit.
+
+    Only INVOLUNTARY stops revive — an explicit close keeps its "blocks
+    future submits" contract, an archived session stays archived, and
+    external-TUI takeover candidates keep the consent-based takeover prompt.
+    """
+    if session.status != "stopped":
+        return False
+    if session.stop_reason not in _CHANNEL_REVIVAL_STOP_REASONS:
+        return False
+    if session.archived_at:
+        return False
+    if session.transport_kind not in _STRUCTURED_TRANSPORT_KINDS:
+        return False
+    if _session_is_external_tui_takeover_candidate(session):
+        return False
+    return bool(_durable_resume_ref(session))
+
+
 def _external_claude_resume_ref(session: Session) -> dict[str, Any]:
     """The Claude-native resume_ref of a TUI-observed session, if any.
 
@@ -1455,7 +1497,21 @@ class SessionRegistry:
     def resolve_binding(self, key: BindingKey) -> str | None:
         return self._binding_to_session.get(key)
 
-    def resolve_active_binding(self, key: BindingKey) -> BindingResolution:
+    def resolve_active_binding(
+        self,
+        key: BindingKey,
+        *,
+        revival_eligible: Callable[[Session], bool] | None = None,
+    ) -> BindingResolution:
+        """Resolve a binding key to the session a message should reach.
+
+        ``revival_eligible`` opts a call site into ADR 0054 revival
+        resolution: stopped-but-revivable sessions are considered only as a
+        SECOND layer, after the existing active/takeover candidates, and only
+        when the predicate confirms the session could actually be revived
+        (transport wired + resumable). Call sites that never revive keep the
+        pre-0054 semantics by omitting it.
+        """
         exact = self.resolve_binding(key)
         if exact is not None:
             channel_kind, account_id, chat_id, thread_id, root_message_id = key
@@ -1467,6 +1523,7 @@ class SessionRegistry:
         if root_message_id and not thread_id:
             return BindingResolution()
         candidates: list[str] = []
+        revival_candidates: list[tuple[float, str]] = []
         for candidate_key, session_id in self._binding_to_session.items():
             candidate_channel, candidate_account, candidate_chat, candidate_thread, _candidate_root = candidate_key
             if (
@@ -1477,16 +1534,30 @@ class SessionRegistry:
             ) != (channel_kind, account_id, chat_id, thread_id):
                 continue
             session = self._sessions.get(session_id)
-            if session is not None and (
-                session.status != "stopped"
-                or (bool(thread_id) and _session_is_external_tui_takeover_candidate(session))
+            if session is None:
+                continue
+            if session.status != "stopped" or (
+                bool(thread_id) and _session_is_external_tui_takeover_candidate(session)
             ):
                 candidates.append(session_id)
+            elif (
+                revival_eligible is not None
+                and bool(thread_id)
+                and _session_is_channel_revival_candidate(session)
+                and revival_eligible(session)
+            ):
+                revival_candidates.append((session.last_progress_at, session_id))
         unique_candidates = sorted(set(candidates))
         if len(unique_candidates) == 1:
             return BindingResolution(session_id=unique_candidates[0])
         if len(unique_candidates) > 1:
             return BindingResolution(reason=BlockedReason.AMBIGUOUS_SESSION)
+        if revival_candidates:
+            # Revival never produces a chooser (the chooser filters stopped
+            # sessions and would come up empty): pick the most recently
+            # active candidate deterministically.
+            revival_candidates.sort()
+            return BindingResolution(session_id=revival_candidates[-1][1])
         return BindingResolution()
 
     def update_channel_binding(self, session_id: str, binding: ChannelBinding) -> None:
@@ -1752,6 +1823,60 @@ class SessionRegistry:
         session.last_progress_at = now
         session.last_progress_event = "writer.reacquired"
         return SubmitResult(True)
+
+    def revive_stopped_structured_session(self, session_id: str) -> SubmitResult:
+        """Bring a stopped structured session back for a channel-driven submit.
+
+        ADR 0054: every runtime restart sweeps headless sessions to
+        "stopped", and a later channel message used to dead-end at 会话已结束
+        even though the transcript and resume credentials are intact. This is
+        takeover minus the kill: bump the generation (fences any stale
+        drains), reset to IDLE, and let the normal resume-for-submit path
+        spawn a fresh worker. The caller is responsible for verifying a
+        durable resume ref and transport capability BEFORE calling, and for
+        reverting via mark_revive_failed if the resume then fails.
+        """
+        session = self._sessions.get(session_id)
+        if session is None:
+            return SubmitResult(False, BlockedReason.NOT_FOUND)
+        if session.status != "stopped":
+            return SubmitResult(False, "not_stopped")
+        if session.archived_at:
+            # An archived session is hidden from the session list; reviving
+            # it would produce a running-but-invisible record.
+            return SubmitResult(False, "archived")
+        if session.transport_kind not in _STRUCTURED_TRANSPORT_KINDS:
+            return SubmitResult(False, "not_structured")
+        now = self._now()
+        session.generation += 1
+        session.status = "running"
+        session.stop_reason = ""
+        session.lifecycle_state = "IDLE"
+        session.writer_owner = None
+        session.writer_lease = None
+        session.background_tasks = []
+        session.last_progress_at = now
+        session.last_progress_event = "session.revived_by_channel"
+        return SubmitResult(True)
+
+    def mark_revive_failed(self, session_id: str) -> None:
+        """Revert a channel revival whose resume never produced a worker.
+
+        Leaving the session "running" with no writer after a failed revive
+        would be a phantom-alive record (status card says running, nothing
+        serves it). The generation stays bumped — that is harmless and keeps
+        the fence monotonic.
+        """
+        session = self._sessions.get(session_id)
+        if session is None:
+            return
+        session.status = "stopped"
+        session.stop_reason = "revive_failed"
+        session.lifecycle_state = "STOPPED"
+        session.writer_owner = None
+        session.writer_lease = None
+        session.last_progress_at = self._now()
+        session.last_progress_event = "session.revive_failed"
 
     def handoff_to_external_tui(
         self,
@@ -8155,6 +8280,36 @@ class Orchestrator:
             authz_result = self.authz.can_submit(session_id, actor)
             if not authz_result.allowed:
                 return SubmitResult(False, authz_result.reason)
+        # ADR 0054: a message to a stopped STRUCTURED session revives it
+        # instead of dead-ending at 会话已结束 — takeover minus the kill. Every
+        # restart sweep used to orphan all channel conversations this way.
+        # Scope guards:
+        #  - only INVOLUNTARY stops revive (restart sweep, failed revival
+        #    retry); an explicit close keeps its "blocks future submits"
+        #    contract, and an archived session stays archived;
+        #  - external-TUI takeover candidates keep their existing
+        #    consent-based takeover-prompt path below;
+        #  - the caller's generation must match the CURRENT one — a stale
+        #    delayed submit must not resurrect the session past the fence.
+        revived = False
+        if (
+            _session_is_channel_revival_candidate(session)
+            and generation == session.generation
+        ):
+            revive_transport = self.transports.get(session.transport_kind)
+            if revive_transport is not None and revive_transport.capabilities().resume_after_complete:
+                revive = self.sessions.revive_stopped_structured_session(session_id)
+                if revive.accepted:
+                    revived = True
+                    generation = session.generation
+                    # Any free-text wait left behind by the dead worker's
+                    # AskUserQuestion would swallow later plain messages.
+                    self.interactions.clear_awaiting_other_for_session(session_id)
+                    _log_degrade(
+                        "session_revived_by_channel",
+                        session_id=session_id,
+                        actor=actor.actor_id,
+                    )
         transport = None
         if session.lifecycle_state in {"IDLE", "ERROR_RECOVERABLE"}:
             transport = self.transports.get(session.transport_kind)
@@ -8162,6 +8317,10 @@ class Orchestrator:
                 return SubmitResult(False, "transport_not_wired")
             ready = await self._ensure_writer_ready_for_submit(session, transport, actor)
             if not ready.accepted:
+                if revived:
+                    # No worker came up: do not leave a phantom "running"
+                    # record behind — the next message will retry the revival.
+                    self.sessions.mark_revive_failed(session_id)
                 return ready
         validation = self.sessions.validate_submit(session_id, generation)
         if not validation.accepted:
@@ -8459,20 +8618,23 @@ class Orchestrator:
 
     @staticmethod
     def _durable_resume_ref(session: Session) -> dict[str, Any]:
-        ref = dict(session.transport_ref)
-        if session.transport_kind == "claude_headless":
-            agent_session_id = str(
-                ref.get("agent_session_id")
-                or ref.get("claude_session_id")
-                or ""
-            )
-            if not agent_session_id:
-                return {}
-            ref["agent_session_id"] = agent_session_id
-            return ref
-        if session.transport_kind == "codex_app_server" and not ref.get("thread_id"):
-            return {}
-        return ref
+        return _durable_resume_ref(session)
+
+    def _revival_transport_ready(self, session: Session) -> bool:
+        """Whether an ADR 0054 revival could actually be carried out here.
+
+        Binding resolution must not route a message into a stopped session
+        this runtime cannot resume (e.g. an old claude session in a topic now
+        served by a codex-only runtime) — that would dead-end at 会话已结束
+        where the pre-0054 path would have started a fresh session.
+        """
+        transport = self.transports.get(session.transport_kind)
+        if transport is None:
+            return False
+        try:
+            return bool(transport.capabilities().resume_after_complete)
+        except Exception:
+            return False
 
     async def prepare_turn_from_inbound(self, inbound: InboundEvent) -> TurnInput | SubmitResult:
         if not inbound.attachments:
@@ -8870,6 +9032,18 @@ class Orchestrator:
                 else:
                     awaiting = self.interactions.awaiting_context_for_binding(key)
                     if awaiting is not None:
+                        # A stopped session's question has no asker left. A
+                        # dead wait must not capture the plain message that
+                        # would otherwise revive the session (ADR 0054) or
+                        # reach normal routing.
+                        try:
+                            awaiting_session = self.sessions.get(awaiting.session_id)
+                        except KeyError:
+                            awaiting_session = None
+                        if awaiting_session is None or awaiting_session.status == "stopped":
+                            self.interactions.clear_awaiting_other_for_session(awaiting.session_id)
+                            awaiting = None
+                    if awaiting is not None:
                         session = self.sessions.get(awaiting.session_id)
                         result = None
                         if self.authz is not None:
@@ -8899,7 +9073,9 @@ class Orchestrator:
                                 )
                             result = SubmitResult(decision.accepted, decision.reason)
                     else:
-                        resolution = self.sessions.resolve_active_binding(key)
+                        resolution = self.sessions.resolve_active_binding(
+                            key, revival_eligible=self._revival_transport_ready
+                        )
                         if resolution.reason:
                             if resolution.reason == BlockedReason.AMBIGUOUS_SESSION:
                                 await self._send_session_chooser(inbound)
