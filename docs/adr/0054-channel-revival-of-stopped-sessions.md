@@ -69,3 +69,14 @@ generation +1（围栏一切残留 drain）、status=running、lifecycle=IDLE、
 
 前置条件收敛为模块级 `_session_is_channel_revival_candidate()`，绑定解析与
 提交入口共用，避免两处漂移。并发维结论 SAFE（入站锁覆盖复活至提交）。
+
+第二轮增量复核抓到上述第 3 项修复自身引入的 High 回归：把可复活会话直接
+压进候选集合，会（a）同话题有活跃会话时误报歧义、（b）双 stopped 弹空
+chooser、（c）transport 未接线时把"新建会话"变成死路。终版改为**分层解析
++ 显式 opt-in**：`resolve_active_binding(key, revival_eligible=...)` 只有传入
+谓词的调用点才考虑复活候选，且作为第二层——活跃/接管候选优先且语义不变；
+复活层从不产生 chooser（多个可复活取 `last_progress_at` 最近者）；谓词由
+调用方提供（transport 已接线且 `resume_after_complete`）。未传谓词的调用点
+（takeover 命令、telegram 命令解析、话题创建、诊断以外）完全回到 0054 前
+语义。诊断预检 `_summarize_submit_gate` 同步：可复活会话报
+`submit_action="revive_stopped_session"`。第三轮复核确认无残留后合并。

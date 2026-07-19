@@ -51,8 +51,8 @@ def _actor(actor_id: str = "owner") -> ActorRef:
     return ActorRef(channel_kind="telegram", actor_id=actor_id, display_name=actor_id.title())
 
 
-def _binding() -> ChannelBinding:
-    return ChannelBinding("telegram", "bot", "chat", "topic", "root")
+def _binding(root: str = "root") -> ChannelBinding:
+    return ChannelBinding("telegram", "bot", "chat", "topic", root)
 
 
 def _channel_caps() -> ChannelCapabilities:
@@ -308,19 +308,145 @@ class ChannelRevivalTests(unittest.TestCase):
         # A reply inside the topic carries a different root_message_id, so it
         # misses the exact binding match; candidate matching must still find
         # the swept session (instead of spawning a fresh one) — but only when
-        # it is actually revivable.
+        # it is actually revivable AND the call site opted into revival.
         orchestrator, _transport, _channel, session = _headless_orchestrator()
         _sweep_to_stopped(session)
         reply_key = ("telegram", "bot", "chat", "topic", "reply-root")
 
-        resolution = orchestrator.sessions.resolve_active_binding(reply_key)
+        resolution = orchestrator.sessions.resolve_active_binding(
+            reply_key, revival_eligible=lambda s: True
+        )
         self.assertEqual(resolution.session_id, session.session_id)
+
+        # Call sites that never revive keep the pre-0054 semantics.
+        self.assertFalse(orchestrator.sessions.resolve_active_binding(reply_key).session_id)
+        # A predicate veto (e.g. transport not wired) also excludes it.
+        self.assertFalse(
+            orchestrator.sessions.resolve_active_binding(
+                reply_key, revival_eligible=lambda s: False
+            ).session_id
+        )
 
         # An explicitly closed session is not a revival candidate and must
         # not be resolved into.
         session.stop_reason = "closed_by_user"
-        resolution = orchestrator.sessions.resolve_active_binding(reply_key)
+        resolution = orchestrator.sessions.resolve_active_binding(
+            reply_key, revival_eligible=lambda s: True
+        )
         self.assertFalse(resolution.session_id)
+
+    def test_resolution_prefers_active_session_over_revivable_stopped(self):
+        # Revival candidates are a strictly second layer: an active session in
+        # the same topic must win outright — not trip AMBIGUOUS_SESSION into a
+        # chooser (which filters stopped sessions and would confuse the user).
+        orchestrator, _transport, _channel, stopped = _headless_orchestrator()
+        _sweep_to_stopped(stopped)
+        active = asyncio.run(
+            orchestrator.start_session(
+                _binding("root-2"), "claude_headless", "/tmp/project", _actor("owner")
+            )
+        )
+        reply_key = ("telegram", "bot", "chat", "topic", "reply-root")
+
+        resolution = orchestrator.sessions.resolve_active_binding(
+            reply_key, revival_eligible=lambda s: True
+        )
+        self.assertFalse(resolution.reason)
+        self.assertEqual(resolution.session_id, active.session_id)
+
+    def test_resolution_picks_most_recent_of_multiple_revivable(self):
+        # Two swept sessions in one topic must not produce an (empty) chooser;
+        # the most recently active one is what the reply means.
+        orchestrator, _transport, _channel, older = _headless_orchestrator()
+        _sweep_to_stopped(older)
+        newer = asyncio.run(
+            orchestrator.start_session(
+                _binding("root-2"), "claude_headless", "/tmp/project", _actor("owner")
+            )
+        )
+        _sweep_to_stopped(newer)
+        older.last_progress_at = 100.0
+        newer.last_progress_at = 200.0
+        reply_key = ("telegram", "bot", "chat", "topic", "reply-root")
+
+        resolution = orchestrator.sessions.resolve_active_binding(
+            reply_key, revival_eligible=lambda s: True
+        )
+        self.assertFalse(resolution.reason)
+        self.assertEqual(resolution.session_id, newer.session_id)
+
+    def test_registry_rejects_archived_revival_directly(self):
+        # Pin the registry-level defense on its own — the submit-path guard
+        # (candidate helper) must not be the only thing standing.
+        orchestrator, _transport, _channel, session = _headless_orchestrator()
+        _sweep_to_stopped(session)
+        session.archived_at = 1234.0
+
+        result = orchestrator.sessions.revive_stopped_structured_session(session.session_id)
+
+        self.assertFalse(result.accepted)
+        self.assertEqual(result.reason, "archived")
+        self.assertEqual(session.status, "stopped")
+
+    def test_revival_clears_stale_wait_even_on_direct_submit(self):
+        # Pin the orchestrator-side clear on its own: the wait lives on a
+        # DIFFERENT binding key, so the inbound-path retirement can never be
+        # the one removing it.
+        orchestrator, _transport, _channel, session = _headless_orchestrator()
+        ctx = orchestrator.interactions.register_ask_user_question(
+            session_id=session.session_id,
+            generation=session.generation,
+            questions=[{"question": "Which env?", "options": ["dev", "prod"]}],
+        )
+        other_key = ("telegram", "bot", "chat", "topic-2", "root-2")
+        orchestrator.interactions.begin_awaiting_other(
+            ctx.interaction_id, other_key, question_index=0
+        )
+        _sweep_to_stopped(session)
+
+        result = asyncio.run(
+            orchestrator.submit_user_input(
+                session.session_id,
+                TurnInput(text="hi"),
+                actor=_actor("owner"),
+                generation=session.generation,
+            )
+        )
+
+        self.assertTrue(result.accepted)
+        self.assertIsNone(orchestrator.interactions.awaiting_context_for_binding(other_key))
+
+    def test_unwired_transport_swept_session_gets_new_session_not_dead_end(self):
+        # An old session whose transport this runtime cannot resume (e.g. a
+        # codex session in a runtime with only claude wired) must fall back to
+        # the pre-0054 path — a fresh session — not dead-end at 会话已结束.
+        orchestrator, transport, _channel, session = _headless_orchestrator()
+        _sweep_to_stopped(session)
+        session.transport_kind = "codex_app_server"
+        session.transport_ref = {"thread_id": "thread-1"}
+
+        inbound = InboundEvent(
+            event_id="evt-2",
+            channel_kind="telegram",
+            account_id="bot",
+            chat_id="chat",
+            thread_id="topic",
+            message_id="m-2",
+            root_message_id="reply-root",
+            sender_id="owner",
+            sender_display="Owner",
+            text="hello again",
+        )
+        result = asyncio.run(
+            orchestrator.handle_inbound_event(
+                inbound, agent_transport_kind="claude_headless", cwd="/tmp/project"
+            )
+        )
+
+        self.assertTrue(result.accepted)
+        self.assertEqual(len(list(orchestrator.sessions.iter_sessions())), 2)
+        self.assertEqual(orchestrator.sessions.get(session.session_id).status, "stopped")
+        self.assertIn("submit_turn", transport.call_log)
 
     def test_stopped_external_tui_candidate_gets_takeover_prompt_not_revival(self):
         clock = _Clock()

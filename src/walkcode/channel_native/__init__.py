@@ -1497,7 +1497,21 @@ class SessionRegistry:
     def resolve_binding(self, key: BindingKey) -> str | None:
         return self._binding_to_session.get(key)
 
-    def resolve_active_binding(self, key: BindingKey) -> BindingResolution:
+    def resolve_active_binding(
+        self,
+        key: BindingKey,
+        *,
+        revival_eligible: Callable[[Session], bool] | None = None,
+    ) -> BindingResolution:
+        """Resolve a binding key to the session a message should reach.
+
+        ``revival_eligible`` opts a call site into ADR 0054 revival
+        resolution: stopped-but-revivable sessions are considered only as a
+        SECOND layer, after the existing active/takeover candidates, and only
+        when the predicate confirms the session could actually be revived
+        (transport wired + resumable). Call sites that never revive keep the
+        pre-0054 semantics by omitting it.
+        """
         exact = self.resolve_binding(key)
         if exact is not None:
             channel_kind, account_id, chat_id, thread_id, root_message_id = key
@@ -1509,6 +1523,7 @@ class SessionRegistry:
         if root_message_id and not thread_id:
             return BindingResolution()
         candidates: list[str] = []
+        revival_candidates: list[tuple[float, str]] = []
         for candidate_key, session_id in self._binding_to_session.items():
             candidate_channel, candidate_account, candidate_chat, candidate_thread, _candidate_root = candidate_key
             if (
@@ -1519,22 +1534,30 @@ class SessionRegistry:
             ) != (channel_kind, account_id, chat_id, thread_id):
                 continue
             session = self._sessions.get(session_id)
-            if session is not None and (
-                session.status != "stopped"
-                or (
-                    bool(thread_id)
-                    and (
-                        _session_is_external_tui_takeover_candidate(session)
-                        or _session_is_channel_revival_candidate(session)
-                    )
-                )
+            if session is None:
+                continue
+            if session.status != "stopped" or (
+                bool(thread_id) and _session_is_external_tui_takeover_candidate(session)
             ):
                 candidates.append(session_id)
+            elif (
+                revival_eligible is not None
+                and bool(thread_id)
+                and _session_is_channel_revival_candidate(session)
+                and revival_eligible(session)
+            ):
+                revival_candidates.append((session.last_progress_at, session_id))
         unique_candidates = sorted(set(candidates))
         if len(unique_candidates) == 1:
             return BindingResolution(session_id=unique_candidates[0])
         if len(unique_candidates) > 1:
             return BindingResolution(reason=BlockedReason.AMBIGUOUS_SESSION)
+        if revival_candidates:
+            # Revival never produces a chooser (the chooser filters stopped
+            # sessions and would come up empty): pick the most recently
+            # active candidate deterministically.
+            revival_candidates.sort()
+            return BindingResolution(session_id=revival_candidates[-1][1])
         return BindingResolution()
 
     def update_channel_binding(self, session_id: str, binding: ChannelBinding) -> None:
@@ -8597,6 +8620,22 @@ class Orchestrator:
     def _durable_resume_ref(session: Session) -> dict[str, Any]:
         return _durable_resume_ref(session)
 
+    def _revival_transport_ready(self, session: Session) -> bool:
+        """Whether an ADR 0054 revival could actually be carried out here.
+
+        Binding resolution must not route a message into a stopped session
+        this runtime cannot resume (e.g. an old claude session in a topic now
+        served by a codex-only runtime) — that would dead-end at 会话已结束
+        where the pre-0054 path would have started a fresh session.
+        """
+        transport = self.transports.get(session.transport_kind)
+        if transport is None:
+            return False
+        try:
+            return bool(transport.capabilities().resume_after_complete)
+        except Exception:
+            return False
+
     async def prepare_turn_from_inbound(self, inbound: InboundEvent) -> TurnInput | SubmitResult:
         if not inbound.attachments:
             return TurnInput(text=inbound.text)
@@ -9034,7 +9073,9 @@ class Orchestrator:
                                 )
                             result = SubmitResult(decision.accepted, decision.reason)
                     else:
-                        resolution = self.sessions.resolve_active_binding(key)
+                        resolution = self.sessions.resolve_active_binding(
+                            key, revival_eligible=self._revival_transport_ready
+                        )
                         if resolution.reason:
                             if resolution.reason == BlockedReason.AMBIGUOUS_SESSION:
                                 await self._send_session_chooser(inbound)
