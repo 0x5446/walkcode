@@ -375,6 +375,54 @@ class ChannelRevivalTests(unittest.TestCase):
         self.assertFalse(resolution.reason)
         self.assertEqual(resolution.session_id, newer.session_id)
 
+    def test_resolution_tie_break_is_deterministic(self):
+        # Identical last_progress_at must not make the pick order-dependent:
+        # the lexically larger session_id wins, every time.
+        orchestrator, _transport, _channel, first = _headless_orchestrator()
+        _sweep_to_stopped(first)
+        second = asyncio.run(
+            orchestrator.start_session(
+                _binding("root-2"), "claude_headless", "/tmp/project", _actor("owner")
+            )
+        )
+        _sweep_to_stopped(second)
+        first.last_progress_at = 500.0
+        second.last_progress_at = 500.0
+        expected = max(first.session_id, second.session_id)
+        reply_key = ("telegram", "bot", "chat", "topic", "reply-root")
+
+        for _ in range(3):
+            resolution = orchestrator.sessions.resolve_active_binding(
+                reply_key, revival_eligible=lambda s: True
+            )
+            self.assertEqual(resolution.session_id, expected)
+
+    def test_revival_transport_ready_predicate_failure_modes(self):
+        # The orchestrator predicate must veto: unwired transport, transport
+        # without resume_after_complete, and a capabilities() that raises.
+        orchestrator, _transport, _channel, session = _headless_orchestrator()
+        _sweep_to_stopped(session)
+        self.assertTrue(orchestrator._revival_transport_ready(session))
+
+        session.transport_kind = "codex_app_server"
+        self.assertFalse(orchestrator._revival_transport_ready(session))
+
+        session.transport_kind = "claude_headless"
+        no_resume = FakeAgentTransport(
+            "claude_headless", _transport_caps(resume_after_complete=False)
+        )
+        orchestrator.transports["claude_headless"] = no_resume
+        self.assertFalse(orchestrator._revival_transport_ready(session))
+
+        class BrokenCapsTransport(FakeAgentTransport):
+            def capabilities(self):
+                raise RuntimeError("caps unavailable")
+
+        orchestrator.transports["claude_headless"] = BrokenCapsTransport(
+            "claude_headless", _transport_caps()
+        )
+        self.assertFalse(orchestrator._revival_transport_ready(session))
+
     def test_registry_rejects_archived_revival_directly(self):
         # Pin the registry-level defense on its own — the submit-path guard
         # (candidate helper) must not be the only thing standing.
