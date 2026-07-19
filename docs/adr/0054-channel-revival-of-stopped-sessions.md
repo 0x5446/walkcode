@@ -50,3 +50,22 @@ generation +1（围栏一切残留 drain）、status=running、lifecycle=IDLE、
 - 残留：`外部 TUI 印记 + TUI 进程已死`的 stopped 会话仍走接管提示（多一次
   点击）；因 v0.14.3 的 `target_gone` 该接管已是纯自动清杀，后续可评估把
   这类也并入静默复活。
+
+## Revision（发版前 deep-review 采纳，同版修复）
+
+三维审查（correctness / concurrency / consistency）报 4 项 Warning，全部采纳：
+
+1. **代际围栏**：复活曾先于 `validate_submit`，旧代际的延迟提交可复活会话
+   并越过围栏写入。修复：复活前置条件加 `generation == session.generation`。
+2. **旧等待吞消息**：清扫时残留的 AskUserQuestion 自由文本等待会在
+   `handle_inbound_event` 里把复活消息当旧答案吃掉（永远到不了复活分支）。
+   修复：入站分流前，等待归属的会话已 stopped（或不存在）即退役该等待、
+   走正常路由；复活成功后同时 `clear_awaiting_other_for_session` 兜底。
+3. **话题内回复绕过复活**：回复消息的 binding key 带不同 root_message_id，
+   精确匹配落空后候选匹配排除全部 stopped 会话 → 新建会话而非复活。
+   修复：候选匹配纳入满足复活前置条件的 stopped 会话（仅限 thread 作用域）。
+4. **归档矛盾态**：已归档的异常停止会话可被复活成"运行但列表隐藏"。
+   修复：`revive_stopped_structured_session` 拒绝 `archived_at` 非零的会话。
+
+前置条件收敛为模块级 `_session_is_channel_revival_candidate()`，绑定解析与
+提交入口共用，避免两处漂移。并发维结论 SAFE（入站锁覆盖复活至提交）。

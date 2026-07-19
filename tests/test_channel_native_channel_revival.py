@@ -28,6 +28,7 @@ from walkcode.channel_native import (
     FakeAgentTransport,
     FakeChannelAdapter,
     FakeExternalTuiController,
+    InboundEvent,
     InteractionStore,
     Orchestrator,
     ResumeSpec,
@@ -223,6 +224,103 @@ class ChannelRevivalTests(unittest.TestCase):
         # revive_failed is in the allowlist: the second message attempted a
         # fresh resume instead of dead-ending.
         self.assertEqual(transport.call_log.count("resume"), 2)
+
+    def test_stale_generation_does_not_revive(self):
+        # The generation fence stays authoritative: a delayed submit carrying
+        # an old generation must not resurrect the session past the fence.
+        orchestrator, transport, _channel, session = _headless_orchestrator()
+        _sweep_to_stopped(session)
+
+        result = asyncio.run(
+            orchestrator.submit_user_input(
+                session.session_id,
+                TurnInput(text="late replay"),
+                actor=_actor("owner"),
+                generation=session.generation - 1,
+            )
+        )
+
+        self.assertFalse(result.accepted)
+        self.assertNotIn("resume", transport.call_log)
+        self.assertEqual(orchestrator.sessions.get(session.session_id).status, "stopped")
+
+    def test_archived_swept_session_stays_dead(self):
+        # Reviving an archived session would create a running-but-hidden
+        # record (archived sessions are filtered out of the session list).
+        orchestrator, transport, _channel, session = _headless_orchestrator()
+        _sweep_to_stopped(session)
+        session.archived_at = 1234.0
+
+        result = asyncio.run(
+            orchestrator.submit_user_input(
+                session.session_id,
+                TurnInput(text="hello?"),
+                actor=_actor("owner"),
+                generation=session.generation,
+            )
+        )
+
+        self.assertFalse(result.accepted)
+        self.assertNotIn("resume", transport.call_log)
+        self.assertEqual(orchestrator.sessions.get(session.session_id).status, "stopped")
+
+    def test_stale_free_text_wait_is_retired_and_inbound_message_revives(self):
+        # An AskUserQuestion parked in the free-text "Other" wait when the
+        # sweep hit must not swallow the message that should revive the
+        # session — the dead wait is retired and normal routing proceeds.
+        orchestrator, transport, _channel, session = _headless_orchestrator()
+        ctx = orchestrator.interactions.register_ask_user_question(
+            session_id=session.session_id,
+            generation=session.generation,
+            questions=[{"question": "Which env?", "options": ["dev", "prod"]}],
+        )
+        binding_key = session.channel_binding.key()
+        orchestrator.interactions.begin_awaiting_other(
+            ctx.interaction_id, binding_key, question_index=0
+        )
+        _sweep_to_stopped(session)
+
+        inbound = InboundEvent(
+            event_id="evt-1",
+            channel_kind="telegram",
+            account_id="bot",
+            chat_id="chat",
+            thread_id="topic",
+            message_id="m-1",
+            root_message_id="root",
+            sender_id="owner",
+            sender_display="Owner",
+            text="back to work",
+        )
+        result = asyncio.run(
+            orchestrator.handle_inbound_event(
+                inbound, agent_transport_kind="claude_headless", cwd="/tmp/project"
+            )
+        )
+
+        self.assertTrue(result.accepted)
+        self.assertIn("resume", transport.call_log)
+        self.assertEqual([turn.text for turn in transport.submitted_turns], ["back to work"])
+        self.assertIsNone(orchestrator.interactions.awaiting_context_for_binding(binding_key))
+        self.assertEqual(orchestrator.sessions.get(session.session_id).status, "running")
+
+    def test_topic_reply_binding_resolves_to_swept_session(self):
+        # A reply inside the topic carries a different root_message_id, so it
+        # misses the exact binding match; candidate matching must still find
+        # the swept session (instead of spawning a fresh one) — but only when
+        # it is actually revivable.
+        orchestrator, _transport, _channel, session = _headless_orchestrator()
+        _sweep_to_stopped(session)
+        reply_key = ("telegram", "bot", "chat", "topic", "reply-root")
+
+        resolution = orchestrator.sessions.resolve_active_binding(reply_key)
+        self.assertEqual(resolution.session_id, session.session_id)
+
+        # An explicitly closed session is not a revival candidate and must
+        # not be resolved into.
+        session.stop_reason = "closed_by_user"
+        resolution = orchestrator.sessions.resolve_active_binding(reply_key)
+        self.assertFalse(resolution.session_id)
 
     def test_stopped_external_tui_candidate_gets_takeover_prompt_not_revival(self):
         clock = _Clock()

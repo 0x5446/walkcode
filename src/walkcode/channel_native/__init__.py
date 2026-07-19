@@ -907,6 +907,48 @@ def _session_is_external_tui_takeover_candidate(session: Session) -> bool:
     return any(str(ref.get("source", "")) == "native_tui_hook" for ref in refs)
 
 
+_STRUCTURED_TRANSPORT_KINDS = frozenset({"claude_headless", "codex_app_server"})
+_CHANNEL_REVIVAL_STOP_REASONS = frozenset({"runtime_restart", "revive_failed"})
+
+
+def _durable_resume_ref(session: Session) -> dict[str, Any]:
+    """The transport ref if it carries enough identity to resume, else {}."""
+    ref = dict(session.transport_ref)
+    if session.transport_kind == "claude_headless":
+        agent_session_id = str(
+            ref.get("agent_session_id")
+            or ref.get("claude_session_id")
+            or ""
+        )
+        if not agent_session_id:
+            return {}
+        ref["agent_session_id"] = agent_session_id
+        return ref
+    if session.transport_kind == "codex_app_server" and not ref.get("thread_id"):
+        return {}
+    return ref
+
+
+def _session_is_channel_revival_candidate(session: Session) -> bool:
+    """ADR 0054 preconditions, shared by binding resolution and submit.
+
+    Only INVOLUNTARY stops revive — an explicit close keeps its "blocks
+    future submits" contract, an archived session stays archived, and
+    external-TUI takeover candidates keep the consent-based takeover prompt.
+    """
+    if session.status != "stopped":
+        return False
+    if session.stop_reason not in _CHANNEL_REVIVAL_STOP_REASONS:
+        return False
+    if session.archived_at:
+        return False
+    if session.transport_kind not in _STRUCTURED_TRANSPORT_KINDS:
+        return False
+    if _session_is_external_tui_takeover_candidate(session):
+        return False
+    return bool(_durable_resume_ref(session))
+
+
 def _external_claude_resume_ref(session: Session) -> dict[str, Any]:
     """The Claude-native resume_ref of a TUI-observed session, if any.
 
@@ -1479,7 +1521,13 @@ class SessionRegistry:
             session = self._sessions.get(session_id)
             if session is not None and (
                 session.status != "stopped"
-                or (bool(thread_id) and _session_is_external_tui_takeover_candidate(session))
+                or (
+                    bool(thread_id)
+                    and (
+                        _session_is_external_tui_takeover_candidate(session)
+                        or _session_is_channel_revival_candidate(session)
+                    )
+                )
             ):
                 candidates.append(session_id)
         unique_candidates = sorted(set(candidates))
@@ -1770,7 +1818,11 @@ class SessionRegistry:
             return SubmitResult(False, BlockedReason.NOT_FOUND)
         if session.status != "stopped":
             return SubmitResult(False, "not_stopped")
-        if session.transport_kind not in {"claude_headless", "codex_app_server"}:
+        if session.archived_at:
+            # An archived session is hidden from the session list; reviving
+            # it would produce a running-but-invisible record.
+            return SubmitResult(False, "archived")
+        if session.transport_kind not in _STRUCTURED_TRANSPORT_KINDS:
             return SubmitResult(False, "not_structured")
         now = self._now()
         session.generation += 1
@@ -8211,15 +8263,15 @@ class Orchestrator:
         # Scope guards:
         #  - only INVOLUNTARY stops revive (restart sweep, failed revival
         #    retry); an explicit close keeps its "blocks future submits"
-        #    contract;
+        #    contract, and an archived session stays archived;
         #  - external-TUI takeover candidates keep their existing
-        #    consent-based takeover-prompt path below.
+        #    consent-based takeover-prompt path below;
+        #  - the caller's generation must match the CURRENT one — a stale
+        #    delayed submit must not resurrect the session past the fence.
         revived = False
         if (
-            session.status == "stopped"
-            and session.stop_reason in {"runtime_restart", "revive_failed"}
-            and not _session_is_external_tui_takeover_candidate(session)
-            and self._durable_resume_ref(session)
+            _session_is_channel_revival_candidate(session)
+            and generation == session.generation
         ):
             revive_transport = self.transports.get(session.transport_kind)
             if revive_transport is not None and revive_transport.capabilities().resume_after_complete:
@@ -8227,6 +8279,9 @@ class Orchestrator:
                 if revive.accepted:
                     revived = True
                     generation = session.generation
+                    # Any free-text wait left behind by the dead worker's
+                    # AskUserQuestion would swallow later plain messages.
+                    self.interactions.clear_awaiting_other_for_session(session_id)
                     _log_degrade(
                         "session_revived_by_channel",
                         session_id=session_id,
@@ -8540,20 +8595,7 @@ class Orchestrator:
 
     @staticmethod
     def _durable_resume_ref(session: Session) -> dict[str, Any]:
-        ref = dict(session.transport_ref)
-        if session.transport_kind == "claude_headless":
-            agent_session_id = str(
-                ref.get("agent_session_id")
-                or ref.get("claude_session_id")
-                or ""
-            )
-            if not agent_session_id:
-                return {}
-            ref["agent_session_id"] = agent_session_id
-            return ref
-        if session.transport_kind == "codex_app_server" and not ref.get("thread_id"):
-            return {}
-        return ref
+        return _durable_resume_ref(session)
 
     async def prepare_turn_from_inbound(self, inbound: InboundEvent) -> TurnInput | SubmitResult:
         if not inbound.attachments:
@@ -8950,6 +8992,18 @@ class Orchestrator:
                     result = await self._handle_takeover_request_callback(inbound)
                 else:
                     awaiting = self.interactions.awaiting_context_for_binding(key)
+                    if awaiting is not None:
+                        # A stopped session's question has no asker left. A
+                        # dead wait must not capture the plain message that
+                        # would otherwise revive the session (ADR 0054) or
+                        # reach normal routing.
+                        try:
+                            awaiting_session = self.sessions.get(awaiting.session_id)
+                        except KeyError:
+                            awaiting_session = None
+                        if awaiting_session is None or awaiting_session.status == "stopped":
+                            self.interactions.clear_awaiting_other_for_session(awaiting.session_id)
+                            awaiting = None
                     if awaiting is not None:
                         session = self.sessions.get(awaiting.session_id)
                         result = None
