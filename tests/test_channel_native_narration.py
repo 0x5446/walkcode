@@ -430,6 +430,66 @@ class TranscriptNarrationReaderTests(unittest.TestCase):
         self.assertEqual(texts, ["after"])
         self.assertEqual(cursor[1], os.path.getsize(self.path))
 
+    def test_keyless_boundary_never_positions_fresh_cursor(self):
+        # A size-only boundary (legacy payload, no file identity) cannot
+        # prove which file it measured: using it to place a FRESH cursor
+        # inside the current file could land mid-history of a replacement.
+        # It must fast-forward to EOF instead.
+        for i in range(5):
+            self._append(_transcript_line(_assistant_entry([{"type": "text", "text": f"h-{i}"}])))
+        cursor, texts = _read_transcript_narration(self.path, None, (10, None))
+        self.assertEqual(texts, [])
+        self.assertEqual(cursor[1], os.path.getsize(self.path))
+        _, again = _read_transcript_narration(self.path, cursor)
+        self.assertEqual(again, [])
+
+    def test_discard_completion_parses_remainder_in_same_batch(self):
+        # Once the over-long line's newline is found, the rest of the batch
+        # must parse IN THE SAME CALL — returning early would delay legit
+        # narration by one hook, or lose it to a following Stop advance.
+        self._append(b"x" * 1000 + b"\n")
+        self._append(_transcript_line(_assistant_entry([{"type": "text", "text": "legit"}])))
+        info = os.stat(self.path)
+        cursor = (self.path, 500, (int(info.st_dev), int(info.st_ino)), True)  # mid junk line
+
+        cursor, texts = _read_transcript_narration(self.path, cursor)
+        self.assertEqual(texts, ["legit"])
+        self.assertEqual(cursor[1], os.path.getsize(self.path))
+        self.assertFalse(cursor[3])
+
+    def test_advance_preserves_in_progress_discard(self):
+        # A forward jump cannot prove it crossed the over-long line's real
+        # newline; clearing the discard flag would hand the line's tail
+        # (potentially a valid assistant JSON) to the parser.
+        from walkcode.channel_native_runtime import ChannelNativeRuntime
+
+        class _CursorHost:
+            _advance_tui_narration_cursor = ChannelNativeRuntime._advance_tui_narration_cursor
+            _store_tui_narration_cursor = ChannelNativeRuntime._store_tui_narration_cursor
+
+            def __init__(self):
+                self._tui_transcript_cursors = {}
+
+        class _Session:
+            session_id = "sess-1"
+
+        self._append(b" " * 3000)  # over-long line still open, no newline
+        info = os.stat(self.path)
+        file_key = (int(info.st_dev), int(info.st_ino))
+        host = _CursorHost()
+        host._tui_transcript_cursors["sess-1"] = (self.path, 1000, file_key, True)
+
+        payload = {
+            "transcript_path": self.path,
+            "_walkcode_transcript_size": 2500,
+            "_walkcode_transcript_file_key": list(file_key),
+        }
+        host._advance_tui_narration_cursor(_Session(), payload)
+
+        cursor = host._tui_transcript_cursors["sess-1"]
+        self.assertEqual(cursor[1], 2500)
+        self.assertTrue(cursor[3])  # discard state survives the jump
+
     def test_missing_file_returns_no_cursor(self):
         # Storing (path, 0) for an unreadable file would replay its entire
         # history once it appears; the caller must get None and store nothing.

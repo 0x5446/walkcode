@@ -3947,12 +3947,15 @@ class ChannelNativeRuntime:
             and prev[2] == file_key
         ):
             # Advance is monotonic: an out-of-order (older) hook must not
-            # rewind the cursor and re-emit already-mirrored narration. An
-            # in-progress over-long-line discard survives only if we did not
-            # jump past the line.
+            # rewind the cursor and re-emit already-mirrored narration.
             if int(prev[1]) >= offset:
                 offset = int(prev[1])
-                discarding = bool(prev[3])
+            # An in-progress over-long-line discard is preserved even across
+            # a forward jump: we cannot prove the jump crossed that line's
+            # real newline, and clearing the flag mid-line would hand the
+            # line's tail to the JSON parser. Worst case the reader drops
+            # one legit line after the jump — safe direction.
+            discarding = bool(prev[3])
         self._store_tui_narration_cursor(session.session_id, (path, offset, file_key, discarding))
 
     def _store_tui_narration_cursor(self, session_id: str, cursor: tuple[Any, ...]) -> None:
@@ -6102,6 +6105,12 @@ def _read_transcript_narration(
             return (path, int(cursor[1]), file_key, bool(cursor[3])), []
         limit = size if boundary_size is None else max(0, min(boundary_size, size))
         if stale_cursor:
+            if boundary_size is not None and boundary_key is None:
+                # A size-only boundary (legacy payload) cannot prove which
+                # file it was measured on; positioning a FRESH cursor with it
+                # could land mid-history of a replaced file. Skip to EOF —
+                # degraded but safe ("never replay" beats "never miss").
+                return (path, size, file_key, False), []
             return (path, limit, file_key, False), []
         offset = int(cursor[1])
         discarding = bool(cursor[3])
@@ -6113,23 +6122,31 @@ def _read_transcript_narration(
             blob = fh.read(requested)
         except OSError:
             return (path, offset, file_key, discarding), []
+    base_offset = offset
     if discarding:
-        # Finish dropping an over-long line BEFORE parsing anything: a
+        # Finish dropping the over-long line BEFORE parsing anything: a
         # mid-line fragment could otherwise parse as a valid JSON entry.
         cut = blob.find(b"\n")
         if cut < 0:
             return (path, offset + len(blob), file_key, True), []
-        return (path, offset + cut + 1, file_key, False), []
+        # Crossed the real newline: the rest of this batch parses normally
+        # in the SAME call (returning early would delay legit narration by
+        # one hook — or lose it to a following Stop advance).
+        blob = blob[cut + 1 :]
+        base_offset = offset + cut + 1
     end = blob.rfind(b"\n")
     if end < 0:
-        if (limit - offset) > len(blob):
-            # A single line bigger than the batch cap: skip what we read and
-            # keep discarding until its real newline, so the cursor cannot
-            # wedge and no fragment reaches the parser.
+        if base_offset == offset and (limit - offset) > len(blob):
+            # A FULL cap-sized window from a line start with no newline: the
+            # line is bigger than the batch cap. Skip what we read and keep
+            # discarding until its real newline, so the cursor cannot wedge
+            # and no fragment reaches the parser. (A window trimmed by the
+            # discard prefix is partial — it cannot prove over-long; the next
+            # read starts at the line start with a full window and decides.)
             return (path, offset + len(blob), file_key, True), []
-        return (path, offset, file_key, False), []
+        return (path, base_offset, file_key, False), []
     consumed = blob[: end + 1]
-    new_offset = offset + end + 1
+    new_offset = base_offset + end + 1
     texts: list[str] = []
     for raw in consumed.splitlines():
         raw = raw.strip()
