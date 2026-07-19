@@ -3749,12 +3749,26 @@ class _ProcProbe:
     command: str = ""
 
 
+def _c_locale_env() -> dict[str, str]:
+    """Env for ps/pgrep children with a pinned C locale.
+
+    `ps` renders lstart per LC_TIME: en_SG (and most European locales) puts the
+    day before the month ("Sun 19 Jul ..."), which broke every lstart parse in
+    v0.14.3 (hooks inherit the terminal's locale) — empty process trees, probe
+    errors, revival refused, sentinel blind. Live incident 2026-07-19 evening.
+    """
+    env = dict(os.environ)
+    env["LC_ALL"] = "C"
+    return env
+
+
 def _probe_process(pid: int) -> _ProcProbe:
     if pid <= 1:
         return _ProcProbe("gone")
     try:
         result = subprocess.run(
             ["ps", "-o", "stat=,lstart=,command=", "-p", str(pid)],
+            env=_c_locale_env(),
             capture_output=True,
             text=True,
             timeout=1,
@@ -3958,6 +3972,7 @@ class LocalProcessController:
         try:
             result = subprocess.run(
                 ["pgrep", "-f", f"(session-id|resume)[= ]{session_id}"],
+                env=_c_locale_env(),
                 capture_output=True,
                 text=True,
                 timeout=2,
@@ -4028,6 +4043,7 @@ class LocalProcessController:
         try:
             result = subprocess.run(
                 ["ps", "-o", "stat=", "-p", str(pid)],
+                env=_c_locale_env(),
                 capture_output=True,
                 text=True,
                 timeout=1,
