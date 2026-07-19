@@ -108,3 +108,26 @@ R4 终轮：advance 路径补上与 reader 同款的 keyless 边界封堵（无�
 游标时一律跳 EOF），并给"裁剪不满窗不判超限"补反例测试（近 cap 合法行
 不得被误丢）。四轮共报 1 High + 2 High(反例) + 若干 Medium，全部闭合或
 显式记录为残留。
+
+## Revision 2（v0.14.7）：headless 判定假设错误，线上无效
+
+v0.14.6 上线后现场验收失败：headless 会话完全没有 💬 行。实测 bundled
+CLI 的 stream-json——**每个 content block 是独立的 assistant 事件**
+（[thinking]、[text]、[tool_use] 各一条），text 与 tool_use 永远不同消息。
+"同消息含工具块"的叙述判定在真实流上一次都没触发（只在合成 fixture 上
+成立），中段文本仍走 TURN_DELTA 气泡。四轮 deep-review 均未发现——
+reviewer 审的是给定假设。教训与 ps locale 事故同构：**mock 形状 ≠ 生产
+形状，接外部数据流必须先实测一份真样本**。
+
+**最终形态（用户拍板：不必进卡片）**：中段叙述在两条路径上都以**普通
+消息**送达——
+
+- headless：因为流是逐块拆分的，纯文本消息本来就走 TURN_DELTA 气泡，
+  **现状已满足需求，一行不改**。曾评估过"事件泵缓一拍、按后继事件把文本
+  改道进卡"的方案，用户确认气泡即可后废弃（省一台状态机）。
+- TUI：transcript 增量游标（Revision 1 的全部边界/防回放机制原样保留）
+  排出的叙述，从"💬 上卡"改为在工具行之前直接发 turn_delta 消息（先
+  seal 当前工具卡，行为与 headless 的"文本气泡打断工具卡"一致）。
+
+卡片机制（TURN_NARRATION → 💬 行、折叠、渲染）保留为兼容兜底——仅在
+"文本与工具块同消息"的形状下触发，真实 CLI 流不产生该形状。
