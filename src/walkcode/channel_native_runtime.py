@@ -3929,23 +3929,25 @@ class ChannelNativeRuntime:
             return
         size = int(info.st_size)
         file_key = (int(info.st_dev), int(info.st_ino))
-        boundary = _payload_transcript_boundary(payload)
-        offset = size
-        if boundary is not None:
-            boundary_size, boundary_key = boundary
-            if boundary_key is None or boundary_key == file_key:
-                offset = max(0, min(boundary_size, size))
-            # else: the hook's file is gone — everything currently at this
-            # path is pre-cursor history; skipping to EOF is the only safe
-            # advance ("never replay").
-        discarding = False
         prev = self._tui_transcript_cursors.get(session.session_id)
-        if (
+        prev_matches = (
             prev is not None
             and len(prev) >= 4
             and prev[0] == path
             and prev[2] == file_key
-        ):
+        )
+        boundary = _payload_transcript_boundary(payload)
+        offset = size
+        if boundary is not None:
+            boundary_size, boundary_key = boundary
+            if boundary_key == file_key or (boundary_key is None and prev_matches):
+                offset = max(0, min(boundary_size, size))
+            # else: a boundary from a replaced file, or a size-only legacy
+            # boundary with no established cursor on THIS file — using it to
+            # position a fresh cursor could land mid-history (same hole the
+            # reader closed); EOF is the only safe advance ("never replay").
+        discarding = False
+        if prev_matches:
             # Advance is monotonic: an out-of-order (older) hook must not
             # rewind the cursor and re-emit already-mirrored narration.
             if int(prev[1]) >= offset:

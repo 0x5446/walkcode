@@ -490,6 +490,64 @@ class TranscriptNarrationReaderTests(unittest.TestCase):
         self.assertEqual(cursor[1], 2500)
         self.assertTrue(cursor[3])  # discard state survives the jump
 
+    def test_advance_with_keyless_boundary_and_no_prior_cursor_jumps_to_eof(self):
+        # Same hole as the reader's: a legacy size-only boundary must not
+        # position a FRESH advance cursor inside a (possibly replaced) file.
+        from walkcode.channel_native_runtime import ChannelNativeRuntime
+
+        class _CursorHost:
+            _advance_tui_narration_cursor = ChannelNativeRuntime._advance_tui_narration_cursor
+            _store_tui_narration_cursor = ChannelNativeRuntime._store_tui_narration_cursor
+
+            def __init__(self):
+                self._tui_transcript_cursors = {}
+
+        class _Session:
+            session_id = "sess-1"
+
+        for i in range(5):
+            self._append(_transcript_line(_assistant_entry([{"type": "text", "text": f"h-{i}"}])))
+        host = _CursorHost()
+        host._advance_tui_narration_cursor(
+            _Session(), {"transcript_path": self.path, "_walkcode_transcript_size": 10}
+        )
+        cursor = host._tui_transcript_cursors["sess-1"]
+        self.assertEqual(cursor[1], os.path.getsize(self.path))
+        _, texts = _read_transcript_narration(self.path, cursor)
+        self.assertEqual(texts, [])
+
+    def test_trimmed_window_never_flags_overlong(self):
+        # A cap-sized batch = [discarded line's newline + incomplete prefix
+        # of the next line]: the trimmed window is partial, so it must NOT be
+        # used to flag the next line as over-long — that would discard a
+        # legitimate (near-cap but legal) narration line from its start.
+        cap = 2 * 1024 * 1024
+        junk = b"j" * 100 + b"\n"
+        self._append(junk)
+        base = _assistant_entry([{"type": "text", "text": "big"}])
+        overhead = len(_transcript_line({**base, "padding": ""}))
+        big_line = _transcript_line({**base, "padding": "y" * (cap - 60 - overhead)})
+        self.assertTrue(cap - 101 < len(big_line) <= cap)  # legal, but fills the trimmed window
+        self._append(big_line)
+        self._append(_transcript_line(_assistant_entry([{"type": "text", "text": "fine"}])))
+        info = os.stat(self.path)
+        cursor = (self.path, 0, (int(info.st_dev), int(info.st_ino)), True)
+
+        cursor, texts = _read_transcript_narration(self.path, cursor)
+        self.assertEqual(texts, [])
+        self.assertEqual(cursor[1], len(junk))  # parked at the line start
+        self.assertFalse(cursor[3])  # NOT flagged over-long from a partial window
+
+        texts_all: list[str] = []
+        for _ in range(8):
+            cursor, batch = _read_transcript_narration(self.path, cursor)
+            texts_all.extend(batch)
+            if cursor[1] >= os.path.getsize(self.path):
+                break
+        # The near-cap line survives; flagging it over-long would have
+        # silently discarded "big".
+        self.assertEqual(texts_all, ["big", "fine"])
+
     def test_missing_file_returns_no_cursor(self):
         # Storing (path, 0) for an unreadable file would replay its entire
         # history once it appears; the caller must get None and store nothing.
