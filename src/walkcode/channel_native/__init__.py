@@ -88,6 +88,11 @@ def _options_supports_field(cls: Any, name: str) -> bool:
 
 class AgentEventType:
     TURN_DELTA = "turn.delta"
+    # Mid-turn assistant narration (text sharing a message with tool_use
+    # blocks, or transcript text drained between TUI hooks). Rendered as a 💬
+    # line on the rolling tool-progress card — never as a channel bubble, and
+    # never seals the burst (ADR 0055).
+    TURN_NARRATION = "turn.narration"
     TURN_COMPLETED = "turn.completed"
     TOOL_STARTED = "tool.started"
     TOOL_COMPLETED = "tool.completed"
@@ -4469,8 +4474,9 @@ def render_view_text(view_model: dict[str, Any]) -> str:
             else [view_model]
         )
         # One tool keeps the original single-block layout; a coalesced burst
-        # lists each tool on its own line.
-        if len(entries) == 1:
+        # lists each tool on its own line. Narration entries (ADR 0055)
+        # render as plain quoted lines.
+        if len(entries) == 1 and str(entries[0].get("kind", "") or "") != "narration":
             entry = entries[0]
             rows = [
                 "Agent activity",
@@ -4483,6 +4489,12 @@ def render_view_text(view_model: dict[str, Any]) -> str:
             return "\n".join(rows)
         rows = ["Agent activity"]
         for entry in entries:
+            if str(entry.get("kind", "") or "") == "narration":
+                text = str(entry.get("text", "") or "").strip()
+                if len(text) > 300:
+                    text = text[:299] + "…"
+                rows.append(f"> {text}")
+                continue
             label = _status_label(str(entry.get("status", "") or "running"))
             row = f"Status: {label} — {entry.get('tool_name', '') or 'tool'}"
             summary = str(entry.get("summary", "") or "").strip()
@@ -6954,7 +6966,14 @@ class ClaudeHeadlessTransport:
             # CLI's injected <task-notification> turns) — echoing their text
             # back to the channel would show the user machine-generated prompts
             # as if the agent said them.
-            events.append(AgentEvent(AgentEventType.TURN_DELTA, {"text": text}))
+            if events:
+                # ADR 0055: text sharing a message with tool blocks is
+                # mid-turn narration. It precedes the tools in content order,
+                # so it must not become a bubble APPENDED after them (the old
+                # behavior: out of order, and it sealed the burst card).
+                events.insert(0, AgentEvent(AgentEventType.TURN_NARRATION, {"text": text}))
+            else:
+                events.append(AgentEvent(AgentEventType.TURN_DELTA, {"text": text}))
 
         result = getattr(message, "result", None)
         class_name = message.__class__.__name__
@@ -6991,7 +7010,12 @@ class ClaudeHeadlessTransport:
             events = cls._extract_sdk_tool_events(message.get("content"))
         text = "" if tool_block_message else cls._extract_sdk_text(message.get("content"))
         if text and not cls._is_user_role_message(message):
-            events.append(AgentEvent(AgentEventType.TURN_DELTA, {"text": text}))
+            if events:
+                # ADR 0055: same as the object path — narration precedes the
+                # tools it narrates and joins the burst card, never a bubble.
+                events.insert(0, AgentEvent(AgentEventType.TURN_NARRATION, {"text": text}))
+            else:
+                events.append(AgentEvent(AgentEventType.TURN_DELTA, {"text": text}))
         if "result" in message or message.get("type") == "result":
             payload: dict[str, Any] = {"message": str(message.get("result", ""))}
             if message.get("session_id"):
@@ -10469,6 +10493,7 @@ class Orchestrator:
                 open_turn = False
             elif event.type in {
                 AgentEventType.TURN_DELTA,
+                AgentEventType.TURN_NARRATION,
                 AgentEventType.TOOL_STARTED,
                 AgentEventType.TOOL_COMPLETED,
                 AgentEventType.TOOL_FAILED,
@@ -10478,7 +10503,10 @@ class Orchestrator:
             view = self._event_to_view(session, event)
             session.last_event_seq += 1
             await self.refresh_session_status_card(session)
-            if view.get("type") == "tool_progress":
+            if view.get("type") in {"tool_progress", "turn_narration"}:
+                # Narration joins the rolling burst card as a 💬 line — never
+                # a bubble, and it must NOT seal the burst (the tools it
+                # narrates land right after it).
                 await self._upsert_tool_progress_view(session, channel, view)
                 continue
             if view.get("type") == "background_tasks":
@@ -10523,9 +10551,18 @@ class Orchestrator:
         # Accumulate a burst of consecutive tool events into one card that is
         # patched in place. A tool_result (completed/failed) updates its own
         # started line (matched by tool_id) instead of appending a new one.
+        # Narration entries (ADR 0055) interleave chronologically as 💬 lines.
         lines = binding.capabilities.get("tool_progress_lines")
         if not isinstance(lines, list):
             lines = []
+        if view.get("type") == "turn_narration":
+            text = str(view.get("text", "") or "").strip()
+            if not text:
+                return
+            lines.append({"kind": "narration", "text": text[:600]})
+            binding.capabilities["tool_progress_lines"] = lines
+            await self._patch_tool_progress_card(session, channel, lines)
+            return
         entry = {
             "tool_name": str(view.get("tool_name", "") or "tool"),
             "status": str(view.get("status", "") or "running"),
@@ -10548,8 +10585,23 @@ class Orchestrator:
         if not merged:
             lines.append(entry)
         binding.capabilities["tool_progress_lines"] = lines
-        aggregate = {"type": "tool_progress", "lines": [dict(line) for line in lines]}
+        await self._patch_tool_progress_card(
+            session, channel, lines, tool=entry["tool_name"], status=entry["status"]
+        )
 
+    async def _patch_tool_progress_card(
+        self,
+        session: Session,
+        channel: ChannelAdapter,
+        lines: list[Any],
+        *,
+        tool: str = "narration",
+        status: str = "",
+    ) -> None:
+        binding = session.channel_binding
+        if binding is None:
+            return
+        aggregate = {"type": "tool_progress", "lines": [dict(line) for line in lines if isinstance(line, dict)]}
         message_id = str(binding.capabilities.get("tool_progress_message_id", "") or "")
         if message_id and channel.capabilities().editable_message:
             try:
@@ -10560,7 +10612,7 @@ class Orchestrator:
                     "tool_progress_edit_failed",
                     session_id=session.session_id,
                     message_id=message_id,
-                    tool=entry["tool_name"],
+                    tool=tool,
                     error=exc,
                     fallback="send_new_card",
                 )
@@ -10575,8 +10627,8 @@ class Orchestrator:
             _log_degrade(
                 "tool_progress_send_failed",
                 session_id=session.session_id,
-                tool=entry["tool_name"],
-                status=entry["status"],
+                tool=tool,
+                status=status,
                 error=exc,
                 drop=True,
             )
@@ -10666,6 +10718,8 @@ class Orchestrator:
     def _event_to_view(self, session: Session, event: AgentEvent) -> dict[str, Any]:
         if event.type == AgentEventType.TURN_DELTA:
             return {"type": "turn_delta", "text": str(event.payload.get("text", ""))}
+        if event.type == AgentEventType.TURN_NARRATION:
+            return {"type": "turn_narration", "text": str(event.payload.get("text", ""))}
         if event.type == AgentEventType.TURN_COMPLETED:
             return {"type": "turn_completed", "message": str(event.payload.get("message", ""))}
         if event.type == AgentEventType.BACKGROUND_TASKS:

@@ -684,6 +684,10 @@ class ChannelNativeRuntime:
         self._tui_hook_queue_dir = _tui_hook_queue_dir(self.state_store.path)
         self._ingress_lock = asyncio.Lock()
         self._drain_lock = asyncio.Lock()
+        # ADR 0055: per-session transcript read cursor (path, byte offset)
+        # for mirroring mid-turn narration; first sight fast-forwards to EOF
+        # so history is never replayed into the channel.
+        self._tui_transcript_cursors: dict[str, tuple[str, int]] = {}
         self._loaded_tui_observed_bindings_refreshed = False
         # PreToolUse gate bookkeeping (ADR 0046 v2): rid -> dispatch time for
         # pending requests already turned into cards, and per-session tools
@@ -3894,6 +3898,29 @@ class ChannelNativeRuntime:
                 SessionRole.OWNER,
             )
 
+    async def _drain_tui_narration(self, session, payload: dict[str, Any]) -> list[str]:
+        path = str(payload.get("transcript_path", "") or "")
+        if not path:
+            return []
+        cursor = self._tui_transcript_cursors.get(session.session_id)
+        new_cursor, texts = await asyncio.to_thread(_read_transcript_narration, path, cursor)
+        self._tui_transcript_cursors[session.session_id] = new_cursor
+        if len(self._tui_transcript_cursors) > 512:
+            # Bounded bookkeeping: evict the oldest-tracked session rather
+            # than growing for the life of the process.
+            self._tui_transcript_cursors.pop(next(iter(self._tui_transcript_cursors)))
+        return texts
+
+    def _advance_tui_narration_cursor(self, session, payload: dict[str, Any]) -> None:
+        path = str(payload.get("transcript_path", "") or "")
+        if not path:
+            return
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            return
+        self._tui_transcript_cursors[session.session_id] = (path, size)
+
     async def _send_tui_hook_output(self, session, *, hook_type: str, payload: dict[str, Any]) -> None:
         tool_event = _tui_hook_tool_event(hook_type, payload)
         if tool_event is not None:
@@ -3911,6 +3938,13 @@ class ChannelNativeRuntime:
             view = self.orchestrator._event_to_view(session, tool_event)
             channel = self.channels.get(session.channel_binding.channel_kind) if session.channel_binding else None
             if channel is not None:
+                # ADR 0055: the narration that preceded this tool call is in
+                # the transcript but in NO hook payload — drain it onto the
+                # burst card ahead of the tool line it narrates.
+                for narration in await self._drain_tui_narration(session, payload):
+                    await self.orchestrator._upsert_tool_progress_view(
+                        session, channel, {"type": "turn_narration", "text": narration}
+                    )
                 await self.orchestrator._upsert_tool_progress_view(session, channel, view)
             if hook_type == "permission-request":
                 # v3 dual-surface: when this dialog already has an interactive
@@ -3931,6 +3965,10 @@ class ChannelNativeRuntime:
                     )
             return
         text = _tui_hook_text(hook_type, payload)
+        if hook_type in {"stop", "user-prompt-submit"}:
+            # The turn-final text goes out as its own bubble below; skipping
+            # the cursor past it keeps it from doubling as a narration line.
+            self._advance_tui_narration_cursor(session, payload)
         session.last_progress_at = self._now()
         session.last_progress_event = f"external_tui.{hook_type}"
         if not text:
@@ -5904,6 +5942,67 @@ def _tui_lark_chat_id(endpoint: ChannelEndpointConfig) -> str:
     # Same resolution rule as Telegram: explicit TUI chat wins, otherwise a
     # single-entry allowlist unambiguously names the observation chat.
     return _tui_telegram_chat_id(endpoint)
+
+
+def _read_transcript_narration(
+    path: str, cursor: tuple[str, int] | None
+) -> tuple[tuple[str, int], list[str]]:
+    """Read new assistant narration texts from a Claude transcript (ADR 0055).
+
+    ``cursor`` is (path, byte_offset) from the previous read. First sight of a
+    path — or a replaced/shrunk file — fast-forwards to EOF WITHOUT emitting:
+    replaying transcript history into the channel would spam the topic. Only
+    complete JSONL lines are consumed; a partially-written tail stays for the
+    next call. Sidechain (subagent) entries and non-text blocks are ignored.
+    """
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return (cursor if cursor is not None else (path, 0)), []
+    if cursor is None or cursor[0] != path or cursor[1] > size:
+        return (path, size), []
+    offset = cursor[1]
+    if offset >= size:
+        return (path, offset), []
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(offset)
+            blob = fh.read(size - offset)
+    except OSError:
+        return (path, offset), []
+    end = blob.rfind(b"\n")
+    if end < 0:
+        return (path, offset), []
+    consumed = blob[: end + 1]
+    new_offset = offset + end + 1
+    texts: list[str] = []
+    for raw in consumed.splitlines():
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            entry = json.loads(raw.decode("utf-8", errors="replace"))
+        except Exception:
+            continue
+        if not isinstance(entry, dict) or entry.get("isSidechain"):
+            continue
+        if str(entry.get("type", "")) != "assistant":
+            continue
+        message = entry.get("message")
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        parts = [
+            str(block.get("text", "") or "")
+            for block in content
+            if isinstance(block, dict) and block.get("type") == "text"
+        ]
+        text = "\n".join(part for part in parts if part).strip()
+        if text:
+            texts.append(text)
+    return (path, new_offset), texts
 
 
 def _tui_hook_text(hook_type: str, payload: dict[str, Any]) -> str:

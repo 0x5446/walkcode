@@ -322,6 +322,13 @@ def _health_card(view: dict[str, Any]) -> dict[str, Any]:
 
 
 def _tool_progress_line(entry: dict[str, Any]) -> str:
+    if str(entry.get("kind", "") or "") == "narration":
+        # Mid-turn assistant narration (ADR 0055): what the agent said it is
+        # about to do, interleaved chronologically with the tool lines.
+        text = _inline(str(entry.get("text", "") or "").strip())
+        if len(text) > 300:
+            text = text[:299] + "…"
+        return f"💬 {escape_lark_md(text)}"
     status = str(entry.get("status", "") or "running")
     icon = {"running": "⏳", "completed": "✅", "failed": "❌"}.get(status, "⏳")
     row = f"{icon} `{escape_lark_md(str(entry.get('tool_name', '') or 'tool'))}`"
@@ -340,14 +347,26 @@ def _tool_progress_card(view: dict[str, Any]) -> dict[str, Any]:
         entries = [ln for ln in lines if isinstance(ln, dict)]
     else:
         entries = [view]
-    statuses = {str(e.get("status", "") or "running") for e in entries}
+    # Card color tracks TOOL outcomes only; narration lines carry no status
+    # and must not hold an all-green burst on grey.
+    tool_entries = [e for e in entries if str(e.get("kind", "") or "") != "narration"]
+    statuses = {str(e.get("status", "") or "running") for e in tool_entries}
     if statuses == {"completed"}:
         template = "green"
     elif "failed" in statuses:
         template = "red"
     else:
         template = "grey"
-    body = "\n".join(_tool_progress_line(e) for e in entries) or "⏳ `tool`"
+    if len(entries) > 30:
+        # Lark caps card sizes; a marathon burst must fold its head rather
+        # than fail the patch call outright.
+        folded = len(entries) - 30
+        entries = entries[-30:]
+        body_lines = [f"…（已折叠前 {folded} 行）"]
+    else:
+        body_lines = []
+    body_lines.extend(_tool_progress_line(e) for e in entries)
+    body = "\n".join(body_lines) or "⏳ `tool`"
     return _card_message("🔧 工具执行", template, [_md_div(body)])
 
 
