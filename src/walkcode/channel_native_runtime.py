@@ -4822,6 +4822,9 @@ def _telegram_update_id(update: dict[str, Any]) -> int | None:
 _LARK_REJECTION_NOTES = {
     BlockedReason.UNAUTHORIZED: "⛔ 这条消息没有提交：你没有操作这个会话的权限。",
     BlockedReason.SESSION_STOPPED: "⚪ 这条消息没有提交：会话已结束。到根会话发新消息即可开新任务。",
+    # ADR 0056：上一个 worker 进程尚未确认退出时拒绝拉新（防双写）；
+    # 静默丢消息会让用户以为发送成功（deep-review R3）。
+    "resume_failed": "⚠️ 这条消息没有提交：上一个进程还没退干净。稍等几秒，把这条消息再发一次即可。",
 }
 
 

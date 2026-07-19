@@ -334,6 +334,25 @@ class WorkerPidExtractionTests(unittest.TestCase):
             proc.wait(timeout=5)
         del base
 
+    def test_capture_retries_transient_probe_error(self):
+        transport = _transport()
+        transport._clients["h1"] = object()
+        ok = mock.Mock(status="ok", lstart="Sun Jul 20 01:00:00 2026", command="claude --resume x")
+        err = mock.Mock(status="error", lstart="", command="")
+        with mock.patch(
+            "walkcode.channel_native._probe_process", mock.Mock(side_effect=[err, err, ok])
+        ):
+            asyncio.run(transport._capture_worker_proc("h1", "sess-1", _FakeClient(4242)))
+        self.assertIn("h1", transport._worker_procs)
+
+    def test_lark_has_feedback_for_refused_resume(self):
+        # A refused spawn (previous worker not confirmed dead) must not drop
+        # the user's message silently (deep-review R3).
+        from walkcode.channel_native_runtime import _LARK_REJECTION_NOTES
+
+        self.assertIn("resume_failed", _LARK_REJECTION_NOTES)
+        self.assertIn("再发一次", _LARK_REJECTION_NOTES["resume_failed"])
+
     def test_pid_extraction_rejects_garbage(self):
         self.assertEqual(ClaudeHeadlessTransport._client_worker_pid(object()), 0)
 

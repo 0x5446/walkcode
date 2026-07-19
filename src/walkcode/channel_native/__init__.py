@@ -5886,8 +5886,23 @@ class ClaudeHeadlessTransport:
         pid = self._client_worker_pid(client)
         if not pid:
             return
-        probe = await asyncio.to_thread(_probe_process, pid)
-        if probe.status != "ok":
+        probe = None
+        for attempt in range(3):
+            if attempt:
+                await asyncio.sleep(0.2)
+            probe = await asyncio.to_thread(_probe_process, pid)
+            if probe.status != "error":
+                break
+        if probe is None or probe.status != "ok":
+            # Untracked worker == pre-ADR-0056 behavior for this one process
+            # (fail-closed: we never signal what we cannot identify). Loud in
+            # the logs so an environment where ps keeps failing is visible.
+            _log_degrade(
+                "headless_worker_capture_failed",
+                handle_id=handle_id,
+                pid=pid,
+                status=getattr(probe, "status", "none"),
+            )
             return
         if handle_id not in self._clients:
             # Closed while we were probing: recording it now would resurrect

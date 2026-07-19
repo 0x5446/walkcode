@@ -65,3 +65,9 @@ TransportUnavailable 拒绝拉新，下一条消息重试整个阶梯；③注�
 身份条件删除（消 ABA 竞态）；④shield 会重抛验尸自身异常——在关闭路径
 隔离并打点，不放大/替换 EOF 原始异常；⑤捕获前确认 handle 仍登记在册，
 关闭后的迟到捕获不会复活跟踪记录。
+
+R3 终轮：①拉起时身份捕获对瞬时 ps 失败重试 3 次，仍失败则打点
+`headless_worker_capture_failed`——该 worker 退回 ADR 前的无跟踪行为
+（残留：审查建议的"未决状态阻塞后续拉新"在 pid 复用时会把会话永久卡死，
+不采纳，fail-closed 优先）；②lark 路径给"拒绝拉新"补用户反馈文案
+（resume_failed→"稍等几秒再发一次"），不再静默丢消息。
