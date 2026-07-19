@@ -1753,6 +1753,56 @@ class SessionRegistry:
         session.last_progress_event = "writer.reacquired"
         return SubmitResult(True)
 
+    def revive_stopped_structured_session(self, session_id: str) -> SubmitResult:
+        """Bring a stopped structured session back for a channel-driven submit.
+
+        ADR 0054: every runtime restart sweeps headless sessions to
+        "stopped", and a later channel message used to dead-end at 会话已结束
+        even though the transcript and resume credentials are intact. This is
+        takeover minus the kill: bump the generation (fences any stale
+        drains), reset to IDLE, and let the normal resume-for-submit path
+        spawn a fresh worker. The caller is responsible for verifying a
+        durable resume ref and transport capability BEFORE calling, and for
+        reverting via mark_revive_failed if the resume then fails.
+        """
+        session = self._sessions.get(session_id)
+        if session is None:
+            return SubmitResult(False, BlockedReason.NOT_FOUND)
+        if session.status != "stopped":
+            return SubmitResult(False, "not_stopped")
+        if session.transport_kind not in {"claude_headless", "codex_app_server"}:
+            return SubmitResult(False, "not_structured")
+        now = self._now()
+        session.generation += 1
+        session.status = "running"
+        session.stop_reason = ""
+        session.lifecycle_state = "IDLE"
+        session.writer_owner = None
+        session.writer_lease = None
+        session.background_tasks = []
+        session.last_progress_at = now
+        session.last_progress_event = "session.revived_by_channel"
+        return SubmitResult(True)
+
+    def mark_revive_failed(self, session_id: str) -> None:
+        """Revert a channel revival whose resume never produced a worker.
+
+        Leaving the session "running" with no writer after a failed revive
+        would be a phantom-alive record (status card says running, nothing
+        serves it). The generation stays bumped — that is harmless and keeps
+        the fence monotonic.
+        """
+        session = self._sessions.get(session_id)
+        if session is None:
+            return
+        session.status = "stopped"
+        session.stop_reason = "revive_failed"
+        session.lifecycle_state = "STOPPED"
+        session.writer_owner = None
+        session.writer_lease = None
+        session.last_progress_at = self._now()
+        session.last_progress_event = "session.revive_failed"
+
     def handoff_to_external_tui(
         self,
         session_id: str,
@@ -8155,6 +8205,33 @@ class Orchestrator:
             authz_result = self.authz.can_submit(session_id, actor)
             if not authz_result.allowed:
                 return SubmitResult(False, authz_result.reason)
+        # ADR 0054: a message to a stopped STRUCTURED session revives it
+        # instead of dead-ending at 会话已结束 — takeover minus the kill. Every
+        # restart sweep used to orphan all channel conversations this way.
+        # Scope guards:
+        #  - only INVOLUNTARY stops revive (restart sweep, failed revival
+        #    retry); an explicit close keeps its "blocks future submits"
+        #    contract;
+        #  - external-TUI takeover candidates keep their existing
+        #    consent-based takeover-prompt path below.
+        revived = False
+        if (
+            session.status == "stopped"
+            and session.stop_reason in {"runtime_restart", "revive_failed"}
+            and not _session_is_external_tui_takeover_candidate(session)
+            and self._durable_resume_ref(session)
+        ):
+            revive_transport = self.transports.get(session.transport_kind)
+            if revive_transport is not None and revive_transport.capabilities().resume_after_complete:
+                revive = self.sessions.revive_stopped_structured_session(session_id)
+                if revive.accepted:
+                    revived = True
+                    generation = session.generation
+                    _log_degrade(
+                        "session_revived_by_channel",
+                        session_id=session_id,
+                        actor=actor.actor_id,
+                    )
         transport = None
         if session.lifecycle_state in {"IDLE", "ERROR_RECOVERABLE"}:
             transport = self.transports.get(session.transport_kind)
@@ -8162,6 +8239,10 @@ class Orchestrator:
                 return SubmitResult(False, "transport_not_wired")
             ready = await self._ensure_writer_ready_for_submit(session, transport, actor)
             if not ready.accepted:
+                if revived:
+                    # No worker came up: do not leave a phantom "running"
+                    # record behind — the next message will retry the revival.
+                    self.sessions.mark_revive_failed(session_id)
                 return ready
         validation = self.sessions.validate_submit(session_id, generation)
         if not validation.accepted:
