@@ -203,6 +203,127 @@ class BurstCardNarrationTests(unittest.TestCase):
         self.assertNotIn("tool_progress_message_id", binding.capabilities)
 
 
+class TuiHookNarrationDeliveryTests(unittest.TestCase):
+    """The TUI mirror path posts drained narration as PLAIN MESSAGES before
+    the tool line (final form). Pins the runtime wiring itself — reverting
+    the _send_tui_hook_output change must redden this."""
+
+    def setUp(self):
+        import time as _time
+
+        from walkcode.channel_native_runtime import ChannelNativeRuntime
+
+        self.tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".jsonl")
+        self.path = self.tmp.name
+        self.tmp.close()
+        self.addCleanup(lambda: os.path.exists(self.path) and os.unlink(self.path))
+
+        orchestrator, _transport, channel, session = _orchestrator()
+        self.orchestrator = orchestrator
+        self.channel = channel
+        self.session = session
+
+        class _HookHost:
+            _send_tui_hook_output = ChannelNativeRuntime._send_tui_hook_output
+            _drain_tui_narration = ChannelNativeRuntime._drain_tui_narration
+            _advance_tui_narration_cursor = ChannelNativeRuntime._advance_tui_narration_cursor
+            _store_tui_narration_cursor = ChannelNativeRuntime._store_tui_narration_cursor
+
+        host = _HookHost()
+        host.orchestrator = orchestrator
+        host.channels = {"telegram": channel}
+        host._tui_transcript_cursors = {}
+        host._now = _time.time
+        self.host = host
+
+    def _append(self, entry: dict) -> None:
+        with open(self.path, "ab") as fh:
+            fh.write(_transcript_line(entry))
+
+    def _stamped_payload(self, **extra) -> dict:
+        info = os.stat(self.path)
+        payload = {
+            "transcript_path": self.path,
+            "_walkcode_transcript_size": int(info.st_size),
+            "_walkcode_transcript_file_key": [int(info.st_dev), int(info.st_ino)],
+        }
+        payload.update(extra)
+        return payload
+
+    def _views(self, kind: str) -> list:
+        return [v for v in self.channel.sent_views if v["view"].get("type") == kind]
+
+    def test_narration_posts_as_plain_message_before_tool_line(self):
+        # Hook 1 initializes the cursor (no history replay).
+        asyncio.run(
+            self.host._send_tui_hook_output(
+                self.session,
+                hook_type="pre-tool",
+                payload=self._stamped_payload(tool_name="Bash", tool_use_id="t1"),
+            )
+        )
+        self.assertEqual(self._views("turn_delta"), [])
+
+        # Narration lands in the transcript, then the next tool hook fires.
+        self._append(_assistant_entry([{"type": "text", "text": "先查日志"}]))
+        payload2 = self._stamped_payload(tool_name="Bash", tool_use_id="t2")
+        asyncio.run(
+            self.host._send_tui_hook_output(self.session, hook_type="pre-tool", payload=payload2)
+        )
+
+        deltas = self._views("turn_delta")
+        self.assertEqual([d["view"]["text"] for d in deltas], ["先查日志"])
+        # Plain message, not a 💬 card line.
+        for card in self._views("tool_progress"):
+            for line in card["view"].get("lines", []):
+                if isinstance(line, dict):
+                    self.assertNotEqual(line.get("kind"), "narration")
+        # Ordering: the narration bubble precedes the t2 tool card update.
+        types = [v["view"].get("type") for v in self.channel.sent_views]
+        self.assertLess(
+            types.index("turn_delta"),
+            max(i for i, t in enumerate(types) if t == "tool_progress"),
+        )
+
+        # Replaying the same hook must not repeat the narration (cursor moved).
+        asyncio.run(
+            self.host._send_tui_hook_output(self.session, hook_type="pre-tool", payload=payload2)
+        )
+        self.assertEqual(len(self._views("turn_delta")), 1)
+
+    def test_stop_hook_final_text_is_not_reposted_by_narration_path(self):
+        asyncio.run(
+            self.host._send_tui_hook_output(
+                self.session,
+                hook_type="pre-tool",
+                payload=self._stamped_payload(tool_name="Bash", tool_use_id="t1"),
+            )
+        )
+        # Turn-final text lands in the transcript; Stop mirrors it as its own
+        # message and the cursor must skip past it.
+        self._append(_assistant_entry([{"type": "text", "text": "最终回复"}]))
+        asyncio.run(
+            self.host._send_tui_hook_output(
+                self.session,
+                hook_type="stop",
+                payload=self._stamped_payload(last_assistant_message="最终回复"),
+            )
+        )
+        completed = [v["view"].get("message") for v in self._views("turn_completed")]
+        self.assertEqual(completed, ["最终回复"])  # the Stop bubble itself
+        self.assertEqual(self._views("turn_delta"), [])  # no narration double
+
+        # A later tool hook must not re-read the already-skipped final text.
+        asyncio.run(
+            self.host._send_tui_hook_output(
+                self.session,
+                hook_type="pre-tool",
+                payload=self._stamped_payload(tool_name="Bash", tool_use_id="t2"),
+            )
+        )
+        self.assertEqual(self._views("turn_delta"), [])
+
+
 class NarrationRenderingTests(unittest.TestCase):
     def test_lark_card_renders_narration_line_and_ignores_it_for_color(self):
         view = {
