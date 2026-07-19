@@ -76,3 +76,21 @@ Agent 在工具调用之间输出的叙述文本（"我现在要干嘛"）是长
 8. 残留（记录不修）：defer 队列 recent-first 调度在积压 >5 分钟时可能让同
    会话的 Stop 先于旧工具 hook 处理——有捕获边界+单调 advance 后，后果从
    "重复/乱序"降级为"漏一段叙述"；排队序保序是后续 defer 调度器的活。
+
+R2 确认轮对修复本身构造出两个反例，再修：
+
+9. **边界戳绑定文件身份**：只盖 size 时，"hook 捕获于文件 A → 排水前被
+   替换成更大的文件 B"会让首见游标落在 B 的 boundary 处、下一读把 B 的
+   剩余历史当实时叙述发出。改为一次 open+fstat 原子盖
+   `_walkcode_transcript_size` + `_walkcode_transcript_file_key`（dev,ino）；
+   身份不匹配的边界一律不适用——首见跳 EOF、既有游标原地不动不外发。
+10. **丢弃态跨批次**：超限单行跳过后若行尾碎片恰好是合法 assistant JSON，
+    会被当成一行解析（构造反例：2 MiB 空白 + 合法条目同一物理行）。游标
+    增加第 4 元 `discarding`：置位后逐批丢弃到该行真正的换行符，任何
+    中线碎片都进不了解析器。
+11. defer_tui_hook / gate_tui_hook 直接调用路径在入队时补盖捕获戳（时间 +
+    transcript 边界），不再等到排水时。
+12. 残留（记录不修）：同 inode 原地截断后回长（Claude transcript 是
+    append-only，此形态不真实发生）可能漏掉低于旧游标的新字节；网络盘
+    st_ino 不稳定时退化为"漏叙述"或"首见跳过"，不会回放（本机场景为
+    APFS，声明范围内可靠）。

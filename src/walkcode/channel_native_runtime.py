@@ -2158,6 +2158,11 @@ class ChannelNativeRuntime:
         created_at_ns = time.time_ns()
         queued_payload = dict(payload)
         queued_payload.setdefault("_walkcode_deferred_id", hook_id)
+        # Enqueue time IS capture time for direct defer callers; a drain
+        # minutes later must not treat the then-current transcript size as
+        # this hook's boundary (ADR 0055).
+        queued_payload.setdefault("_walkcode_hook_captured_at", created_at_ns / 1_000_000_000)
+        _stamp_transcript_size(queued_payload)
         queued = {
             "id": hook_id,
             "created_at": created_at_ns / 1_000_000_000,
@@ -3922,20 +3927,33 @@ class ChannelNativeRuntime:
             info = os.stat(path)
         except OSError:
             return
+        size = int(info.st_size)
+        file_key = (int(info.st_dev), int(info.st_ino))
         boundary = _payload_transcript_boundary(payload)
-        offset = int(info.st_size) if boundary is None else max(0, min(boundary, int(info.st_size)))
-        file_key = (info.st_dev, info.st_ino)
+        offset = size
+        if boundary is not None:
+            boundary_size, boundary_key = boundary
+            if boundary_key is None or boundary_key == file_key:
+                offset = max(0, min(boundary_size, size))
+            # else: the hook's file is gone — everything currently at this
+            # path is pre-cursor history; skipping to EOF is the only safe
+            # advance ("never replay").
+        discarding = False
         prev = self._tui_transcript_cursors.get(session.session_id)
         if (
             prev is not None
-            and len(prev) >= 3
+            and len(prev) >= 4
             and prev[0] == path
             and prev[2] == file_key
         ):
             # Advance is monotonic: an out-of-order (older) hook must not
-            # rewind the cursor and re-emit already-mirrored narration.
-            offset = max(offset, int(prev[1]))
-        self._store_tui_narration_cursor(session.session_id, (path, offset, file_key))
+            # rewind the cursor and re-emit already-mirrored narration. An
+            # in-progress over-long-line discard survives only if we did not
+            # jump past the line.
+            if int(prev[1]) >= offset:
+                offset = int(prev[1])
+                discarding = bool(prev[3])
+        self._store_tui_narration_cursor(session.session_id, (path, offset, file_key, discarding))
 
     def _store_tui_narration_cursor(self, session_id: str, cursor: tuple[Any, ...]) -> None:
         cursors = self._tui_transcript_cursors
@@ -5975,25 +5993,43 @@ def _tui_lark_chat_id(endpoint: ChannelEndpointConfig) -> str:
 _TRANSCRIPT_READ_MAX_BYTES = 2 * 1024 * 1024
 
 
-def _payload_transcript_boundary(payload: dict[str, Any]) -> int | None:
-    """The transcript size stamped when the hook FIRED, if any (ADR 0055)."""
+def _payload_transcript_boundary(
+    payload: dict[str, Any],
+) -> tuple[int, tuple[int, int] | None] | None:
+    """The (size, file identity) stamped when the hook FIRED, if any.
+
+    The identity ((st_dev, st_ino), when stamped by 0.14.6+) pins the size to
+    the file it was measured on — a boundary applied to a DIFFERENT file
+    would expose that file's history as live narration (ADR 0055 revision 2).
+    """
     raw = payload.get("_walkcode_transcript_size")
     if raw is None:
         return None
     try:
-        value = int(raw)
+        size = int(raw)
     except (TypeError, ValueError):
         return None
-    return value if value >= 0 else None
+    if size < 0:
+        return None
+    key_raw = payload.get("_walkcode_transcript_file_key")
+    key: tuple[int, int] | None = None
+    if isinstance(key_raw, (list, tuple)) and len(key_raw) == 2:
+        try:
+            key = (int(key_raw[0]), int(key_raw[1]))
+        except (TypeError, ValueError):
+            key = None
+    return size, key
 
 
 def _stamp_transcript_size(payload: dict[str, Any]) -> None:
-    """Stamp the capture-time transcript byte size onto a hook payload.
+    """Stamp the capture-time transcript size AND file identity onto a hook.
 
     The narration cursor must be bounded by what existed when the hook fired,
     not when it is drained: a delayed drain would otherwise lift the
     turn-final text (written after the last tool call) into a narration line
-    right before Stop sends the same text as a bubble.
+    right before Stop sends the same text as a bubble. Size and identity are
+    taken from one fstat on an open handle so they cannot describe two
+    different files.
     """
     if "_walkcode_transcript_size" in payload:
         return
@@ -6001,30 +6037,36 @@ def _stamp_transcript_size(payload: dict[str, Any]) -> None:
     if not path:
         return
     try:
-        payload["_walkcode_transcript_size"] = int(os.path.getsize(path))
+        with open(path, "rb") as fh:
+            info = os.fstat(fh.fileno())
     except OSError:
         return
+    payload["_walkcode_transcript_size"] = int(info.st_size)
+    payload["_walkcode_transcript_file_key"] = [int(info.st_dev), int(info.st_ino)]
 
 
 def _read_transcript_narration(
     path: str,
     cursor: tuple[Any, ...] | None,
-    boundary: int | None = None,
+    boundary: tuple[int, tuple[int, int] | None] | None = None,
 ) -> tuple[tuple[Any, ...] | None, list[str]]:
     """Read new assistant narration texts from a Claude transcript (ADR 0055).
 
-    ``cursor`` is (path, byte_offset, file_key) from the previous read, where
-    file_key is (st_dev, st_ino): a replaced file at the same path must not be
-    read from the old offset — its bytes there are history, and replaying
-    history into the channel is never acceptable. First sight of a file
-    fast-forwards to ``boundary`` (the transcript size stamped at hook fire
-    time) without emitting. ``boundary`` also caps every read: bytes written
-    after the hook fired belong to a later hook. Only complete JSONL lines
-    are consumed — a torn tail waits for the next call, but a single line
-    larger than the batch cap is skipped (its fragments fail JSON parsing
-    harmlessly) so the cursor cannot wedge. Returns (new_cursor, texts);
-    new_cursor is None when the file is unreadable and no prior cursor exists
-    (storing (path, 0) would replay the whole file once it appears).
+    ``cursor`` is (path, byte_offset, file_key, discarding) from the previous
+    read, where file_key is (st_dev, st_ino): a replaced file at the same
+    path must not be read from the old offset — its bytes there are history,
+    and replaying history into the channel is never acceptable. First sight
+    of a file fast-forwards WITHOUT emitting. ``boundary`` is the (size,
+    file identity) stamped at hook fire time; it caps every read (bytes
+    written after the hook fired belong to a later hook) but applies ONLY to
+    the file it was measured on — against a replaced file it is meaningless
+    and the call emits nothing. Only complete JSONL lines are consumed — a
+    torn tail waits for the next call, and a single line larger than the
+    batch cap flips ``discarding``: subsequent reads drop bytes until that
+    line's real newline, so no mid-line fragment ever reaches the JSON
+    parser. Returns (new_cursor, texts); new_cursor is None when the file is
+    unreadable and no prior cursor exists (storing (path, 0) would replay the
+    whole file once it appears).
     """
     try:
         fh = open(path, "rb")
@@ -6037,32 +6079,55 @@ def _read_transcript_narration(
             return cursor, []
         size = int(info.st_size)
         file_key = (info.st_dev, info.st_ino)
-        limit = size if boundary is None else max(0, min(int(boundary), size))
+        boundary_size: int | None = None
+        boundary_key: tuple[int, int] | None = None
+        if boundary is not None:
+            boundary_size, boundary_key = boundary
+        boundary_foreign = boundary_key is not None and boundary_key != file_key
         stale_cursor = (
             cursor is None
-            or len(cursor) < 3
+            or len(cursor) < 4
             or cursor[0] != path
             or cursor[2] != file_key
             or int(cursor[1]) > size
         )
+        if boundary_foreign:
+            # The hook was captured against a file that no longer exists at
+            # this path; its boundary says nothing about THIS file. Emit
+            # nothing — a later hook stamped on the current file drains. On
+            # first sight the current content is all pre-cursor history:
+            # skip it entirely.
+            if stale_cursor:
+                return (path, size, file_key, False), []
+            return (path, int(cursor[1]), file_key, bool(cursor[3])), []
+        limit = size if boundary_size is None else max(0, min(boundary_size, size))
         if stale_cursor:
-            return (path, limit, file_key), []
+            return (path, limit, file_key, False), []
         offset = int(cursor[1])
+        discarding = bool(cursor[3])
         if offset >= limit:
-            return (path, offset, file_key), []
+            return (path, offset, file_key, discarding), []
         requested = min(limit - offset, _TRANSCRIPT_READ_MAX_BYTES)
         try:
             fh.seek(offset)
             blob = fh.read(requested)
         except OSError:
-            return (path, offset, file_key), []
+            return (path, offset, file_key, discarding), []
+    if discarding:
+        # Finish dropping an over-long line BEFORE parsing anything: a
+        # mid-line fragment could otherwise parse as a valid JSON entry.
+        cut = blob.find(b"\n")
+        if cut < 0:
+            return (path, offset + len(blob), file_key, True), []
+        return (path, offset + cut + 1, file_key, False), []
     end = blob.rfind(b"\n")
     if end < 0:
         if (limit - offset) > len(blob):
-            # A single line bigger than the batch cap: skip past what we read
-            # so the cursor keeps moving instead of re-reading it forever.
-            return (path, offset + len(blob), file_key), []
-        return (path, offset, file_key), []
+            # A single line bigger than the batch cap: skip what we read and
+            # keep discarding until its real newline, so the cursor cannot
+            # wedge and no fragment reaches the parser.
+            return (path, offset + len(blob), file_key, True), []
+        return (path, offset, file_key, False), []
     consumed = blob[: end + 1]
     new_offset = offset + end + 1
     texts: list[str] = []
@@ -6092,7 +6157,7 @@ def _read_transcript_narration(
         text = "\n".join(part for part in parts if part).strip()
         if text:
             texts.append(text)
-    return (path, new_offset, file_key), texts
+    return (path, new_offset, file_key, False), texts
 
 
 def _tui_hook_text(hook_type: str, payload: dict[str, Any]) -> str:

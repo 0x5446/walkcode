@@ -371,9 +371,50 @@ class TranscriptNarrationReaderTests(unittest.TestCase):
         boundary = os.path.getsize(self.path)
         self._append(_transcript_line(_assistant_entry([{"type": "text", "text": "回合末文本"}])))
 
-        cursor, texts = _read_transcript_narration(self.path, cursor, boundary)
+        cursor, texts = _read_transcript_narration(self.path, cursor, (boundary, None))
         self.assertEqual(texts, ["叙述"])
         self.assertEqual(cursor[1], boundary)
+
+    def test_boundary_from_replaced_file_is_not_applied(self):
+        # A boundary stamped on file A must not be applied to file B at the
+        # same path: fast-forwarding a fresh cursor to A's boundary inside B
+        # would expose B's remaining history as live narration on the next
+        # read (deep-review R2 counterexample).
+        self._append(_transcript_line(_assistant_entry([{"type": "text", "text": "old"}])))
+        info = os.stat(self.path)
+        old_boundary = (os.path.getsize(self.path), (int(info.st_dev), int(info.st_ino)))
+
+        replacement = self.path + ".new"
+        with open(replacement, "wb") as fh:
+            for i in range(5):
+                fh.write(_transcript_line(_assistant_entry([{"type": "text", "text": f"history-{i}"}])))
+        os.replace(replacement, self.path)
+
+        cursor, texts = _read_transcript_narration(self.path, None, old_boundary)
+        self.assertEqual(texts, [])
+        # First sight of the replaced file lands at ITS EOF, not at the old
+        # boundary — so no later read can emit its history.
+        self.assertEqual(cursor[1], os.path.getsize(self.path))
+        _, again = _read_transcript_narration(self.path, cursor)
+        self.assertEqual(again, [])
+
+    def test_overlong_line_tail_fragment_is_never_parsed(self):
+        # If the bytes right after the batch cap happen to BE a valid
+        # assistant JSON document, a naive skip would feed them to the
+        # parser as a "line". The discard state must drop everything up to
+        # the over-long line's real newline.
+        cursor, _ = _read_transcript_narration(self.path, None)
+        bait = _transcript_line(_assistant_entry([{"type": "text", "text": "poisoned"}]))
+        self._append(b" " * (2 * 1024 * 1024) + bait)  # ONE physical line
+        self._append(_transcript_line(_assistant_entry([{"type": "text", "text": "clean"}])))
+
+        texts: list[str] = []
+        for _ in range(8):
+            cursor, batch = _read_transcript_narration(self.path, cursor)
+            texts.extend(batch)
+            if cursor[1] >= os.path.getsize(self.path):
+                break
+        self.assertEqual(texts, ["clean"])
 
     def test_monster_line_does_not_wedge_cursor(self):
         cursor, _ = _read_transcript_narration(self.path, None)
