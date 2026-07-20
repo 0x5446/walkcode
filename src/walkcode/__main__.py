@@ -173,6 +173,94 @@ def _discover_v3_launchd_labels() -> list[str]:
     return _parse_launchd_labels(result.stdout or "")
 
 
+def _self_driver_label() -> str:
+    """ADR 0058: the launchd label of the runtime driving THIS process, or "".
+
+    Priority 1 is the WALKCODE_DRIVER_LABEL marker exported by `walkcode
+    native serve` (v0.14.10+) and inherited by every worker subprocess.
+    Fallback climbs the process tree for a `walkcode native serve` ancestor
+    and maps its PID to a label via `launchctl list` (LC_ALL=C: day-first
+    locales broke ps parsing before, v0.14.4).
+    """
+    marker = os.environ.get("WALKCODE_DRIVER_LABEL", "")
+    if marker:
+        return marker
+    env = {**os.environ, "LC_ALL": "C"}
+    try:
+        listing = subprocess.run(
+            ["launchctl", "list"], capture_output=True, text=True, env=env
+        ).stdout
+    except Exception:
+        listing = ""
+    pid_to_label: dict[str, str] = {}
+    for line in listing.splitlines():
+        parts = line.split()
+        if len(parts) >= 3 and parts[-1].startswith("com.walkcode."):
+            pid_to_label[parts[0]] = parts[-1]
+    pid = str(os.getpid())
+    for _ in range(25):
+        try:
+            out = subprocess.run(
+                ["ps", "-o", "ppid=,command=", "-p", pid],
+                capture_output=True,
+                text=True,
+                env=env,
+            ).stdout.strip()
+        except Exception:
+            return ""
+        if not out:
+            return ""
+        ppid, _, command = out.partition(" ")
+        ppid = ppid.strip()
+        if "walkcode native serve" in command and pid in pid_to_label:
+            return pid_to_label[pid]
+        if not ppid or ppid == pid or ppid in {"0", "1"}:
+            return ""
+        pid = ppid
+    return ""
+
+
+def _schedule_deferred_self_restart(label: str) -> None:
+    """Restart our own driver runtime later, from a detached process.
+
+    start_new_session=True: the restarter must survive the SIGTERM it will
+    deliver to our own ancestry. `&&` (not `;`): a failed sleep must never
+    fall through to an immediate kickstart.
+    """
+    delay_raw = os.environ.get("WALKCODE_SELF_RESTART_DELAY", "120")
+    # isascii too: str.isdigit() accepts full-width digits, which the system
+    # `sleep` rejects — the detached restarter would die silently (review R2).
+    delay = delay_raw if (delay_raw.isascii() and delay_raw.isdigit()) else "120"
+    if delay != delay_raw:
+        print(f"invalid WALKCODE_SELF_RESTART_DELAY {delay_raw!r}; using 120s.")
+    # Say everything and FLUSH before starting the timer (R3): with a
+    # zero/short delay the detached kickstart could otherwise kill the driver
+    # before buffered output lands.
+    print(
+        f"this upgrade runs inside a session driven by {label}; its restart is "
+        f"deferred by {delay}s (detached). Wrap up the final reply now — the "
+        "session revives on the next message.",
+        flush=True,
+    )
+    sys.stderr.flush()
+    uid = str(os.getuid())
+    subprocess.Popen(
+        [
+            "/bin/sh",
+            "-c",
+            'sleep "$1" && exec launchctl kickstart -k "gui/$2/$3"',
+            "sh",
+            delay,
+            uid,
+            label,
+        ],
+        start_new_session=True,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
 def cmd_upgrade(_args) -> None:
     current = _current_version()
     print(f"Current version: {current}")
@@ -214,6 +302,13 @@ def cmd_upgrade(_args) -> None:
         if label.startswith("com.walkcode.tap-"):
             print(f"refusing to restart tap proxy {label} (carries live Claude API traffic).")
     labels = [label for label in labels if not label.startswith("com.walkcode.tap-")]
+    # ADR 0058 suicide-trap guard, same semantics as upgrade.sh: never
+    # kickstart the runtime that drives the session running this command.
+    self_label = _self_driver_label()
+    deferred_self = ""
+    if self_label and self_label in labels:
+        deferred_self = self_label
+        labels = [label for label in labels if label != self_label]
     if labels:
         uid = os.getuid()
         for label in labels:
@@ -231,7 +326,7 @@ def cmd_upgrade(_args) -> None:
         # A bare doctor without an env file only reports a config error; bind
         # each restarted instance to its own env file instead.
         ran_doctor = False
-        for label in labels:
+        for label in [*labels, *([deferred_self] if deferred_self else [])]:
             label_env = Path.home() / ".walkcode" / (label.removeprefix("com.walkcode.") + ".env")
             if label_env.is_file():
                 _run(f"WALKCODE_ENV_FILE={shlex.quote(str(label_env))} walkcode native doctor")
@@ -241,6 +336,10 @@ def cmd_upgrade(_args) -> None:
         if not ran_doctor:
             _run("walkcode native doctor")
     print("Upgrade complete.")
+    if deferred_self:
+        # Scheduled dead last, after every print: even a zero/short delay
+        # must not kill the driver before this command's output lands.
+        _schedule_deferred_self_restart(deferred_self)
 
 
 def cmd_uninstall(_args) -> None:
