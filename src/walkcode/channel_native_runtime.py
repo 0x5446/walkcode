@@ -1390,6 +1390,19 @@ class ChannelNativeRuntime:
             command = _telegram_bot_command(inbound)
             if command:
                 result = await self._handle_telegram_bot_command(channel, inbound, command)
+                if (
+                    not result.accepted
+                    and str(getattr(result, "reason", "") or "") == "stale_inbound"
+                ):
+                    # ADR 0057：滞留的控制命令被拦时同样不能静默（本分支
+                    # 提前返回，走不到通用拒绝提示）。
+                    try:
+                        await channel.send_view(
+                            reply_binding,
+                            {"type": "text", "text": _LARK_REJECTION_NOTES["stale_inbound"]},
+                        )
+                    except Exception:
+                        pass
                 self._complete_lark_local_inbound(inbound)
                 self.save_state()
                 return result
@@ -4021,6 +4034,11 @@ class ChannelNativeRuntime:
                     )
             return
         text = _tui_hook_text(hook_type, payload)
+        if hook_type == "user-prompt-submit" and not text:
+            # 空文本不可能是回显；先盖水位再走后面的空文本早退。
+            self.orchestrator._stamp_last_user_input(
+                session, float(payload.get("_walkcode_hook_captured_at") or 0.0)
+            )
         if hook_type in {"stop", "user-prompt-submit"}:
             # The turn-final text goes out as its own bubble below; skipping
             # the cursor past it keeps it from doubling as a narration line.
@@ -4058,11 +4076,10 @@ class ChannelNativeRuntime:
             # 滞留（ADR 0057 审查 R1）。daemon 直写路径已盖过频道时间。
             return
         if hook_type == "user-prompt-submit":
-            # ADR 0057：真实终端输入推进"最近一次被人说话"的时刻（用 hook
-            # 捕获时间，别用排水时间——defer 队列可能晚很多）。
-            captured = float(payload.get("_walkcode_hook_captured_at") or 0.0)
-            session.last_user_input_at = max(
-                session.last_user_input_at, captured or self._now()
+            # ADR 0057：真实终端输入推进"最近一次被人说话"的时刻（hook
+            # 捕获时间，非排水时间）；统一走带毒时间戳防护的盖章助手。
+            self.orchestrator._stamp_last_user_input(
+                session, float(payload.get("_walkcode_hook_captured_at") or 0.0)
             )
         session.last_event_seq += 1
         view = (

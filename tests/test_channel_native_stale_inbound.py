@@ -240,10 +240,15 @@ class StaleInboundGuardTests(unittest.TestCase):
         # 落后 >5s 但自身滞留 <30s → 放
         session.last_user_input_at = clock.now - 4.0
         self.assertFalse(guard(_inbound("x", created_at=clock.now - 20.0), session))
+        # 滞留正好 30s（达到最小滞留）且落后 >5s → 拦
+        session.last_user_input_at = clock.now - 10.0
+        self.assertTrue(guard(_inbound("x", created_at=clock.now - 30.0), session))
+        # 轻微超前（时钟偏差 3s 内）不污染：水位取 max 后仍为合法值
+        # （60 秒未来窗口内原样入水位，超窗才退化为本机 now）。
 
     def test_watermark_stamp_rejects_poisoned_timestamps(self):
         orchestrator, _transport, _channel, session, clock = _setup()
-        for bad in (float("nan"), float("inf"), clock.now + 10_000.0, -5.0):
+        for bad in (float("nan"), float("inf"), clock.now + 61.0, -5.0):
             session.last_user_input_at = 0.0
             orchestrator._stamp_last_user_input(session, bad)
             # 非法/未来值退化为本机当前时间，绝不放大水位。

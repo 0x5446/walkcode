@@ -5166,7 +5166,7 @@ class LarkChannelAdapter:
                 created_at = float(message.get("create_time", 0) or 0) / 1000.0
             except (TypeError, ValueError):
                 created_at = 0.0
-            if not (created_at > 0 and math.isfinite(created_at) and created_at < time.time() + 600.0):
+            if not (created_at > 0 and math.isfinite(created_at) and created_at < time.time() + 60.0):
                 # NaN/Infinity/负数/明显未来的时间戳一律视为未知：进水位会
                 # 把所有后续正常消息判旧（ADR 0057 审查 R1）。
                 created_at = 0.0
@@ -8884,7 +8884,7 @@ class Orchestrator:
         """ADR 0057 水位盖章：非法/未来时间戳绝不允许污染水位。"""
         value = float(created_at or 0.0)
         now = self._now()
-        if not (value > 0 and math.isfinite(value) and value <= now + 600.0):
+        if not (value > 0 and math.isfinite(value) and value <= now + 60.0):
             value = now
         session.last_user_input_at = max(session.last_user_input_at, value)
 
