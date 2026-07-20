@@ -195,6 +195,60 @@ class StaleInboundGuardTests(unittest.TestCase):
         self.assertTrue(result.accepted)
         self.assertEqual(session.last_user_input_at, clock.now)
 
+    def test_stale_takeover_command_is_refused(self):
+        # A stranded /takeover would change writer ownership — more dangerous
+        # than a stale text; it gets the same guard (review R1).
+        orchestrator, transport, _channel, session, clock = _setup()
+        session.last_user_input_at = clock.now - 60.0
+        stranded = _inbound("/takeover", created_at=clock.now - 600.0)
+
+        result = self._handle(orchestrator, stranded)
+        self.assertFalse(result.accepted)
+        self.assertEqual(result.reason, "stale_inbound")
+        self.assertEqual(session.writer_owner.kind, "orchestrator")  # unchanged
+
+    def test_stale_text_does_not_answer_pending_question(self):
+        # The generation fence only blocks post-takeover answers; a session
+        # advanced WITHOUT a generation bump would still swallow the stale
+        # text as an "Other" answer (review R1).
+        orchestrator, transport, _channel, session, clock = _setup()
+        ctx = orchestrator.interactions.register_ask_user_question(
+            session_id=session.session_id,
+            generation=session.generation,
+            questions=[{"question": "Which env?", "options": ["dev", "prod"]}],
+        )
+        binding_key = session.channel_binding.key()
+        orchestrator.interactions.begin_awaiting_other(ctx.interaction_id, binding_key, question_index=0)
+        session.last_user_input_at = clock.now - 60.0
+
+        stranded = _inbound("旧回答", created_at=clock.now - 600.0)
+        result = self._handle(orchestrator, stranded)
+
+        self.assertFalse(result.accepted)
+        self.assertEqual(result.reason, "stale_inbound")
+        # The wait is NOT consumed by the stale text.
+        self.assertIsNotNone(orchestrator.interactions.awaiting_context_for_binding(binding_key))
+
+    def test_guard_boundaries_are_exact(self):
+        orchestrator, _transport, _channel, session, clock = _setup()
+        guard = orchestrator._inbound_is_stale_for_session
+        session.last_user_input_at = clock.now - 100.0
+        # 滞留 >=30s 且落后水位 >5s → 拦
+        self.assertTrue(guard(_inbound("x", created_at=clock.now - 106.0), session))
+        # 落后正好 5s（容差内）→ 放
+        self.assertFalse(guard(_inbound("x", created_at=clock.now - 105.0), session))
+        # 落后 >5s 但自身滞留 <30s → 放
+        session.last_user_input_at = clock.now - 4.0
+        self.assertFalse(guard(_inbound("x", created_at=clock.now - 20.0), session))
+
+    def test_watermark_stamp_rejects_poisoned_timestamps(self):
+        orchestrator, _transport, _channel, session, clock = _setup()
+        for bad in (float("nan"), float("inf"), clock.now + 10_000.0, -5.0):
+            session.last_user_input_at = 0.0
+            orchestrator._stamp_last_user_input(session, bad)
+            # 非法/未来值退化为本机当前时间，绝不放大水位。
+            self.assertEqual(session.last_user_input_at, clock.now)
+
     def test_watermark_survives_persistence_round_trip(self):
         _orchestrator, _transport, _channel, session, clock = _setup()
         session.last_user_input_at = 12345.5

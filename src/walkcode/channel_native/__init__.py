@@ -5166,6 +5166,10 @@ class LarkChannelAdapter:
                 created_at = float(message.get("create_time", 0) or 0) / 1000.0
             except (TypeError, ValueError):
                 created_at = 0.0
+            if not (created_at > 0 and math.isfinite(created_at) and created_at < time.time() + 600.0):
+                # NaN/Infinity/负数/明显未来的时间戳一律视为未知：进水位会
+                # 把所有后续正常消息判旧（ADR 0057 审查 R1）。
+                created_at = 0.0
             return InboundEvent(
                 event_id=f"lark:{event_id}",
                 channel_kind="lark",
@@ -8583,6 +8587,10 @@ class Orchestrator:
                     session, turn, ack_message_id=ack_message_id
                 )
                 if daemon_result is not None:
+                    if daemon_result.accepted:
+                        # ADR 0057：daemon 直写同样是"被人说话"——不盖会让
+                        # 回显 hook 的本机时间独占水位（误拦后续连发）。
+                        self._stamp_last_user_input(session, turn.created_at)
                     return daemon_result
             if validation.reason in {BlockedReason.EXTERNAL_TUI_READONLY, BlockedReason.SESSION_STOPPED} and (
                 _session_is_external_tui_takeover_candidate(session)
@@ -8638,9 +8646,7 @@ class Orchestrator:
         # ADR 0057：记录"最近一次被人说话"的时刻。频道消息用渠道产生时刻
         # （不是提交时刻——否则快速连发的第二条会被时效守卫误判），无时间
         # 戳的输入退化为本机当前时间。
-        session.last_user_input_at = max(
-            session.last_user_input_at, float(turn.created_at or 0.0) or self._now()
-        )
+        self._stamp_last_user_input(session, turn.created_at)
         # "Got it, on it" reaction on the user's message — the status card
         # says the turn started, but the emoji is the at-a-glance receipt.
         await self._react_ack(session, ack_message_id)
@@ -8873,6 +8879,14 @@ class Orchestrator:
     @staticmethod
     def _durable_resume_ref(session: Session) -> dict[str, Any]:
         return _durable_resume_ref(session)
+
+    def _stamp_last_user_input(self, session: Session, created_at: float | None) -> None:
+        """ADR 0057 水位盖章：非法/未来时间戳绝不允许污染水位。"""
+        value = float(created_at or 0.0)
+        now = self._now()
+        if not (value > 0 and math.isfinite(value) and value <= now + 600.0):
+            value = now
+        session.last_user_input_at = max(session.last_user_input_at, value)
 
     _STALE_INBOUND_TOLERANCE_SECONDS = 5.0
     _STALE_INBOUND_MIN_AGE_SECONDS = 30.0
@@ -9319,6 +9333,18 @@ class Orchestrator:
                     if awaiting is not None:
                         session = self.sessions.get(awaiting.session_id)
                         result = None
+                        if self._inbound_is_stale_for_session(inbound, session):
+                            # ADR 0057：代际围栏只挡接管后的旧答案；会话被
+                            # 更新输入推进但代际未变时，滞留文本仍会被当成
+                            # 问题答案吃掉——同样按时效拦。
+                            _log_degrade(
+                                "stale_inbound_refused",
+                                session_id=session.session_id,
+                                created_at=inbound.created_at,
+                                last_user_input_at=session.last_user_input_at,
+                                kind="awaiting_answer",
+                            )
+                            result = SubmitResult(False, "stale_inbound")
                         if self.authz is not None:
                             authz_result = self.authz.can_submit(session.session_id, actor)
                             if not authz_result.allowed:
@@ -9337,6 +9363,7 @@ class Orchestrator:
                                 current_generation=session.generation,
                             )
                             if decision.accepted:
+                                self._stamp_last_user_input(session, inbound.created_at)
                                 await self._handle_ask_user_decision(
                                     session,
                                     awaiting,
@@ -9836,6 +9863,17 @@ class Orchestrator:
         if not resolution.session_id:
             return SubmitResult(False, BlockedReason.NOT_FOUND)
         session = self.sessions.get(resolution.session_id)
+        if self._inbound_is_stale_for_session(inbound, session):
+            # ADR 0057：滞留的控制命令比普通旧输入更危险——旧 /takeover
+            # 补推进来会改变 writer 归属，必须同样拦下。
+            _log_degrade(
+                "stale_inbound_refused",
+                session_id=session.session_id,
+                created_at=inbound.created_at,
+                last_user_input_at=session.last_user_input_at,
+                kind="takeover_command",
+            )
+            return SubmitResult(False, "stale_inbound")
         actor = ActorRef(inbound.channel_kind, inbound.sender_id, inbound.sender_display)
         if self.authz is not None:
             authz_result = self.authz.can_takeover(session.session_id, actor)

@@ -4021,13 +4021,6 @@ class ChannelNativeRuntime:
                     )
             return
         text = _tui_hook_text(hook_type, payload)
-        if hook_type == "user-prompt-submit":
-            # ADR 0057：终端输入同样推进"最近一次被人说话"的时刻（用 hook
-            # 捕获时间，别用排水时间——defer 队列可能晚很多）。
-            captured = float(payload.get("_walkcode_hook_captured_at") or 0.0)
-            session.last_user_input_at = max(
-                session.last_user_input_at, captured or self._now()
-            )
         if hook_type in {"stop", "user-prompt-submit"}:
             # The turn-final text goes out as its own bubble below; skipping
             # the cursor past it keeps it from doubling as a narration line.
@@ -4061,7 +4054,16 @@ class ChannelNativeRuntime:
         if hook_type == "user-prompt-submit" and self.orchestrator.consume_daemon_reply_echo(
             session.session_id, text
         ):
+            # 频道注入的回显不是终端输入：抬水位会让频道后续连发被误判
+            # 滞留（ADR 0057 审查 R1）。daemon 直写路径已盖过频道时间。
             return
+        if hook_type == "user-prompt-submit":
+            # ADR 0057：真实终端输入推进"最近一次被人说话"的时刻（用 hook
+            # 捕获时间，别用排水时间——defer 队列可能晚很多）。
+            captured = float(payload.get("_walkcode_hook_captured_at") or 0.0)
+            session.last_user_input_at = max(
+                session.last_user_input_at, captured or self._now()
+            )
         session.last_event_seq += 1
         view = (
             {"type": "tui_user_input", "input": text}
