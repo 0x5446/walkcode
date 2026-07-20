@@ -351,6 +351,96 @@ class LarkAdapterTests(unittest.TestCase):
         self.assertEqual(api.calls[0][1]["chat_id"], "oc_chat")
         self.assertEqual(api.calls[0][1]["root_id"], "om_root")
 
+    # Real magic bytes per format; Lark image resources come back with no
+    # file_name and only an "image/*" placeholder mime, so the suffix must be
+    # sniffed from content or agents choke on the opaque ".img" extension.
+    _IMAGE_SAMPLES = (
+        (b"\xff\xd8\xff\xe0" + b"\x00" * 16, ".jpg", "image/jpeg"),
+        (b"\x89PNG\r\n\x1a\n" + b"\x00" * 16, ".png", "image/png"),
+        (b"GIF89a" + b"\x00" * 16, ".gif", "image/gif"),
+        (b"RIFF\x24\x00\x00\x00WEBPVP8 " + b"\x00" * 8, ".webp", "image/webp"),
+        (b"II*\x00" + b"\x00" * 16, ".tiff", "image/tiff"),
+        (b"MM\x00*" + b"\x00" * 16, ".tiff", "image/tiff"),
+        (b"\x00\x00\x00\x18ftypheic" + b"\x00" * 12, ".heic", "image/heic"),
+        (b"\x00\x00\x00\x1cftypavif" + b"\x00" * 12, ".avif", "image/avif"),
+        (b"\x00\x00\x01\x00\x01\x00" + b"\x00" * 16, ".ico", "image/x-icon"),
+        (b"BM\x9a\x00\x00\x00\x00\x00\x00\x00\x36\x00\x00\x00", ".bmp", "image/bmp"),
+    )
+
+    def test_download_suffix_sniffs_real_image_type(self):
+        for content, suffix, _ in self._IMAGE_SAMPLES:
+            with self.subTest(suffix=suffix):
+                self.assertEqual(
+                    LarkChannelAdapter._download_suffix({}, "image/*", content), suffix
+                )
+
+    def test_download_suffix_prefers_file_name_over_sniffing(self):
+        png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 16
+        self.assertEqual(
+            LarkChannelAdapter._download_suffix({"file_name": "photo.jpeg"}, "image/*", png),
+            ".jpeg",
+        )
+
+    def test_download_suffix_unrecognized_content_keeps_fallbacks(self):
+        junk = b"definitely not an image"
+        self.assertEqual(LarkChannelAdapter._download_suffix({}, "image/*", junk), ".img")
+        self.assertEqual(
+            LarkChannelAdapter._download_suffix({}, "application/pdf", junk), ".pdf"
+        )
+        self.assertEqual(LarkChannelAdapter._download_suffix({}, "", junk), "")
+        self.assertEqual(LarkChannelAdapter._download_suffix({}, "image/*", b""), ".img")
+
+    def test_download_suffix_weak_bmp_prefix_is_not_enough(self):
+        # "BM" alone (reserved header bytes non-zero) must not classify as BMP.
+        self.assertEqual(
+            LarkChannelAdapter._download_suffix(
+                {}, "", b"BMW is a car maker, not a bitmap"
+            ),
+            "",
+        )
+
+    def test_download_attachment_saves_sniffed_suffix_and_mime(self):
+        from walkcode.channel_native import AttachmentRef
+
+        png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 16
+        adapter = LarkChannelAdapter(
+            LarkBotApi(caller=lambda method, payload: {"content": png, "file_name": ""})
+        )
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            with mock.patch.dict("os.environ", {"WALKCODE_DOWNLOAD_DIR": tmp_dir}):
+                downloaded = asyncio.run(
+                    adapter.download_attachment(
+                        AttachmentRef(
+                            source_id="img_v3_key",
+                            mime="image/*",
+                            source_message_id="om_img",
+                        )
+                    )
+                )
+            self.assertTrue(downloaded.local_path.endswith(".png"))
+            self.assertEqual(downloaded.mime, "image/png")
+            self.assertEqual(Path(downloaded.local_path).read_bytes(), png)
+
+    def test_download_attachment_unknown_bytes_keep_img_fallback(self):
+        from walkcode.channel_native import AttachmentRef
+
+        adapter = LarkChannelAdapter(
+            LarkBotApi(caller=lambda method, payload: {"content": b"mystery", "file_name": ""})
+        )
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            with mock.patch.dict("os.environ", {"WALKCODE_DOWNLOAD_DIR": tmp_dir}):
+                downloaded = asyncio.run(
+                    adapter.download_attachment(
+                        AttachmentRef(
+                            source_id="img_v3_key",
+                            mime="image/*",
+                            source_message_id="om_img",
+                        )
+                    )
+                )
+            self.assertTrue(downloaded.local_path.endswith(".img"))
+            self.assertEqual(downloaded.mime, "image/*")
+
 
 class LarkOrchestratorTests(unittest.TestCase):
     def test_thread_text_creates_session_and_submits_to_agent_transport(self):

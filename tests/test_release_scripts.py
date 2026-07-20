@@ -121,7 +121,13 @@ class _ScriptGateBase(unittest.TestCase):
         self.env["GIT_CONFIG_GLOBAL"] = "/dev/null"
         self.env["TMPDIR"] = str(self.tmp)
         for key in list(self.env):
-            if key.startswith("FEISHU_"):
+            # Strip host-session state so script gates stay hermetic:
+            # FEISHU_* are legacy-remnant blockers, and WALKCODE_* leak in
+            # when the suite itself runs inside a walkcode-driven session
+            # (e.g. the runtime's WALKCODE_DRIVER_LABEL marker short-circuits
+            # upgrade.sh's ps-climb fallback). Tests that need WALKCODE_*
+            # values pass them explicitly via extra_env.
+            if key.startswith(("FEISHU_", "WALKCODE_")):
                 self.env.pop(key)
         self.env.update({
             "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",

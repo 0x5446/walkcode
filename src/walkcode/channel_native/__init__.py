@@ -5269,7 +5269,15 @@ class LarkChannelAdapter:
             },
         )
         content = self._download_content_bytes(result)
-        suffix = self._download_suffix(result, attachment.mime)
+        suffix = self._download_suffix(result, attachment.mime, content)
+        # Lark image messages carry no MIME ("image/*" placeholder); once the
+        # bytes are in hand, prefer the sniffed concrete type so downstream
+        # consumers see honest metadata.
+        mime = attachment.mime
+        if mime == "image/*":
+            sniffed = self._sniff_image_type(content)
+            if sniffed is not None:
+                mime = sniffed[1]
         with tempfile.NamedTemporaryFile(
             "wb",
             prefix="walkcode-lark-",
@@ -5281,7 +5289,7 @@ class LarkChannelAdapter:
             local_path = tmp.name
         return AttachmentRef(
             source_id=attachment.source_id,
-            mime=attachment.mime,
+            mime=mime,
             local_path=local_path,
             source_message_id=attachment.source_message_id,
         )
@@ -5480,18 +5488,68 @@ class LarkChannelAdapter:
             return str(content).encode("utf-8")
         return bytes(result)
 
-    @staticmethod
-    def _download_suffix(result: Any, mime: str) -> str:
+    @classmethod
+    def _download_suffix(cls, result: Any, mime: str, content: bytes = b"") -> str:
         if isinstance(result, dict):
             file_name = str(result.get("file_name", "") or "")
             suffix = Path(file_name).suffix
             if suffix:
                 return suffix
+        # No trustworthy file name (Lark image resources never carry one):
+        # sniff the actual bytes so agents get an honest, readable extension
+        # instead of the opaque ".img" they had to rename before Read worked.
+        sniffed = cls._sniff_image_type(content)
+        if sniffed is not None:
+            return sniffed[0]
         if mime == "application/pdf":
             return ".pdf"
         if mime.startswith("image/"):
             return ".img"
         return ""
+
+    # Magic-byte table for image formats Lark realistically delivers. Python
+    # >= 3.13 removed stdlib ``imghdr``, so this is hand-rolled on purpose.
+    _IMAGE_MAGIC: tuple[tuple[bytes, str, str], ...] = (
+        (b"\xff\xd8\xff", ".jpg", "image/jpeg"),
+        (b"\x89PNG\r\n\x1a\n", ".png", "image/png"),
+        (b"GIF87a", ".gif", "image/gif"),
+        (b"GIF89a", ".gif", "image/gif"),
+        (b"II*\x00", ".tiff", "image/tiff"),
+        (b"MM\x00*", ".tiff", "image/tiff"),
+        (b"\x00\x00\x01\x00", ".ico", "image/x-icon"),
+    )
+
+    _FTYP_BRANDS: tuple[tuple[bytes, str, str], ...] = (
+        (b"heic", ".heic", "image/heic"),
+        (b"heix", ".heic", "image/heic"),
+        (b"mif1", ".heic", "image/heic"),
+        (b"avif", ".avif", "image/avif"),
+    )
+
+    @classmethod
+    def _sniff_image_type(cls, content: bytes) -> tuple[str, str] | None:
+        """Return ``(suffix, mime)`` for recognized image bytes; None otherwise.
+
+        Deliberately returns None for unknown content instead of guessing —
+        the caller keeps its existing fallback and never fabricates a type.
+        """
+        if not content:
+            return None
+        for magic, suffix, mime in cls._IMAGE_MAGIC:
+            if content.startswith(magic):
+                return suffix, mime
+        if len(content) >= 12 and content[4:8] == b"ftyp":
+            brand = content[8:12]
+            for known, suffix, mime in cls._FTYP_BRANDS:
+                if brand == known:
+                    return suffix, mime
+        if len(content) >= 12 and content[:4] == b"RIFF" and content[8:12] == b"WEBP":
+            return ".webp", "image/webp"
+        # BMP's bare "BM" prefix is too weak on its own; require the reserved
+        # header bytes (offset 6-9) to be zero as the spec mandates.
+        if len(content) >= 14 and content[:2] == b"BM" and content[6:10] == b"\x00\x00\x00\x00":
+            return ".bmp", "image/bmp"
+        return None
 
 
 # Tools that only read or observe are low-risk: any authorized collaborator may
