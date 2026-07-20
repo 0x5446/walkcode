@@ -357,22 +357,49 @@ class LarkAdapterTests(unittest.TestCase):
     _IMAGE_SAMPLES = (
         (b"\xff\xd8\xff\xe0" + b"\x00" * 16, ".jpg", "image/jpeg"),
         (b"\x89PNG\r\n\x1a\n" + b"\x00" * 16, ".png", "image/png"),
+        (b"GIF87a" + b"\x00" * 16, ".gif", "image/gif"),
         (b"GIF89a" + b"\x00" * 16, ".gif", "image/gif"),
         (b"RIFF\x24\x00\x00\x00WEBPVP8 " + b"\x00" * 8, ".webp", "image/webp"),
         (b"II*\x00" + b"\x00" * 16, ".tiff", "image/tiff"),
         (b"MM\x00*" + b"\x00" * 16, ".tiff", "image/tiff"),
+        # ftyp majors that name the codec directly.
         (b"\x00\x00\x00\x18ftypheic" + b"\x00" * 12, ".heic", "image/heic"),
-        (b"\x00\x00\x00\x1cftypavif" + b"\x00" * 12, ".avif", "image/avif"),
+        (b"\x00\x00\x00\x18ftypheix" + b"\x00" * 12, ".heic", "image/heic"),
+        (b"\x00\x00\x00\x18ftypavif" + b"\x00" * 12, ".avif", "image/avif"),
+        (b"\x00\x00\x00\x18ftypavis" + b"\x00" * 12, ".avif", "image/avif"),
+        # Generic HEIF major (mif1): the codec hides in the compatible-brand
+        # list — box size 0x1c = 28 covers brands mif1, avif, heic.
+        (b"\x00\x00\x00\x1cftypmif1\x00\x00\x00\x00mif1avifheic", ".avif", "image/avif"),
+        (b"\x00\x00\x00\x1cftypmsf1\x00\x00\x00\x00msf1heicavif", ".heic", "image/heic"),
         (b"\x00\x00\x01\x00\x01\x00" + b"\x00" * 16, ".ico", "image/x-icon"),
         (b"BM\x9a\x00\x00\x00\x00\x00\x00\x00\x36\x00\x00\x00", ".bmp", "image/bmp"),
     )
 
-    def test_download_suffix_sniffs_real_image_type(self):
-        for content, suffix, _ in self._IMAGE_SAMPLES:
-            with self.subTest(suffix=suffix):
+    def test_sniff_image_type_maps_content_to_suffix_and_mime(self):
+        for content, suffix, mime in self._IMAGE_SAMPLES:
+            with self.subTest(suffix=suffix, mime=mime, head=content[:16]):
+                self.assertEqual(
+                    LarkChannelAdapter._sniff_image_type(content), (suffix, mime)
+                )
                 self.assertEqual(
                     LarkChannelAdapter._download_suffix({}, "image/*", content), suffix
                 )
+
+    def test_sniff_image_type_negative_and_boundary_cases(self):
+        cases = (
+            b"",
+            b"\x89PN",  # truncated PNG magic
+            b"\xff\xd8",  # truncated JPEG magic
+            b"RIFF\x24\x00\x00\x00WEB",  # truncated WebP header
+            b"\x00\x00\x00\x18ftypmp42" + b"\x00" * 12,  # video container brand
+            b"\x00\x00\x00\x14ftypmif1\x00\x00\x00\x00",  # generic HEIF, no codec brand
+            b"\x00\x00\x00\x18ftyp",  # ftyp box cut off before the major brand
+            b"GIF88a" + b"\x00" * 16,  # unknown GIF version
+            b"definitely not an image",
+        )
+        for content in cases:
+            with self.subTest(head=content[:16]):
+                self.assertIsNone(LarkChannelAdapter._sniff_image_type(content))
 
     def test_download_suffix_prefers_file_name_over_sniffing(self):
         png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 16
@@ -380,6 +407,25 @@ class LarkAdapterTests(unittest.TestCase):
             LarkChannelAdapter._download_suffix({"file_name": "photo.jpeg"}, "image/*", png),
             ".jpeg",
         )
+
+    def test_resolve_download_type_file_name_wins_wholesale(self):
+        # A sender-provided file name must win for BOTH suffix and mime:
+        # rewriting the mime against the kept ".jpeg" path would produce
+        # contradictory attachment metadata.
+        png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 16
+        suffix, mime = LarkChannelAdapter._resolve_download_type(
+            {"file_name": "photo.jpeg"}, "image/*", png
+        )
+        self.assertEqual(suffix, ".jpeg")
+        self.assertEqual(mime, "image/*")
+
+    def test_resolve_download_type_keeps_concrete_inbound_mime(self):
+        # Only the "image/*" placeholder is upgraded; concrete sender-provided
+        # mimes (file/media messages) are metadata we pass through untouched.
+        png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 16
+        suffix, mime = LarkChannelAdapter._resolve_download_type({}, "image/jpeg", png)
+        self.assertEqual(suffix, ".png")
+        self.assertEqual(mime, "image/jpeg")
 
     def test_download_suffix_unrecognized_content_keeps_fallbacks(self):
         junk = b"definitely not an image"
@@ -428,18 +474,25 @@ class LarkAdapterTests(unittest.TestCase):
             LarkBotApi(caller=lambda method, payload: {"content": b"mystery", "file_name": ""})
         )
         with tempfile.TemporaryDirectory() as tmp_dir:
+            stderr = io.StringIO()
             with mock.patch.dict("os.environ", {"WALKCODE_DOWNLOAD_DIR": tmp_dir}):
-                downloaded = asyncio.run(
-                    adapter.download_attachment(
-                        AttachmentRef(
-                            source_id="img_v3_key",
-                            mime="image/*",
-                            source_message_id="om_img",
+                with contextlib.redirect_stderr(stderr):
+                    downloaded = asyncio.run(
+                        adapter.download_attachment(
+                            AttachmentRef(
+                                source_id="img_v3_key",
+                                mime="image/*",
+                                source_message_id="om_img",
+                            )
                         )
                     )
-                )
             self.assertTrue(downloaded.local_path.endswith(".img"))
             self.assertEqual(downloaded.mime, "image/*")
+            # The silent-degradation path must leave a trace: an unidentified
+            # image falling back to ".img" is the exact failure the sniffer
+            # exists to eliminate.
+            self.assertIn("degrade=lark_image_sniff_failed", stderr.getvalue())
+            self.assertIn("message_id=om_img", stderr.getvalue())
 
 
 class LarkOrchestratorTests(unittest.TestCase):

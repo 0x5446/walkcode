@@ -99,6 +99,42 @@ def _write_exe(path: Path, body: str):
     path.chmod(path.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
 
 
+def _sanitized_host_env(environ) -> dict:
+    """Copy ``environ`` minus host-session state that breaks gate hermeticity.
+
+    FEISHU_* are legacy-remnant blockers upgrade.sh refuses to run with, and
+    WALKCODE_* leak in when this suite itself runs inside a walkcode-driven
+    session — e.g. the runtime's WALKCODE_DRIVER_LABEL marker would
+    short-circuit upgrade.sh's ps-climb self-detection and flip the
+    self-restart tests onto the wrong branch. Tests that need WALKCODE_*
+    values pass them explicitly via extra_env.
+    """
+    return {
+        key: value
+        for key, value in dict(environ).items()
+        if not key.startswith(("FEISHU_", "WALKCODE_"))
+    }
+
+
+class HostEnvSanitizationTests(unittest.TestCase):
+    def test_strips_walkcode_and_feishu_vars_and_keeps_the_rest(self):
+        env = _sanitized_host_env(
+            {
+                "WALKCODE_DRIVER_LABEL": "com.walkcode.personal-claude",
+                "WALKCODE_V3_LAUNCHD_LABELS": "com.walkcode.a-claude",
+                "WALKCODE_SELF_RESTART_DELAY": "0",
+                "FEISHU_APP_ID": "cli_x",
+                "PATH": "/usr/bin",
+                "HOME": "/tmp/h",
+            }
+        )
+        self.assertNotIn("WALKCODE_DRIVER_LABEL", env)
+        self.assertNotIn("WALKCODE_V3_LAUNCHD_LABELS", env)
+        self.assertNotIn("WALKCODE_SELF_RESTART_DELAY", env)
+        self.assertNotIn("FEISHU_APP_ID", env)
+        self.assertEqual(env, {"PATH": "/usr/bin", "HOME": "/tmp/h"})
+
+
 @unittest.skipUnless(_GIT and _BASH, "git and bash required")
 class _ScriptGateBase(unittest.TestCase):
     def setUp(self):
@@ -115,20 +151,11 @@ class _ScriptGateBase(unittest.TestCase):
         _write_exe(self.fakebin / "walkcode", FAKE_WALKCODE)
         _write_exe(self.fakebin / "launchctl", FAKE_LAUNCHCTL)
 
-        self.env = os.environ.copy()
+        self.env = _sanitized_host_env(os.environ)
         self.env["PATH"] = f"{self.fakebin}{os.pathsep}{self.env['PATH']}"
         self.env["HOME"] = str(self.home)
         self.env["GIT_CONFIG_GLOBAL"] = "/dev/null"
         self.env["TMPDIR"] = str(self.tmp)
-        for key in list(self.env):
-            # Strip host-session state so script gates stay hermetic:
-            # FEISHU_* are legacy-remnant blockers, and WALKCODE_* leak in
-            # when the suite itself runs inside a walkcode-driven session
-            # (e.g. the runtime's WALKCODE_DRIVER_LABEL marker short-circuits
-            # upgrade.sh's ps-climb fallback). Tests that need WALKCODE_*
-            # values pass them explicitly via extra_env.
-            if key.startswith(("FEISHU_", "WALKCODE_")):
-                self.env.pop(key)
         self.env.update({
             "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
             "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t",

@@ -5269,15 +5269,17 @@ class LarkChannelAdapter:
             },
         )
         content = self._download_content_bytes(result)
-        suffix = self._download_suffix(result, attachment.mime, content)
-        # Lark image messages carry no MIME ("image/*" placeholder); once the
-        # bytes are in hand, prefer the sniffed concrete type so downstream
-        # consumers see honest metadata.
-        mime = attachment.mime
-        if mime == "image/*":
-            sniffed = self._sniff_image_type(content)
-            if sniffed is not None:
-                mime = sniffed[1]
+        suffix, mime = self._resolve_download_type(result, attachment.mime, content)
+        if suffix == ".img":
+            # An unidentifiable image falls back to the opaque ".img" the
+            # sniffer exists to eliminate; leave a trace so the recurrence
+            # (new format, truncated bytes, odd API response) is debuggable.
+            _log_degrade(
+                "lark_image_sniff_failed",
+                message_id=attachment.source_message_id,
+                source_id=attachment.source_id,
+                content_bytes=len(content),
+            )
         with tempfile.NamedTemporaryFile(
             "wb",
             prefix="walkcode-lark-",
@@ -5490,22 +5492,36 @@ class LarkChannelAdapter:
 
     @classmethod
     def _download_suffix(cls, result: Any, mime: str, content: bytes = b"") -> str:
+        return cls._resolve_download_type(result, mime, content)[0]
+
+    @classmethod
+    def _resolve_download_type(cls, result: Any, mime: str, content: bytes) -> tuple[str, str]:
+        """Single source of truth for a download's ``(suffix, mime)``.
+
+        Priority: a sender-provided file name wins wholesale — its suffix is
+        kept and the inbound mime is left untouched, so path and metadata can
+        never contradict each other. Without one (Lark image resources never
+        carry a file name), a single content sniff decides both: agents get an
+        honest, readable extension instead of the opaque ".img" they had to
+        rename before Read worked, and the "image/*" placeholder mime is
+        replaced by the sniffed concrete type. Fallbacks never fabricate a
+        type.
+        """
         if isinstance(result, dict):
-            file_name = str(result.get("file_name", "") or "")
-            suffix = Path(file_name).suffix
-            if suffix:
-                return suffix
-        # No trustworthy file name (Lark image resources never carry one):
-        # sniff the actual bytes so agents get an honest, readable extension
-        # instead of the opaque ".img" they had to rename before Read worked.
+            named = Path(str(result.get("file_name", "") or "")).suffix
+            if named:
+                return named, mime
         sniffed = cls._sniff_image_type(content)
         if sniffed is not None:
-            return sniffed[0]
+            suffix, sniffed_mime = sniffed
+            # A concrete inbound mime (file/media messages) is sender
+            # metadata — keep it; only the placeholder gets upgraded.
+            return suffix, (sniffed_mime if mime == "image/*" else mime)
         if mime == "application/pdf":
-            return ".pdf"
+            return ".pdf", mime
         if mime.startswith("image/"):
-            return ".img"
-        return ""
+            return ".img", mime
+        return "", mime
 
     # Magic-byte table for image formats Lark realistically delivers. Python
     # >= 3.13 removed stdlib ``imghdr``, so this is hand-rolled on purpose.
@@ -5519,12 +5535,17 @@ class LarkChannelAdapter:
         (b"\x00\x00\x01\x00", ".ico", "image/x-icon"),
     )
 
-    _FTYP_BRANDS: tuple[tuple[bytes, str, str], ...] = (
-        (b"heic", ".heic", "image/heic"),
-        (b"heix", ".heic", "image/heic"),
-        (b"mif1", ".heic", "image/heic"),
-        (b"avif", ".avif", "image/avif"),
-    )
+    # ISO-BMFF brands that pin down a concrete image codec. The generic HEIF
+    # container brands (mif1/msf1) deliberately have no entry: they only say
+    # "HEIF container", so the compatible-brand list must name the codec.
+    _FTYP_CODEC_BRANDS: dict[bytes, tuple[str, str]] = {
+        b"heic": (".heic", "image/heic"),
+        b"heix": (".heic", "image/heic"),
+        b"avif": (".avif", "image/avif"),
+        b"avis": (".avif", "image/avif"),
+    }
+
+    _FTYP_GENERIC_BRANDS = frozenset({b"mif1", b"msf1"})
 
     @classmethod
     def _sniff_image_type(cls, content: bytes) -> tuple[str, str] | None:
@@ -5539,16 +5560,39 @@ class LarkChannelAdapter:
             if content.startswith(magic):
                 return suffix, mime
         if len(content) >= 12 and content[4:8] == b"ftyp":
-            brand = content[8:12]
-            for known, suffix, mime in cls._FTYP_BRANDS:
-                if brand == known:
-                    return suffix, mime
+            return cls._sniff_ftyp_brands(content)
         if len(content) >= 12 and content[:4] == b"RIFF" and content[8:12] == b"WEBP":
             return ".webp", "image/webp"
         # BMP's bare "BM" prefix is too weak on its own; require the reserved
         # header bytes (offset 6-9) to be zero as the spec mandates.
         if len(content) >= 14 and content[:2] == b"BM" and content[6:10] == b"\x00\x00\x00\x00":
             return ".bmp", "image/bmp"
+        return None
+
+    @classmethod
+    def _sniff_ftyp_brands(cls, content: bytes) -> tuple[str, str] | None:
+        """Resolve an ISO-BMFF ``ftyp`` box to ``(suffix, mime)``, or None.
+
+        The major brand alone is not enough: generic HEIF containers use
+        ``mif1``/``msf1`` as the major brand and name the actual codec (heic,
+        avif, ...) in the compatible-brand list. So: major brand first, then —
+        for generic majors only — walk the compatible brands bounded by the
+        box size. Unknown brands return None rather than a guess.
+        """
+        major = content[8:12]
+        hit = cls._FTYP_CODEC_BRANDS.get(major)
+        if hit is not None:
+            return hit
+        if major not in cls._FTYP_GENERIC_BRANDS:
+            return None
+        box_size = int.from_bytes(content[0:4], "big")
+        # Clamp the scan: a corrupt/hostile size field must not run past the
+        # buffer, and 256 bytes is far beyond any real ftyp box.
+        end = min(box_size if box_size >= 16 else 16, len(content), 256)
+        for offset in range(16, end - 3, 4):
+            hit = cls._FTYP_CODEC_BRANDS.get(content[offset:offset + 4])
+            if hit is not None:
+                return hit
         return None
 
 
