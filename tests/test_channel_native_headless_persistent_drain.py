@@ -1229,7 +1229,39 @@ class TakeoverInjectedTurnRegressionTests(unittest.TestCase):
         errors = [e for e in events if e.type == AgentEventType.SESSION_ERROR]
         self.assertTrue(errors, "worker death with a pending submit was silent")
         self.assertIn("没有被处理", str(errors[-1].payload.get("message", "")))
+        # ADR 0058 contract pin: the orchestrator keys auto-replay off these
+        # structured fields — a renamed/dropped field would silently disable
+        # replay while every text-based assert still passes (review R1
+        # tests#2).
+        self.assertEqual(errors[-1].payload.get("reason"), "pending_turn_lost")
+        self.assertIs(errors[-1].payload.get("traffic_seen"), False)
+        self.assertEqual(errors[-1].payload.get("pending_lost"), 1)
         self.assertFalse(transport.handle_is_live(handle.handle_id))
+
+    def test_worker_death_after_traffic_marks_traffic_seen(self):
+        # ADR 0058: a turn that already streamed output may have executed
+        # side effects — the EOF marker must say so, so the orchestrator
+        # refuses auto-replay instead of re-executing them (review R1
+        # errors/data/risk consensus).
+        async def scenario():
+            cls = _stream_client_class()
+            transport = _transport(cls, grace=0.05)
+            handle = await transport.launch_session(cwd="/tmp/p", session_id="s1")
+            await transport.submit_turn(handle, TurnInput(text="hi"), "k1")
+            client = transport._clients[handle.handle_id]
+            collected: list = []
+            consumer = asyncio.create_task(_consume(transport, handle, collected))
+            client.feed(_assistant("partial output, then death"))
+            await asyncio.sleep(0.05)
+            client.feed_eof()
+            await asyncio.wait_for(consumer, timeout=5.0)
+            return collected
+
+        events = asyncio.run(scenario())
+        errors = [e for e in events if e.type == AgentEventType.SESSION_ERROR]
+        self.assertTrue(errors, "mid-turn worker death was silent")
+        self.assertEqual(errors[-1].payload.get("reason"), "pending_turn_lost")
+        self.assertIs(errors[-1].payload.get("traffic_seen"), True)
 
     def test_reply_with_text_after_expired_prediction_consumes_submit(self):
         # Round-3 review Critical: prediction expiry must be evaluated at

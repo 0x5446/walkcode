@@ -153,6 +153,17 @@ discover_v3_labels() {
 # again 2026-07-20 15:13). Detect the driving runtime and defer its restart
 # to a detached process instead of restarting it under our own feet.
 SELF_RESTART_DELAY="${WALKCODE_SELF_RESTART_DELAY:-120}"
+# Validate up front: with `sleep "$X"; kickstart` a garbage delay would make
+# sleep fail and kickstart run IMMEDIATELY — the exact suicide this guard
+# exists to prevent. Non-numeric/negative → fall back to 120 with a warning.
+case "$SELF_RESTART_DELAY" in
+  ''|*[!0-9]*)
+    warn "$(msg \
+      "invalid WALKCODE_SELF_RESTART_DELAY '${SELF_RESTART_DELAY}'; using 120s." \
+      "WALKCODE_SELF_RESTART_DELAY 非法：'${SELF_RESTART_DELAY}'；改用默认 120 秒。")"
+    SELF_RESTART_DELAY=120
+    ;;
+esac
 
 self_driver_label() {
   # Priority 1: env marker exported by `walkcode native serve` (v0.14.10+)
@@ -195,13 +206,15 @@ schedule_deferred_self_restart() {
   fi
   # start_new_session=True detaches from our process group: the restart must
   # survive the very SIGTERM it is about to deliver to our ancestry.
+  # `&&` (not `;`): a failed sleep must NEVER fall through to an immediate
+  # kickstart — that would be the suicide this guard exists to prevent.
   python3 - "$UID_NUM" "$label" "$SELF_RESTART_DELAY" <<'PY'
 import subprocess
 import sys
 
 uid, label, delay = sys.argv[1:4]
 subprocess.Popen(
-    ["/bin/sh", "-c", 'sleep "$1"; exec launchctl kickstart -k "gui/$2/$3"', "sh", delay, uid, label],
+    ["/bin/sh", "-c", 'sleep "$1" && exec launchctl kickstart -k "gui/$2/$3"', "sh", delay, uid, label],
     start_new_session=True,
     stdin=subprocess.DEVNULL,
     stdout=subprocess.DEVNULL,
@@ -292,8 +305,10 @@ run uv tool install --python "$PYTHON_SPEC" --with claude-agent-sdk --with lark-
 restart_v3_labels
 
 if [ -n "$DEFERRED_SELF_LABEL" ]; then
-  schedule_deferred_self_restart "$DEFERRED_SELF_LABEL"
   # It WILL be restarted shortly — run its per-env doctor with the others.
+  # The actual scheduling happens AFTER the doctor block below: the countdown
+  # must not start while the script still has tail work (doctor can be slow),
+  # or the deferred kill lands mid-upgrade (review R1 concurrency#3).
   RESTARTED_LABELS+=("$DEFERRED_SELF_LABEL")
 fi
 
@@ -334,6 +349,10 @@ if command -v walkcode >/dev/null 2>&1; then
       "no runtime restarted and default env file missing; run WALKCODE_ENV_FILE=<env> walkcode native doctor manually." \
       "未重启任何 runtime 且默认 env 文件不存在；请手动运行 WALKCODE_ENV_FILE=<env> walkcode native doctor。")"
   fi
+fi
+
+if [ -n "$DEFERRED_SELF_LABEL" ]; then
+  schedule_deferred_self_restart "$DEFERRED_SELF_LABEL"
 fi
 
 new_ver="$(current_version)"

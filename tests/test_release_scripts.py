@@ -381,6 +381,74 @@ class UpgradeGateTests(_ScriptGateBase):
             time.sleep(0.1)
         self.assertTrue(any("com.walkcode.a-claude" in l for l in kicks), kicks)
 
+    def test_self_driver_process_tree_fallback_defers(self):
+        # Pre-marker runtimes (first upgrade to v0.14.10) rely on the ps
+        # climb: ancestor chain ends at a fake `walkcode native serve` whose
+        # PID maps to a label via launchctl list (review R1 tests#1).
+        fake_ps = """#!/usr/bin/env bash
+mode=""; pid=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o) mode="$2"; shift 2 ;;
+    -p) pid="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+case "$mode" in
+  command=) if [ "$pid" = "77777" ]; then echo "/usr/bin/python3 walkcode native serve"; else echo "bash ./upgrade.sh"; fi ;;
+  ppid=)    if [ "$pid" = "77777" ]; then echo "    1"; else echo "77777"; fi ;;
+esac
+"""
+        _write_exe(self.fakebin / "ps", fake_ps)
+        self.addCleanup(lambda: (self.fakebin / "ps").unlink())
+        log = self.tmp / "launchctl.log"
+        listing = "\n".join(
+            [
+                "77777\t0\tcom.walkcode.a-claude",
+                "2\t0\tcom.walkcode.b-codex",
+            ]
+        )
+        r = self._run("upgrade.sh", extra_env=self._upgrade_env(
+            FAKE_LAUNCHCTL_LOG=str(log),
+            FAKE_LAUNCHCTL_LIST=listing,
+            WALKCODE_SELF_RESTART_DELAY="0",
+        ))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertRegex(r.stdout + r.stderr, r"deferred|脱管重启")
+        kicks = [l for l in log.read_text().splitlines() if "kickstart" in l]
+        self.assertTrue(any("com.walkcode.b-codex" in l for l in kicks), kicks)
+        deadline = time.time() + 10.0
+        while time.time() < deadline:
+            kicks = [l for l in log.read_text().splitlines() if "kickstart" in l]
+            if any("com.walkcode.a-claude" in l for l in kicks):
+                break
+            time.sleep(0.1)
+        self.assertTrue(any("com.walkcode.a-claude" in l for l in kicks), kicks)
+
+    def test_invalid_self_restart_delay_falls_back_and_never_kicks_now(self):
+        # `sleep garbage; kickstart` would fire the kickstart immediately —
+        # the exact suicide the guard prevents. Invalid delay must warn, fall
+        # back to 120s, and the self label must NOT restart during the test.
+        log = self.tmp / "launchctl.log"
+        listing = "\n".join(
+            [
+                "1\t0\tcom.walkcode.a-claude",
+                "2\t0\tcom.walkcode.b-codex",
+            ]
+        )
+        r = self._run("upgrade.sh", extra_env=self._upgrade_env(
+            FAKE_LAUNCHCTL_LOG=str(log),
+            FAKE_LAUNCHCTL_LIST=listing,
+            WALKCODE_DRIVER_LABEL="com.walkcode.a-claude",
+            WALKCODE_SELF_RESTART_DELAY="abc",
+        ))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertRegex(r.stdout + r.stderr, r"invalid|非法")
+        time.sleep(1.0)
+        kicks = [l for l in log.read_text().splitlines() if "kickstart" in l]
+        self.assertTrue(any("com.walkcode.b-codex" in l for l in kicks), kicks)
+        self.assertFalse(any("com.walkcode.a-claude" in l for l in kicks), kicks)
+
     def test_self_driver_dry_run_prints_plan_without_scheduling(self):
         log = self.tmp / "launchctl.log"
         listing = "1\t0\tcom.walkcode.a-claude"

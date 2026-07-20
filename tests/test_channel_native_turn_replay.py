@@ -87,12 +87,14 @@ def _transport_caps() -> TransportCapabilities:
     )
 
 
-def _pending_turn_lost_event() -> AgentEvent:
+def _pending_turn_lost_event(*, traffic_seen: bool = False, pending_lost: int = 1) -> AgentEvent:
     return AgentEvent(
         AgentEventType.SESSION_ERROR,
         {
             "message": "代理进程在生成回复前退出了，你刚发送的消息没有被处理；请重发一次。",
             "reason": "pending_turn_lost",
+            "traffic_seen": traffic_seen,
+            "pending_lost": pending_lost,
         },
     )
 
@@ -280,10 +282,125 @@ class TurnReplayTests(unittest.TestCase):
         )
 
 
+class TurnReplaySafetyTests(unittest.TestCase):
+    """Review R1 adoptions: partial execution, supersession, stash hygiene."""
+
+    def test_traffic_seen_refuses_replay_and_says_so(self):
+        # A turn that already streamed output may have executed side effects;
+        # replaying it re-executes them. Refuse and tell the truth.
+        orchestrator, transport, channel, session, _clock = _orchestrator()
+        orchestrator.turn_replay_delays = (0.0,)
+        transport._scripted_events = [_pending_turn_lost_event(traffic_seen=True)]
+
+        async def scenario():
+            await orchestrator.submit_user_input(
+                session.session_id,
+                TurnInput(text="deploy prod", created_at=990.0),
+                actor=_actor("owner"),
+                generation=session.generation,
+            )
+            await _drain_replay_tasks(orchestrator)
+
+        asyncio.run(scenario())
+
+        self.assertEqual([turn.text for turn in transport.submitted_turns], ["deploy prod"])
+        self.assertTrue(
+            any("不自动重发" in text for text in _error_texts(channel)),
+            f"no partial-execution notice in {channel.sent_views!r}",
+        )
+        self.assertNotIn(session.session_id, orchestrator._turn_replays)
+
+    def test_superseded_entry_is_not_replayed(self):
+        # replay_id identity pin: a newer accepted submit overwrites the
+        # stash; the old sleeping replay task must yield even when the new
+        # input landed inside the 0.5s watermark tolerance (R1 old-new-old).
+        orchestrator, transport, _channel, session, _clock = _orchestrator()
+        orchestrator.turn_replay_delays = (0.05,)
+        transport._scripted_events = [_pending_turn_lost_event()]
+
+        async def scenario():
+            await orchestrator.submit_user_input(
+                session.session_id,
+                TurnInput(text="old", created_at=990.0),
+                actor=_actor("owner"),
+                generation=session.generation,
+            )
+            # New human input 0.2s later — inside the watermark tolerance.
+            await orchestrator.submit_user_input(
+                session.session_id,
+                TurnInput(text="new", created_at=990.2),
+                actor=_actor("owner"),
+                generation=session.generation,
+            )
+            await asyncio.sleep(0.15)
+            await _drain_replay_tasks(orchestrator)
+
+        asyncio.run(scenario())
+
+        self.assertEqual(
+            [turn.text for turn in transport.submitted_turns],
+            ["old", "new"],
+            "superseded replay must not resubmit the old message",
+        )
+
+    def test_empty_submit_clears_previous_stash(self):
+        # An empty watermark submit is newer human input: a stale entry left
+        # behind would replay an already-answered message if the empty
+        # submit's worker dies (R1 tests#4).
+        orchestrator, transport, _channel, session, _clock = _orchestrator()
+
+        async def scenario():
+            await orchestrator.submit_user_input(
+                session.session_id,
+                TurnInput(text="ship it", created_at=990.0),
+                actor=_actor("owner"),
+                generation=session.generation,
+            )
+            self.assertIn(session.session_id, orchestrator._turn_replays)
+            await orchestrator.submit_user_input(
+                session.session_id,
+                TurnInput(text="   ", created_at=991.0),
+                actor=_actor("owner"),
+                generation=session.generation,
+            )
+
+        asyncio.run(scenario())
+
+        self.assertNotIn(session.session_id, orchestrator._turn_replays)
+
+    def test_missing_resume_ref_rejection_notifies_channel(self):
+        # A failure-class rejection has no successor speaking for us — the
+        # user holds a "will auto-resend" promise and must hear the truth.
+        orchestrator, transport, channel, session, _clock = _orchestrator()
+        orchestrator.turn_replay_delays = (0.0,)
+        # No durable resume identity: the replay's fresh resume is rejected.
+        session.transport_ref.pop("agent_session_id", None)
+        transport._scripted_events = [_pending_turn_lost_event()]
+
+        async def scenario():
+            await orchestrator.submit_user_input(
+                session.session_id,
+                TurnInput(text="ship it", created_at=990.0),
+                actor=_actor("owner"),
+                generation=session.generation,
+            )
+            # Simulate the worker being gone so the replay must resume fresh.
+            session.lifecycle_state = "ERROR_RECOVERABLE"
+            session.writer_lease = None
+            await _drain_replay_tasks(orchestrator)
+
+        asyncio.run(scenario())
+
+        self.assertTrue(
+            any("自动重发失败" in text for text in _error_texts(channel)),
+            f"no failure notice in {channel.sent_views!r}",
+        )
+
+
 class DriverLabelExportTests(unittest.TestCase):
     def test_label_derived_from_env_file(self):
         env = {"WALKCODE_ENV_FILE": "/Users/x/.walkcode/personal-claude.env"}
-        self.assertEqual(_export_driver_label(env), "com.walkcode.personal-claude")
+        self.assertEqual(_export_driver_label(environ=env), "com.walkcode.personal-claude")
         self.assertEqual(env["WALKCODE_DRIVER_LABEL"], "com.walkcode.personal-claude")
 
     def test_existing_label_wins(self):
@@ -291,12 +408,12 @@ class DriverLabelExportTests(unittest.TestCase):
             "WALKCODE_ENV_FILE": "/Users/x/.walkcode/personal-claude.env",
             "WALKCODE_DRIVER_LABEL": "com.walkcode.custom",
         }
-        self.assertEqual(_export_driver_label(env), "com.walkcode.custom")
+        self.assertEqual(_export_driver_label(environ=env), "com.walkcode.custom")
         self.assertEqual(env["WALKCODE_DRIVER_LABEL"], "com.walkcode.custom")
 
     def test_no_env_file_no_label(self):
         env = {}
-        self.assertEqual(_export_driver_label(env), "")
+        self.assertEqual(_export_driver_label(environ=env), "")
         self.assertNotIn("WALKCODE_DRIVER_LABEL", env)
 
 
