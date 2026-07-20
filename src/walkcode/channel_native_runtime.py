@@ -1390,6 +1390,19 @@ class ChannelNativeRuntime:
             command = _telegram_bot_command(inbound)
             if command:
                 result = await self._handle_telegram_bot_command(channel, inbound, command)
+                if (
+                    not result.accepted
+                    and str(getattr(result, "reason", "") or "") == "stale_inbound"
+                ):
+                    # ADR 0057：滞留的控制命令被拦时同样不能静默（本分支
+                    # 提前返回，走不到通用拒绝提示）。
+                    try:
+                        await channel.send_view(
+                            reply_binding,
+                            {"type": "text", "text": _LARK_REJECTION_NOTES["stale_inbound"]},
+                        )
+                    except Exception:
+                        pass
                 self._complete_lark_local_inbound(inbound)
                 self.save_state()
                 return result
@@ -4021,6 +4034,11 @@ class ChannelNativeRuntime:
                     )
             return
         text = _tui_hook_text(hook_type, payload)
+        if hook_type == "user-prompt-submit" and not text:
+            # 空文本不可能是回显；先盖水位再走后面的空文本早退。
+            self.orchestrator._stamp_last_user_input(
+                session, float(payload.get("_walkcode_hook_captured_at") or 0.0)
+            )
         if hook_type in {"stop", "user-prompt-submit"}:
             # The turn-final text goes out as its own bubble below; skipping
             # the cursor past it keeps it from doubling as a narration line.
@@ -4054,7 +4072,15 @@ class ChannelNativeRuntime:
         if hook_type == "user-prompt-submit" and self.orchestrator.consume_daemon_reply_echo(
             session.session_id, text
         ):
+            # 频道注入的回显不是终端输入：抬水位会让频道后续连发被误判
+            # 滞留（ADR 0057 审查 R1）。daemon 直写路径已盖过频道时间。
             return
+        if hook_type == "user-prompt-submit":
+            # ADR 0057：真实终端输入推进"最近一次被人说话"的时刻（hook
+            # 捕获时间，非排水时间）；统一走带毒时间戳防护的盖章助手。
+            self.orchestrator._stamp_last_user_input(
+                session, float(payload.get("_walkcode_hook_captured_at") or 0.0)
+            )
         session.last_event_seq += 1
         view = (
             {"type": "tui_user_input", "input": text}
@@ -4825,6 +4851,8 @@ _LARK_REJECTION_NOTES = {
     # ADR 0056：上一个 worker 进程尚未确认退出时拒绝拉新（防双写）；
     # 静默丢消息会让用户以为发送成功（deep-review R3）。
     "resume_failed": "⚠️ 这条消息没有提交：上一个进程还没退干净。稍等几秒，把这条消息再发一次即可。",
+    # ADR 0057：离线滞留的旧消息，会话已被更新输入推进时不自动提交。
+    "stale_inbound": "⏸️ 这条消息没有提交：它在滞留期间，会话已被更新的输入推进，语境可能已失效。仍需要请重新发送。",
 }
 
 
