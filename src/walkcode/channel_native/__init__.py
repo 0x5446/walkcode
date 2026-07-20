@@ -6545,7 +6545,10 @@ class ClaudeHeadlessTransport:
                         # 权限事件可先于任何流消息浮出；获准的工具可能已
                         # 执行副作用——必须计入流量，否则 EOF 会把"已授权
                         # 已执行"判成零流量并自动重放（R2 Critical）。
-                        user_turn_traffic = True
+                        # R3 精化：注入回合开着时浮出的权限属于注入回合，
+                        # 不算排队用户消息的流量；回合归属不明时保守计入。
+                        if not (turn_open and current_turn_injected):
+                            user_turn_traffic = True
                         yield floated
                     continue
                 try:
@@ -8670,9 +8673,11 @@ class Orchestrator:
             if current_replay is None or current_replay.get("replay_id") != replay_guard:
                 return SubmitResult(False, "replay_superseded")
         # ADR 0058：先登记再提交（提交等待期间 EOF 时暂存必须已指向本条，
-        # 否则会误重放上一条已完成消息）；失败路径按 replay_id 回滚。
-        replay_entry_id = self._remember_replayable_turn(
-            session, turn, actor, attempt=replay_attempt
+        # 否则会误重放上一条已完成消息）；失败路径按 replay_id 还原旧态。
+        # 水位值只预计算一次：登记和成功后落章用同一个值（R3 issue#4）。
+        stamp_value = self._effective_input_stamp(session, turn.created_at)
+        replay_entry_id, replaced_entry = self._remember_replayable_turn(
+            session, turn, actor, attempt=replay_attempt, stamp_value=stamp_value
         )
         self._record_turn_submitted(session)
         try:
@@ -8685,12 +8690,22 @@ class Orchestrator:
                 retry = await self._resume_writer_for_submit(session, transport, actor)
                 if not retry.accepted:
                     raise
+                if replay_guard:
+                    # R3 Critical：resume 的 await 窗口里更新的人类提交可能
+                    # 已覆盖暂存并先行发出——重放的第二次发送前必须再对
+                    # 一次钉子，否则 old 追着 new 执行的顺序又回来了。
+                    current_replay = self._turn_replays.get(session_id)
+                    if (
+                        current_replay is None
+                        or current_replay.get("replay_id") != replay_entry_id
+                    ):
+                        return SubmitResult(False, "replay_superseded")
                 handle = self._handle_for_session(session)
                 await transport.submit_turn(
                     handle, turn, idempotency_key=f"{session_id}:{generation}:{turn.text}"
                 )
         except Exception:
-            self._forget_replayable_turn(session_id, replay_entry_id)
+            self._rollback_replayable_turn(session_id, replay_entry_id, replaced_entry)
             session.last_progress_at = self._now()
             session.last_progress_event = "turn.submit_failed"
             session.lifecycle_state = "ERROR_RECOVERABLE"
@@ -8698,8 +8713,8 @@ class Orchestrator:
             raise
         # ADR 0057：记录"最近一次被人说话"的时刻。频道消息用渠道产生时刻
         # （不是提交时刻——否则快速连发的第二条会被时效守卫误判），无时间
-        # 戳的输入退化为本机当前时间。
-        self._stamp_last_user_input(session, turn.created_at)
+        # 戳的输入退化为本机当前时间。与登记时同值落章（R3 issue#4）。
+        session.last_user_input_at = max(session.last_user_input_at, stamp_value)
         # "Got it, on it" reaction on the user's message — the status card
         # says the turn started, but the emoji is the at-a-glance receipt.
         await self._react_ack(session, ack_message_id)
@@ -8971,20 +8986,24 @@ class Orchestrator:
         actor: ActorRef,
         *,
         attempt: int,
-    ) -> str:
+        stamp_value: float,
+    ) -> tuple[str, dict[str, Any] | None]:
         """ADR 0058：记住 worker 已接受、但可能死于回答之前的最后一条提交。
 
         R2：在**提交发出前**登记（而非提交成功后）——否则提交等待期间
         worker EOF，排水看到 pending_turn_lost 时暂存里还是上一条已完成
-        消息，会把它误重放（R2 复现 old-new-old 的另一半）。失败路径由
-        调用方用返回的 replay_id 调 _forget_replayable_turn 回滚。
+        消息，会把它误重放（R2 复现 old-new-old 的另一半）。返回
+        (replay_id, 被覆盖的旧条目)；失败路径由调用方调
+        _rollback_replayable_turn 还原（R3：光删不还原会把上一条仍在
+        等回答的有效暂存永久丢掉）。
         """
+        previous = self._turn_replays.get(session.session_id)
         if not (turn.text.strip() or turn.attachments):
             # 空提交只为盖水位（ADR 0057 R2），没有内容可重放——并且它是
             # 更新的人类输入，必须让旧暂存一并失效，否则空提交丢失时会
             # 误重放上一条早已回答过的消息（审查 R1 tests#4）。
             self._turn_replays.pop(session.session_id, None)
-            return ""
+            return "", previous
         replay_id = uuid.uuid4().hex
         self._turn_replays[session.session_id] = {
             # 身份钉子：新提交覆盖暂存后，还睡在退避里的旧重放任务靠它
@@ -8994,20 +9013,29 @@ class Orchestrator:
             "turn": turn,
             "actor": actor,
             "attempt": int(attempt),
-            # 预计算"盖章后"的水位（提交成功后才真正落章）：无时间戳输入
-            # 盖的是本机当前时间，拿 created_at(=0) 对比会把自己误判成
-            # "已被推进"。
-            "watermark": self._effective_input_stamp(session, turn.created_at),
+            # 与成功后落章**同一个**预计算值（R3：落章时重读当前时间会让
+            # 无时间戳消息在慢提交后越过自己的水位，自我封禁重放）。
+            "watermark": stamp_value,
         }
-        return replay_id
+        return replay_id, previous
 
-    def _forget_replayable_turn(self, session_id: str, replay_id: str) -> None:
-        """回滚一次预登记——仅当暂存还是我们写的那条（没被更新提交覆盖）。"""
-        if not replay_id:
-            return
+    def _rollback_replayable_turn(
+        self,
+        session_id: str,
+        replay_id: str,
+        previous: dict[str, Any] | None,
+    ) -> None:
+        """还原一次预登记到提交前的状态——仅当没被更新的提交覆盖。"""
         current = self._turn_replays.get(session_id)
-        if current is not None and current.get("replay_id") == replay_id:
-            self._turn_replays.pop(session_id, None)
+        if replay_id:
+            if current is not None and current.get("replay_id") == replay_id:
+                if previous is not None:
+                    self._turn_replays[session_id] = previous
+                else:
+                    self._turn_replays.pop(session_id, None)
+        elif current is None and previous is not None:
+            # 空提交把旧条目 pop 掉后自身失败：槽位还空着才还原。
+            self._turn_replays[session_id] = previous
 
     def _maybe_schedule_turn_replay(self, session: Session) -> float | None:
         """pending_turn_lost 时调度自动重放；返回延迟秒数，None=不重放。

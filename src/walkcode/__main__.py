@@ -233,6 +233,16 @@ def _schedule_deferred_self_restart(label: str) -> None:
     delay = delay_raw if (delay_raw.isascii() and delay_raw.isdigit()) else "120"
     if delay != delay_raw:
         print(f"invalid WALKCODE_SELF_RESTART_DELAY {delay_raw!r}; using 120s.")
+    # Say everything and FLUSH before starting the timer (R3): with a
+    # zero/short delay the detached kickstart could otherwise kill the driver
+    # before buffered output lands.
+    print(
+        f"this upgrade runs inside a session driven by {label}; its restart is "
+        f"deferred by {delay}s (detached). Wrap up the final reply now — the "
+        "session revives on the next message.",
+        flush=True,
+    )
+    sys.stderr.flush()
     uid = str(os.getuid())
     subprocess.Popen(
         [
@@ -248,11 +258,6 @@ def _schedule_deferred_self_restart(label: str) -> None:
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
-    )
-    print(
-        f"this upgrade runs inside a session driven by {label}; its restart is "
-        f"deferred by {delay}s (detached). Wrap up the final reply now — the "
-        "session revives on the next message."
     )
 
 

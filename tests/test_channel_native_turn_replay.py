@@ -426,6 +426,126 @@ class ReplayGuardTests(unittest.TestCase):
         self.assertEqual(result.reason, "replay_superseded")
         self.assertEqual(transport.submitted_turns, [])
 
+    def test_resume_retry_rechecks_guard_before_second_send(self):
+        # R3 Critical: guard passes, first send hits TransportUnavailable,
+        # and DURING the writer resume a newer human submit overwrites the
+        # stash — the second send must abort, not restore old-after-new.
+        from walkcode.channel_native import TransportUnavailable
+
+        orchestrator, transport, _channel, session, _clock = _orchestrator()
+        sid = session.session_id
+        orchestrator._turn_replays[sid] = {
+            "replay_id": "orig",
+            "turn": TurnInput(text="old"),
+            "actor": _actor("owner"),
+            "attempt": 0,
+            "watermark": 990.0,
+        }
+
+        original_submit = transport.submit_turn
+        calls = {"n": 0}
+
+        async def flaky(handle, turn, idempotency_key):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise TransportUnavailable("worker settled")
+            await original_submit(handle, turn, idempotency_key=idempotency_key)
+
+        transport.submit_turn = flaky
+
+        async def fake_resume(session_arg, transport_arg, actor_arg):
+            # A newer human submit completes inside the resume window.
+            orchestrator._turn_replays[sid] = {
+                "replay_id": "intruder",
+                "turn": TurnInput(text="new"),
+                "actor": _actor("owner"),
+                "attempt": 0,
+                "watermark": 991.0,
+            }
+            from walkcode.channel_native import SubmitResult
+
+            return SubmitResult(True)
+
+        orchestrator._resume_writer_for_submit = fake_resume
+
+        result = asyncio.run(
+            orchestrator.submit_user_input(
+                sid,
+                TurnInput(text="old", created_at=980.0),
+                actor=_actor("owner"),
+                generation=session.generation,
+                replay_guard="orig",
+            )
+        )
+
+        self.assertFalse(result.accepted)
+        self.assertEqual(result.reason, "replay_superseded")
+        self.assertEqual(
+            [turn.text for turn in transport.submitted_turns],
+            [],
+            "the old replay must never reach the transport after supersession",
+        )
+
+    def test_watermark_stamp_matches_prestage_for_timestampless_turns(self):
+        # R3: the stash watermark and the post-success stamp must be the SAME
+        # precomputed value — re-reading the clock after a slow submit made
+        # timestampless (created_at=0) turns overrun their own watermark and
+        # self-block their replay.
+        orchestrator, transport, _channel, session, clock = _orchestrator()
+
+        original_submit = transport.submit_turn
+
+        async def slow_submit(handle, turn, idempotency_key):
+            clock.now += 5.0
+            await original_submit(handle, turn, idempotency_key=idempotency_key)
+
+        transport.submit_turn = slow_submit
+
+        asyncio.run(
+            orchestrator.submit_user_input(
+                session.session_id,
+                TurnInput(text="no timestamp", created_at=0.0),
+                actor=_actor("owner"),
+                generation=session.generation,
+            )
+        )
+
+        entry = orchestrator._turn_replays[session.session_id]
+        self.assertEqual(entry["watermark"], session.last_user_input_at)
+
+    def test_failed_submit_restores_previous_stash_entry(self):
+        # R3: rollback must RESTORE the pre-submit entry, not just delete —
+        # the previous accepted turn may still be awaiting its answer.
+        orchestrator, transport, _channel, session, _clock = _orchestrator()
+
+        async def scenario():
+            await orchestrator.submit_user_input(
+                session.session_id,
+                TurnInput(text="first", created_at=990.0),
+                actor=_actor("owner"),
+                generation=session.generation,
+            )
+            first_id = orchestrator._turn_replays[session.session_id]["replay_id"]
+
+            async def boom(handle, turn, idempotency_key):
+                raise RuntimeError("submit boom")
+
+            transport.submit_turn = boom
+            with self.assertRaises(RuntimeError):
+                await orchestrator.submit_user_input(
+                    session.session_id,
+                    TurnInput(text="second", created_at=991.0),
+                    actor=_actor("owner"),
+                    generation=session.generation,
+                )
+            return first_id
+
+        first_id = asyncio.run(scenario())
+        entry = orchestrator._turn_replays.get(session.session_id)
+        self.assertIsNotNone(entry, "previous stash entry was lost by rollback")
+        self.assertEqual(entry["replay_id"], first_id)
+        self.assertEqual(entry["turn"].text, "first")
+
     def test_failed_submit_rolls_back_prestaged_entry(self):
         # Stash is written BEFORE the transport submit (so an EOF during the
         # submit window sees this turn, not the previous one); a submit that

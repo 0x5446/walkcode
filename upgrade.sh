@@ -212,6 +212,11 @@ schedule_deferred_self_restart() {
       "找不到 python3；${label} 未被重启（脱管调度需要它）。请稍后手动执行: launchctl kickstart -k gui/${UID_NUM}/${label}")"
     return
   fi
+  # Say everything BEFORE starting the timer (R3): with a zero/short delay
+  # the detached kickstart could otherwise kill the driver mid-sentence.
+  warn "$(msg \
+    "this upgrade is running inside a session driven by ${label}; its restart is deferred by ${SELF_RESTART_DELAY}s (detached). This session's driver WILL restart then — wrap up the final reply now; the session revives on the next message." \
+    "检测到本次升级正运行在 ${label} 驱动的会话里；已安排 ${SELF_RESTART_DELAY}s 后脱管重启（立即重启会切断当前会话自己的驱动进程）。届时本会话会短暂中断，请提前说完收尾结论；之后发消息会触发复活。")"
   # start_new_session=True detaches from our process group: the restart must
   # survive the very SIGTERM it is about to deliver to our ancestry.
   # `&&` (not `;`): a failed sleep must NEVER fall through to an immediate
@@ -229,9 +234,6 @@ subprocess.Popen(
     stderr=subprocess.DEVNULL,
 )
 PY
-  warn "$(msg \
-    "this upgrade is running inside a session driven by ${label}; its restart is deferred by ${SELF_RESTART_DELAY}s (detached). This session's driver WILL restart then — wrap up the final reply now; the session revives on the next message." \
-    "检测到本次升级正运行在 ${label} 驱动的会话里；已安排 ${SELF_RESTART_DELAY}s 后脱管重启（立即重启会切断当前会话自己的驱动进程）。届时本会话会短暂中断，请提前说完收尾结论；之后发消息会触发复活。")"
 }
 
 RESTARTED_LABELS=()
