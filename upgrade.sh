@@ -204,6 +204,14 @@ schedule_deferred_self_restart() {
       "$SELF_RESTART_DELAY" "$UID_NUM" "$label"
     return
   fi
+  # No python3 → no detached scheduler. Failing safe means NOT restarting the
+  # self driver at all (manual kickstart later), never restarting it now.
+  if ! command -v python3 >/dev/null 2>&1; then
+    warn "$(msg \
+      "python3 not found; ${label} was NOT restarted (its restart needs a detached scheduler). Run manually later: launchctl kickstart -k gui/${UID_NUM}/${label}" \
+      "找不到 python3；${label} 未被重启（脱管调度需要它）。请稍后手动执行: launchctl kickstart -k gui/${UID_NUM}/${label}")"
+    return
+  fi
   # start_new_session=True detaches from our process group: the restart must
   # survive the very SIGTERM it is about to deliver to our ancestry.
   # `&&` (not `;`): a failed sleep must NEVER fall through to an immediate
@@ -351,10 +359,12 @@ if command -v walkcode >/dev/null 2>&1; then
   fi
 fi
 
-if [ -n "$DEFERRED_SELF_LABEL" ]; then
-  schedule_deferred_self_restart "$DEFERRED_SELF_LABEL"
-fi
-
 new_ver="$(current_version)"
 new_ver="${new_ver:-unknown}"
 info "$(msg "Upgrade complete: $old_ver -> $new_ver." "升级完成: ${old_ver} -> ${new_ver}。")"
+
+if [ -n "$DEFERRED_SELF_LABEL" ]; then
+  # Dead last, after every line of output: even a zero/short delay must not
+  # kill the driver before the completion message lands (review R2).
+  schedule_deferred_self_restart "$DEFERRED_SELF_LABEL"
+fi

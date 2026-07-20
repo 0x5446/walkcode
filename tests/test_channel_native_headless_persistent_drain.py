@@ -1263,6 +1263,39 @@ class TakeoverInjectedTurnRegressionTests(unittest.TestCase):
         self.assertEqual(errors[-1].payload.get("reason"), "pending_turn_lost")
         self.assertIs(errors[-1].payload.get("traffic_seen"), True)
 
+    def test_injected_turn_traffic_does_not_mark_queued_submit_executed(self):
+        # Review R2 (cross-dimension repro): an INJECTED turn's output must
+        # not count as the queued user submit's traffic — the user's message
+        # never started, refusing its replay on this evidence is wrong.
+        async def scenario():
+            cls = _stream_client_class()
+            transport = _transport(cls, grace=0.05)
+            handle = await transport.launch_session(cwd="/tmp/p", session_id="s1")
+            await transport.submit_turn(handle, TurnInput(text="queued"), "k1")
+            client = transport._clients[handle.handle_id]
+            collected: list = []
+            consumer = asyncio.create_task(_consume(transport, handle, collected))
+            # A user-role stream message opens an injected turn (submitted
+            # prompts are never echoed back on the stream)...
+            client.feed({"type": "user", "role": "user", "content": "<task-notification>t</task-notification>"})
+            await asyncio.sleep(0.02)
+            # ...and its assistant output is injected-turn traffic.
+            client.feed(_assistant("injected turn output"))
+            await asyncio.sleep(0.02)
+            client.feed_eof()
+            await asyncio.wait_for(consumer, timeout=5.0)
+            return collected
+
+        events = asyncio.run(scenario())
+        errors = [e for e in events if e.type == AgentEventType.SESSION_ERROR]
+        self.assertTrue(errors, "worker death with a queued submit was silent")
+        self.assertEqual(errors[-1].payload.get("reason"), "pending_turn_lost")
+        self.assertIs(
+            errors[-1].payload.get("traffic_seen"),
+            False,
+            "injected-turn traffic must not mark the queued submit as executed",
+        )
+
     def test_reply_with_text_after_expired_prediction_consumes_submit(self):
         # Round-3 review Critical: prediction expiry must be evaluated at
         # turn-classification time (the pending wait sleeps on the ceiling and

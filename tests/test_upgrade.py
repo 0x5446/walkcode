@@ -79,6 +79,58 @@ class UpgradeV3Tests(unittest.TestCase):
         self.assertIn("&&", argv[2])
         self.assertNotIn(";", argv[2])
 
+    def test_schedule_deferred_self_restart_rejects_fullwidth_digits(self):
+        # str.isdigit() accepts full-width digits the system sleep rejects —
+        # the detached restarter would die silently (review R2 shell#2).
+        popens = []
+        with patch.object(m.subprocess, "Popen", lambda *a, **kw: popens.append(a[0])), \
+             patch.dict("os.environ", {"WALKCODE_SELF_RESTART_DELAY": "１２"}, clear=True):
+            m._schedule_deferred_self_restart("com.walkcode.a-claude")
+        self.assertEqual(popens[0][4], "120", popens[0])
+
+    def test_upgrade_schedules_self_restart_after_all_output(self):
+        # Ordering pin (review R2 tests#5): a zero/short delay must not kill
+        # the driver before doctor and the completion message land.
+        events = []
+        with patch.object(m, "_run", lambda cmd, **kw: events.append(("run", cmd))), \
+             patch.object(m, "_get_latest_tag", lambda: None), \
+             patch.object(m, "_current_version", lambda: "0.0.0"), \
+             patch.object(m, "_schedule_deferred_self_restart",
+                          lambda label: events.append(("schedule", label))), \
+             patch.dict("os.environ", {
+                 "WALKCODE_V3_LAUNCHD_LABELS": "com.walkcode.a-claude,com.walkcode.b-codex",
+                 "WALKCODE_DRIVER_LABEL": "com.walkcode.a-claude",
+             }, clear=True):
+            m.cmd_upgrade(argparse.Namespace())
+
+        kinds = [kind for kind, _ in events]
+        self.assertIn("schedule", kinds, events)
+        self.assertEqual(kinds[-1], "schedule", f"schedule must be the last action: {events}")
+
+    def test_self_driver_label_process_tree_fallback(self):
+        # No env marker (first upgrade from an old runtime): the ps climb
+        # must find the `walkcode native serve` ancestor and map its PID to
+        # a label via launchctl list (review R2 tests#4).
+        listing = "77777\t0\tcom.walkcode.a-claude\n2\t0\tcom.walkcode.b-codex\n"
+
+        def fake_run(argv, **kwargs):
+            class R:
+                stdout = ""
+            r = R()
+            if argv[0] == "launchctl":
+                r.stdout = listing
+            elif argv[0] == "ps":
+                pid = argv[-1]
+                if pid == "77777":
+                    r.stdout = "    1 /usr/bin/python3 walkcode native serve"
+                else:
+                    r.stdout = "77777 python3 -m walkcode upgrade"
+            return r
+
+        with patch.object(m.subprocess, "run", fake_run), \
+             patch.dict("os.environ", {}, clear=True):
+            self.assertEqual(m._self_driver_label(), "com.walkcode.a-claude")
+
     def test_parse_launchd_labels_excludes_taps_and_foreign_services(self):
         listing = "\n".join(
             [

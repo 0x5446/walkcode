@@ -397,7 +397,105 @@ class TurnReplaySafetyTests(unittest.TestCase):
         )
 
 
+class ReplayGuardTests(unittest.TestCase):
+    def test_stale_replay_guard_is_rejected_before_submit(self):
+        # The last-instant identity re-check inside submit_user_input: a
+        # replay whose stash entry was overwritten during its writer-ready
+        # awaits must abort with replay_superseded, never reach the transport
+        # (review R2 Critical: new-then-old submit order).
+        orchestrator, transport, _channel, session, _clock = _orchestrator()
+        orchestrator._turn_replays[session.session_id] = {
+            "replay_id": "current-id",
+            "turn": TurnInput(text="new"),
+            "actor": _actor("owner"),
+            "attempt": 0,
+            "watermark": 990.0,
+        }
+
+        result = asyncio.run(
+            orchestrator.submit_user_input(
+                session.session_id,
+                TurnInput(text="old", created_at=980.0),
+                actor=_actor("owner"),
+                generation=session.generation,
+                replay_guard="stale-id",
+            )
+        )
+
+        self.assertFalse(result.accepted)
+        self.assertEqual(result.reason, "replay_superseded")
+        self.assertEqual(transport.submitted_turns, [])
+
+    def test_failed_submit_rolls_back_prestaged_entry(self):
+        # Stash is written BEFORE the transport submit (so an EOF during the
+        # submit window sees this turn, not the previous one); a submit that
+        # raises must roll its own entry back.
+        orchestrator, transport, _channel, session, _clock = _orchestrator()
+
+        async def boom(handle, turn, idempotency_key):
+            raise RuntimeError("submit boom")
+
+        transport.submit_turn = boom
+
+        async def scenario():
+            with self.assertRaises(RuntimeError):
+                await orchestrator.submit_user_input(
+                    session.session_id,
+                    TurnInput(text="ship it", created_at=990.0),
+                    actor=_actor("owner"),
+                    generation=session.generation,
+                )
+
+        asyncio.run(scenario())
+        self.assertNotIn(session.session_id, orchestrator._turn_replays)
+
+    def test_degrade_markers_on_yield_paths(self):
+        # R1 promised every silent yield leaves a grep-able trace; pin the
+        # marker names so a rename can't silently unwire them (R2 tests#6).
+        import contextlib as _ctx
+        import io
+
+        orchestrator, transport, _channel, session, _clock = _orchestrator()
+        orchestrator.turn_replay_delays = (0.0,)
+        transport._scripted_events = [_pending_turn_lost_event()]
+
+        stderr = io.StringIO()
+
+        async def scenario():
+            await orchestrator.submit_user_input(
+                session.session_id,
+                TurnInput(text="ship it", created_at=990.0),
+                actor=_actor("owner"),
+                generation=session.generation,
+            )
+            session.lifecycle_state = "EXTERNAL_OBSERVED_READONLY"
+            await _drain_replay_tasks(orchestrator)
+
+        with _ctx.redirect_stderr(stderr):
+            asyncio.run(scenario())
+
+        self.assertIn("turn_replay_skipped", stderr.getvalue())
+        self.assertIn("reason=lifecycle", stderr.getvalue())
+
+
 class DriverLabelExportTests(unittest.TestCase):
+    def test_config_is_the_label_source_of_truth(self):
+        # The env-file stem is a documentation convention; the real label
+        # comes from _launchd_service_label(config) — a renamed env file must
+        # not export a wrong marker (review R2 tests#3).
+        from types import SimpleNamespace
+
+        config = SimpleNamespace(
+            channel=SimpleNamespace(kind="lark"),
+            agent="claude",
+            profile="personal",
+        )
+        env = {"WALKCODE_ENV_FILE": "/tmp/renamed-anything.env"}
+        from walkcode.channel_native_runtime import _export_driver_label as export
+
+        self.assertEqual(export(config, environ=env), "com.walkcode.personal-claude")
+        self.assertEqual(env["WALKCODE_DRIVER_LABEL"], "com.walkcode.personal-claude")
+
     def test_label_derived_from_env_file(self):
         env = {"WALKCODE_ENV_FILE": "/Users/x/.walkcode/personal-claude.env"}
         self.assertEqual(_export_driver_label(environ=env), "com.walkcode.personal-claude")

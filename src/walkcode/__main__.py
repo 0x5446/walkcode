@@ -228,7 +228,9 @@ def _schedule_deferred_self_restart(label: str) -> None:
     fall through to an immediate kickstart.
     """
     delay_raw = os.environ.get("WALKCODE_SELF_RESTART_DELAY", "120")
-    delay = delay_raw if delay_raw.isdigit() else "120"
+    # isascii too: str.isdigit() accepts full-width digits, which the system
+    # `sleep` rejects — the detached restarter would die silently (review R2).
+    delay = delay_raw if (delay_raw.isascii() and delay_raw.isdigit()) else "120"
     if delay != delay_raw:
         print(f"invalid WALKCODE_SELF_RESTART_DELAY {delay_raw!r}; using 120s.")
     uid = str(os.getuid())
@@ -328,10 +330,11 @@ def cmd_upgrade(_args) -> None:
                 print(f"no env file for {label} (expected {label_env}); doctor skipped.")
         if not ran_doctor:
             _run("walkcode native doctor")
-    if deferred_self:
-        # Scheduled last: the countdown must not race the doctor tail above.
-        _schedule_deferred_self_restart(deferred_self)
     print("Upgrade complete.")
+    if deferred_self:
+        # Scheduled dead last, after every print: even a zero/short delay
+        # must not kill the driver before this command's output lands.
+        _schedule_deferred_self_restart(deferred_self)
 
 
 def cmd_uninstall(_args) -> None:

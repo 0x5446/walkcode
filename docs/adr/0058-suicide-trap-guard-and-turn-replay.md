@@ -99,3 +99,30 @@ generation 已就位）。用户在飞书上盲等半小时，直到自己去终
     无法复活。
   - 延迟重启是定时的，不感知"到点时是否正有新回合在跑"；被切断的
     回合由 traffic_seen 分界决定重放或如实报告。
+
+## R2 修订（2026-07-20 收口轮采纳）
+
+- **traffic_seen 语义精化**：真源改为"非注入回合的流量"（`user_turn_traffic`）。
+  注入回合（通知重放等 CLI 发起）的输出不代表排队中的用户消息动过手——
+  按旧口径会误拒安全重放；浮出的权限事件计入流量——获准的工具可能已
+  产生副作用，按旧口径会漏判并重复执行（R2 Critical）。非注入回合终局
+  时清零。
+- **暂存前置**：`_remember_replayable_turn` 挪到 transport 提交**之前**
+  （水位值预计算、失败按 replay_id 回滚）。否则提交等待期间 EOF，排水
+  看到的暂存还是上一条已完成消息，会误重放它（R2 Critical 复现）。
+- **replay_guard 终审**：重放提交在 writer 恢复等 await 之后、真正发出
+  之前，最后一刻复核身份钉子；被更新提交覆盖即返回 `replay_superseded`
+  自灭（R2 Critical 复现 new-then-old）。残余窗口收窄到 transport 提交
+  自身的单次 await，接受。
+- **延迟调度收尾化 + 依赖加固**：两个入口的脱管调度都放在全部输出之后
+  （零/短延迟也不会砍掉收尾消息）；CLI 延迟校验加 isascii（全角数字会
+  让 sleep 静默失败）；upgrade.sh 缺 python3 时拒绝重启 self（提示手动
+  kickstart），绝不退化为立即重启。
+- **无法代码修复、发布说明承接的版本偏差**：从 ≤0.14.9 首次升级时，
+  正在运行的旧版 `walkcode upgrade` / 旧 runtime 里的会话不受新守卫保护
+  （旧代码已加载，换盘上文件不热更新）。首次升级请在会话外执行，或用
+  仓库最新 upgrade.sh；此后升级由标记面全覆盖。
+- **遗留边界（记录，暂不做）**：长生命周期 codex app-server daemon 若
+  先于新 runtime 启动并被复用，其 worker 缺环境标记且祖先链不含
+  `walkcode native serve`——codex 会话的守卫要等 daemon 重启后生效；
+  CLI 脱管重启子进程失败仍静默（与 shell 同边界）。

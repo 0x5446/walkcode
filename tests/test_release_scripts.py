@@ -436,6 +436,11 @@ esac
                 "2\t0\tcom.walkcode.b-codex",
             ]
         )
+        # A failing fake `sleep` kills the detached timer instantly: no
+        # leaked 120s process outliving the test, and the `&&` chain must
+        # prevent the kickstart from firing (review R2 tests#2).
+        _write_exe(self.fakebin / "sleep", "#!/usr/bin/env bash\nexit 1\n")
+        self.addCleanup(lambda: (self.fakebin / "sleep").unlink())
         r = self._run("upgrade.sh", extra_env=self._upgrade_env(
             FAKE_LAUNCHCTL_LOG=str(log),
             FAKE_LAUNCHCTL_LIST=listing,
