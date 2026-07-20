@@ -748,6 +748,8 @@ class InboundEvent:
     attachments: list[AttachmentRef] = field(default_factory=list)
     callback: dict[str, Any] | None = None
     raw: dict[str, Any] = field(default_factory=dict)
+    # 渠道侧消息产生时刻（秒，飞书服务端时钟）；0=未知（回调等无此概念）。
+    created_at: float = 0.0
 
     def binding_key(self) -> BindingKey:
         return (
@@ -801,6 +803,8 @@ class TransportHandle:
 class TurnInput:
     text: str
     attachments: list[AttachmentRef] = field(default_factory=list)
+    # 消息在来源渠道的产生时刻（飞书 create_time，秒）；0=未知。
+    created_at: float = 0.0
 
 
 @dataclass
@@ -887,6 +891,9 @@ class Session:
     running_since: float = 0.0
     last_progress_at: float = 0.0
     last_progress_event: str = ""
+    # 会话最近一次"被人说话"的时刻（ADR 0057）：频道消息记其渠道产生时刻
+    # （同源同钟），终端输入记 hook 捕获时刻。滞留消息时效守卫的比较基准。
+    last_user_input_at: float = 0.0
     archived_at: float = 0.0
     archived_by: str = ""
     archive_reason: str = ""
@@ -1399,6 +1406,7 @@ def _session_to_dict(session: Session) -> dict[str, Any]:
         "running_since": session.running_since,
         "last_progress_at": session.last_progress_at,
         "last_progress_event": session.last_progress_event,
+        "last_user_input_at": session.last_user_input_at,
         "archived_at": session.archived_at,
         "archived_by": session.archived_by,
         "archive_reason": session.archive_reason,
@@ -1434,6 +1442,7 @@ def _session_from_dict(data: dict[str, Any]) -> Session:
         interrupt_reason=str(data.get("interrupt_reason", "")),
         running_since=float(data.get("running_since", 0.0)),
         last_progress_at=float(data.get("last_progress_at", 0.0)),
+        last_user_input_at=float(data.get("last_user_input_at", 0.0)),
         last_progress_event=str(data.get("last_progress_event", "")),
         archived_at=float(data.get("archived_at", 0.0)),
         archived_by=str(data.get("archived_by", "")),
@@ -5153,6 +5162,10 @@ class LarkChannelAdapter:
                     f"超出上限，仅保留前 {self._MAX_POST_ATTACHMENTS} 个]"
                 )
                 text = f"{text}\n{note}" if text.strip() else note
+            try:
+                created_at = float(message.get("create_time", 0) or 0) / 1000.0
+            except (TypeError, ValueError):
+                created_at = 0.0
             return InboundEvent(
                 event_id=f"lark:{event_id}",
                 channel_kind="lark",
@@ -5166,6 +5179,7 @@ class LarkChannelAdapter:
                 text=text,
                 attachments=attachments,
                 raw=payload,
+                created_at=created_at,
             )
         action = event.get("action", {})
         value = action.get("value", {}) if isinstance(action, dict) else {}
@@ -8621,6 +8635,12 @@ class Orchestrator:
             session.lifecycle_state = "ERROR_RECOVERABLE"
             await self.refresh_session_status_card(session)
             raise
+        # ADR 0057：记录"最近一次被人说话"的时刻。频道消息用渠道产生时刻
+        # （不是提交时刻——否则快速连发的第二条会被时效守卫误判），无时间
+        # 戳的输入退化为本机当前时间。
+        session.last_user_input_at = max(
+            session.last_user_input_at, float(turn.created_at or 0.0) or self._now()
+        )
         # "Got it, on it" reaction on the user's message — the status card
         # says the turn started, but the emoji is the at-a-glance receipt.
         await self._react_ack(session, ack_message_id)
@@ -8854,6 +8874,25 @@ class Orchestrator:
     def _durable_resume_ref(session: Session) -> dict[str, Any]:
         return _durable_resume_ref(session)
 
+    _STALE_INBOUND_TOLERANCE_SECONDS = 5.0
+    _STALE_INBOUND_MIN_AGE_SECONDS = 30.0
+
+    def _inbound_is_stale_for_session(self, inbound: InboundEvent, session: Session) -> bool:
+        """ADR 0057：离线滞留的旧消息不追着已被推进的会话跑。
+
+        断连期间飞书会积压事件、重连后原样补推；若期间会话已被更新的输入
+        （终端或更晚的频道消息）推进，滞留消息的语境已失效——自动提交
+        （乃至触发复活）弊大于利。双保险防时钟撞车：仅当消息比会话最近
+        一次用户输入早 5 秒以上、且自身已滞留 ≥30 秒才拦；同源（频道对
+        频道）比较全走飞书同一时钟，无偏差。宁可放过，不可错杀。
+        """
+        created = float(getattr(inbound, "created_at", 0.0) or 0.0)
+        if created <= 0 or session.last_user_input_at <= 0:
+            return False
+        if self._now() - created < self._STALE_INBOUND_MIN_AGE_SECONDS:
+            return False
+        return created < session.last_user_input_at - self._STALE_INBOUND_TOLERANCE_SECONDS
+
     def _revival_transport_ready(self, session: Session) -> bool:
         """Whether an ADR 0054 revival could actually be carried out here.
 
@@ -8872,12 +8911,12 @@ class Orchestrator:
 
     async def prepare_turn_from_inbound(self, inbound: InboundEvent) -> TurnInput | SubmitResult:
         if not inbound.attachments:
-            return TurnInput(text=inbound.text)
+            return TurnInput(text=inbound.text, created_at=inbound.created_at)
         channel = self.channels.get(inbound.channel_kind)
         if channel is None or not channel.capabilities().attachment_download:
             return SubmitResult(False, BlockedReason.CAPABILITY_DISABLED)
         attachments = [await channel.download_attachment(attachment) for attachment in inbound.attachments]
-        return TurnInput(text=inbound.text, attachments=attachments)
+        return TurnInput(text=inbound.text, attachments=attachments, created_at=inbound.created_at)
 
     async def interrupt_session(
         self,
@@ -9365,8 +9404,15 @@ class Orchestrator:
                                 await self._delete_blocked_readonly_input_if_possible(inbound, session, result)
                         else:
                             session = self.sessions.get(resolution.session_id)
-                            turn = await self.prepare_turn_from_inbound(inbound)
-                            if isinstance(turn, SubmitResult):
+                            if self._inbound_is_stale_for_session(inbound, session):
+                                _log_degrade(
+                                    "stale_inbound_refused",
+                                    session_id=session.session_id,
+                                    created_at=inbound.created_at,
+                                    last_user_input_at=session.last_user_input_at,
+                                )
+                                result = SubmitResult(False, "stale_inbound")
+                            elif isinstance(turn := await self.prepare_turn_from_inbound(inbound), SubmitResult):
                                 result = turn
                             else:
                                 result = await self.submit_user_input(
@@ -11055,6 +11101,9 @@ def _submit_result_completes_inbound_ledger(result: SubmitResult) -> bool:
         # same event would only re-send the note. LEASE_EXPIRED deliberately
         # stays out — redelivery retries the submit once the lease recovers.
         BlockedReason.SESSION_STOPPED,
+        # ADR 0057: a stale (stranded) inbound is terminally refused — a
+        # redelivery would only be refused again and re-send the note.
+        "stale_inbound",
         "keep_readonly",
     }
 
