@@ -22,6 +22,7 @@ import shutil
 import stat
 import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -346,6 +347,54 @@ class UpgradeGateTests(_ScriptGateBase):
         self.assertTrue(any("com.walkcode.a-claude" in l for l in kicks), kicks)
         self.assertFalse(any("tap-work" in l for l in kicks), kicks)
         self.assertRegex(r.stdout + r.stderr, r"tap proxy|tap 代理")
+
+    def test_self_driver_label_restart_is_deferred(self):
+        # ADR 0058 suicide trap: an upgrade run from inside a session that a
+        # com.walkcode.* runtime drives must not kickstart that runtime under
+        # its own feet (2026-07-20 15:13: the restart severed the session's
+        # driver mid-turn; Feishu went silent for half an hour). The self
+        # label is deferred to a detached restart; other labels restart now.
+        log = self.tmp / "launchctl.log"
+        listing = "\n".join(
+            [
+                "1\t0\tcom.walkcode.a-claude",
+                "2\t0\tcom.walkcode.b-codex",
+            ]
+        )
+        r = self._run("upgrade.sh", extra_env=self._upgrade_env(
+            FAKE_LAUNCHCTL_LOG=str(log),
+            FAKE_LAUNCHCTL_LIST=listing,
+            WALKCODE_DRIVER_LABEL="com.walkcode.a-claude",
+            WALKCODE_SELF_RESTART_DELAY="0",
+        ))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertRegex(r.stdout + r.stderr, r"deferred|脱管重启")
+        kicks = [l for l in log.read_text().splitlines() if "kickstart" in l]
+        self.assertTrue(any("com.walkcode.b-codex" in l for l in kicks), kicks)
+        # The self label is restarted by the detached scheduler (delay 0),
+        # not by the script's own restart loop — poll briefly for it.
+        deadline = time.time() + 10.0
+        while time.time() < deadline:
+            kicks = [l for l in log.read_text().splitlines() if "kickstart" in l]
+            if any("com.walkcode.a-claude" in l for l in kicks):
+                break
+            time.sleep(0.1)
+        self.assertTrue(any("com.walkcode.a-claude" in l for l in kicks), kicks)
+
+    def test_self_driver_dry_run_prints_plan_without_scheduling(self):
+        log = self.tmp / "launchctl.log"
+        listing = "1\t0\tcom.walkcode.a-claude"
+        r = self._run("upgrade.sh", "--dry-run", extra_env=self._upgrade_env(
+            FAKE_LAUNCHCTL_LOG=str(log),
+            FAKE_LAUNCHCTL_LIST=listing,
+            WALKCODE_DRIVER_LABEL="com.walkcode.a-claude",
+            WALKCODE_SELF_RESTART_DELAY="0",
+        ))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("[dry-run] deferred self restart", r.stdout + r.stderr)
+        time.sleep(0.5)
+        kicks = [l for l in (log.read_text().splitlines() if log.exists() else []) if "kickstart" in l]
+        self.assertFalse(any("com.walkcode.a-claude" in l for l in kicks), kicks)
 
     def test_shell_scripts_brace_vars_before_cjk(self):
         # macOS bash 3.2 misparses `$VAR` glued to a CJK character as part of

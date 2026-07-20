@@ -922,6 +922,12 @@ def _session_is_external_tui_takeover_candidate(session: Session) -> bool:
 _STRUCTURED_TRANSPORT_KINDS = frozenset({"claude_headless", "codex_app_server"})
 _CHANNEL_REVIVAL_STOP_REASONS = frozenset({"runtime_restart", "revive_failed"})
 
+# ADR 0058：worker 在回答已接受的提交前退出（API 故障窗、进程崩溃）时的
+# 自动重放退避表。两档：短退避接住瞬时抖动，长退避跨过典型的过载窗口。
+TURN_REPLAY_DELAYS: tuple[float, ...] = (30.0, 300.0)
+# 水位比较容差：等值意味着水位就是这条输入自己盖的章，不算"被更新输入推进"。
+_TURN_REPLAY_WATERMARK_TOLERANCE_SECONDS = 0.5
+
 
 def _durable_resume_ref(session: Session) -> dict[str, Any]:
     """The transport ref if it carries enough identity to resume, else {}."""
@@ -6390,7 +6396,11 @@ class ClaudeHeadlessTransport:
                                 "message": (
                                     "代理进程在生成回复前退出了，你刚发送的消息没有被处理；"
                                     "请重发一次。"
-                                )
+                                ),
+                                # ADR 0058：结构化标记，让 orchestrator 识别
+                                # "已接受的提交没了"并调度自动重放，而不是
+                                # 只靠上面这句可能被代际围栏丢掉的文案。
+                                "reason": "pending_turn_lost",
                             },
                         )
                     break
@@ -8460,6 +8470,13 @@ class Orchestrator:
         # sender's own words repeated at them. In-memory on purpose: the
         # window is seconds, a restart in between just lets one echo through.
         self._daemon_reply_echoes: dict[str, tuple[str, float]] = {}
+        # ADR 0058：每会话最近一次被接受的用户提交，供 worker 死于回答之前
+        # 时带退避自动重放。In-memory on purpose：runtime 重启后的下一条
+        # 新消息本来就会走复活路径，不需要跨重启的重放。
+        self._turn_replays: dict[str, dict[str, Any]] = {}
+        self._turn_replay_tasks: set[asyncio.Task] = set()
+        # 测试可缩短；生产值见模块级 TURN_REPLAY_DELAYS。
+        self.turn_replay_delays: tuple[float, ...] = TURN_REPLAY_DELAYS
         # Status-card dedup: fingerprint of the last successfully delivered
         # card per session. Refresh calls are event-driven, but most events
         # (tool started/completed churn, elapsed-time ticks) don't change what
@@ -8526,6 +8543,7 @@ class Orchestrator:
         actor: ActorRef,
         generation: int,
         ack_message_id: str = "",
+        replay_attempt: int = 0,
     ) -> SubmitResult:
         session = self.sessions.get(session_id)
         if self.authz is not None:
@@ -8647,6 +8665,9 @@ class Orchestrator:
         # （不是提交时刻——否则快速连发的第二条会被时效守卫误判），无时间
         # 戳的输入退化为本机当前时间。
         self._stamp_last_user_input(session, turn.created_at)
+        # ADR 0058：暂存这条已被 worker 接受的提交；若 worker 死于回答之前
+        # （pending_turn_lost），按退避自动重放而不是让用户干等。
+        self._remember_replayable_turn(session, turn, actor, attempt=replay_attempt)
         # "Got it, on it" reaction on the user's message — the status card
         # says the turn started, but the emoji is the at-a-glance receipt.
         await self._react_ack(session, ack_message_id)
@@ -8906,6 +8927,114 @@ class Orchestrator:
         if self._now() - created < self._STALE_INBOUND_MIN_AGE_SECONDS:
             return False
         return created < session.last_user_input_at - self._STALE_INBOUND_TOLERANCE_SECONDS
+
+    def _remember_replayable_turn(
+        self,
+        session: Session,
+        turn: TurnInput,
+        actor: ActorRef,
+        *,
+        attempt: int,
+    ) -> None:
+        """ADR 0058：记住 worker 已接受、但可能死于回答之前的最后一条提交。"""
+        if not (turn.text.strip() or turn.attachments):
+            # 空提交只为盖水位（ADR 0057 R2），没有内容可重放。
+            return
+        self._turn_replays[session.session_id] = {
+            "turn": turn,
+            "actor": actor,
+            "attempt": int(attempt),
+            # 记盖章后的水位而非 turn.created_at：无时间戳输入盖的是本机
+            # 当前时间，拿 created_at(=0) 对比会把自己误判成"已被推进"。
+            "watermark": session.last_user_input_at,
+        }
+
+    def _maybe_schedule_turn_replay(self, session: Session) -> float | None:
+        """pending_turn_lost 时调度自动重放；返回延迟秒数，None=不重放。
+
+        2026-07-20 15:47 事故：复活后的 worker 撞上模型 API 故障窗，死于
+        回答之前；当时只有一句走事件流的"请重发"——还被代际围栏丢掉了，
+        用户在飞书上盲等半小时。重放给故障窗一个自愈的机会。
+        """
+        entry = self._turn_replays.get(session.session_id)
+        if entry is None:
+            return None
+        attempt = int(entry.get("attempt", 0))
+        delays = self.turn_replay_delays
+        if attempt >= len(delays):
+            # 退避用尽：清掉暂存（下一条人话重新计数），调用方换终局文案。
+            self._turn_replays.pop(session.session_id, None)
+            return None
+        delay = float(delays[attempt])
+        task = asyncio.create_task(
+            self._replay_lost_turn(session.session_id, dict(entry), delay)
+        )
+        self._turn_replay_tasks.add(task)
+        task.add_done_callback(self._turn_replay_tasks.discard)
+        return delay
+
+    async def _replay_lost_turn(
+        self, session_id: str, entry: dict[str, Any], delay: float
+    ) -> None:
+        await asyncio.sleep(delay)
+        try:
+            session = self.sessions.get(session_id)
+        except Exception:
+            return
+        turn: TurnInput = entry["turn"]
+        watermark = float(entry.get("watermark", 0.0))
+        # 让位围栏：会话被 TUI 认领、正在跑别的回合、或水位已越过我们盖的
+        # 章（有更新的人话进来）时，重放只会添乱——静默放弃，UX 归继任者。
+        if session.lifecycle_state in {"EXTERNAL_OBSERVED_READONLY", "ACTIVE"}:
+            return
+        if session.last_user_input_at > watermark + _TURN_REPLAY_WATERMARK_TOLERANCE_SECONDS:
+            return
+        attempt = int(entry.get("attempt", 0)) + 1
+        _log_degrade(
+            "turn_replay_attempt",
+            session_id=session_id,
+            attempt=attempt,
+            delay=delay,
+        )
+        try:
+            result = await self.submit_user_input(
+                session_id,
+                turn,
+                actor=entry["actor"],
+                generation=session.generation,
+                replay_attempt=attempt,
+            )
+        except Exception as exc:
+            # 重放自己失败不能再沉默——直发通知，不走可能被围栏丢弃的
+            # 事件流。之后不再自动续命：交还给人。
+            _log_degrade(
+                "turn_replay_failed",
+                session_id=session_id,
+                attempt=attempt,
+                error=exc,
+            )
+            with contextlib.suppress(Exception):
+                await self._send_session_view(
+                    session,
+                    {
+                        "type": "error",
+                        "message": (
+                            f"⚠️ 自动重发第 {attempt} 次失败"
+                            f"（{type(exc).__name__}）；请稍后手动重发一次。"
+                        ),
+                    },
+                    idempotency_key=f"turn-replay-failed:{session_id}:{attempt}",
+                )
+            return
+        if not result.accepted:
+            # 被拒即被更合法的状态接管（时效守卫、只读、接管中……）；
+            # 静默让位，但留下可 grep 的痕迹。
+            _log_degrade(
+                "turn_replay_rejected",
+                session_id=session_id,
+                attempt=attempt,
+                reason=result.reason,
+            )
 
     def _revival_transport_ready(self, session: Session) -> bool:
         """Whether an ADR 0054 revival could actually be carried out here.
@@ -10794,6 +10923,24 @@ class Orchestrator:
             }:
                 open_turn = True
             self._record_session_progress(session, event)
+            if (
+                event.type == AgentEventType.SESSION_ERROR
+                and str(event.payload.get("reason", "")) == "pending_turn_lost"
+            ):
+                # ADR 0058：已接受的提交随 worker 一起没了。能重放就自动
+                # 重放（换掉"请重发"文案）；退避用尽则明说，别让用户猜。
+                had_replay_entry = session.session_id in self._turn_replays
+                replay_delay = self._maybe_schedule_turn_replay(session)
+                if replay_delay is not None:
+                    event.payload["message"] = (
+                        "⚠️ 代理进程在生成回复前退出了；"
+                        f"{replay_delay:g} 秒后自动重发你刚才的消息。"
+                    )
+                elif had_replay_entry:
+                    event.payload["message"] = (
+                        "⚠️ 代理进程在生成回复前退出了，自动重发已尝试 "
+                        f"{len(self.turn_replay_delays)} 次仍未成功；请稍后重发一次。"
+                    )
             view = self._event_to_view(session, event)
             session.last_event_seq += 1
             await self.refresh_session_status_card(session)

@@ -4634,6 +4634,8 @@ def run_native_cli(args) -> None:
             print(f"native hook rejected: {result.reason}", file=sys.stderr)
         raise SystemExit(0 if result.accepted else 1)
     if args.native_command == "serve":
+        # 只有 serve 会派生 worker，也只有它需要向会话内暴露驱动者身份。
+        _export_driver_label()
         if runtime.config.channel_kind == "lark":
             if getattr(args, "once", False):
                 raise ChannelConfigError(
@@ -6489,6 +6491,31 @@ def _deferred_tui_hook_created_at(path: Path) -> float:
             return path.stat().st_mtime
         except OSError:
             return 0.0
+
+
+def _export_driver_label(environ=None) -> str:
+    """ADR 0058 自杀陷阱守卫的标记面。
+
+    serve 进程把自己的 launchd label（com.walkcode.<env 文件名去 .env>）写进
+    自身环境；worker 生成时整体继承 os.environ，于是会话内的每个子进程（包括
+    Bash 工具里跑的 upgrade.sh）都能据此识别"驱动我的 runtime 是谁"，从而
+    跳过对它的立即重启。已有值时不覆盖——操作者显式指定优先。
+    """
+    env = os.environ if environ is None else environ
+    existing = env.get("WALKCODE_DRIVER_LABEL", "")
+    if existing:
+        return existing
+    env_file = env.get("WALKCODE_ENV_FILE", "")
+    if not env_file:
+        return ""
+    stem = Path(env_file).expanduser().name
+    if stem.endswith(".env"):
+        stem = stem[: -len(".env")]
+    if not stem:
+        return ""
+    label = f"com.walkcode.{stem}"
+    env["WALKCODE_DRIVER_LABEL"] = label
+    return label
 
 
 def _load_native_env(env: dict[str, str] | None) -> dict[str, str]:

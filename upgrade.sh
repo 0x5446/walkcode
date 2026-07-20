@@ -146,11 +146,80 @@ discover_v3_labels() {
     | grep -E '^com\.walkcode\.' | grep -v '^com\.walkcode\.tap-' | sort || true
 }
 
+# Self-driver guard (ADR 0058, "自杀陷阱"): when this upgrade runs INSIDE a
+# session that a com.walkcode.* runtime is driving (Feishu takeover / headless
+# worker), kickstarting that runtime kills our own driver mid-turn — the
+# session goes silent with no reply and no error (observed 2026-07-19 and
+# again 2026-07-20 15:13). Detect the driving runtime and defer its restart
+# to a detached process instead of restarting it under our own feet.
+SELF_RESTART_DELAY="${WALKCODE_SELF_RESTART_DELAY:-120}"
+
+self_driver_label() {
+  # Priority 1: env marker exported by `walkcode native serve` (v0.14.10+)
+  # and inherited by every worker/tool subprocess it spawns.
+  if [ -n "${WALKCODE_DRIVER_LABEL:-}" ]; then
+    printf '%s\n' "$WALKCODE_DRIVER_LABEL"
+    return
+  fi
+  # Priority 2 (pre-marker runtimes / SDK-spawned workers): climb the process
+  # tree for a `walkcode native serve` ancestor and map its PID to a launchd
+  # label. LC_ALL=C: day-first locales broke ps parsing before (v0.14.4).
+  local pid=$$ depth=0 cmd ppid label
+  while [ "$depth" -lt 25 ]; do
+    case "$pid" in ''|*[!0-9]*) break ;; esac
+    [ "$pid" -gt 1 ] || break
+    cmd="$(LC_ALL=C ps -o command= -p "$pid" 2>/dev/null || true)"
+    case "$cmd" in
+      *"walkcode native serve"*)
+        label="$(launchctl list 2>/dev/null | LC_ALL=C awk -v p="$pid" '$1 == p {print $NF}' || true)"
+        if [ -n "$label" ]; then
+          printf '%s\n' "$label"
+          return
+        fi
+        ;;
+    esac
+    ppid="$(LC_ALL=C ps -o ppid= -p "$pid" 2>/dev/null | tr -d '[:space:]' || true)"
+    [ -n "$ppid" ] && [ "$ppid" != "$pid" ] || break
+    pid="$ppid"
+    depth=$((depth + 1))
+  done
+  printf ''
+}
+
+schedule_deferred_self_restart() {
+  local label="$1"
+  if $DRY_RUN; then
+    printf '  [dry-run] deferred self restart: sleep %s; launchctl kickstart -k gui/%s/%s\n' \
+      "$SELF_RESTART_DELAY" "$UID_NUM" "$label"
+    return
+  fi
+  # start_new_session=True detaches from our process group: the restart must
+  # survive the very SIGTERM it is about to deliver to our ancestry.
+  python3 - "$UID_NUM" "$label" "$SELF_RESTART_DELAY" <<'PY'
+import subprocess
+import sys
+
+uid, label, delay = sys.argv[1:4]
+subprocess.Popen(
+    ["/bin/sh", "-c", 'sleep "$1"; exec launchctl kickstart -k "gui/$2/$3"', "sh", delay, uid, label],
+    start_new_session=True,
+    stdin=subprocess.DEVNULL,
+    stdout=subprocess.DEVNULL,
+    stderr=subprocess.DEVNULL,
+)
+PY
+  warn "$(msg \
+    "this upgrade is running inside a session driven by ${label}; its restart is deferred by ${SELF_RESTART_DELAY}s (detached). This session's driver WILL restart then — wrap up the final reply now; the session revives on the next message." \
+    "检测到本次升级正运行在 ${label} 驱动的会话里；已安排 ${SELF_RESTART_DELAY}s 后脱管重启（立即重启会切断当前会话自己的驱动进程）。届时本会话会短暂中断，请提前说完收尾结论；之后发消息会触发复活。")"
+}
+
 RESTARTED_LABELS=()
+DEFERRED_SELF_LABEL=""
 
 restart_v3_labels() {
-  local label
+  local label self_label
   local -a labels=()
+  self_label="$(self_driver_label)"
   if [ -n "$LABELS_RAW" ]; then
     IFS=',' read -r -a labels <<< "$LABELS_RAW"
   else
@@ -181,6 +250,11 @@ restart_v3_labels() {
         continue
         ;;
     esac
+    if [ -n "$self_label" ] && [ "$label" = "$self_label" ]; then
+      # Restarting our own driver here is the suicide trap; defer it.
+      DEFERRED_SELF_LABEL="$label"
+      continue
+    fi
     if run launchctl kickstart -k "gui/$UID_NUM/$label"; then
       RESTARTED_LABELS+=("$label")
     else
@@ -216,6 +290,12 @@ run uv tool install --python "$PYTHON_SPEC" --with claude-agent-sdk --with lark-
   --force --reinstall --refresh-package walkcode
 
 restart_v3_labels
+
+if [ -n "$DEFERRED_SELF_LABEL" ]; then
+  schedule_deferred_self_restart "$DEFERRED_SELF_LABEL"
+  # It WILL be restarted shortly — run its per-env doctor with the others.
+  RESTARTED_LABELS+=("$DEFERRED_SELF_LABEL")
+fi
 
 doctor_one() {
   # NB: braces on ${...} inside the zh message are load-bearing — macOS
