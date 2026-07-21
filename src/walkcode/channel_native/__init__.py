@@ -1804,8 +1804,16 @@ class SessionRegistry:
             return SubmitResult(False, BlockedReason.SESSION_STOPPED)
         if session.writer_owner and session.writer_owner.kind == "external_tui":
             return SubmitResult(False, BlockedReason.EXTERNAL_TUI_READONLY)
-        if session.writer_lease is None or session.writer_lease.expired(self._now()):
-            return SubmitResult(False, BlockedReason.LEASE_EXPIRED)
+        # ADR 0059: no lease-expiry veto. The lease is only stamped at writer
+        # (re)acquire and never renewed while a turn runs, so any mid-turn
+        # message arriving after the TTL used to hit LEASE_EXPIRED — and on
+        # the Lark WS ingress (fire-and-forget ack, no redelivery) that meant
+        # a silent, permanent message drop. Real double-writer protection is
+        # the generation fence above, the external-TUI ownership check, and
+        # the transport's atomic close-old→verify-dead→create-new resume
+        # barrier; worker liveness is proven by the submit itself
+        # (TransportUnavailable → resume fallback). The lease stays as
+        # bookkeeping only.
         return SubmitResult(True)
 
     def acquire_structured_writer(
@@ -8791,7 +8799,19 @@ class Orchestrator:
                 # resume so the user's message is not lost.
                 retry = await self._resume_writer_for_submit(session, transport, actor)
                 if not retry.accepted:
-                    raise
+                    # ADR 0059 R1: surface the structured refusal instead of
+                    # re-raising. A bare raise skips the channel's rejection
+                    # note (Lark WS logs it and never redelivers), so the one
+                    # message that hit "worker gone AND resume refused" would
+                    # vanish with only a status-card error. Same cleanup as
+                    # the except-branch below, then return the reason so the
+                    # sender gets the resume_failed / missing_resume_ref note.
+                    self._rollback_replayable_turn(session_id, replay_entry_id, replaced_entry)
+                    session.last_progress_at = self._now()
+                    session.last_progress_event = "turn.submit_failed"
+                    session.lifecycle_state = "ERROR_RECOVERABLE"
+                    await self.refresh_session_status_card(session)
+                    return retry
                 if replay_guard:
                     # R3 Critical：resume 的 await 窗口里更新的人类提交可能
                     # 已覆盖暂存并先行发出——重放的第二次发送前必须再对
@@ -9032,7 +9052,16 @@ class Orchestrator:
                     resume_ref=resume_ref,
                 )
             )
-        except Exception:
+        except Exception as exc:
+            # ADR 0059 R1: the flattened "resume_failed" hid the real cause
+            # (dead socket vs unconfirmed old worker vs SDK error) — trace it
+            # so the silent-degradation path stays debuggable.
+            _log_degrade(
+                "writer_resume_failed",
+                session_id=session.session_id,
+                handle_id=str(session.transport_ref.get("handle_id", "")),
+                error=exc,
+            )
             return SubmitResult(False, "resume_failed")
         return self.sessions.acquire_structured_writer(
             session.session_id,
@@ -11545,8 +11574,8 @@ def _submit_result_completes_inbound_ledger(result: SubmitResult) -> bool:
         BlockedReason.NOT_FOUND,
         BlockedReason.EXTERNAL_TUI_READONLY,
         # Terminal rejection that replies a note to the sender: retrying the
-        # same event would only re-send the note. LEASE_EXPIRED deliberately
-        # stays out — redelivery retries the submit once the lease recovers.
+        # same event would only re-send the note. (LEASE_EXPIRED is no longer
+        # produced by validate_submit — ADR 0059 removed the expiry veto.)
         BlockedReason.SESSION_STOPPED,
         # ADR 0057: a stale (stranded) inbound is terminally refused — a
         # redelivery would only be refused again and re-send the note.

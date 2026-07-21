@@ -1614,7 +1614,7 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
             self.assertNotIn("offset", get_updates[0])
             self.assertEqual(len(get_updates), 1)
 
-    def test_diagnose_telegram_ingress_blocks_serve_once_for_expired_active_session_lease(self):
+    def test_diagnose_telegram_ingress_accepts_active_session_past_lease_ttl(self):
         clock = _Clock()
         with tempfile.TemporaryDirectory() as tmp:
             cfg = ChannelNativeConfig.from_env(
@@ -1653,12 +1653,16 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
 
             get_updates = [payload for method, payload in api.calls if method == "getUpdates"]
             item = report["pending_updates"]["items"][0]
-            self.assertFalse(report["safe_to_run_serve_once"])
+            # ADR 0059: an ACTIVE session past the lease TTL is still
+            # submittable — the real submit path injects mid-turn (or falls
+            # back to resume when the worker is gone), so the doctor must not
+            # report it as blocked.
+            self.assertTrue(report["safe_to_run_serve_once"])
             self.assertTrue(item["chat_allowed"])
             self.assertTrue(item["active_session_present"])
-            self.assertFalse(item["submit_would_accept"])
-            self.assertEqual(item["submit_blocked_reason"], BlockedReason.LEASE_EXPIRED)
-            self.assertIn("not currently submittable", report["warnings"][0])
+            self.assertTrue(item["submit_would_accept"])
+            self.assertEqual(item["submit_blocked_reason"], "")
+            self.assertEqual(report["warnings"], [])
             self.assertNotIn("offset", get_updates[0])
             self.assertEqual(len(get_updates), 1)
 
@@ -1796,7 +1800,10 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
             self.assertEqual(get_updates[1]["offset"], 42)
             self.assertIn("temporary confirm failure", runtime.last_telegram_offset_confirm_error)
 
-    def test_poll_telegram_once_does_not_confirm_offset_for_expired_active_session_lease(self):
+    def test_poll_telegram_once_submits_mid_turn_past_lease_ttl_and_confirms_offset(self):
+        # ADR 0059: the lease-expiry hold-back is gone. A message for an
+        # ACTIVE session past the lease TTL is submitted mid-turn, completes
+        # the inbound ledger, and confirms the Telegram offset.
         clock = _Clock()
         with tempfile.TemporaryDirectory() as tmp:
             cfg = ChannelNativeConfig.from_env(
@@ -1810,10 +1817,11 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
                 }
             )
             api = _FakeTelegramApi(batches=[[_telegram_update(41)]])
+            transport = FakeAgentTransport("claude_headless", _transport_caps())
             runtime = ChannelNativeRuntime.from_config(
                 cfg,
                 telegram_api=api,
-                transports={"claude_headless": FakeAgentTransport("claude_headless", _transport_caps())},
+                transports={"claude_headless": transport},
                 now=clock,
             )
             session = runtime.state.sessions.create_structured_session(
@@ -1830,17 +1838,17 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
             )
             runtime.state.authz.grant(session.session_id, ActorRef("telegram", "456", "Ada"), SessionRole.OWNER)
             clock.now += 31.0
-            # This test guards the lease-expiry hold-back semantics; treat the
-            # session as created by this process so the startup sweep skips it.
+            # Treat the session as created by this process so the startup
+            # sweep skips it.
             runtime._orphan_sweep_done = True
 
             processed = asyncio.run(runtime.poll_telegram_once(timeout=0, limit=5))
 
             get_updates = [payload for method, payload in api.calls if method == "getUpdates"]
-            self.assertEqual(processed, 0)
-            self.assertEqual(len(get_updates), 1)
-            self.assertNotIn("offset", get_updates[0])
-            self.assertEqual(runtime.state.inbound_ledger.to_dict()["completed"], {})
+            self.assertEqual(processed, 1)
+            self.assertEqual([turn.text for turn in transport.submitted_turns], ["ship it"])
+            self.assertEqual(get_updates[1]["offset"], 42)
+            self.assertNotEqual(runtime.state.inbound_ledger.to_dict()["completed"], {})
 
     def test_describe_reports_single_channel_and_bound_agent(self):
         cfg = ChannelNativeConfig.from_env(

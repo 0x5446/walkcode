@@ -55,7 +55,8 @@ Acceptance:
 - unknown agent event renders as fallback text.
 - capability-disabled operations return explicit blocked results.
 - stale generation input/callback does not execute.
-- expired writer lease blocks submit until recovered.
+- ~~expired writer lease blocks submit until recovered.~~ Withdrawn by
+  ADR 0059: lease expiry never blocks submits; the lease is bookkeeping only.
 
 Verification:
 
@@ -1667,7 +1668,9 @@ Acceptance:
   running native owner and relies on Telegram 409/pending-update checks.
 - state gate can load existing state and prove atomic write/read with a
   temporary sibling file, without creating or rewriting the configured state.
-- state gate fails when active or waiting sessions have expired writer leases.
+- ~~state gate fails when active or waiting sessions have expired writer
+  leases.~~ Withdrawn by ADR 0059: the count is informational and does not
+  fail the gate.
 - state repair can stop dead read-only external TUI observations after creating
   a state backup, so hook smoke leftovers do not block private-chat routing.
 - outbox gate reports pending/sent/dead counts and verifies sent/permanent/
@@ -1694,9 +1697,11 @@ Acceptance:
 - Telegram gate returns `safe_to_run_serve_once=false` if competing local
   consumer processes are present.
 - Telegram gate returns `safe_to_run_serve_once=false` if a pending update targets
-  an existing session that would reject submit, such as an expired writer lease.
+  an existing session that would reject submit. (An expired writer lease is no
+  longer such a reason — ADR 0059.)
 - `poll_telegram_once` does not confirm the Telegram offset or complete inbound
-  ledger for repairable submit failures such as `lease_expired`.
+  ledger for repairable submit failures. (`lease_expired` is no longer
+  produced — ADR 0059.)
 - focused tests prove no confirming offset is sent during Telegram diagnostics.
 
 Design:

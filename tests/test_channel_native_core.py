@@ -17,6 +17,7 @@ from walkcode.channel_native import (
     Orchestrator,
     SessionRegistry,
     TransportCapabilities,
+    TransportUnavailable,
     TurnInput,
 )
 
@@ -633,7 +634,7 @@ class ChannelNativeCoreContractTests(unittest.TestCase):
         self.assertEqual(result.reason, BlockedReason.CAPABILITY_DISABLED)
         self.assertEqual(transport.submitted_turns, [])
 
-    def test_writer_lease_and_generation_gate_submits(self):
+    def test_generation_gates_submits_but_lease_expiry_does_not(self):
         clock = _Clock()
         sessions = SessionRegistry(now=clock, lease_ttl=10.0)
         channel = FakeChannelAdapter("fake", _channel_caps())
@@ -661,17 +662,112 @@ class ChannelNativeCoreContractTests(unittest.TestCase):
         self.assertFalse(stale.accepted)
         self.assertEqual(stale.reason, BlockedReason.STALE_GENERATION)
 
+        # ADR 0059 regression: a message arriving mid-turn AFTER the lease TTL
+        # must still be submitted. The lease is never renewed while a turn
+        # runs, so the old LEASE_EXPIRED veto silently dropped every message
+        # sent >TTL into a long-running turn (and Lark WS never redelivers).
         clock.now += 11
-        expired = asyncio.run(
+        mid_turn = asyncio.run(
             orchestrator.submit_user_input(
                 session.session_id,
-                TurnInput(text="after expiry"),
+                TurnInput(text="after lease ttl"),
                 actor=_actor(),
                 generation=session.generation,
             )
         )
-        self.assertFalse(expired.accepted)
-        self.assertEqual(expired.reason, BlockedReason.LEASE_EXPIRED)
+        self.assertTrue(mid_turn.accepted)
+        self.assertEqual(
+            [turn.text for turn in transport.submitted_turns], ["after lease ttl"]
+        )
+        updated = sessions.get(session.session_id)
+        self.assertEqual(updated.last_user_input_at, clock.now)
+
+    def test_dead_worker_with_failed_resume_returns_reason_instead_of_raising(self):
+        # ADR 0059 R1: "worker gone AND resume refused" must surface the
+        # structured reason (so the channel sends its rejection note), not
+        # re-raise past the note branch into a silent serve-loop log line.
+        clock = _Clock()
+        sessions = SessionRegistry(now=clock, lease_ttl=10.0)
+        channel = FakeChannelAdapter("fake", _channel_caps())
+
+        class DeadWorkerTransport(FakeAgentTransport):
+            async def submit_turn(self, handle, turn, idempotency_key):
+                raise TransportUnavailable("worker gone")
+
+            async def resume(self, spec):
+                raise RuntimeError("resume broke")
+
+        transport = DeadWorkerTransport("fake-transport", _transport_caps())
+        orchestrator = Orchestrator(
+            sessions=sessions,
+            interactions=InteractionStore(now=clock),
+            outbox=DurableOutbox(now=clock),
+            channels={"fake": channel},
+            transports={"fake-transport": transport},
+            now=clock,
+        )
+        session = asyncio.run(
+            orchestrator.start_session(_binding(), "fake-transport", "/tmp/project", _actor())
+        )
+
+        clock.now += 11
+        result = asyncio.run(
+            orchestrator.submit_user_input(
+                session.session_id,
+                TurnInput(text="mid-turn message"),
+                actor=_actor(),
+                generation=session.generation,
+            )
+        )
+
+        self.assertFalse(result.accepted)
+        self.assertEqual(result.reason, "resume_failed")
+        updated = sessions.get(session.session_id)
+        self.assertEqual(updated.lifecycle_state, "ERROR_RECOVERABLE")
+        self.assertEqual(updated.last_progress_event, "turn.submit_failed")
+        # The failed turn's replay entry is rolled back — no ghost auto-replay.
+        self.assertIsNone(orchestrator._turn_replays.get(session.session_id))
+
+    def test_dead_worker_without_resume_ref_returns_missing_resume_ref(self):
+        # ADR 0059 R1: claude_headless with no agent_session_id yet (first
+        # turn never completed) cannot resume — the refusal must carry
+        # "missing_resume_ref" so the sender learns the session is dead.
+        clock = _Clock()
+        sessions = SessionRegistry(now=clock, lease_ttl=10.0)
+        channel = FakeChannelAdapter("fake", _channel_caps())
+
+        class DeadWorkerTransport(FakeAgentTransport):
+            async def submit_turn(self, handle, turn, idempotency_key):
+                raise TransportUnavailable("worker gone")
+
+        transport = DeadWorkerTransport("claude_headless", _transport_caps())
+        orchestrator = Orchestrator(
+            sessions=sessions,
+            interactions=InteractionStore(now=clock),
+            outbox=DurableOutbox(now=clock),
+            channels={"fake": channel},
+            transports={"claude_headless": transport},
+            now=clock,
+        )
+        session = asyncio.run(
+            orchestrator.start_session(_binding(), "claude_headless", "/tmp/project", _actor())
+        )
+
+        clock.now += 11
+        result = asyncio.run(
+            orchestrator.submit_user_input(
+                session.session_id,
+                TurnInput(text="mid-turn message"),
+                actor=_actor(),
+                generation=session.generation,
+            )
+        )
+
+        self.assertFalse(result.accepted)
+        self.assertEqual(result.reason, "missing_resume_ref")
+        self.assertEqual(
+            sessions.get(session.session_id).lifecycle_state, "ERROR_RECOVERABLE"
+        )
 
     def test_external_observed_session_blocks_input(self):
         sessions = SessionRegistry(now=_Clock())

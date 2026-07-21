@@ -209,7 +209,7 @@ wheels = [
 
 [[package]]
 name = "walkcode"
-version = "0.14.11"
+version = "0.14.12"
 source = { editable = "." }
 
 [package.optional-dependencies]

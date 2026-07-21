@@ -238,9 +238,14 @@ def debug_state(
         snapshot, load_report = _load_state_snapshot(cfg)
     write_probe = _probe_state_write(Path(cfg.state_path))
     counts = _snapshot_counts(snapshot) if snapshot is not None else {}
-    expired_writer_leases = int(counts.get("expired_writer_leases", 0) or 0)
+    # ADR 0059: an expired writer lease on a running session is normal — the
+    # lease is only stamped at writer (re)acquire and never renewed while a
+    # turn runs, and validate_submit no longer vetoes on expiry. The count
+    # stays informational in `counts`, but it neither fails the gate nor
+    # warns ("updates confirmed without submitting" can no longer happen for
+    # that reason).
     payload: dict[str, Any] = {
-        "ok": bool(load_report["ok"] and write_probe["ok"] and expired_writer_leases == 0),
+        "ok": bool(load_report["ok"] and write_probe["ok"]),
         "state_path": cfg.state_path,
         "state_file": load_report,
         "write_probe": write_probe,
@@ -250,10 +255,6 @@ def debug_state(
     }
     if snapshot is not None:
         payload["counts"] = counts
-    if expired_writer_leases:
-        payload["warnings"].append(
-            "state has running session(s) with expired writer lease; consume commands may confirm IM updates without submitting them"
-        )
     return payload
 
 
