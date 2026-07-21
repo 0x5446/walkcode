@@ -4844,15 +4844,19 @@ def _telegram_update_id(update: dict[str, Any]) -> int | None:
 # Reply text for silently-rejected Lark messages from authorized senders.
 # Reasons with their own feedback card (external_tui_readonly → takeover
 # prompt, ambiguous_session → session chooser) are intentionally absent.
-# LEASE_EXPIRED is deliberately absent: it does not complete the inbound
-# ledger, so channel redelivery retries the submit once the lease recovers —
-# telling the user to "resend" would conflict with that automatic retry.
+# LEASE_EXPIRED is absent because validate_submit no longer produces it
+# (ADR 0059): the old "redelivery retries once the lease recovers" bet never
+# paid off on the Lark WS ingress, whose ack is fire-and-forget — the message
+# was silently dropped instead.
 _LARK_REJECTION_NOTES = {
     BlockedReason.UNAUTHORIZED: "⛔ 这条消息没有提交：你没有操作这个会话的权限。",
     BlockedReason.SESSION_STOPPED: "⚪ 这条消息没有提交：会话已结束。到根会话发新消息即可开新任务。",
     # ADR 0056：上一个 worker 进程尚未确认退出时拒绝拉新（防双写）；
     # 静默丢消息会让用户以为发送成功（deep-review R3）。
     "resume_failed": "⚠️ 这条消息没有提交：上一个进程还没退干净。稍等几秒，把这条消息再发一次即可。",
+    # ADR 0059 R1：worker 已退出且没有可恢复的存档（首回合未产生
+    # agent_session_id）——重发也无济于事，指引开新任务。
+    "missing_resume_ref": "⚠️ 这条消息没有提交：工作进程已退出且没有可恢复的存档，这个会话无法继续。请在根会话发新消息开新任务。",
     # ADR 0057：离线滞留的旧消息，会话已被更新输入推进时不自动提交。
     "stale_inbound": "⏸️ 这条消息没有提交：它在滞留期间，会话已被更新的输入推进，语境可能已失效。仍需要请重新发送。",
 }

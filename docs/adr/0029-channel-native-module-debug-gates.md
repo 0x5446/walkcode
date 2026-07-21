@@ -2,7 +2,9 @@
 
 Date: 2026-06-28
 
-Status: Accepted
+Status: Accepted; partially superseded by ADR 0059 (expired writer leases on
+running sessions are informational now — they no longer fail the state gate,
+block `serve --once`, or hold back submits)
 
 ## Context
 
@@ -71,15 +73,19 @@ local consumer process can consume Telegram updates first.
 - Claude and Codex Telegram services can run side by side without being
   reported as competing consumers, because each V3 runtime owns a separate
   bot/agent pair.
-- Running active or waiting sessions with expired writer leases are reported as
-  unsafe state, because a fresh one-shot runtime cannot submit into that stale
-  handle. Completed `IDLE` sessions are handled by ADR 0030: they release the
-  active lease and are resumed from durable transport state on the next input.
+- ~~Running active or waiting sessions with expired writer leases are reported
+  as unsafe state, because a fresh one-shot runtime cannot submit into that
+  stale handle.~~ Superseded by ADR 0059: the lease is never renewed mid-turn,
+  so this shape is a healthy long-running turn; the count is informational
+  and submits proceed (stale handles fall back to resume). Completed `IDLE`
+  sessions are handled by ADR 0030: they release the active lease and are
+  resumed from durable transport state on the next input.
 - `state --repair-stale-external-tui` may stop read-only external TUI sessions
   whose recorded process no longer exists. It creates a state backup first and
   never terminates a live process.
-- Repairable submit failures such as `lease_expired` and capability-disabled
-  transports do not complete the inbound ledger or confirm the Telegram offset.
+- Repairable submit failures such as capability-disabled transports do not
+  complete the inbound ledger or confirm the Telegram offset. (`lease_expired`
+  is no longer produced — ADR 0059.)
 - Agent adapter smoke is opt-in for live turns, so routine module checks do not
   spend model calls or mutate external sessions.
 - Agent auth/provider failures are caught before IM updates are consumed.
@@ -92,11 +98,12 @@ Contract tests cover:
 
 - Telegram diagnostics do not send a confirming offset.
 - disallowed pending updates block the next destructive `serve --once` step.
-- pending updates targeting expired active-session leases block the next
-  destructive `serve --once` step, while resumable `IDLE` sessions remain safe.
+- ~~pending updates targeting expired active-session leases block the next
+  destructive `serve --once` step~~ (superseded by ADR 0059: such sessions
+  are reported submittable), while resumable `IDLE` sessions remain safe.
 - state diagnostics do not create the configured state file when it is absent.
-- state diagnostics fail when active or waiting sessions have expired writer
-  leases.
+- ~~state diagnostics fail when active or waiting sessions have expired writer
+  leases.~~ Superseded by ADR 0059: the count is reported as informational.
 - state repair stops dead external TUI observations with a backup and leaves
   live observed processes untouched.
 - outbox diagnostics use synthetic dispatch and no live channel send.

@@ -70,7 +70,7 @@ class ChannelNativeDebugScriptTests(unittest.TestCase):
         self.assertIn('"exists": false', result.stdout)
         self.assertFalse(state_path.exists())
 
-    def test_state_debug_fails_for_expired_running_writer_lease(self):
+    def test_state_debug_reports_expired_running_writer_lease_as_informational(self):
         with tempfile.TemporaryDirectory() as tmp:
             state_path = Path(tmp) / "state.json"
             env_file = Path(tmp) / ".env"
@@ -121,9 +121,12 @@ class ChannelNativeDebugScriptTests(unittest.TestCase):
                 text=True,
             )
 
-        self.assertEqual(result.returncode, 1, result.stderr + result.stdout)
+        # ADR 0059: expired lease on a running session is normal (never
+        # renewed mid-turn) and no longer blocks submits — the count stays
+        # informational and must not fail the health gate.
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
         self.assertIn('"expired_writer_leases": 1', result.stdout)
-        self.assertIn("expired writer lease", result.stdout)
+        self.assertNotIn("expired writer lease", result.stdout)
 
     def test_state_repair_stops_unresumable_expired_error_session_with_backup(self):
         with tempfile.TemporaryDirectory() as tmp:

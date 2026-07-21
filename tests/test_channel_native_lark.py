@@ -1521,12 +1521,37 @@ class LarkRejectionNoteTests(_LarkRuntimeHarness):
         self.assertEqual(len(notes), 1)
         # Noted rejections must be ledger-terminal: a WS redelivery of the
         # same event would otherwise re-send the note (or re-submit a message
-        # the user was told did not go through). LEASE_EXPIRED stays
-        # non-terminal (and note-less): redelivery retries the submit.
+        # the user was told did not go through). (LEASE_EXPIRED is no longer
+        # produced — ADR 0059 removed the lease-expiry veto.)
         self.assertTrue(_submit_result_completes_inbound_ledger(result))
-        self.assertFalse(
-            _submit_result_completes_inbound_ledger(SubmitResult(False, BlockedReason.LEASE_EXPIRED))
+
+    def test_missing_resume_ref_rejection_gets_note(self):
+        # ADR 0059 R1: "worker gone AND no durable resume ref" must reach the
+        # sender as a note instead of vanishing behind a bare re-raise.
+        from walkcode.channel_native import SubmitResult
+
+        runtime, api, transport = self._runtime(
+            env_extra={"LARK_ALLOWED_CHAT_IDS": "oc_chat", "LARK_ALLOWED_OPEN_IDS": "ou_user"},
+            scripted_events=[],
         )
+
+        async def refuse(inbound, **kwargs):
+            return SubmitResult(False, "missing_resume_ref")
+
+        runtime.orchestrator.handle_inbound_event = refuse
+        result = asyncio.run(
+            runtime.process_lark_event(
+                self._message_payload(text="hi", root_id="lark-root", message_id="om_norref")
+            )
+        )
+
+        self.assertFalse(result.accepted)
+        notes = [
+            p
+            for m, p in api.calls
+            if m == "sendMessage" and "没有可恢复的存档" in p.get("view", {}).get("text", "")
+        ]
+        self.assertEqual(len(notes), 1)
 
     def test_allowlist_rejection_stays_silent(self):
         runtime, api, transport = self._runtime(
