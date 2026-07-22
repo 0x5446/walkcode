@@ -949,6 +949,50 @@ class PersistentStreamTests(unittest.TestCase):
         reasons = [e.payload.get("reason") for e in errors]
         self.assertIn("pending_turn_lost", reasons)
 
+    def test_non_started_task_traffic_also_blocks_absorbed_at_eof(self):
+        # Final verify pass 5: an unobserved turn's opening may equally be a
+        # non-started task subtype (updated/progress for a pre-existing
+        # task). Any task lifecycle traffic with no open turn is sticky
+        # evidence — the leftover must keep pending_turn_lost at EOF.
+        async def scenario():
+            cls = _stream_client_class()
+            transport = _transport(cls)
+            transport._ABSORBED_MIN_RESULT_AGE_SECONDS = 0.3
+            handle = await transport.launch_session(cwd="/tmp/p", session_id="s1")
+            await transport.submit_turn(handle, TurnInput(text="first"), "k1")
+            client = transport._clients[handle.handle_id]
+            collected: list = []
+            consumer = asyncio.create_task(_consume(transport, handle, collected))
+            client.feed(_assistant("干活中"))
+            # The first turn starts a task that completes within the turn.
+            client.feed(_task_started("t1", "回合内任务"))
+            client.feed(_task_updated("t1", status="completed"))
+            self.assertTrue(
+                await _wait_until(
+                    lambda: any(e.type == AgentEventType.TURN_DELTA for e in collected)
+                )
+            )
+            await transport.submit_turn(handle, TurnInput(text="排队消息"), "k2")
+            client.feed(_result("first done"))
+            self.assertTrue(
+                await _wait_until(
+                    lambda: transport._pending_turns.get(handle.handle_id) == 1
+                )
+            )
+            await asyncio.sleep(0.4)
+            # The queued turn surfaces only as NON-started task traffic...
+            client.feed(_task_updated("t1", status="running"))
+            client.feed(_task_updated("t1", status="completed"))
+            await asyncio.sleep(0.4)
+            client.feed_eof()
+            await asyncio.wait_for(consumer, timeout=5.0)
+            return transport, handle, collected
+
+        transport, handle, events = asyncio.run(scenario())
+        errors = [e for e in events if e.type == AgentEventType.SESSION_ERROR]
+        reasons = [e.payload.get("reason") for e in errors]
+        self.assertIn("pending_turn_lost", reasons)
+
     def test_task_only_turn_still_alarms_at_ceiling(self):
         # Ceiling flavor of the task-only turn: the sticky traffic evidence
         # must keep the visible alarm instead of a silent absorbed settle.

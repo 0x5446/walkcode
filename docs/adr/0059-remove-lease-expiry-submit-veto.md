@@ -184,12 +184,15 @@ drain loop 维护候选状态并只在结算点动手：
   **task 生命周期消息**（task_started/updated/…）同样刷新年龄基准：
   排队 turn 可能只以任务流量可见（终验面板：仅任务流量 + EOF 曾能
   静默清掉真实在跑的提交）。进一步地，`task_started` 在**无开着
-  turn**时出现＝有一个未被观察到的 turn 正在运行（task 只能由运行中
-  turn 的工具调用启动），无条件设置**粘性** `user_turn_traffic`——
-  只刷新可老化的时钟不够，30s 后仍会被清（终验面板第三轮）；也刻意
-  **不**让存活的注入预测认领它（第四轮：预测窗内启动的真 task-only
-  steering turn 会因此丢掉唯一证据被静默清掉；误把注入回合的 task
-  记为用户流量只多一次告警或一次可见的拒绝重放，不会静默丢）。
+  turn**时出现＝有一个未被观察到的 turn 正在运行（task 流量只能由
+  运行中 turn 产生），无条件设置**粘性** `user_turn_traffic`——只
+  刷新可老化的时钟不够，30s 后仍会被清（终验第三轮）；覆盖全部任务
+  子类型而不只 `task_started`（第五轮：progress/updated 也可能是
+  未观察 turn 的唯一开场）；也刻意**不**让存活的注入预测认领它
+  （第四轮）。唯 `task_notification` 除外——它是回合间注入预测的
+  既有设计信号。误把旧任务的后台心跳记为用户流量只多一次告警或
+  一次可见的拒绝重放（=v0.14.12 行为），不会静默丢；粘性照常由
+  下一个核销 result 重置。
 - `last_accounted_result_at`：最近一次已核销 `TURN_COMPLETED` 的排水
   消费时刻，只作 belt-and-braces 的新旧校验，绝不单独作数。
 - EOF 观测基准 `eof_observation_basis`：流等待真实阻塞后返回 → EOF

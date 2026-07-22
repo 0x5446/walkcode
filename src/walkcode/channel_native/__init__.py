@@ -6914,21 +6914,24 @@ class ClaudeHeadlessTransport:
                     # next _ABSORBED_MIN_RESULT_AGE_SECONDS — a queued turn
                     # may be running behind this traffic (final verify).
                     last_task_activity_at = time.monotonic()
-                    if task_subtype == "task_started" and not turn_open:
-                        # A task can only be STARTED by a running turn's tool
-                        # call. Seeing one with NO open turn means an
-                        # unobserved turn is running — its opening traffic was
-                        # this very message, swallowed by this branch. Sticky
-                        # evidence for the queued user turn (final verify
-                        # pass 3: task-only turns aged out of the activity
-                        # clock and their submits were silently cleared).
-                        # Deliberately NOT ceded to a live injected-turn
-                        # prediction (pass 4): a real task-only steering turn
-                        # starting inside the prediction window would lose
-                        # its only evidence and get silently cleared —
-                        # mis-crediting an injected turn's early task here
-                        # only costs an extra alarm / a refused-but-visible
-                        # replay, never a silent drop.
+                    if not turn_open and task_subtype != "task_notification":
+                        # Task lifecycle traffic (started/progress/updated/
+                        # ledger change) with NO open turn may be the ONLY
+                        # visible activity of an unobserved running turn —
+                        # its opening traffic was swallowed by this early-
+                        # continue branch. Sticky evidence for the queued
+                        # user turn (final verify passes 3-5: task-only turns
+                        # aged out of the activity clock and their submits
+                        # were silently cleared; pass 5 showed non-started
+                        # subtypes can be the opening too). Deliberately NOT
+                        # ceded to a live injected-turn prediction (pass 4),
+                        # and task_notification alone stays out — it is the
+                        # designed between-turns injected-turn signal with
+                        # its own hold machinery. Mis-crediting background
+                        # beats of an OLD task here only costs an extra
+                        # alarm / a refused-but-visible replay (v0.14.12
+                        # behavior), never a silent drop; the sticky flag is
+                        # reset by the next accounting result as usual.
                         user_turn_traffic = True
                     if not turn_open and (
                         task_subtype == "task_notification"
