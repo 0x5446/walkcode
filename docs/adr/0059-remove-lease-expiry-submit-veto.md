@@ -167,12 +167,14 @@ drain loop 维护候选状态并只在结算点动手：
   候选；turn 开启前排队的提交永不进入候选（两条预排队只回第一条时，
   残留必须继续告警/重放）。
 - `absorbable_pending`：每个非注入 `TURN_COMPLETED` result 核销时
-  **合并**（`min(残留, 旧候选 + 本回合新增非在途提交数)`）。新的
-  非注入 turn 开启时只按"本回合消费一个标记"收缩
-  （`min(旧候选, 开启时标记数 - 1)`），不整体清零——混合去向（一条
-  吸收一条排队）不得丢失吸收证据（round 2：整体吊销会让原误报在
-  混合序列重现，EOF 侧还会误重放）。turn 以 `SESSION_ERROR` 终局时
-  归零（中止的回合证明不了任何吸收）。
+  **合并**（`min(残留, 旧候选 + 本回合新增非在途提交数)`）。每个新的
+  非注入 turn 开启时**扣一**（`max(0, min(旧候选, 开启时标记数) - 1)`）
+  ——候选没有身份，按最坏情况假定开启的 turn 消费的就是一个候选
+  （round 3：按"标记数-1"封顶会让回合间新提交继承旧候选而被静默清掉；
+  扣一只会多告警、不会静默丢）。不整体清零——混合去向（一条吸收一条
+  排队）不得丢失吸收证据（round 2）。**任意** turn（含注入回合）以
+  `SESSION_ERROR` 终局时归零（中止的回合证明不了任何吸收，CLI 出错
+  也削弱"排队 turn 早该开启"的推断，round 3）。
 - `last_turn_terminal_at`：**任意** turn 终局（含注入回合）刷新。
   吸收年龄从最近一次 turn 终局起算——排队消息在任何 turn 占用 worker
   期间都无法运行（round 2：候选后插入长注入回合再 EOF 的静默丢窗口）。
@@ -191,7 +193,8 @@ result、距最近 turn 终局至少 `_ABSORBED_MIN_RESULT_AGE_SECONDS`
 
 - **ceiling 到点**（等满一个 ceiling 窗口、无开着的 turn）：满足即
   静默清零、正常 settle，只记 `headless_pending_turns_absorbed`
-  （含 walkcode session_id、result_age_seconds、submit_age_seconds），
+  （含 walkcode session_id、absorbable_pending、判定时冻结的
+  absorption_age_seconds / result_age_seconds / submit_age_seconds），
   不发告警。排队型 steering turn 会在 result 后数秒内开启，整个
   ceiling 窗口的沉默是强证据。
 - **worker EOF**（无窗口等待，随时可能发生）：额外要求
@@ -230,4 +233,7 @@ result、距最近 turn 终局至少 `_ABSORBED_MIN_RESULT_AGE_SECONDS`
 `test_inflight_submit_failure_does_not_pollute_absorption_candidates`、
 `test_mixed_absorbed_and_steering_submits_settle_silently`、
 `test_queued_submit_behind_injected_turn_reports_lost_at_eof`、
-`test_buffered_eof_behind_slow_delivery_reports_lost`。
+`test_buffered_eof_behind_slow_delivery_reports_lost`、
+`test_between_turns_submit_does_not_inherit_stale_candidate`、
+`test_injected_turn_session_error_revokes_absorption_candidates`、
+`test_short_ceiling_does_not_bypass_absorption_age_guard`。

@@ -6498,19 +6498,23 @@ class ClaudeHeadlessTransport:
         #   mid-turn and can have been absorbed. Submits queued before the
         #   turn opened own their own future turns and stay fully protected
         #   (review: two pre-queued submits + one result must still alarm).
-        # - absorbable_pending is (re)computed at each non-injected
-        #   TURN_COMPLETED result and REVOKED whenever a new non-injected
-        #   turn opens (that turn is consuming a queued marker, so the
-        #   leftover was NOT absorbed) or a turn ends in SESSION_ERROR (an
-        #   aborted turn proves nothing about injected messages).
+        # - absorbable_pending MERGES at each non-injected TURN_COMPLETED
+        #   result (min(leftover, carried + this turn's confirmed mid-turn
+        #   submits)); SHRINKS BY ONE at every non-injected turn open (the
+        #   opened turn consumed one marker — worst case a candidate, since
+        #   candidates carry no identity); and is ZEROED by ANY turn ending
+        #   in SESSION_ERROR, injected included (an aborted turn proves
+        #   nothing). In-flight submits (awaiting the client write) never
+        #   become candidates.
         # - last_accounted_result_at is the drain-side consumption time of
         #   the latest accounted TURN_COMPLETED result. It is deliberately
         #   NOT trusted alone (yield-suspension makes time attribution
         #   unsound — see the accounting comment below): it only feeds the
         #   belt-and-braces recency checks next to the counters.
-        # Injected results are excluded everywhere on purpose: they never
-        # answer a queued user submit (takeover incident semantics), so a
-        # leftover behind one must keep alarming/replaying.
+        # Injected results never account submits and never create candidates
+        # (takeover incident semantics — a leftover behind one must keep
+        # alarming/replaying); they DO refresh last_turn_terminal_at, since
+        # a queued message cannot run while any turn holds the worker.
         last_accounted_result_at = 0.0
         absorbable_pending = 0
         pending_at_turn_open: int | None = None
@@ -6562,13 +6566,19 @@ class ClaudeHeadlessTransport:
                     # leftover is a mid-turn candidate, no open turn and no
                     # unaccounted turn traffic contradicts it, the covering
                     # result postdates the last submit, and the result is old
-                    # enough (_ABSORBED_EOF_MIN_RESULT_AGE_SECONDS) that a
+                    # enough (_ABSORBED_MIN_RESULT_AGE_SECONDS) that a
                     # queued steering turn would already have opened. Any
                     # doubt keeps the pre-R2 pending_turn_lost path: a
                     # duplicate execution is recoverable, a silent drop on
                     # the fire-and-forget Lark ingress is not.
                     eof_last_submit_ts = self._last_submit_monotonic.get(
                         handle.handle_id, float("inf")
+                    )
+                    # Frozen decision values — the log below runs after yields
+                    # and must record what the guard actually saw (round 3).
+                    eof_decision_now = time.monotonic()
+                    eof_absorption_age = eof_observation_basis - max(
+                        last_accounted_result_at, last_turn_terminal_at
                     )
                     pending_absorbed = (
                         pending_lost > 0
@@ -6577,9 +6587,7 @@ class ClaudeHeadlessTransport:
                         and self._inflight_submits.get(handle.handle_id, 0) == 0
                         and absorbable_pending >= pending_lost
                         and last_accounted_result_at > eof_last_submit_ts
-                        and eof_observation_basis
-                        - max(last_accounted_result_at, last_turn_terminal_at)
-                        >= self._ABSORBED_MIN_RESULT_AGE_SECONDS
+                        and eof_absorption_age >= self._ABSORBED_MIN_RESULT_AGE_SECONDS
                     )
                     if persistent:
                         closing = self._unregister_handle(handle.handle_id)
@@ -6636,11 +6644,13 @@ class ClaudeHeadlessTransport:
                                 or handle.ref.get("session_id", "")
                             ),
                             pending_turns=pending_lost,
+                            absorbable_pending=absorbable_pending,
+                            absorption_age_seconds=round(eof_absorption_age, 1),
                             result_age_seconds=round(
-                                time.monotonic() - last_accounted_result_at, 1
+                                eof_decision_now - last_accounted_result_at, 1
                             ),
                             submit_age_seconds=round(
-                                time.monotonic() - eof_last_submit_ts, 1
+                                eof_decision_now - eof_last_submit_ts, 1
                             ),
                         )
                     elif pending_lost > 0:
@@ -6735,14 +6745,19 @@ class ClaudeHeadlessTransport:
                         last_submit_ts = self._last_submit_monotonic.get(
                             handle.handle_id, float("inf")
                         )
+                        # Freeze the decision-time values: the log below must
+                        # record exactly what the guard saw (round 3
+                        # observability), never a later re-read.
+                        decision_now = time.monotonic()
+                        absorption_age = decision_now - max(
+                            last_accounted_result_at, last_turn_terminal_at
+                        )
                         if (
                             absorbable_pending >= pending_submits
                             and not user_turn_traffic
                             and self._inflight_submits.get(handle.handle_id, 0) == 0
                             and last_accounted_result_at > last_submit_ts
-                            and time.monotonic()
-                            - max(last_accounted_result_at, last_turn_terminal_at)
-                            >= self._ABSORBED_MIN_RESULT_AGE_SECONDS
+                            and absorption_age >= self._ABSORBED_MIN_RESULT_AGE_SECONDS
                         ):
                             # Every leftover pending is a mid-turn absorption
                             # candidate covered by an accounted result, no
@@ -6760,12 +6775,14 @@ class ClaudeHeadlessTransport:
                                     or handle.ref.get("session_id", "")
                                 ),
                                 pending_turns=pending_submits,
+                                absorbable_pending=absorbable_pending,
                                 ceiling_seconds=self.background_wait_ceiling_seconds,
+                                absorption_age_seconds=round(absorption_age, 1),
                                 result_age_seconds=round(
-                                    time.monotonic() - last_accounted_result_at, 1
+                                    decision_now - last_accounted_result_at, 1
                                 ),
                                 submit_age_seconds=round(
-                                    time.monotonic() - last_submit_ts, 1
+                                    decision_now - last_submit_ts, 1
                                 ),
                             )
                             self._pending_turns.pop(handle.handle_id, None)
@@ -6940,6 +6957,16 @@ class ClaudeHeadlessTransport:
                     # clock: absorption age is measured from here — a queued
                     # message could not run while this turn held the worker.
                     last_turn_terminal_at = time.monotonic()
+                    turn_completed_cleanly = any(
+                        event.type == AgentEventType.TURN_COMPLETED for event in events
+                    )
+                    if not turn_completed_cleanly:
+                        # ANY turn ending in SESSION_ERROR — injected included
+                        # — revokes absorption evidence: an aborted turn
+                        # proves nothing about injected messages, and a CLI
+                        # unhealthy enough to error weakens the "a queued
+                        # turn would have opened by now" inference (round 3).
+                        absorbable_pending = 0
                     if not result_is_injected:
                         # A non-injected turn completed: it accounts for one
                         # submitted turn. Injected turns (notification
@@ -6959,12 +6986,9 @@ class ClaudeHeadlessTransport:
                         # Candidates MERGE with the carried ones (a mixed
                         # batch — one absorbed, one steering — must not lose
                         # the absorbed evidence when the steering turn runs).
-                        # A turn that ends in SESSION_ERROR gives NO
-                        # absorption evidence — the aborted turn may never
-                        # have processed the injected message.
-                        if any(
-                            event.type == AgentEventType.TURN_COMPLETED for event in events
-                        ):
+                        # (A turn ending in SESSION_ERROR was already
+                        # revoked above, injected turns included.)
+                        if turn_completed_cleanly:
                             last_accounted_result_at = time.monotonic()
                             mid_turn_submits = (
                                 max(
@@ -6980,8 +7004,6 @@ class ClaudeHeadlessTransport:
                                 max(0, pending - 1),
                                 absorbable_pending + mid_turn_submits,
                             )
-                        else:
-                            absorbable_pending = 0
                         pending_at_turn_open = None
                         # 该非注入回合已终局并核销一个提交：它的流量不再
                         # 属于任何仍在排队的提交。
@@ -7014,18 +7036,21 @@ class ClaudeHeadlessTransport:
                             # ADR 0059 R2: floor for absorption candidates —
                             # only submits counted ABOVE this snapshot arrive
                             # mid-turn. Opening a real turn consumes exactly
-                            # ONE queued marker (FIFO: the oldest), so it
-                            # proves at least one leftover was steering — but
-                            # not that ALL candidates were. Carry the rest:
-                            # candidates are capped at markers-minus-the-one
-                            # this turn is consuming (round 2: a mixed batch
-                            # must keep the absorbed evidence).
+                            # ONE queued marker, and candidates carry no
+                            # identity, so assume the WORST case: the opened
+                            # turn consumed a candidate — always deduct one
+                            # (round 3: capping at markers-minus-one let an
+                            # in-between submit inherit a stale candidate and
+                            # get silently cleared). The deduction can only
+                            # cause extra alarms, never a silent drop; the
+                            # remaining carry keeps the mixed-batch absorbed
+                            # evidence (round 2).
                             pending_at_turn_open = self._pending_turns.get(
                                 handle.handle_id, 0
                             )
-                            absorbable_pending = min(
-                                absorbable_pending,
-                                max(0, pending_at_turn_open - 1),
+                            absorbable_pending = max(
+                                0,
+                                min(absorbable_pending, pending_at_turn_open) - 1,
                             )
                     turn_open = True
                     if not current_turn_injected:
