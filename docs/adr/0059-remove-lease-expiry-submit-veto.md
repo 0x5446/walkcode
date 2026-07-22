@@ -147,26 +147,66 @@ mid-turn 提交全部拒掉，暴露面极小；本 ADR 移除否决后暴露面
 排队型 steering 提交必须保留计数，否则 settle 会在 steering turn
 排队期间关掉 worker（正是 2026-07-18 事故）。
 
-**修复（结算点判别）**：提交时保持保守计数不变；drain loop 记录
-`last_accounted_result_at`（最近一次**非注入** result 的 monotonic
-时刻），在两个结算点判别残留 pending：
+**为何不能只比时间**（发版门禁审查 14 维度一致否决了纯时间谓词）：
 
-- **ceiling 到点**：若最后一次提交之后出现过已核销 result，且此后整整
-  一个 ceiling 窗口没有任何新 turn 开启（排队型 steering turn 会在
-  result 后数秒内开启），则残留 pending 判定为已吸收：静默清零、正常
-  settle，只记 `headless_pending_turns_absorbed` 观测日志，不发告警。
-- **worker EOF**：同谓词成立时不再产出 `pending_turn_lost`（避免误
-  重放已处理消息），只记 `headless_pending_turns_absorbed_at_eof`。
+- generator 在 yield 处挂起期间，旧 result 已被预取、新提交竞入，
+  恢复后旧 result 会盖上晚于新提交的时间戳（时间归因不可靠是本文件
+  既有结论，计数模型正是为此而生）；
+- `_last_submit_monotonic` 在异步提交 await **之前**落章，等待窗口内
+  排水处理旧 result 同样形成"result 晚于提交"的假象；
+- 两条都在 turn 开启前排队的提交（各自应得自己的 turn），第一条的
+  result 一样"晚于"第二条的提交时刻——纯时间谓词会把真排队消息
+  误判成吸收并静默丢弃。
+
+**修复（吸收候选 + 结算点判别）**：提交时保持保守计数不变；drain
+loop 维护三个局部量并只在结算点动手：
+
+- `pending_at_turn_open`：**非注入** turn 开启时对计数拍快照（floor）。
+  只有 floor **之上**的提交才是 mid-turn 提交、才可能被该 turn 吸收；
+  turn 开启前排队的提交永不进入吸收候选。
+- `absorbable_pending`：每个非注入 `TURN_COMPLETED` result 核销时
+  重算（`min(残留, 本回合内新增提交数)`）；**新的非注入 turn 开启时
+  吊销归零**（它正在消费一个排队标记，说明残留不是吸收）；turn 以
+  `SESSION_ERROR` 终局时同样归零（中止的回合证明不了任何吸收）。
+- `last_accounted_result_at`：最近一次已核销 `TURN_COMPLETED` 的排水
+  消费时刻，只作 belt-and-braces 的新旧校验，绝不单独作数。
+
+两个结算点的前置条件**不同**：
+
+- **ceiling 到点**（等待已满一个 ceiling 窗口、无开着的 turn）：
+  `absorbable_pending ≥ 残留 pending` 且 `not user_turn_traffic` 且
+  最后提交早于最近核销 result → 判定已吸收：静默清零、正常 settle，
+  只记 `headless_pending_turns_absorbed`（含 session_id、
+  result_age_seconds、submit_age_seconds），不发告警。排队型 steering
+  turn 会在 result 后数秒内开启，整整一个 ceiling 窗口的沉默是强证据。
+- **worker EOF**（无窗口等待，随时可能发生）：在 ceiling 条件之上
+  再加 `not turn_open` 与**最小 result 年龄**
+  `_ABSORBED_EOF_MIN_RESULT_AGE_SECONDS`（30s）——EOF 离 result 太近
+  时吸收与排队不可分，必须保留 `pending_turn_lost` 路径（可见错误 +
+  ADR 0058 重放决策），即维持 R2 之前的行为。判定吸收时只记
+  `headless_pending_turns_absorbed_at_eof`，不产出错误、不重放。
 
 **已知残留窗口**（接受并记录）：
 
-- worker 在 result 之后、排队 steering turn 开启之前的亚秒窗口内死掉，
-  会被判为已吸收而不重放——宁可漏放一条极罕见的排队消息（用户可见
-  无响应后重发），不可重复执行一条已回答的消息。
-- 提交被吸收进**注入回合**（CLI 注入的 notification 回合）时，谓词
-  刻意不认注入 result（takeover 语义），该子场景 ceiling 仍会误报——
-  仅噪音，无破坏性，暴露概率极低。
+- worker 在 result 之后 30 秒**内**死掉且 mid-turn 提交确实已被吸收：
+  会走 `pending_turn_lost` 并可能重放一条已回答的消息（重复执行、
+  用户可见）——宁可如此，不可静默丢消息（Lark ingress 永不重投）。
+- worker 在 result 之后 30 秒**外**死掉且 CLI 把 mid-turn 提交排了队
+  却始终没开 turn（CLI 挂死类故障）：会被判吸收而漏报——概率极低，
+  observability 日志留痕可查。
+- 提交落在**注入回合**开着的窗口内且被其吸收：注入 result 刻意不提供
+  吸收证据（takeover 语义），ceiling 侧仍会误报告警（噪音）；EOF 侧
+  会按 `pending_turn_lost` + `traffic_seen=False` 自动重放，可能重复
+  执行——与 R2 之前行为一致，非本次回归，记入 issue 跟踪。
+- `background_wait_ceiling_seconds=0`（合法配置，语义"永远等"）下
+  吸收清算不可达，phantom 会一直挂住监听与 worker——与 R2 之前该配置
+  下 phantom 的行为一致，非本次回归，记入 issue 跟踪。
 
-回归测试：`test_absorbed_mid_turn_submit_settles_silently_at_ceiling`、
-`test_absorbed_mid_turn_submit_does_not_report_pending_lost_at_eof`
-（`tests/test_channel_native_headless_persistent_drain.py`）。
+回归测试（`tests/test_channel_native_headless_persistent_drain.py`）：
+`test_absorbed_mid_turn_submit_settles_silently_at_ceiling`、
+`test_absorbed_mid_turn_submit_does_not_report_pending_lost_at_eof`、
+`test_absorbed_leftover_with_fresh_result_still_reports_lost_at_eof`、
+`test_pre_queued_second_submit_still_alarms_at_ceiling`、
+`test_pre_queued_second_submit_reports_pending_lost_at_eof`、
+`test_started_steering_turn_death_reports_pending_lost_with_traffic`、
+`test_submit_behind_injected_turn_result_still_alarms_at_ceiling`。
