@@ -5897,9 +5897,18 @@ class ClaudeHeadlessTransport:
         # suspend at arbitrary points, so time comparison mis-credited results
         # to queued submits (2026-07-18 takeover incident + review round).
         self._pending_turns: dict[str, int] = {}
-        # handle_id -> monotonic time of the latest submit; feeds ONLY the
-        # pending-turn ceiling clock (see submit_turn).
+        # handle_id -> monotonic time of the latest submit; feeds the
+        # pending-turn ceiling clock AND the absorbed-submit discrimination
+        # at the settlement points (see _bridged_event_stream, ADR 0059 R2).
         self._last_submit_monotonic: dict[str, float] = {}
+        # handle_id -> submits currently awaiting the async client write.
+        # Their _pending_turns increment is already visible (settle safety),
+        # but they must NEVER count as absorption candidates and no silent
+        # absorbed settlement may run while one is in flight: an unconfirmed
+        # submit has an unknown fate, and a failed one rolls back only the
+        # counter — candidates computed from it would then cover a REAL
+        # queued message (deep-review round 2, ADR 0059 R2).
+        self._inflight_submits: dict[str, int] = {}
 
     def capabilities(self) -> TransportCapabilities:
         available = self._available()
@@ -5938,7 +5947,14 @@ class ClaudeHeadlessTransport:
             handle = TransportHandle(
                 handle_id=f"claude-{uuid.uuid4().hex}",
                 transport_kind=self.kind,
-                ref={"session_id": spec.session_id, "cwd": spec.cwd},
+                ref={
+                    "session_id": spec.session_id,
+                    # Stable WalkCode-local id for log correlation: after a
+                    # resume, "session_id" drifts to the agent-native id
+                    # (ADR 0059 R2 observability review).
+                    "walkcode_session_id": spec.session_id,
+                    "cwd": spec.cwd,
+                },
             )
             self._clients[handle.handle_id] = client
             if bridge is not None:
@@ -5995,7 +6011,15 @@ class ClaudeHeadlessTransport:
             handle = TransportHandle(
                 handle_id=f"claude-{uuid.uuid4().hex}",
                 transport_kind=self.kind,
-                ref={"session_id": resumed_session_id, "agent_session_id": resumed_session_id, "cwd": spec.cwd},
+                ref={
+                    "session_id": resumed_session_id,
+                    "agent_session_id": resumed_session_id,
+                    # Stable WalkCode-local id for log correlation (the
+                    # session_id key must stay agent-native: --resume and
+                    # other consumers read it).
+                    "walkcode_session_id": spec.session_id,
+                    "cwd": spec.cwd,
+                },
             )
             self._clients[handle.handle_id] = client
             if bridge is not None:
@@ -6061,6 +6085,7 @@ class ClaudeHeadlessTransport:
         bridge = self._bridges.pop(handle_id, None)
         self._pending_turns.pop(handle_id, None)
         self._last_submit_monotonic.pop(handle_id, None)
+        self._inflight_submits.pop(handle_id, None)
         for session_id, mapped in list(self._session_handles.items()):
             if mapped == handle_id:
                 self._session_handles.pop(session_id, None)
@@ -6232,13 +6257,33 @@ class ClaudeHeadlessTransport:
             # between the caller's liveness check and this submit. Raising the
             # typed error lets the orchestrator fall back to a fresh resume.
             raise TransportUnavailable("claude headless worker is gone (settled or restarted)")
+        # Every accepted submit counts — including mid-turn ones. A mid-turn
+        # submit has TWO possible fates the CLI never discloses at submit
+        # time: absorbed into the running turn (one result covers several
+        # submits) or queued as its own steering turn (one result each). The
+        # counter must stay conservative here so settle can never close the
+        # worker under a queued steering turn (2026-07-18 takeover incident);
+        # phantom leftovers from absorbed submits are recognized and cleared
+        # at the settlement points instead (ceiling / EOF discrimination in
+        # _bridged_event_stream, ADR 0059 R2).
         self._pending_turns[handle.handle_id] = self._pending_turns.get(handle.handle_id, 0) + 1
-        # Timestamp for the pending-turn ceiling clock ONLY (never for result
-        # attribution): a fresh submit must get the full ceiling even when the
-        # stream has already been quiet for a long time (background tasks).
+        # Timestamp for the pending-turn ceiling clock and the settlement-
+        # point absorption recency check (never for per-result attribution —
+        # results are accounted by counters): a fresh submit must get the
+        # full ceiling even when the stream has already been quiet for a
+        # long time (background tasks). NOTE: stamped before the async
+        # submit is awaited — the absorption predicates therefore never
+        # trust this timestamp alone (ADR 0059 R2).
         previous_submit_ts = self._last_submit_monotonic.get(handle.handle_id)
         this_submit_ts = time.monotonic()
         self._last_submit_monotonic[handle.handle_id] = this_submit_ts
+        # Mark the submit as in flight until the async client write returns:
+        # the drain loop must neither count it as an absorption candidate nor
+        # run a silent absorbed settlement while its fate is unknown (ADR
+        # 0059 R2, deep-review round 2).
+        self._inflight_submits[handle.handle_id] = (
+            self._inflight_submits.get(handle.handle_id, 0) + 1
+        )
         try:
             submit = getattr(client, "submit", None)
             if submit is not None:
@@ -6277,6 +6322,12 @@ class ClaudeHeadlessTransport:
                 else:
                     self._last_submit_monotonic[handle.handle_id] = previous_submit_ts
             raise
+        finally:
+            inflight = self._inflight_submits.get(handle.handle_id, 0) - 1
+            if inflight > 0:
+                self._inflight_submits[handle.handle_id] = inflight
+            else:
+                self._inflight_submits.pop(handle.handle_id, None)
 
     @staticmethod
     def _compose_turn_text(turn: TurnInput) -> str:
@@ -6347,6 +6398,23 @@ class ClaudeHeadlessTransport:
     # instead of infinite: a resolve() only completes a Future and does not
     # wake the stream, so the loop must re-derive its state periodically.
     _PENDING_DECISION_RECHECK_SECONDS = 60.0
+    # ADR 0059 R2: a settlement point may only classify leftover pending as
+    # ABSORBED when the latest terminal result (injected ones included — a
+    # queued message cannot run while ANY turn occupies the worker) is at
+    # least this old. A genuinely queued steering turn opens within seconds
+    # of the previous result, and the drain's yield-suspension can stamp a
+    # stale result AFTER a racing submit — a settlement close to a result
+    # is therefore ambiguous and must keep the alarm / pending_turn_lost
+    # path (visible error + ADR 0058 replay decision), matching pre-R2
+    # behavior. This floor is deliberately independent of the configurable
+    # background_wait_ceiling_seconds so a shortened ceiling cannot weaken
+    # data-safety semantics. 300s, not 30s: a queued turn's first stream
+    # message is subject to first-token latency, which stretches past 30s
+    # exactly during model-API brownouts — the same windows in which workers
+    # die (2026-07-20 incident), so the two failure conditions correlate.
+    # Duplicate execution of a truly absorbed message inside this window is
+    # accepted over a silent drop.
+    _ABSORBED_MIN_RESULT_AGE_SECONDS = 300.0
 
     async def _bridged_event_stream(
         self,
@@ -6422,6 +6490,58 @@ class ClaudeHeadlessTransport:
         # reclassify it as a user turn). Expires with the injection window if
         # no turn materializes.
         injected_turn_expected = False
+        # ADR 0059 R2: absorption evidence for phantom pending markers. A
+        # mid-turn submit may be ABSORBED into the running turn by the CLI
+        # (one result covers several submits) instead of queuing its own
+        # steering turn — indistinguishable at submit time, so the counter
+        # stays conservative and can leak a phantom pending. Discrimination
+        # happens at the settlement points (ceiling / EOF) and ONLY for
+        # leftovers that are absorption CANDIDATES:
+        # - pending_at_turn_open snapshots the counter when a NON-injected
+        #   turn is observed opening; only submits ABOVE that floor arrived
+        #   mid-turn and can have been absorbed. Submits queued before the
+        #   turn opened own their own future turns and stay fully protected
+        #   (review: two pre-queued submits + one result must still alarm).
+        # - absorbable_pending MERGES at each non-injected TURN_COMPLETED
+        #   result (min(leftover, carried + this turn's confirmed mid-turn
+        #   submits)); SHRINKS BY ONE at every non-injected turn open (the
+        #   opened turn consumed one marker — worst case a candidate, since
+        #   candidates carry no identity); and is ZEROED by ANY turn ending
+        #   in SESSION_ERROR, injected included (an aborted turn proves
+        #   nothing). In-flight submits (awaiting the client write) never
+        #   become candidates.
+        # - last_accounted_result_at is the drain-side consumption time of
+        #   the latest accounted TURN_COMPLETED result. It is deliberately
+        #   NOT trusted alone (yield-suspension makes time attribution
+        #   unsound — see the accounting comment below): it only feeds the
+        #   belt-and-braces recency checks next to the counters.
+        # Injected results never account submits and never create candidates
+        # (takeover incident semantics — a leftover behind one must keep
+        # alarming/replaying); they DO refresh last_turn_terminal_at, since
+        # a queued message cannot run while any turn holds the worker.
+        last_accounted_result_at = 0.0
+        absorbable_pending = 0
+        pending_at_turn_open: int | None = None
+        # ANY terminal result (injected included) refreshes this: a queued
+        # message cannot run while a turn occupies the worker, so absorption
+        # age must be measured from the LAST turn end, not just the last
+        # accounted one (round 2: long injected turn after the candidate).
+        last_turn_terminal_at = 0.0
+        # Task lifecycle messages (task_started/progress/updated/…) are
+        # handled by an early-continue branch that never touches the turn
+        # state — but they ARE worker activity: a queued turn may be running
+        # and visible ONLY through them (final verify panel: task-only
+        # traffic then EOF silently cleared a genuinely running submit).
+        # They feed the absorption age basis alongside the terminal clock.
+        last_task_activity_at = 0.0
+        # Observation clock for the EOF basis: when the stream wait returns
+        # ~instantly the EOF was already buffered while this generator was
+        # suspended in a yield (channel send, status card), so its true
+        # arrival is unknowable — the conservative basis is then the moment
+        # the PREVIOUS message was observed, not the resume time (round 2:
+        # a >30s delivery hang must not launder a fresh EOF into an old one).
+        last_msg_observed_at = 0.0
+        eof_observation_basis = 0.0
         # Base for the background-wait ceiling: reset by any stream traffic.
         quiet_since = time.monotonic()
         # Non-zero after a terminal task_notification: hold off settle until
@@ -6448,6 +6568,43 @@ class ClaudeHeadlessTransport:
                     # (receive_response) path too, where a zero-traffic EOF
                     # equally means the turn is gone.
                     pending_lost = self._pending_turns.get(handle.handle_id, 0)
+                    # ADR 0059 R2: read BEFORE unregister pops the timestamp.
+                    # Leftover pending may be a phantom from mid-turn submits
+                    # ABSORBED into an already-accounted turn — reporting it
+                    # as pending_turn_lost would auto-replay (ADR 0058) and
+                    # RE-EXECUTE an already-processed message. Absorption is
+                    # only accepted with ALL the evidence lined up: every
+                    # leftover is a mid-turn candidate, no open turn and no
+                    # unaccounted turn traffic contradicts it, the covering
+                    # result postdates the last submit, and the result is old
+                    # enough (_ABSORBED_MIN_RESULT_AGE_SECONDS) that a
+                    # queued steering turn would already have opened. Any
+                    # doubt keeps the pre-R2 pending_turn_lost path: a
+                    # duplicate execution is recoverable, a silent drop on
+                    # the fire-and-forget Lark ingress is not.
+                    eof_last_submit_ts = self._last_submit_monotonic.get(
+                        handle.handle_id, float("inf")
+                    )
+                    # Frozen decision values — the log below runs after yields
+                    # and must record what the guard actually saw (round 3).
+                    eof_decision_now = time.monotonic()
+                    # Same total-silence basis as the ceiling side: any
+                    # stream message counts as activity (final verify pass 6).
+                    eof_absorption_age = eof_observation_basis - max(
+                        last_accounted_result_at,
+                        last_turn_terminal_at,
+                        last_task_activity_at,
+                        last_msg_observed_at,
+                    )
+                    pending_absorbed = (
+                        pending_lost > 0
+                        and not turn_open
+                        and not user_turn_traffic
+                        and self._inflight_submits.get(handle.handle_id, 0) == 0
+                        and absorbable_pending >= pending_lost
+                        and last_accounted_result_at > eof_last_submit_ts
+                        and eof_absorption_age >= self._ABSORBED_MIN_RESULT_AGE_SECONDS
+                    )
                     if persistent:
                         closing = self._unregister_handle(handle.handle_id)
                         if active_tasks:
@@ -6492,7 +6649,27 @@ class ClaudeHeadlessTransport:
                                     )
                                 },
                             )
-                    if pending_lost > 0:
+                    if pending_lost > 0 and pending_absorbed:
+                        # Phantom leftover from absorbed mid-turn submits:
+                        # observability only — no error, no replay.
+                        _log_degrade(
+                            "headless_pending_turns_absorbed_at_eof",
+                            handle_id=handle.handle_id,
+                            session_id=str(
+                                handle.ref.get("walkcode_session_id")
+                                or handle.ref.get("session_id", "")
+                            ),
+                            pending_turns=pending_lost,
+                            absorbable_pending=absorbable_pending,
+                            absorption_age_seconds=round(eof_absorption_age, 1),
+                            result_age_seconds=round(
+                                eof_decision_now - last_accounted_result_at, 1
+                            ),
+                            submit_age_seconds=round(
+                                eof_decision_now - eof_last_submit_ts, 1
+                            ),
+                        )
+                    elif pending_lost > 0:
                         # Last (lifecycle-wise it must win over any synthetic
                         # completion above): the worker/stream ended before
                         # producing a single message for an accepted submit.
@@ -6541,6 +6718,7 @@ class ClaudeHeadlessTransport:
                 )
                 pending_before_wait = bridge is not None and bridge.has_any_pending()
                 wait_set = {task for task in (msg_task, queue_task) if task is not None}
+                wait_started = time.monotonic()
                 done, _pending = await asyncio.wait(
                     wait_set,
                     return_when=asyncio.FIRST_COMPLETED,
@@ -6580,33 +6758,87 @@ class ClaudeHeadlessTransport:
                             or time.monotonic() - pending_clock < self.background_wait_ceiling_seconds
                         ):
                             continue
-                        closing = self._unregister_handle(handle.handle_id)
-                        _log_degrade(
-                            "headless_pending_turn_ceiling",
-                            handle_id=handle.handle_id,
-                            pending_turns=pending_submits,
-                            ceiling_seconds=self.background_wait_ceiling_seconds,
+                        last_submit_ts = self._last_submit_monotonic.get(
+                            handle.handle_id, float("inf")
                         )
-                        yield AgentEvent(
-                            AgentEventType.TURN_DELTA,
-                            {
-                                "text": (
-                                    f"⚠️ 已提交的消息在 {int(self.background_wait_ceiling_seconds)} 秒内"
-                                    "没有得到任何响应，已停止本次会话监听。直接回复可重新拉起会话。"
-                                )
-                            },
+                        # Freeze the decision-time values: the log below must
+                        # record exactly what the guard saw (round 3
+                        # observability), never a later re-read.
+                        decision_now = time.monotonic()
+                        # Age basis includes last_msg_observed_at: ANY stream
+                        # message — recognized or not (task beats, system
+                        # status, future SDK types) — is worker activity that
+                        # may belong to an unobserved queued turn (final
+                        # verify pass 6). Silence must be total.
+                        absorption_age = decision_now - max(
+                            last_accounted_result_at,
+                            last_turn_terminal_at,
+                            last_task_activity_at,
+                            last_msg_observed_at,
                         )
-                        yield AgentEvent(AgentEventType.TURN_COMPLETED, {"message": ""})
-                        if active_tasks:
-                            # This close also abandons the background ledger;
-                            # clear it or the status card keeps advertising
-                            # tasks nobody is listening for.
-                            yield AgentEvent(
-                                AgentEventType.BACKGROUND_TASKS,
-                                {"count": 0, "tasks": [], "abandoned": len(active_tasks)},
+                        if (
+                            absorbable_pending >= pending_submits
+                            and not user_turn_traffic
+                            and self._inflight_submits.get(handle.handle_id, 0) == 0
+                            and last_accounted_result_at > last_submit_ts
+                            and absorption_age >= self._ABSORBED_MIN_RESULT_AGE_SECONDS
+                        ):
+                            # Every leftover pending is a mid-turn absorption
+                            # candidate covered by an accounted result, no
+                            # unaccounted turn traffic exists, and no steering
+                            # turn opened for a full ceiling window: the
+                            # submits were ABSORBED into that turn (mid-turn
+                            # injection). Clear the phantom counter and settle
+                            # normally — firing the "no response" alarm here
+                            # was the v0.14.12 false-positive (ADR 0059 R2).
+                            _log_degrade(
+                                "headless_pending_turns_absorbed",
+                                handle_id=handle.handle_id,
+                                session_id=str(
+                                    handle.ref.get("walkcode_session_id")
+                                    or handle.ref.get("session_id", "")
+                                ),
+                                pending_turns=pending_submits,
+                                absorbable_pending=absorbable_pending,
+                                ceiling_seconds=self.background_wait_ceiling_seconds,
+                                absorption_age_seconds=round(absorption_age, 1),
+                                result_age_seconds=round(
+                                    decision_now - last_accounted_result_at, 1
+                                ),
+                                submit_age_seconds=round(
+                                    decision_now - last_submit_ts, 1
+                                ),
                             )
-                        settled = True
-                        break
+                            self._pending_turns.pop(handle.handle_id, None)
+                            # Fall through to the normal settle path below.
+                        else:
+                            closing = self._unregister_handle(handle.handle_id)
+                            _log_degrade(
+                                "headless_pending_turn_ceiling",
+                                handle_id=handle.handle_id,
+                                pending_turns=pending_submits,
+                                ceiling_seconds=self.background_wait_ceiling_seconds,
+                            )
+                            yield AgentEvent(
+                                AgentEventType.TURN_DELTA,
+                                {
+                                    "text": (
+                                        f"⚠️ 已提交的消息在 {int(self.background_wait_ceiling_seconds)} 秒内"
+                                        "没有得到任何响应，已停止本次会话监听。直接回复可重新拉起会话。"
+                                    )
+                                },
+                            )
+                            yield AgentEvent(AgentEventType.TURN_COMPLETED, {"message": ""})
+                            if active_tasks:
+                                # This close also abandons the background ledger;
+                                # clear it or the status card keeps advertising
+                                # tasks nobody is listening for.
+                                yield AgentEvent(
+                                    AgentEventType.BACKGROUND_TASKS,
+                                    {"count": 0, "tasks": [], "abandoned": len(active_tasks)},
+                                )
+                            settled = True
+                            break
                     if not active_tasks and time.monotonic() < injection_hold_until:
                         # A notification just drained the ledger; its injected
                         # follow-up turn may still be on the way.
@@ -6664,6 +6896,17 @@ class ClaudeHeadlessTransport:
                 try:
                     message = msg_task.result()
                 except StopAsyncIteration:
+                    # EOF observation basis (ADR 0059 R2 round 2): if the
+                    # wait actually blocked, the EOF arrived just now; if it
+                    # returned ~instantly the EOF was buffered while this
+                    # generator was suspended in a yield — its true arrival
+                    # is only bounded below by the previous message's
+                    # observation time.
+                    eof_observation_basis = (
+                        time.monotonic()
+                        if time.monotonic() - wait_started >= 0.05
+                        else last_msg_observed_at
+                    )
                     msg_task = None
                     continue
                 except Exception:
@@ -6675,10 +6918,34 @@ class ClaudeHeadlessTransport:
                     raise
                 msg_task = asyncio.ensure_future(stream_iter.__anext__())
                 quiet_since = time.monotonic()
+                last_msg_observed_at = quiet_since
                 is_task_message, ledger_changed, task_subtype = self._apply_task_message(
                     message, active_tasks
                 )
                 if is_task_message:
+                    # Worker activity: blocks absorbed classification for the
+                    # next _ABSORBED_MIN_RESULT_AGE_SECONDS — a queued turn
+                    # may be running behind this traffic (final verify).
+                    last_task_activity_at = time.monotonic()
+                    if not turn_open and task_subtype != "task_notification":
+                        # Task lifecycle traffic (started/progress/updated/
+                        # ledger change) with NO open turn may be the ONLY
+                        # visible activity of an unobserved running turn —
+                        # its opening traffic was swallowed by this early-
+                        # continue branch. Sticky evidence for the queued
+                        # user turn (final verify passes 3-5: task-only turns
+                        # aged out of the activity clock and their submits
+                        # were silently cleared; pass 5 showed non-started
+                        # subtypes can be the opening too). Deliberately NOT
+                        # ceded to a live injected-turn prediction (pass 4),
+                        # and task_notification alone stays out — it is the
+                        # designed between-turns injected-turn signal with
+                        # its own hold machinery. Mis-crediting background
+                        # beats of an OLD task here only costs an extra
+                        # alarm / a refused-but-visible replay (v0.14.12
+                        # behavior), never a silent drop; the sticky flag is
+                        # reset by the next accounting result as usual.
+                        user_turn_traffic = True
                     if not turn_open and (
                         task_subtype == "task_notification"
                         or (ledger_changed and not active_tasks)
@@ -6733,6 +7000,20 @@ class ClaudeHeadlessTransport:
                         and time.monotonic() < injection_hold_until
                     )
                     turn_open = False
+                    # Any turn end (injected included) refreshes the terminal
+                    # clock: absorption age is measured from here — a queued
+                    # message could not run while this turn held the worker.
+                    last_turn_terminal_at = time.monotonic()
+                    turn_completed_cleanly = any(
+                        event.type == AgentEventType.TURN_COMPLETED for event in events
+                    )
+                    if not turn_completed_cleanly:
+                        # ANY turn ending in SESSION_ERROR — injected included
+                        # — revokes absorption evidence: an aborted turn
+                        # proves nothing about injected messages, and a CLI
+                        # unhealthy enough to error weakens the "a queued
+                        # turn would have opened by now" inference (round 3).
+                        absorbable_pending = 0
                     if not result_is_injected:
                         # A non-injected turn completed: it accounts for one
                         # submitted turn. Injected turns (notification
@@ -6743,6 +7024,46 @@ class ClaudeHeadlessTransport:
                             self._pending_turns[handle.handle_id] = pending - 1
                         else:
                             self._pending_turns.pop(handle.handle_id, None)
+                        # ADR 0059 R2: absorption evidence. Only submits that
+                        # arrived while THIS turn was observably open (above
+                        # the floor) AND already confirmed by the client
+                        # (not in flight) can have been absorbed into it;
+                        # anything queued before the turn opened owns its own
+                        # future turn and must never be silently cleared.
+                        # Candidates MERGE with the carried ones (a mixed
+                        # batch — one absorbed, one steering — must not lose
+                        # the absorbed evidence when the steering turn runs).
+                        # (A turn ending in SESSION_ERROR was already
+                        # revoked above, injected turns included.)
+                        if turn_completed_cleanly:
+                            last_accounted_result_at = time.monotonic()
+                            if pending_at_turn_open is not None:
+                                mid_turn_submits = max(
+                                    0,
+                                    pending
+                                    - pending_at_turn_open
+                                    - self._inflight_submits.get(handle.handle_id, 0),
+                                )
+                                absorbable_pending = min(
+                                    max(0, pending - 1),
+                                    absorbable_pending + mid_turn_submits,
+                                )
+                            else:
+                                # Bare result: a non-injected turn ran WITHOUT
+                                # observed opening traffic, so the turn-open
+                                # deduction never fired. The turn still
+                                # consumed one marker — worst case a candidate
+                                # (same identity-less rule as the open-time
+                                # deduction) — and observed no mid-turn
+                                # submits, so it contributes no new candidates
+                                # (final verify panel: without this deduction
+                                # a stale candidate transfers to a protected
+                                # between-turns submit and silently drops it).
+                                absorbable_pending = min(
+                                    max(0, pending - 1),
+                                    max(0, absorbable_pending - 1),
+                                )
+                        pending_at_turn_open = None
                         # 该非注入回合已终局并核销一个提交：它的流量不再
                         # 属于任何仍在排队的提交。
                         user_turn_traffic = False
@@ -6770,6 +7091,26 @@ class ClaudeHeadlessTransport:
                             message
                         )
                         injected_turn_expected = False
+                        if not current_turn_injected:
+                            # ADR 0059 R2: floor for absorption candidates —
+                            # only submits counted ABOVE this snapshot arrive
+                            # mid-turn. Opening a real turn consumes exactly
+                            # ONE queued marker, and candidates carry no
+                            # identity, so assume the WORST case: the opened
+                            # turn consumed a candidate — always deduct one
+                            # (round 3: capping at markers-minus-one let an
+                            # in-between submit inherit a stale candidate and
+                            # get silently cleared). The deduction can only
+                            # cause extra alarms, never a silent drop; the
+                            # remaining carry keeps the mixed-batch absorbed
+                            # evidence (round 2).
+                            pending_at_turn_open = self._pending_turns.get(
+                                handle.handle_id, 0
+                            )
+                            absorbable_pending = max(
+                                0,
+                                min(absorbable_pending, pending_at_turn_open) - 1,
+                            )
                     turn_open = True
                     if not current_turn_injected:
                         user_turn_traffic = True
