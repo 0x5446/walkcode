@@ -6919,18 +6919,17 @@ class ClaudeHeadlessTransport:
                         # call. Seeing one with NO open turn means an
                         # unobserved turn is running — its opening traffic was
                         # this very message, swallowed by this branch. Sticky
-                        # evidence, same attribution rule as floated
-                        # permission events: a live injected-turn prediction
-                        # claims it, otherwise it belongs to a queued user
-                        # turn (final verify pass 3: task-only turns aged out
-                        # of the activity clock and their submits were
-                        # silently cleared).
-                        prediction_live = (
-                            injected_turn_expected
-                            and time.monotonic() < injection_hold_until
-                        )
-                        if not prediction_live:
-                            user_turn_traffic = True
+                        # evidence for the queued user turn (final verify
+                        # pass 3: task-only turns aged out of the activity
+                        # clock and their submits were silently cleared).
+                        # Deliberately NOT ceded to a live injected-turn
+                        # prediction (pass 4): a real task-only steering turn
+                        # starting inside the prediction window would lose
+                        # its only evidence and get silently cleared —
+                        # mis-crediting an injected turn's early task here
+                        # only costs an extra alarm / a refused-but-visible
+                        # replay, never a silent drop.
+                        user_turn_traffic = True
                     if not turn_open and (
                         task_subtype == "task_notification"
                         or (ledger_changed and not active_tasks)
