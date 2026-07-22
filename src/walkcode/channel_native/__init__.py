@@ -6408,9 +6408,13 @@ class ClaudeHeadlessTransport:
     # path (visible error + ADR 0058 replay decision), matching pre-R2
     # behavior. This floor is deliberately independent of the configurable
     # background_wait_ceiling_seconds so a shortened ceiling cannot weaken
-    # data-safety semantics. Duplicate execution of a truly absorbed message
-    # in this narrow window is accepted over a silent drop.
-    _ABSORBED_MIN_RESULT_AGE_SECONDS = 30.0
+    # data-safety semantics. 300s, not 30s: a queued turn's first stream
+    # message is subject to first-token latency, which stretches past 30s
+    # exactly during model-API brownouts — the same windows in which workers
+    # die (2026-07-20 incident), so the two failure conditions correlate.
+    # Duplicate execution of a truly absorbed message inside this window is
+    # accepted over a silent drop.
+    _ABSORBED_MIN_RESULT_AGE_SECONDS = 300.0
 
     async def _bridged_event_stream(
         self,
@@ -6584,10 +6588,13 @@ class ClaudeHeadlessTransport:
                     # Frozen decision values — the log below runs after yields
                     # and must record what the guard actually saw (round 3).
                     eof_decision_now = time.monotonic()
+                    # Same total-silence basis as the ceiling side: any
+                    # stream message counts as activity (final verify pass 6).
                     eof_absorption_age = eof_observation_basis - max(
                         last_accounted_result_at,
                         last_turn_terminal_at,
                         last_task_activity_at,
+                        last_msg_observed_at,
                     )
                     pending_absorbed = (
                         pending_lost > 0
@@ -6758,10 +6765,16 @@ class ClaudeHeadlessTransport:
                         # record exactly what the guard saw (round 3
                         # observability), never a later re-read.
                         decision_now = time.monotonic()
+                        # Age basis includes last_msg_observed_at: ANY stream
+                        # message — recognized or not (task beats, system
+                        # status, future SDK types) — is worker activity that
+                        # may belong to an unobserved queued turn (final
+                        # verify pass 6). Silence must be total.
                         absorption_age = decision_now - max(
                             last_accounted_result_at,
                             last_turn_terminal_at,
                             last_task_activity_at,
+                            last_msg_observed_at,
                         )
                         if (
                             absorbable_pending >= pending_submits

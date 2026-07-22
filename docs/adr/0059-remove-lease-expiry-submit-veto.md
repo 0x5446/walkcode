@@ -202,9 +202,12 @@ drain loop 维护候选状态并只在结算点动手：
 
 两个结算点的共同条件：`absorbable_pending ≥ 残留`、
 `not user_turn_traffic`、**无在途提交**、最后提交早于最近核销
-result、距最近 turn 终局至少 `_ABSORBED_MIN_RESULT_AGE_SECONDS`
-（30s，刻意独立于可配置的 ceiling——调短 ceiling 不得削弱数据安全
-语义）。差异：
+result、距**最近一切流量**（核销 result、任意终局、任务活动、任何
+已消费的流消息——不认识的类型也算，终验第六轮）至少
+`_ABSORBED_MIN_RESULT_AGE_SECONDS`（300s：排队 turn 的首条流消息受
+首 token 延迟影响，API 故障窗内可远超 30s，而故障窗恰是 worker
+死亡高发期，二者相关；刻意独立于可配置的 ceiling——调短 ceiling
+不得削弱数据安全语义）。差异：
 
 - **ceiling 到点**（等满一个 ceiling 窗口、无开着的 turn）：满足即
   静默清零、正常 settle，只记 `headless_pending_turns_absorbed`
@@ -219,12 +222,14 @@ result、距最近 turn 终局至少 `_ABSORBED_MIN_RESULT_AGE_SECONDS`
 
 **已知残留窗口**（接受并记录）：
 
-- worker 在最近 turn 终局 30 秒**内**死掉且 mid-turn 提交确实已被
-  吸收：走 `pending_turn_lost` 并可能重放一条已回答的消息（重复执行、
+- worker 在最近流量 300 秒**内**死掉且 mid-turn 提交确实已被吸收：
+  走 `pending_turn_lost` 并可能重放一条已回答的消息（重复执行、
   用户可见）——宁可如此，不可静默丢消息（Lark ingress 永不重投）。
-- worker 在终局 30 秒**外**死掉且 CLI 把 mid-turn 提交排了队却始终
-  没开 turn（CLI 挂死类故障）：会被判吸收而漏报——概率极低，
-  observability 日志（walkcode session_id + 时距字段）留痕可查。
+- 排队 turn 在最近一切流量之后整整 300 秒（EOF 侧）/ 一个 ceiling
+  窗口（ceiling 侧）内没有产生**任何**可归因流量（未开场、CLI 挂死、
+  或 worker 恰死于该窗）：会被判吸收而漏报——需要长时间完全零输出，
+  概率极低，observability 日志（walkcode session_id + 时距字段）
+  留痕可查。
 - drain 恢复被延迟跨越 30s 守卫的窄窗（yield 挂起、事件循环被同步
   回调停摆等——EOF 真实到达时刻在该状态下本质不可观测）且 worker 恰
   死于该窗：可能误判吸收。需要整个进程已处于病态（30s+ 停摆会同时
