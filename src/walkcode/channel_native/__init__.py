@@ -6990,20 +6990,32 @@ class ClaudeHeadlessTransport:
                         # revoked above, injected turns included.)
                         if turn_completed_cleanly:
                             last_accounted_result_at = time.monotonic()
-                            mid_turn_submits = (
-                                max(
+                            if pending_at_turn_open is not None:
+                                mid_turn_submits = max(
                                     0,
                                     pending
                                     - pending_at_turn_open
                                     - self._inflight_submits.get(handle.handle_id, 0),
                                 )
-                                if pending_at_turn_open is not None
-                                else 0
-                            )
-                            absorbable_pending = min(
-                                max(0, pending - 1),
-                                absorbable_pending + mid_turn_submits,
-                            )
+                                absorbable_pending = min(
+                                    max(0, pending - 1),
+                                    absorbable_pending + mid_turn_submits,
+                                )
+                            else:
+                                # Bare result: a non-injected turn ran WITHOUT
+                                # observed opening traffic, so the turn-open
+                                # deduction never fired. The turn still
+                                # consumed one marker — worst case a candidate
+                                # (same identity-less rule as the open-time
+                                # deduction) — and observed no mid-turn
+                                # submits, so it contributes no new candidates
+                                # (final verify panel: without this deduction
+                                # a stale candidate transfers to a protected
+                                # between-turns submit and silently drops it).
+                                absorbable_pending = min(
+                                    max(0, pending - 1),
+                                    max(0, absorbable_pending - 1),
+                                )
                         pending_at_turn_open = None
                         # 该非注入回合已终局并核销一个提交：它的流量不再
                         # 属于任何仍在排队的提交。

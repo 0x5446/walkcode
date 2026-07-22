@@ -171,10 +171,13 @@ drain loop 维护候选状态并只在结算点动手：
   非注入 turn 开启时**扣一**（`max(0, min(旧候选, 开启时标记数) - 1)`）
   ——候选没有身份，按最坏情况假定开启的 turn 消费的就是一个候选
   （round 3：按"标记数-1"封顶会让回合间新提交继承旧候选而被静默清掉；
-  扣一只会多告警、不会静默丢）。不整体清零——混合去向（一条吸收一条
-  排队）不得丢失吸收证据（round 2）。**任意** turn（含注入回合）以
-  `SESSION_ERROR` 终局时归零（中止的回合证明不了任何吸收，CLI 出错
-  也削弱"排队 turn 早该开启"的推断，round 3）。
+  扣一只会多告警、不会静默丢）。**bare result**（无开场流量、只有
+  result 的非注入回合）在核销点做同样的扣一且不产生新候选（终验
+  对抗面板：否则 bare result 绕过唯一扣减点，旧候选照样转移）。不
+  整体清零——混合去向（一条吸收一条排队）不得丢失吸收证据
+  （round 2）。**任意** turn（含注入回合）以 `SESSION_ERROR` 终局时
+  归零（中止的回合证明不了任何吸收，CLI 出错也削弱"排队 turn 早该
+  开启"的推断，round 3）。
 - `last_turn_terminal_at`：**任意** turn 终局（含注入回合）刷新。
   吸收年龄从最近一次 turn 终局起算——排队消息在任何 turn 占用 worker
   期间都无法运行（round 2：候选后插入长注入回合再 EOF 的静默丢窗口）。
@@ -236,4 +239,5 @@ result、距最近 turn 终局至少 `_ABSORBED_MIN_RESULT_AGE_SECONDS`
 `test_buffered_eof_behind_slow_delivery_reports_lost`、
 `test_between_turns_submit_does_not_inherit_stale_candidate`、
 `test_injected_turn_session_error_revokes_absorption_candidates`、
-`test_short_ceiling_does_not_bypass_absorption_age_guard`。
+`test_short_ceiling_does_not_bypass_absorption_age_guard`、
+`test_bare_result_steering_turn_deducts_stale_candidate`。

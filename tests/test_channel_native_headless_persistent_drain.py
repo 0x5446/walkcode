@@ -814,6 +814,47 @@ class PersistentStreamTests(unittest.TestCase):
         texts = [e.payload.get("text", "") for e in events if e.type == AgentEventType.TURN_DELTA]
         self.assertTrue(any("没有得到任何响应" in text for text in texts))
 
+    def test_bare_result_steering_turn_deducts_stale_candidate(self):
+        # Final verify panel: a steering turn that produces ONLY a bare
+        # ResultMessage (no opening traffic) still consumed one marker —
+        # without the deduction at the accounting point, its stale candidate
+        # transfers to a protected between-turns submit which then gets
+        # silently cleared at the ceiling.
+        async def scenario():
+            cls = _stream_client_class()
+            transport = _transport(cls, grace=0.05, ceiling=0.4)
+            transport._ABSORBED_MIN_RESULT_AGE_SECONDS = 0.0
+            handle = await transport.launch_session(cwd="/tmp/p", session_id="s1")
+            await transport.submit_turn(handle, TurnInput(text="first"), "k1")
+            client = transport._clients[handle.handle_id]
+            collected: list = []
+            consumer = asyncio.create_task(_consume(transport, handle, collected))
+            client.feed(_assistant("干活中"))
+            self.assertTrue(
+                await _wait_until(
+                    lambda: any(e.type == AgentEventType.TURN_DELTA for e in collected)
+                )
+            )
+            # Mid-turn submit: becomes a candidate but actually steers.
+            await transport.submit_turn(handle, TurnInput(text="转向二"), "k2")
+            client.feed(_result("first done"))
+            self.assertTrue(
+                await _wait_until(
+                    lambda: transport._pending_turns.get(handle.handle_id) == 1
+                )
+            )
+            # A new message arrives BETWEEN turns (fully protected).
+            await transport.submit_turn(handle, TurnInput(text="三号消息"), "k3")
+            # The steering turn answers with a BARE result — no opening
+            # traffic at all.
+            client.feed(_result("steer bare done"))
+            await asyncio.wait_for(consumer, timeout=5.0)
+            return transport, handle, collected
+
+        transport, handle, events = asyncio.run(scenario())
+        texts = [e.payload.get("text", "") for e in events if e.type == AgentEventType.TURN_DELTA]
+        self.assertTrue(any("没有得到任何响应" in text for text in texts))
+
     def test_submits_with_no_open_turn_still_counted_individually(self):
         # Guard for the 2026-07-18 incident semantics: messages submitted
         # while NO turn is open each queue their own turn and must each be
