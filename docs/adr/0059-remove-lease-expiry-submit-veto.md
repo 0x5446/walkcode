@@ -181,6 +181,9 @@ drain loop 维护候选状态并只在结算点动手：
 - `last_turn_terminal_at`：**任意** turn 终局（含注入回合）刷新。
   吸收年龄从最近一次 turn 终局起算——排队消息在任何 turn 占用 worker
   期间都无法运行（round 2：候选后插入长注入回合再 EOF 的静默丢窗口）。
+  **task 生命周期消息**（task_started/updated/…）同样刷新年龄基准：
+  排队 turn 可能只以任务流量可见（终验面板：仅任务流量 + EOF 曾能
+  静默清掉真实在跑的提交）。
 - `last_accounted_result_at`：最近一次已核销 `TURN_COMPLETED` 的排水
   消费时刻，只作 belt-and-braces 的新旧校验，绝不单独作数。
 - EOF 观测基准 `eof_observation_basis`：流等待真实阻塞后返回 → EOF
@@ -213,10 +216,10 @@ result、距最近 turn 终局至少 `_ABSORBED_MIN_RESULT_AGE_SECONDS`
 - worker 在终局 30 秒**外**死掉且 CLI 把 mid-turn 提交排了队却始终
   没开 turn（CLI 挂死类故障）：会被判吸收而漏报——概率极低，
   observability 日志（walkcode session_id + 时距字段）留痕可查。
-- yield 挂起竞态的窄窗（旧 result 在挂起期间被预取、新提交竞入后被
-  计入候选）：ceiling 侧有整窗沉默兜底；EOF 侧有 30s 年龄 + 观测基准
-  兜底；两者都失效需要"挂起跨越 30s 且 worker 恰好死于该窗"的叠加，
-  接受。
+- drain 恢复被延迟跨越 30s 守卫的窄窗（yield 挂起、事件循环被同步
+  回调停摆等——EOF 真实到达时刻在该状态下本质不可观测）且 worker 恰
+  死于该窗：可能误判吸收。需要整个进程已处于病态（30s+ 停摆会同时
+  打断心跳与其他会话），接受；观测日志留痕。
 - 提交落在**注入回合**开着的窗口内且被其吸收：注入 result 刻意不提供
   吸收证据（takeover 语义），ceiling 侧仍会误报告警（噪音）；EOF 侧
   按 `pending_turn_lost` + `traffic_seen=False` 自动重放，可能重复
@@ -240,4 +243,5 @@ result、距最近 turn 终局至少 `_ABSORBED_MIN_RESULT_AGE_SECONDS`
 `test_between_turns_submit_does_not_inherit_stale_candidate`、
 `test_injected_turn_session_error_revokes_absorption_candidates`、
 `test_short_ceiling_does_not_bypass_absorption_age_guard`、
-`test_bare_result_steering_turn_deducts_stale_candidate`。
+`test_bare_result_steering_turn_deducts_stale_candidate`、
+`test_task_only_traffic_blocks_absorbed_classification_at_eof`。

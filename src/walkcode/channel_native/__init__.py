@@ -6523,6 +6523,13 @@ class ClaudeHeadlessTransport:
         # age must be measured from the LAST turn end, not just the last
         # accounted one (round 2: long injected turn after the candidate).
         last_turn_terminal_at = 0.0
+        # Task lifecycle messages (task_started/progress/updated/…) are
+        # handled by an early-continue branch that never touches the turn
+        # state — but they ARE worker activity: a queued turn may be running
+        # and visible ONLY through them (final verify panel: task-only
+        # traffic then EOF silently cleared a genuinely running submit).
+        # They feed the absorption age basis alongside the terminal clock.
+        last_task_activity_at = 0.0
         # Observation clock for the EOF basis: when the stream wait returns
         # ~instantly the EOF was already buffered while this generator was
         # suspended in a yield (channel send, status card), so its true
@@ -6578,7 +6585,9 @@ class ClaudeHeadlessTransport:
                     # and must record what the guard actually saw (round 3).
                     eof_decision_now = time.monotonic()
                     eof_absorption_age = eof_observation_basis - max(
-                        last_accounted_result_at, last_turn_terminal_at
+                        last_accounted_result_at,
+                        last_turn_terminal_at,
+                        last_task_activity_at,
                     )
                     pending_absorbed = (
                         pending_lost > 0
@@ -6750,7 +6759,9 @@ class ClaudeHeadlessTransport:
                         # observability), never a later re-read.
                         decision_now = time.monotonic()
                         absorption_age = decision_now - max(
-                            last_accounted_result_at, last_turn_terminal_at
+                            last_accounted_result_at,
+                            last_turn_terminal_at,
+                            last_task_activity_at,
                         )
                         if (
                             absorbable_pending >= pending_submits
@@ -6899,6 +6910,10 @@ class ClaudeHeadlessTransport:
                     message, active_tasks
                 )
                 if is_task_message:
+                    # Worker activity: blocks absorbed classification for the
+                    # next _ABSORBED_MIN_RESULT_AGE_SECONDS — a queued turn
+                    # may be running behind this traffic (final verify).
+                    last_task_activity_at = time.monotonic()
                     if not turn_open and (
                         task_subtype == "task_notification"
                         or (ledger_changed and not active_tasks)

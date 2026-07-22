@@ -855,6 +855,53 @@ class PersistentStreamTests(unittest.TestCase):
         texts = [e.payload.get("text", "") for e in events if e.type == AgentEventType.TURN_DELTA]
         self.assertTrue(any("没有得到任何响应" in text for text in texts))
 
+    def test_task_only_traffic_blocks_absorbed_classification_at_eof(self):
+        # Final verify panel round 2: a queued turn may be visible ONLY
+        # through task lifecycle messages (task_started/task_updated) — they
+        # never touch the turn state, but they ARE worker activity. An EOF
+        # right after them must keep the pending_turn_lost path instead of
+        # silently clearing the genuinely running submit.
+        async def scenario():
+            cls = _stream_client_class()
+            transport = _transport(cls)
+            transport._ABSORBED_MIN_RESULT_AGE_SECONDS = 0.3
+            handle = await transport.launch_session(cwd="/tmp/p", session_id="s1")
+            await transport.submit_turn(handle, TurnInput(text="first"), "k1")
+            client = transport._clients[handle.handle_id]
+            collected: list = []
+            consumer = asyncio.create_task(_consume(transport, handle, collected))
+            client.feed(_assistant("干活中"))
+            self.assertTrue(
+                await _wait_until(
+                    lambda: any(e.type == AgentEventType.TURN_DELTA for e in collected)
+                )
+            )
+            await transport.submit_turn(handle, TurnInput(text="排队消息"), "k2")
+            client.feed(_result("first done"))
+            self.assertTrue(
+                await _wait_until(
+                    lambda: transport._pending_turns.get(handle.handle_id) == 1
+                )
+            )
+            # Let the accounted result age past the guard on its own...
+            await asyncio.sleep(0.4)
+            # ...then the queued turn shows up ONLY as task lifecycle
+            # traffic, and the worker dies right after.
+            client.feed(_task_started("bg-1", "后台任务"))
+            client.feed(_task_updated("bg-1", status="completed"))
+            await asyncio.sleep(0.05)
+            client.feed_eof()
+            await asyncio.wait_for(consumer, timeout=5.0)
+            return transport, handle, collected
+
+        transport, handle, events = asyncio.run(scenario())
+        reasons = [
+            e.payload.get("reason")
+            for e in events
+            if e.type == AgentEventType.SESSION_ERROR
+        ]
+        self.assertIn("pending_turn_lost", reasons)
+
     def test_submits_with_no_open_turn_still_counted_individually(self):
         # Guard for the 2026-07-18 incident semantics: messages submitted
         # while NO turn is open each queue their own turn and must each be
