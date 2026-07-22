@@ -121,3 +121,52 @@ non-expired writer lease"——该前提在实现里从未配套心跳，30 秒�
 - **文档同步**：部署手册删除 `expired_writer_leases: 0` 门禁；
   ADR 0029/0030 正文逐条标注推翻；实现设计文档同步。
 - 审查报告：`docs/review/2026-07-21-adr0059-lease-veto-removal-review.md`。
+
+## Revision R2（v0.14.12 上线后回归：pending 计数泄漏误报）
+
+**现象**（2026-07-22 线上，`sess-2f60082f32234dc3ad2914949108f313` 等
+4 个会话）：会话已正常回复完毕、处于 IDLE，1 小时后仍收到
+"⚠️ 已提交的消息在 3600 秒内没有得到任何响应" 的 ceiling 误报
+（`headless_pending_turn_ceiling`，pending_turns=1）。
+
+**根因**：mid-turn 提交在 Claude CLI 侧有两种真实去向，提交时无法区分：
+
+1. **吸收**：被并入当前正在跑的 turn，一个 result 覆盖多条提交；
+2. **排队（steering）**：当前 turn 的 result 之后立刻开自己的新 turn。
+
+`_pending_turns` 的计数模型（2026-07-18 takeover 事故防护）按"每条提交
+一个 result"记账。吸收型注入 2 提交只来 1 个 result，多出的计数永久
+泄漏 → ceiling 误报；worker EOF 时还会误报 `pending_turn_lost` 触发
+ADR 0058 自动重放，**重放的是一条已经被回答过的消息**（可能重复执行
+副作用）。该泄漏机制在 v0.14.12 之前就存在，但旧租约否决把 >30s 的
+mid-turn 提交全部拒掉，暴露面极小；本 ADR 移除否决后暴露面放大。
+
+**为何不能在提交时判别**：吸收与排队在提交时刻不可区分。曾尝试
+"turn 开着就不计数"，被 takeover 回归测试
+`test_mid_turn_steering_submit_survives_current_turn_result` 否决——
+排队型 steering 提交必须保留计数，否则 settle 会在 steering turn
+排队期间关掉 worker（正是 2026-07-18 事故）。
+
+**修复（结算点判别）**：提交时保持保守计数不变；drain loop 记录
+`last_accounted_result_at`（最近一次**非注入** result 的 monotonic
+时刻），在两个结算点判别残留 pending：
+
+- **ceiling 到点**：若最后一次提交之后出现过已核销 result，且此后整整
+  一个 ceiling 窗口没有任何新 turn 开启（排队型 steering turn 会在
+  result 后数秒内开启），则残留 pending 判定为已吸收：静默清零、正常
+  settle，只记 `headless_pending_turns_absorbed` 观测日志，不发告警。
+- **worker EOF**：同谓词成立时不再产出 `pending_turn_lost`（避免误
+  重放已处理消息），只记 `headless_pending_turns_absorbed_at_eof`。
+
+**已知残留窗口**（接受并记录）：
+
+- worker 在 result 之后、排队 steering turn 开启之前的亚秒窗口内死掉，
+  会被判为已吸收而不重放——宁可漏放一条极罕见的排队消息（用户可见
+  无响应后重发），不可重复执行一条已回答的消息。
+- 提交被吸收进**注入回合**（CLI 注入的 notification 回合）时，谓词
+  刻意不认注入 result（takeover 语义），该子场景 ceiling 仍会误报——
+  仅噪音，无破坏性，暴露概率极低。
+
+回归测试：`test_absorbed_mid_turn_submit_settles_silently_at_ceiling`、
+`test_absorbed_mid_turn_submit_does_not_report_pending_lost_at_eof`
+（`tests/test_channel_native_headless_persistent_drain.py`）。

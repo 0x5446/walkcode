@@ -239,6 +239,101 @@ class PersistentStreamTests(unittest.TestCase):
         self.assertTrue(client.disconnected)
         self.assertFalse(transport.handle_is_live(handle.handle_id))
 
+    def test_absorbed_mid_turn_submit_settles_silently_at_ceiling(self):
+        # ADR 0059 R2 regression (v0.14.12): a message submitted while the
+        # turn is OPEN may be ABSORBED into that running turn by the CLI (one
+        # result covers both submits) instead of queuing a steering turn.
+        # The conservative counter then leaks a phantom pending, and the
+        # ceiling fired a false 1h "已提交的消息…没有得到任何响应" alarm on a
+        # healthy idle session (observed live on 4 sessions). The fix keeps
+        # the counter conservative (steering safety) but discriminates at the
+        # ceiling: an accounted result AFTER the last submit + a whole quiet
+        # ceiling window = absorbed → settle silently, no alarm.
+        async def scenario():
+            cls = _stream_client_class()
+            transport = _transport(cls, grace=0.05, ceiling=0.4)
+            handle = await transport.launch_session(cwd="/tmp/p", session_id="s1")
+            await transport.submit_turn(handle, TurnInput(text="first"), "k1")
+            client = transport._clients[handle.handle_id]
+            collected: list = []
+            consumer = asyncio.create_task(_consume(transport, handle, collected))
+            client.feed(_assistant("干活中"))
+            # Wait until the turn is visibly open (delta relayed), then
+            # inject mid-turn; the CLI absorbs it — no second result comes.
+            self.assertTrue(
+                await _wait_until(
+                    lambda: any(e.type == AgentEventType.TURN_DELTA for e in collected)
+                )
+            )
+            await transport.submit_turn(handle, TurnInput(text="补充说明"), "k2")
+            # Conservative accounting: the mid-turn submit IS counted (it
+            # could equally have been a queued steering turn).
+            self.assertEqual(transport._pending_turns.get(handle.handle_id), 2)
+            client.feed(_assistant("收到补充"))
+            client.feed(_result("done"))
+            await asyncio.wait_for(consumer, timeout=5.0)
+            return transport, handle, collected
+
+        transport, handle, events = asyncio.run(scenario())
+        # The phantom leftover was recognized as absorbed at the ceiling:
+        # silent settle — no false alarm, no error event.
+        self.assertNotIn(handle.handle_id, transport._pending_turns)
+        texts = [e.payload.get("text", "") for e in events if e.type == AgentEventType.TURN_DELTA]
+        self.assertFalse(any("没有得到任何响应" in text for text in texts))
+        self.assertFalse(any(e.type == AgentEventType.SESSION_ERROR for e in events))
+        self.assertFalse(transport.handle_is_live(handle.handle_id))
+
+    def test_absorbed_mid_turn_submit_does_not_report_pending_lost_at_eof(self):
+        # Same absorbed-leak scenario, worker EOF flavor: the phantom pending
+        # must NOT be reported as pending_turn_lost — that message was already
+        # processed, and ADR 0058's auto-replay would RE-EXECUTE it.
+        async def scenario():
+            cls = _stream_client_class()
+            transport = _transport(cls)
+            handle = await transport.launch_session(cwd="/tmp/p", session_id="s1")
+            await transport.submit_turn(handle, TurnInput(text="first"), "k1")
+            client = transport._clients[handle.handle_id]
+            collected: list = []
+            consumer = asyncio.create_task(_consume(transport, handle, collected))
+            client.feed(_assistant("干活中"))
+            self.assertTrue(
+                await _wait_until(
+                    lambda: any(e.type == AgentEventType.TURN_DELTA for e in collected)
+                )
+            )
+            await transport.submit_turn(handle, TurnInput(text="补充说明"), "k2")
+            client.feed(_result("done"))
+            # Wait for the result to be accounted (phantom leftover = 1),
+            # then the worker dies.
+            self.assertTrue(
+                await _wait_until(
+                    lambda: transport._pending_turns.get(handle.handle_id) == 1
+                )
+            )
+            client.feed_eof()
+            await asyncio.wait_for(consumer, timeout=5.0)
+            return transport, handle, collected
+
+        transport, handle, events = asyncio.run(scenario())
+        errors = [e for e in events if e.type == AgentEventType.SESSION_ERROR]
+        self.assertEqual(errors, [])
+        self.assertFalse(transport.handle_is_live(handle.handle_id))
+
+    def test_submits_with_no_open_turn_still_counted_individually(self):
+        # Guard for the 2026-07-18 incident semantics: messages submitted
+        # while NO turn is open each queue their own turn and must each be
+        # accounted, so settle cannot close the worker under a queued turn.
+        async def scenario():
+            cls = _stream_client_class()
+            transport = _transport(cls)
+            handle = await transport.launch_session(cwd="/tmp/p", session_id="s1")
+            await transport.submit_turn(handle, TurnInput(text="a"), "k1")
+            await transport.submit_turn(handle, TurnInput(text="b"), "k2")
+            return transport, handle
+
+        transport, handle = asyncio.run(scenario())
+        self.assertEqual(transport._pending_turns.get(handle.handle_id), 2)
+
     def test_settles_after_plain_turn_without_background_tasks(self):
         async def scenario():
             cls = _stream_client_class()

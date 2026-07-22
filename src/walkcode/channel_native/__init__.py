@@ -5897,8 +5897,9 @@ class ClaudeHeadlessTransport:
         # suspend at arbitrary points, so time comparison mis-credited results
         # to queued submits (2026-07-18 takeover incident + review round).
         self._pending_turns: dict[str, int] = {}
-        # handle_id -> monotonic time of the latest submit; feeds ONLY the
-        # pending-turn ceiling clock (see submit_turn).
+        # handle_id -> monotonic time of the latest submit; feeds the
+        # pending-turn ceiling clock AND the absorbed-submit discrimination
+        # at the settlement points (see _bridged_event_stream, ADR 0059 R2).
         self._last_submit_monotonic: dict[str, float] = {}
 
     def capabilities(self) -> TransportCapabilities:
@@ -6232,6 +6233,15 @@ class ClaudeHeadlessTransport:
             # between the caller's liveness check and this submit. Raising the
             # typed error lets the orchestrator fall back to a fresh resume.
             raise TransportUnavailable("claude headless worker is gone (settled or restarted)")
+        # Every accepted submit counts — including mid-turn ones. A mid-turn
+        # submit has TWO possible fates the CLI never discloses at submit
+        # time: absorbed into the running turn (one result covers several
+        # submits) or queued as its own steering turn (one result each). The
+        # counter must stay conservative here so settle can never close the
+        # worker under a queued steering turn (2026-07-18 takeover incident);
+        # phantom leftovers from absorbed submits are recognized and cleared
+        # at the settlement points instead (ceiling / EOF discrimination in
+        # _bridged_event_stream, ADR 0059 R2).
         self._pending_turns[handle.handle_id] = self._pending_turns.get(handle.handle_id, 0) + 1
         # Timestamp for the pending-turn ceiling clock ONLY (never for result
         # attribution): a fresh submit must get the full ceiling even when the
@@ -6422,6 +6432,19 @@ class ClaudeHeadlessTransport:
         # reclassify it as a user turn). Expires with the injection window if
         # no turn materializes.
         injected_turn_expected = False
+        # ADR 0059 R2: monotonic time of the latest NON-injected result. A
+        # mid-turn submit may be ABSORBED into the running turn by the CLI
+        # (one result covers several submits) instead of queuing its own
+        # steering turn — indistinguishable at submit time, so the counter
+        # stays conservative and leaks a phantom pending. Discrimination
+        # happens at the settlement points: if an accounted result closed
+        # AFTER the last submit and no new turn opened for the whole wait,
+        # the leftover pending was absorbed (a queued steering turn would
+        # have opened within seconds of that result). Injected results are
+        # excluded on purpose: they never answer a queued user submit
+        # (takeover incident semantics), so a leftover behind one must keep
+        # alarming/replaying.
+        last_accounted_result_at = 0.0
         # Base for the background-wait ceiling: reset by any stream traffic.
         quiet_since = time.monotonic()
         # Non-zero after a terminal task_notification: hold off settle until
@@ -6448,6 +6471,19 @@ class ClaudeHeadlessTransport:
                     # (receive_response) path too, where a zero-traffic EOF
                     # equally means the turn is gone.
                     pending_lost = self._pending_turns.get(handle.handle_id, 0)
+                    # ADR 0059 R2: read BEFORE unregister pops the timestamp.
+                    # A leftover pending whose last submit predates an
+                    # accounted result was absorbed into that turn — its
+                    # message was already processed, so pending_turn_lost
+                    # (auto-replay, ADR 0058) would RE-EXECUTE it. Residual
+                    # ambiguity: a worker dying in the sub-second window
+                    # between a result and its queued steering turn opening
+                    # is classified as absorbed and NOT replayed — preferred
+                    # over double-executing an already-answered message.
+                    pending_absorbed = pending_lost > 0 and (
+                        last_accounted_result_at
+                        > self._last_submit_monotonic.get(handle.handle_id, float("inf"))
+                    )
                     if persistent:
                         closing = self._unregister_handle(handle.handle_id)
                         if active_tasks:
@@ -6492,7 +6528,15 @@ class ClaudeHeadlessTransport:
                                     )
                                 },
                             )
-                    if pending_lost > 0:
+                    if pending_lost > 0 and pending_absorbed:
+                        # Phantom leftover from absorbed mid-turn submits:
+                        # observability only — no error, no replay.
+                        _log_degrade(
+                            "headless_pending_turns_absorbed_at_eof",
+                            handle_id=handle.handle_id,
+                            pending_turns=pending_lost,
+                        )
+                    elif pending_lost > 0:
                         # Last (lifecycle-wise it must win over any synthetic
                         # completion above): the worker/stream ended before
                         # producing a single message for an accepted submit.
@@ -6580,33 +6624,52 @@ class ClaudeHeadlessTransport:
                             or time.monotonic() - pending_clock < self.background_wait_ceiling_seconds
                         ):
                             continue
-                        closing = self._unregister_handle(handle.handle_id)
-                        _log_degrade(
-                            "headless_pending_turn_ceiling",
-                            handle_id=handle.handle_id,
-                            pending_turns=pending_submits,
-                            ceiling_seconds=self.background_wait_ceiling_seconds,
-                        )
-                        yield AgentEvent(
-                            AgentEventType.TURN_DELTA,
-                            {
-                                "text": (
-                                    f"⚠️ 已提交的消息在 {int(self.background_wait_ceiling_seconds)} 秒内"
-                                    "没有得到任何响应，已停止本次会话监听。直接回复可重新拉起会话。"
-                                )
-                            },
-                        )
-                        yield AgentEvent(AgentEventType.TURN_COMPLETED, {"message": ""})
-                        if active_tasks:
-                            # This close also abandons the background ledger;
-                            # clear it or the status card keeps advertising
-                            # tasks nobody is listening for.
-                            yield AgentEvent(
-                                AgentEventType.BACKGROUND_TASKS,
-                                {"count": 0, "tasks": [], "abandoned": len(active_tasks)},
+                        if last_accounted_result_at > self._last_submit_monotonic.get(
+                            handle.handle_id, float("inf")
+                        ):
+                            # Every leftover pending predates an accounted
+                            # result, and no steering turn opened for a full
+                            # ceiling window after it: the submits were
+                            # ABSORBED into that turn (mid-turn injection).
+                            # Clear the phantom counter and settle normally —
+                            # firing the "no response" alarm here was the
+                            # v0.14.12 false-positive (ADR 0059 R2).
+                            _log_degrade(
+                                "headless_pending_turns_absorbed",
+                                handle_id=handle.handle_id,
+                                pending_turns=pending_submits,
+                                ceiling_seconds=self.background_wait_ceiling_seconds,
                             )
-                        settled = True
-                        break
+                            self._pending_turns.pop(handle.handle_id, None)
+                            # Fall through to the normal settle path below.
+                        else:
+                            closing = self._unregister_handle(handle.handle_id)
+                            _log_degrade(
+                                "headless_pending_turn_ceiling",
+                                handle_id=handle.handle_id,
+                                pending_turns=pending_submits,
+                                ceiling_seconds=self.background_wait_ceiling_seconds,
+                            )
+                            yield AgentEvent(
+                                AgentEventType.TURN_DELTA,
+                                {
+                                    "text": (
+                                        f"⚠️ 已提交的消息在 {int(self.background_wait_ceiling_seconds)} 秒内"
+                                        "没有得到任何响应，已停止本次会话监听。直接回复可重新拉起会话。"
+                                    )
+                                },
+                            )
+                            yield AgentEvent(AgentEventType.TURN_COMPLETED, {"message": ""})
+                            if active_tasks:
+                                # This close also abandons the background ledger;
+                                # clear it or the status card keeps advertising
+                                # tasks nobody is listening for.
+                                yield AgentEvent(
+                                    AgentEventType.BACKGROUND_TASKS,
+                                    {"count": 0, "tasks": [], "abandoned": len(active_tasks)},
+                                )
+                            settled = True
+                            break
                     if not active_tasks and time.monotonic() < injection_hold_until:
                         # A notification just drained the ledger; its injected
                         # follow-up turn may still be on the way.
@@ -6738,6 +6801,7 @@ class ClaudeHeadlessTransport:
                         # submitted turn. Injected turns (notification
                         # replays) never do — the queued user turn is still
                         # behind them.
+                        last_accounted_result_at = time.monotonic()
                         pending = self._pending_turns.get(handle.handle_id, 0)
                         if pending > 1:
                             self._pending_turns[handle.handle_id] = pending - 1
