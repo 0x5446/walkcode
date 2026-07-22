@@ -886,21 +886,59 @@ class PersistentStreamTests(unittest.TestCase):
             # Let the accounted result age past the guard on its own...
             await asyncio.sleep(0.4)
             # ...then the queued turn shows up ONLY as task lifecycle
-            # traffic, and the worker dies right after.
+            # traffic (started + terminal update), goes silent PAST the age
+            # guard again, and the worker dies. The task_started with no
+            # open turn is sticky evidence of the unobserved running turn —
+            # aging must not launder it away.
             client.feed(_task_started("bg-1", "后台任务"))
             client.feed(_task_updated("bg-1", status="completed"))
-            await asyncio.sleep(0.05)
+            await asyncio.sleep(0.4)
             client.feed_eof()
             await asyncio.wait_for(consumer, timeout=5.0)
             return transport, handle, collected
 
         transport, handle, events = asyncio.run(scenario())
-        reasons = [
-            e.payload.get("reason")
-            for e in events
-            if e.type == AgentEventType.SESSION_ERROR
-        ]
+        errors = [e for e in events if e.type == AgentEventType.SESSION_ERROR]
+        reasons = [e.payload.get("reason") for e in errors]
         self.assertIn("pending_turn_lost", reasons)
+        self.assertTrue(errors[-1].payload.get("traffic_seen"))
+
+    def test_task_only_turn_still_alarms_at_ceiling(self):
+        # Ceiling flavor of the task-only turn: the sticky traffic evidence
+        # must keep the visible alarm instead of a silent absorbed settle.
+        async def scenario():
+            cls = _stream_client_class()
+            transport = _transport(cls, grace=0.05, ceiling=0.4)
+            transport._ABSORBED_MIN_RESULT_AGE_SECONDS = 0.0
+            handle = await transport.launch_session(cwd="/tmp/p", session_id="s1")
+            await transport.submit_turn(handle, TurnInput(text="first"), "k1")
+            client = transport._clients[handle.handle_id]
+            collected: list = []
+            consumer = asyncio.create_task(_consume(transport, handle, collected))
+            client.feed(_assistant("干活中"))
+            self.assertTrue(
+                await _wait_until(
+                    lambda: any(e.type == AgentEventType.TURN_DELTA for e in collected)
+                )
+            )
+            await transport.submit_turn(handle, TurnInput(text="排队消息"), "k2")
+            client.feed(_result("first done"))
+            self.assertTrue(
+                await _wait_until(
+                    lambda: transport._pending_turns.get(handle.handle_id) == 1
+                )
+            )
+            client.feed(_task_started("bg-1", "后台任务"))
+            client.feed(_task_updated("bg-1", status="completed"))
+            await asyncio.wait_for(consumer, timeout=5.0)
+            return transport, handle, collected
+
+        transport, handle, events = asyncio.run(scenario())
+        texts = [e.payload.get("text", "") for e in events if e.type == AgentEventType.TURN_DELTA]
+        self.assertTrue(
+            any("没有得到任何响应" in text or "后台任务等待超时" in text for text in texts)
+        )
+        self.assertFalse(any(e.type == AgentEventType.SESSION_ERROR for e in events))
 
     def test_submits_with_no_open_turn_still_counted_individually(self):
         # Guard for the 2026-07-18 incident semantics: messages submitted

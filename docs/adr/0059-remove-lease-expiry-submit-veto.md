@@ -183,7 +183,11 @@ drain loop 维护候选状态并只在结算点动手：
   期间都无法运行（round 2：候选后插入长注入回合再 EOF 的静默丢窗口）。
   **task 生命周期消息**（task_started/updated/…）同样刷新年龄基准：
   排队 turn 可能只以任务流量可见（终验面板：仅任务流量 + EOF 曾能
-  静默清掉真实在跑的提交）。
+  静默清掉真实在跑的提交）。进一步地，`task_started` 在**无开着
+  turn**时出现＝有一个未被观察到的 turn 正在运行（task 只能由运行中
+  turn 的工具调用启动），按浮出权限事件同一归因规则设置**粘性**
+  `user_turn_traffic`（注入预测存活时归注入回合）——只刷新可老化的
+  时钟不够，30s 后仍会被清（终验面板第三轮）。
 - `last_accounted_result_at`：最近一次已核销 `TURN_COMPLETED` 的排水
   消费时刻，只作 belt-and-braces 的新旧校验，绝不单独作数。
 - EOF 观测基准 `eof_observation_basis`：流等待真实阻塞后返回 → EOF
@@ -244,4 +248,5 @@ result、距最近 turn 终局至少 `_ABSORBED_MIN_RESULT_AGE_SECONDS`
 `test_injected_turn_session_error_revokes_absorption_candidates`、
 `test_short_ceiling_does_not_bypass_absorption_age_guard`、
 `test_bare_result_steering_turn_deducts_stale_candidate`、
-`test_task_only_traffic_blocks_absorbed_classification_at_eof`。
+`test_task_only_traffic_blocks_absorbed_classification_at_eof`、
+`test_task_only_turn_still_alarms_at_ceiling`。

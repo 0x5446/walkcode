@@ -6914,6 +6914,23 @@ class ClaudeHeadlessTransport:
                     # next _ABSORBED_MIN_RESULT_AGE_SECONDS — a queued turn
                     # may be running behind this traffic (final verify).
                     last_task_activity_at = time.monotonic()
+                    if task_subtype == "task_started" and not turn_open:
+                        # A task can only be STARTED by a running turn's tool
+                        # call. Seeing one with NO open turn means an
+                        # unobserved turn is running — its opening traffic was
+                        # this very message, swallowed by this branch. Sticky
+                        # evidence, same attribution rule as floated
+                        # permission events: a live injected-turn prediction
+                        # claims it, otherwise it belongs to a queued user
+                        # turn (final verify pass 3: task-only turns aged out
+                        # of the activity clock and their submits were
+                        # silently cleared).
+                        prediction_live = (
+                            injected_turn_expected
+                            and time.monotonic() < injection_hold_until
+                        )
+                        if not prediction_live:
+                            user_turn_traffic = True
                     if not turn_open and (
                         task_subtype == "task_notification"
                         or (ledger_changed and not active_tasks)
