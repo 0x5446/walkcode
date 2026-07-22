@@ -158,45 +158,62 @@ mid-turn 提交全部拒掉，暴露面极小；本 ADR 移除否决后暴露面
   result 一样"晚于"第二条的提交时刻——纯时间谓词会把真排队消息
   误判成吸收并静默丢弃。
 
-**修复（吸收候选 + 结算点判别）**：提交时保持保守计数不变；drain
-loop 维护三个局部量并只在结算点动手：
+**修复（吸收候选 + 结算点判别，含第二轮审查修订）**：提交时保持保守
+计数不变；新增 `_inflight_submits`（提交 await 期间的在途计数）；
+drain loop 维护候选状态并只在结算点动手：
 
 - `pending_at_turn_open`：**非注入** turn 开启时对计数拍快照（floor）。
-  只有 floor **之上**的提交才是 mid-turn 提交、才可能被该 turn 吸收；
-  turn 开启前排队的提交永不进入吸收候选。
+  只有 floor **之上**、且已被客户端确认（**不在途**）的提交才是吸收
+  候选；turn 开启前排队的提交永不进入候选（两条预排队只回第一条时，
+  残留必须继续告警/重放）。
 - `absorbable_pending`：每个非注入 `TURN_COMPLETED` result 核销时
-  重算（`min(残留, 本回合内新增提交数)`）；**新的非注入 turn 开启时
-  吊销归零**（它正在消费一个排队标记，说明残留不是吸收）；turn 以
-  `SESSION_ERROR` 终局时同样归零（中止的回合证明不了任何吸收）。
+  **合并**（`min(残留, 旧候选 + 本回合新增非在途提交数)`）。新的
+  非注入 turn 开启时只按"本回合消费一个标记"收缩
+  （`min(旧候选, 开启时标记数 - 1)`），不整体清零——混合去向（一条
+  吸收一条排队）不得丢失吸收证据（round 2：整体吊销会让原误报在
+  混合序列重现，EOF 侧还会误重放）。turn 以 `SESSION_ERROR` 终局时
+  归零（中止的回合证明不了任何吸收）。
+- `last_turn_terminal_at`：**任意** turn 终局（含注入回合）刷新。
+  吸收年龄从最近一次 turn 终局起算——排队消息在任何 turn 占用 worker
+  期间都无法运行（round 2：候选后插入长注入回合再 EOF 的静默丢窗口）。
 - `last_accounted_result_at`：最近一次已核销 `TURN_COMPLETED` 的排水
   消费时刻，只作 belt-and-braces 的新旧校验，绝不单独作数。
+- EOF 观测基准 `eof_observation_basis`：流等待真实阻塞后返回 → EOF
+  到达时刻就是现在；等待**瞬时返回**（EOF 在 generator 因 yield 挂起
+  期间已缓冲）→ 到达时刻不可知，保守取上一条消息的观测时刻
+  （round 2：>30s 的慢投递挂起不得把新 EOF 洗成旧 EOF）。
 
-两个结算点的前置条件**不同**：
+两个结算点的共同条件：`absorbable_pending ≥ 残留`、
+`not user_turn_traffic`、**无在途提交**、最后提交早于最近核销
+result、距最近 turn 终局至少 `_ABSORBED_MIN_RESULT_AGE_SECONDS`
+（30s，刻意独立于可配置的 ceiling——调短 ceiling 不得削弱数据安全
+语义）。差异：
 
-- **ceiling 到点**（等待已满一个 ceiling 窗口、无开着的 turn）：
-  `absorbable_pending ≥ 残留 pending` 且 `not user_turn_traffic` 且
-  最后提交早于最近核销 result → 判定已吸收：静默清零、正常 settle，
-  只记 `headless_pending_turns_absorbed`（含 session_id、
-  result_age_seconds、submit_age_seconds），不发告警。排队型 steering
-  turn 会在 result 后数秒内开启，整整一个 ceiling 窗口的沉默是强证据。
-- **worker EOF**（无窗口等待，随时可能发生）：在 ceiling 条件之上
-  再加 `not turn_open` 与**最小 result 年龄**
-  `_ABSORBED_EOF_MIN_RESULT_AGE_SECONDS`（30s）——EOF 离 result 太近
-  时吸收与排队不可分，必须保留 `pending_turn_lost` 路径（可见错误 +
-  ADR 0058 重放决策），即维持 R2 之前的行为。判定吸收时只记
-  `headless_pending_turns_absorbed_at_eof`，不产出错误、不重放。
+- **ceiling 到点**（等满一个 ceiling 窗口、无开着的 turn）：满足即
+  静默清零、正常 settle，只记 `headless_pending_turns_absorbed`
+  （含 walkcode session_id、result_age_seconds、submit_age_seconds），
+  不发告警。排队型 steering turn 会在 result 后数秒内开启，整个
+  ceiling 窗口的沉默是强证据。
+- **worker EOF**（无窗口等待，随时可能发生）：额外要求
+  `not turn_open`，年龄用 EOF 观测基准计算。不满足则保留
+  `pending_turn_lost` 路径（可见错误 + ADR 0058 重放决策，即 R2 之前
+  行为）。判定吸收时只记 `headless_pending_turns_absorbed_at_eof`。
 
 **已知残留窗口**（接受并记录）：
 
-- worker 在 result 之后 30 秒**内**死掉且 mid-turn 提交确实已被吸收：
-  会走 `pending_turn_lost` 并可能重放一条已回答的消息（重复执行、
+- worker 在最近 turn 终局 30 秒**内**死掉且 mid-turn 提交确实已被
+  吸收：走 `pending_turn_lost` 并可能重放一条已回答的消息（重复执行、
   用户可见）——宁可如此，不可静默丢消息（Lark ingress 永不重投）。
-- worker 在 result 之后 30 秒**外**死掉且 CLI 把 mid-turn 提交排了队
-  却始终没开 turn（CLI 挂死类故障）：会被判吸收而漏报——概率极低，
-  observability 日志留痕可查。
+- worker 在终局 30 秒**外**死掉且 CLI 把 mid-turn 提交排了队却始终
+  没开 turn（CLI 挂死类故障）：会被判吸收而漏报——概率极低，
+  observability 日志（walkcode session_id + 时距字段）留痕可查。
+- yield 挂起竞态的窄窗（旧 result 在挂起期间被预取、新提交竞入后被
+  计入候选）：ceiling 侧有整窗沉默兜底；EOF 侧有 30s 年龄 + 观测基准
+  兜底；两者都失效需要"挂起跨越 30s 且 worker 恰好死于该窗"的叠加，
+  接受。
 - 提交落在**注入回合**开着的窗口内且被其吸收：注入 result 刻意不提供
   吸收证据（takeover 语义），ceiling 侧仍会误报告警（噪音）；EOF 侧
-  会按 `pending_turn_lost` + `traffic_seen=False` 自动重放，可能重复
+  按 `pending_turn_lost` + `traffic_seen=False` 自动重放，可能重复
   执行——与 R2 之前行为一致，非本次回归，记入 issue 跟踪。
 - `background_wait_ceiling_seconds=0`（合法配置，语义"永远等"）下
   吸收清算不可达，phantom 会一直挂住监听与 worker——与 R2 之前该配置
@@ -209,4 +226,8 @@ loop 维护三个局部量并只在结算点动手：
 `test_pre_queued_second_submit_still_alarms_at_ceiling`、
 `test_pre_queued_second_submit_reports_pending_lost_at_eof`、
 `test_started_steering_turn_death_reports_pending_lost_with_traffic`、
-`test_submit_behind_injected_turn_result_still_alarms_at_ceiling`。
+`test_submit_behind_injected_turn_result_still_alarms_at_ceiling`、
+`test_inflight_submit_failure_does_not_pollute_absorption_candidates`、
+`test_mixed_absorbed_and_steering_submits_settle_silently`、
+`test_queued_submit_behind_injected_turn_reports_lost_at_eof`、
+`test_buffered_eof_behind_slow_delivery_reports_lost`。

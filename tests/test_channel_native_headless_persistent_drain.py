@@ -252,6 +252,7 @@ class PersistentStreamTests(unittest.TestCase):
         async def scenario():
             cls = _stream_client_class()
             transport = _transport(cls, grace=0.05, ceiling=0.4)
+            transport._ABSORBED_MIN_RESULT_AGE_SECONDS = 0.05
             handle = await transport.launch_session(cwd="/tmp/p", session_id="s1")
             await transport.submit_turn(handle, TurnInput(text="first"), "k1")
             client = transport._clients[handle.handle_id]
@@ -293,7 +294,7 @@ class PersistentStreamTests(unittest.TestCase):
         async def scenario():
             cls = _stream_client_class()
             transport = _transport(cls)
-            transport._ABSORBED_EOF_MIN_RESULT_AGE_SECONDS = 0.05
+            transport._ABSORBED_MIN_RESULT_AGE_SECONDS = 0.05
             handle = await transport.launch_session(cwd="/tmp/p", session_id="s1")
             await transport.submit_turn(handle, TurnInput(text="first"), "k1")
             client = transport._clients[handle.handle_id]
@@ -392,7 +393,7 @@ class PersistentStreamTests(unittest.TestCase):
         async def scenario():
             cls = _stream_client_class()
             transport = _transport(cls)
-            transport._ABSORBED_EOF_MIN_RESULT_AGE_SECONDS = 0.0
+            transport._ABSORBED_MIN_RESULT_AGE_SECONDS = 0.0
             handle = await transport.launch_session(cwd="/tmp/p", session_id="s1")
             await transport.submit_turn(handle, TurnInput(text="a"), "k1")
             await transport.submit_turn(handle, TurnInput(text="b"), "k2")
@@ -425,7 +426,7 @@ class PersistentStreamTests(unittest.TestCase):
         async def scenario():
             cls = _stream_client_class()
             transport = _transport(cls)
-            transport._ABSORBED_EOF_MIN_RESULT_AGE_SECONDS = 0.0
+            transport._ABSORBED_MIN_RESULT_AGE_SECONDS = 0.0
             handle = await transport.launch_session(cwd="/tmp/p", session_id="s1")
             await transport.submit_turn(handle, TurnInput(text="first"), "k1")
             client = transport._clients[handle.handle_id]
@@ -496,6 +497,201 @@ class PersistentStreamTests(unittest.TestCase):
         transport, handle, events = asyncio.run(scenario())
         texts = [e.payload.get("text", "") for e in events if e.type == AgentEventType.TURN_DELTA]
         self.assertTrue(any("没有得到任何响应" in text for text in texts))
+
+    def test_inflight_submit_failure_does_not_pollute_absorption_candidates(self):
+        # Round-2 review: a mid-turn submit still awaiting the client write
+        # must NOT become an absorption candidate. If it later fails, its
+        # counter rolls back — a candidate computed from it would then cover
+        # a REAL pre-queued message and silently clear it at the ceiling.
+        async def scenario():
+            base = _stream_client_class()
+            release = asyncio.Event()
+
+            class _Client(base):
+                async def query(self, prompt, session_id="default"):
+                    if "third" in str(prompt):
+                        await release.wait()
+                        raise RuntimeError("write failed")
+                    await super().query(prompt, session_id=session_id)
+
+            transport = _transport(_Client, grace=0.05, ceiling=0.4)
+            transport._ABSORBED_MIN_RESULT_AGE_SECONDS = 0.0
+            handle = await transport.launch_session(cwd="/tmp/p", session_id="s1")
+            await transport.submit_turn(handle, TurnInput(text="a"), "k1")
+            await transport.submit_turn(handle, TurnInput(text="b"), "k2")
+            client = transport._clients[handle.handle_id]
+            collected: list = []
+            consumer = asyncio.create_task(_consume(transport, handle, collected))
+            client.feed(_assistant("回答第一条"))
+            self.assertTrue(
+                await _wait_until(
+                    lambda: any(e.type == AgentEventType.TURN_DELTA for e in collected)
+                )
+            )
+            # A third submit starts mid-turn and hangs awaiting the client.
+            third = asyncio.create_task(
+                transport.submit_turn(handle, TurnInput(text="third"), "k3")
+            )
+            self.assertTrue(
+                await _wait_until(
+                    lambda: transport._inflight_submits.get(handle.handle_id) == 1
+                )
+            )
+            self.assertEqual(transport._pending_turns.get(handle.handle_id), 3)
+            # The turn's result arrives while the third submit is in flight:
+            # it must NOT be counted as an absorption candidate.
+            client.feed(_result("done"))
+            self.assertTrue(
+                await _wait_until(
+                    lambda: transport._pending_turns.get(handle.handle_id) == 2
+                )
+            )
+            # The in-flight submit now fails and rolls its counter back.
+            release.set()
+            with self.assertRaises(RuntimeError):
+                await third
+            await asyncio.wait_for(consumer, timeout=5.0)
+            return transport, handle, collected
+
+        transport, handle, events = asyncio.run(scenario())
+        # The leftover marker belongs to the pre-queued second message: the
+        # ceiling alarm must fire — silence here would drop a real message.
+        texts = [e.payload.get("text", "") for e in events if e.type == AgentEventType.TURN_DELTA]
+        self.assertTrue(any("没有得到任何响应" in text for text in texts))
+
+    def test_mixed_absorbed_and_steering_submits_settle_silently(self):
+        # Round-2 review: a mixed mid-turn batch — one submit absorbed, one
+        # queued as a steering turn — must keep the absorbed evidence when
+        # the steering turn runs (carry, not blanket revocation), so the
+        # phantom leftover still settles silently instead of re-firing the
+        # original false alarm.
+        async def scenario():
+            cls = _stream_client_class()
+            transport = _transport(cls, grace=0.05, ceiling=0.4)
+            transport._ABSORBED_MIN_RESULT_AGE_SECONDS = 0.05
+            handle = await transport.launch_session(cwd="/tmp/p", session_id="s1")
+            await transport.submit_turn(handle, TurnInput(text="first"), "k1")
+            client = transport._clients[handle.handle_id]
+            collected: list = []
+            consumer = asyncio.create_task(_consume(transport, handle, collected))
+            client.feed(_assistant("干活中"))
+            self.assertTrue(
+                await _wait_until(
+                    lambda: any(e.type == AgentEventType.TURN_DELTA for e in collected)
+                )
+            )
+            # Two mid-turn submits: one will be absorbed, one steers.
+            await transport.submit_turn(handle, TurnInput(text="补充一"), "k2")
+            await transport.submit_turn(handle, TurnInput(text="转向二"), "k3")
+            client.feed(_result("first done"))
+            self.assertTrue(
+                await _wait_until(
+                    lambda: transport._pending_turns.get(handle.handle_id) == 2
+                )
+            )
+            # The steering turn runs and completes; the absorbed one never
+            # gets its own turn.
+            client.feed(_assistant("处理转向二"))
+            client.feed(_result("steer done"))
+            await asyncio.wait_for(consumer, timeout=5.0)
+            return transport, handle, collected
+
+        transport, handle, events = asyncio.run(scenario())
+        texts = [e.payload.get("text", "") for e in events if e.type == AgentEventType.TURN_DELTA]
+        self.assertFalse(any("没有得到任何响应" in text for text in texts))
+        self.assertFalse(any(e.type == AgentEventType.SESSION_ERROR for e in events))
+        self.assertNotIn(handle.handle_id, transport._pending_turns)
+
+    def test_queued_submit_behind_injected_turn_reports_lost_at_eof(self):
+        # Round-2 review: absorption age must be measured from the LAST turn
+        # end (injected included) — a queued message cannot run while an
+        # injected turn occupies the worker, so an EOF shortly after that
+        # turn must not launder the leftover into an "old enough" absorbed
+        # phantom.
+        async def scenario():
+            cls = _stream_client_class()
+            transport = _transport(cls)
+            transport._ABSORBED_MIN_RESULT_AGE_SECONDS = 0.5
+            handle = await transport.launch_session(cwd="/tmp/p", session_id="s1")
+            await transport.submit_turn(handle, TurnInput(text="first"), "k1")
+            client = transport._clients[handle.handle_id]
+            collected: list = []
+            consumer = asyncio.create_task(_consume(transport, handle, collected))
+            client.feed(_assistant("干活中"))
+            self.assertTrue(
+                await _wait_until(
+                    lambda: any(e.type == AgentEventType.TURN_DELTA for e in collected)
+                )
+            )
+            await transport.submit_turn(handle, TurnInput(text="排队消息"), "k2")
+            client.feed(_result("first done"))
+            self.assertTrue(
+                await _wait_until(
+                    lambda: transport._pending_turns.get(handle.handle_id) == 1
+                )
+            )
+            # Let the accounted result age past the guard on its own...
+            await asyncio.sleep(0.6)
+            # ...then a CLI-injected turn runs and ends; the worker dies
+            # right after — the fresh injected terminal must block the
+            # absorbed classification.
+            client.feed(_user("回放的通知"))
+            client.feed(_assistant("通知内容"))
+            client.feed(_result("injected done"))
+            await asyncio.sleep(0.1)
+            client.feed_eof()
+            await asyncio.wait_for(consumer, timeout=5.0)
+            return transport, handle, collected
+
+        transport, handle, events = asyncio.run(scenario())
+        errors = [e for e in events if e.type == AgentEventType.SESSION_ERROR]
+        self.assertEqual(len(errors), 1)
+        self.assertEqual(errors[0].payload.get("reason"), "pending_turn_lost")
+
+    def test_buffered_eof_behind_slow_delivery_reports_lost(self):
+        # Round-2 review: when the EOF was already buffered while the
+        # generator was suspended in a yield (slow channel delivery), the
+        # wall clock at resume must not launder a fresh EOF into an old one
+        # — the conservative observation basis is the previous message's
+        # observation time, which fails the min-age guard and keeps the
+        # pending_turn_lost path.
+        async def scenario():
+            cls = _stream_client_class()
+            transport = _transport(cls)
+            transport._ABSORBED_MIN_RESULT_AGE_SECONDS = 0.2
+            handle = await transport.launch_session(cwd="/tmp/p", session_id="s1")
+            await transport.submit_turn(handle, TurnInput(text="first"), "k1")
+            client = transport._clients[handle.handle_id]
+            collected: list = []
+
+            async def slow_consume():
+                stream = await transport.events(handle)
+                async for event in stream:
+                    collected.append(event)
+                    if event.type == AgentEventType.TURN_COMPLETED:
+                        # Simulate a slow channel send: the generator stays
+                        # suspended in this yield past the min-age guard.
+                        await asyncio.sleep(0.4)
+
+            consumer = asyncio.create_task(slow_consume())
+            client.feed(_assistant("干活中"))
+            self.assertTrue(
+                await _wait_until(
+                    lambda: any(e.type == AgentEventType.TURN_DELTA for e in collected)
+                )
+            )
+            await transport.submit_turn(handle, TurnInput(text="排队消息"), "k2")
+            # Result and EOF are buffered back-to-back: the worker died
+            # immediately after the result, before the queued message ran.
+            client.feed(_result("first done"))
+            client.feed_eof()
+            await asyncio.wait_for(consumer, timeout=5.0)
+            return transport, handle, collected
+
+        transport, handle, events = asyncio.run(scenario())
+        errors = [e for e in events if e.type == AgentEventType.SESSION_ERROR]
+        self.assertEqual(len(errors), 1)
+        self.assertEqual(errors[0].payload.get("reason"), "pending_turn_lost")
 
     def test_submits_with_no_open_turn_still_counted_individually(self):
         # Guard for the 2026-07-18 incident semantics: messages submitted
