@@ -257,10 +257,11 @@ class CodexStdioAppServerClient:
 
     async def _discard_process(self) -> None:
         # Callers hold self._lock. Clearing _process makes the next request
-        # start a fresh subprocess; buffered notifications belong to the dead
-        # stream and would otherwise be replayed against the new one.
+        # start a fresh subprocess. Buffered notifications are KEPT: they are
+        # complete, validly-parsed events (agent text, turn/completed) that
+        # already happened — killing the transport does not un-happen them,
+        # and dropping them would silently lose session events.
         process, self._process = self._process, None
-        self._buffered_notifications.clear()
         if process is None or process.returncode is not None:
             return
         try:
@@ -2165,7 +2166,11 @@ class ChannelNativeRuntime:
                 await self._send_tui_hook_output(
                     session, hook_type=hook_type, payload=payload, agent=agent_name
                 )
-        except Exception:
+        except BaseException:
+            # BaseException, not Exception: a drain-timeout cancellation
+            # (asyncio.CancelledError) must also release the ledger entry —
+            # an event stuck in_progress makes the replay look like a
+            # duplicate and the queued hook is then dropped as "processed".
             if ledger_started:
                 self.state.inbound_ledger.fail(event_id)
             raise

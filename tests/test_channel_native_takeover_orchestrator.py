@@ -326,13 +326,26 @@ class TakeoverOrchestratorTests(unittest.TestCase):
             callback={"token": "request_takeover", "data": "request_takeover"},
         )
 
-        first = asyncio.run(
-            orchestrator.handle_inbound_event(
-                callback,
-                agent_transport_kind="fake-transport",
-                cwd="/tmp/project",
+        import walkcode.channel_native as channel_native_module
+        from unittest.mock import patch
+
+        with patch.object(channel_native_module, "_log_degrade") as log_degrade:
+            first = asyncio.run(
+                orchestrator.handle_inbound_event(
+                    callback,
+                    agent_transport_kind="fake-transport",
+                    cwd="/tmp/project",
+                )
             )
-        )
+        # The real cause must reach the degrade log (flattened
+        # "resume_failed" hid oversized thread/resume responses before);
+        # and the transaction must already be failed by then.
+        degrade_events = [c for c in log_degrade.call_args_list if c.args and c.args[0] == "takeover_resume_failed"]
+        self.assertEqual(len(degrade_events), 1)
+        logged = degrade_events[0].kwargs
+        self.assertEqual(logged["session_id"], session.session_id)
+        self.assertIsInstance(logged["error"], RuntimeError)
+        self.assertEqual(str(logged["error"]), "resume failed")
         second = asyncio.run(
             orchestrator.handle_inbound_event(
                 InboundEvent(
