@@ -399,6 +399,15 @@ walkcode native hook stop --agent codex --json < hook.json
 walkcode native hook PreToolUse --agent claude --defer < hook.json
 ```
 
+Channel environment context: every channel-driven agent conversation carries a
+preamble telling the agent the user is on Feishu/Telegram and cannot see the
+local machine (visuals must go INTO the chat or be reachable URLs). Claude
+headless sessions get it appended to the system prompt via the SDK's
+`claude_code` preset on every launch/resume (post-takeover resumes included);
+Codex app-server threads get it prepended to the first turn of each
+launched/resumed thread (codex has no append-system-prompt surface). Read-only
+TUI observation injects nothing.
+
 For real TUI hook configs, use `--defer` and omit `--json`: the hook is written
 to a local spool and the command exits quickly with no stdout. The running
 `walkcode native serve` process drains that spool from an independent
