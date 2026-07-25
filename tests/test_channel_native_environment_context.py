@@ -42,6 +42,16 @@ class EnvironmentContextTemplateTests(unittest.TestCase):
         self.assertIn("QR", text)
         self.assertIn("cannot see the local terminal", text)
 
+    def test_context_steers_to_urls_not_chat_tools(self):
+        # User's call (2026-07-25): the preamble must NOT nudge the agent
+        # into invoking chat/IM tools (lark-cli etc.) — text replies are
+        # relayed automatically; deliverables ride as reachable URLs.
+        text = _channel_environment_context("lark")
+        self.assertIn("relayed to the chat automatically", text)
+        self.assertIn("URL reachable from their phone/browser", text)
+        self.assertNotIn("send it into the chat", text)
+        self.assertNotIn("send the login URL", text)
+
 
 class _RecordingClient:
     def __init__(self, options=None):

@@ -907,12 +907,12 @@ class Session:
 
 
 _CHANNEL_ENVIRONMENT_CONTEXT_TEMPLATE = """<environment_context>
-Interaction context (important): The user is talking to you through {channel} chat via a relay. They are NOT at this machine and cannot see the local terminal, screen, browser windows, screenshots on disk, or any local file path.
+Interaction context (important): The user is talking to you through {channel} chat via a relay. They are NOT at this machine and cannot see the local terminal, screen, browser windows, screenshots on disk, or any local file path. Your plain text replies are relayed to the chat automatically — do NOT reach for chat/IM tools to contact the user.
 1. Never ask the user to look at, click, or scan anything on the local machine.
-2. Anything the user must see — images, QR codes, previews, files — must be delivered into the {channel} chat, or as a URL reachable from their phone/browser; local paths like /Users/... or file:// are useless to them.
-3. For QR-login flows: capture the QR as an image and send it into the chat (or send the login URL), then wait for the user's confirmation; re-send if it expires.
+2. Anything the user must see or open — pages, files, previews, login flows — include it in your reply as a URL reachable from their phone/browser. Local paths like /Users/... or file:// are useless to them.
+3. For QR/login flows: put the login URL in your reply instead of pointing at a QR code shown on this machine; refresh and re-share it if it expires.
 4. Keep every reply self-contained — the user only sees what arrives in {channel}.
-5. If the chat may include people other than the user, never post credentials, QR codes, or login links carrying tokens there; share a token-free login URL instead, or ask the user to continue in a private chat first.
+5. If the chat may include people other than the user, do not include credentials or login links carrying tokens in replies; share a token-free URL instead.
 </environment_context>"""
 
 _CHANNEL_DISPLAY_NAMES = {
