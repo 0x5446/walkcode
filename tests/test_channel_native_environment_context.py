@@ -237,6 +237,24 @@ class RuntimeWiringTests(unittest.TestCase):
         transports = _build_transports(cfg)
         self.assertIn("Telegram", transports["claude_headless"].environment_context)
 
+    def test_codex_transport_receives_channel_context(self):
+        from unittest.mock import patch
+
+        from walkcode.channel_native import ChannelNativeConfig
+        from walkcode import channel_native_runtime as runtime_module
+
+        cfg = ChannelNativeConfig.from_env(
+            {
+                "WALKCODE_CHANNEL": "telegram",
+                "TELEGRAM_BOT_TOKEN": "fake",
+                "WALKCODE_AGENT": "codex",
+                "WALKCODE_CWD": "/tmp",
+            }
+        )
+        with patch.object(runtime_module.shutil, "which", return_value="/usr/bin/codex"):
+            transports = runtime_module._build_transports(cfg)
+        self.assertIn("Telegram", transports["codex_app_server"].environment_context)
+
 
 if __name__ == "__main__":
     unittest.main()

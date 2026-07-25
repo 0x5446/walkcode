@@ -406,7 +406,9 @@ headless sessions get it appended to the system prompt via the SDK's
 `claude_code` preset on every launch/resume (post-takeover resumes included);
 Codex app-server threads get it prepended to the first turn of each
 launched/resumed thread (codex has no append-system-prompt surface). Read-only
-TUI observation injects nothing.
+TUI observation injects nothing. Known gap: sessions born via
+`WALKCODE_CLAUDE_SPAWN_MODE=daemon` (`claude --bg`) do not carry the preamble
+yet — the daemon reply surface has no system-prompt hook.
 
 For real TUI hook configs, use `--defer` and omit `--json`: the hook is written
 to a local spool and the command exits quickly with no stdout. The running

@@ -2580,27 +2580,153 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
                 writer_owner=_WriterOwner(kind="external_tui"),
             )
 
+        from types import SimpleNamespace
+
+        from walkcode.channel_native import SessionRegistry as _SessionRegistry
+
+        def _register(session):
+            registry = _SessionRegistry()
+            registry._sessions[session.session_id] = session
+            registry._binding_to_session[session.channel_binding.key()] = session.session_id
+            return registry
+
         session = _rootless_session()
-        healed = asyncio.run(host._heal_rootless_lark_tui_binding(session))
-        self.assertTrue(healed)
-        self.assertEqual(session.channel_binding.root_message_id, "msg-1")
-        self.assertEqual(session.channel_binding.thread_id, "msg-1")
+        rootless_key = session.channel_binding.key()
+        registry = _register(session)
+        host.state = SimpleNamespace(sessions=registry)
+        self.assertEqual(asyncio.run(host._heal_rootless_lark_tui_binding(session)), "healed")
+        healed_binding = registry.get(session.session_id).channel_binding
+        self.assertEqual(healed_binding.root_message_id, "msg-1")
+        self.assertEqual(healed_binding.thread_id, "msg-1")
+        # Registry routing must follow the NEW key, or replies in the healed
+        # thread would not resolve to this session (deep-review round 1).
+        self.assertEqual(registry.resolve_binding(healed_binding.key()), session.session_id)
+        self.assertIsNone(registry.resolve_binding(rootless_key))
+        # Card pointers reset so the status card is recreated in the thread.
+        self.assertEqual(healed_binding.health_message_id, "")
         notice = channel.sent_views[0]["view"]
         self.assertIn("TUI", notice.get("text", ""))
         # Already-rooted binding is left alone.
-        self.assertFalse(asyncio.run(host._heal_rootless_lark_tui_binding(session)))
+        self.assertEqual(asyncio.run(host._heal_rootless_lark_tui_binding(session)), "")
         # Stopped sessions never send heal notices for dead threads.
-        self.assertFalse(asyncio.run(host._heal_rootless_lark_tui_binding(_rootless_session(status="stopped"))))
+        self.assertEqual(
+            asyncio.run(host._heal_rootless_lark_tui_binding(_rootless_session(status="stopped"))), ""
+        )
 
-        # A failing channel leaves the binding rootless for the next pass.
+        # A failing channel reports "retry" and leaves the binding rootless.
         class _FailingChannel(_FakeChannel):
             async def send_view(self, binding, view_model):
                 raise RuntimeError("lark down")
 
         host.channels = {"lark": _FailingChannel("lark", _channel_caps())}
         broken = _rootless_session()
-        self.assertFalse(asyncio.run(host._heal_rootless_lark_tui_binding(broken)))
+        host.state = SimpleNamespace(sessions=_register(broken))
+        self.assertEqual(asyncio.run(host._heal_rootless_lark_tui_binding(broken)), "retry")
         self.assertEqual(broken.channel_binding.root_message_id, "")
+
+    def test_rootless_heal_send_failure_keeps_load_pass_retryable(self):
+        # A transient Lark outage at startup must NOT freeze the one-shot
+        # refresh flag: the maintenance tick has to retry until the root is
+        # actually rebuilt (deep-review round 1, 4-dimension consensus).
+        from types import SimpleNamespace
+
+        from walkcode.channel_native import ChannelBinding as _CB
+        from walkcode.channel_native import ChannelCapabilities as _ChannelCaps
+        from walkcode.channel_native import FakeChannelAdapter as _FakeChannel
+        from walkcode.channel_native import Session as _Session
+        from walkcode.channel_native import SessionRegistry as _SessionRegistry
+        from walkcode.channel_native import WriterOwner as _WriterOwner
+
+        caps = _ChannelCaps(
+            thread_context=True,
+            editable_message=True,
+            interactive_message=True,
+            interactive_update=True,
+            private_callback_ack=True,
+            toast_or_ephemeral_notice=True,
+            force_reply=True,
+            attachment_download=True,
+            forum_or_topic=True,
+            max_text_chars=4096,
+            max_callback_payload_bytes=64,
+        )
+
+        class _FlakyChannel(_FakeChannel):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.fail_next = 1
+
+            async def send_view(self, binding, view_model):
+                if self.fail_next > 0:
+                    self.fail_next -= 1
+                    raise RuntimeError("lark still down")
+                return await super().send_view(binding, view_model)
+
+        session = _Session(
+            schema_version=1,
+            session_id="tui-claude-heal2",
+            transport_kind="external_tui",
+            transport_ref={"agent": "claude", "resume_ref": {"agent_session_id": "875ae58c-bbbb"}},
+            cwd="/tmp",
+            channel_binding=_CB(
+                channel_kind="lark",
+                account_id="bot",
+                chat_id="oc_chat",
+                capabilities={"origin": "external_tui", "status_card": True},
+            ),
+            status="running",
+            lifecycle_state="EXTERNAL_OBSERVED_READONLY",
+            writer_owner=_WriterOwner(kind="external_tui"),
+        )
+        registry = _SessionRegistry()
+        registry._sessions[session.session_id] = session
+        registry._binding_to_session[session.channel_binding.key()] = session.session_id
+
+        class _RefreshHost:
+            _refresh_loaded_tui_observed_bindings = (
+                ChannelNativeRuntime._refresh_loaded_tui_observed_bindings
+            )
+            _heal_rootless_lark_tui_binding = ChannelNativeRuntime._heal_rootless_lark_tui_binding
+            _ensure_tui_observed_binding_capabilities = staticmethod(
+                ChannelNativeRuntime._ensure_tui_observed_binding_capabilities
+            )
+
+            def __init__(self):
+                self._loaded_tui_observed_bindings_refreshed = False
+                self.saved = 0
+
+            def _grant_tui_channel_owners(self, session_id, binding):
+                return None
+
+            async def _maybe_mark_stale_tui_process_detached(self, session):
+                return False
+
+            def save_state(self):
+                self.saved += 1
+
+        class _Cfg:
+            agent = "claude"
+
+        class _Orch:
+            async def refresh_session_status_card(self, session):
+                return None
+
+        host = _RefreshHost()
+        host.config = _Cfg()
+        host.orchestrator = _Orch()
+        host.state = SimpleNamespace(sessions=registry)
+        channel = _FlakyChannel("lark", caps)
+        host.channels = {"lark": channel}
+
+        asyncio.run(host._refresh_loaded_tui_observed_bindings())
+        self.assertFalse(host._loaded_tui_observed_bindings_refreshed)  # retry pending
+        self.assertEqual(registry.get(session.session_id).channel_binding.root_message_id, "")
+
+        asyncio.run(host._refresh_loaded_tui_observed_bindings())
+        healed = registry.get(session.session_id).channel_binding
+        self.assertTrue(host._loaded_tui_observed_bindings_refreshed)
+        self.assertEqual(healed.root_message_id, "msg-1")
+        self.assertEqual(registry.resolve_binding(healed.key()), session.session_id)
 
     def test_tui_permission_request_hook_sends_loud_notice_and_flips_health(self):
         with tempfile.TemporaryDirectory() as tmp:

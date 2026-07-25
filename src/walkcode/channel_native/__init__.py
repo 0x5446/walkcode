@@ -912,6 +912,7 @@ Interaction context (important): The user is talking to you through {channel} ch
 2. Anything the user must see — images, QR codes, previews, files — must be delivered into the {channel} chat, or as a URL reachable from their phone/browser; local paths like /Users/... or file:// are useless to them.
 3. For QR-login flows: capture the QR as an image and send it into the chat (or send the login URL), then wait for the user's confirmation; re-send if it expires.
 4. Keep every reply self-contained — the user only sees what arrives in {channel}.
+5. If the chat may include people other than the user, never post credentials, QR codes, or login links carrying tokens there; share a token-free login URL instead, or ask the user to continue in a private chat first.
 </environment_context>"""
 
 _CHANNEL_DISPLAY_NAMES = {
