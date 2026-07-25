@@ -48,6 +48,7 @@ from .channel_native import (
     LaunchSpec,
     LocalProcessController,
     Orchestrator,
+    _channel_environment_context,
     _command_executable_basename,
     _command_is_claude_headless_sdk_process,
     _command_is_claude_tui_process,
@@ -3755,12 +3756,68 @@ class ChannelNativeRuntime:
                 continue
             if self._ensure_tui_observed_binding_capabilities(session):
                 changed = True
+            if await self._heal_rootless_lark_tui_binding(session):
+                changed = True
             await self.orchestrator.refresh_session_status_card(session)
         # Mark done only after a full pass: a cancelled/failed first pass must
         # be retried on the next tick instead of silently skipping re-grants.
         self._loaded_tui_observed_bindings_refreshed = True
         if changed:
             self.save_state()
+
+    async def _heal_rootless_lark_tui_binding(self, session) -> bool:
+        """Re-root a Lark observation binding whose root message never sent.
+
+        _create_lark_tui_observed_binding degrades to an EMPTY root when the
+        notice send fails (e.g. the 2026-07-24/25 bare-venv outage windows),
+        and a rootless binding never healed afterwards — every mirrored
+        message landed in the main chat forever. Creation-time failure means
+        the channel was down, so the heal runs on the load-time pass: by the
+        time the runtime is back up, the channel usually is too.
+        """
+        binding = session.channel_binding
+        if (
+            binding is None
+            or binding.channel_kind != "lark"
+            or binding.capabilities.get("origin") != "external_tui"
+            or binding.root_message_id
+            or binding.thread_id
+            or session.status == "stopped"
+        ):
+            return False
+        channel = self.channels.get("lark")
+        if channel is None:
+            return False
+        transport_ref = session.transport_ref if isinstance(session.transport_ref, dict) else {}
+        agent = _normalize_tui_agent(str(transport_ref.get("agent", "") or "")) or self.config.agent
+        resume_ref = transport_ref.get("resume_ref")
+        identity = (
+            _resume_ref_identity(_agent_to_transport_kind(agent), resume_ref)
+            if isinstance(resume_ref, dict)
+            else ""
+        )
+        try:
+            root_id = await channel.send_view(
+                ChannelBinding(
+                    channel_kind="lark",
+                    account_id=binding.account_id,
+                    chat_id=binding.chat_id,
+                    thread_id="",
+                    root_message_id="",
+                ),
+                {"type": "text", "text": f"👀 TUI: {agent} {identity}（补建话题根）"},
+            )
+        except Exception as exc:
+            print(
+                f"lark TUI rootless binding heal failed: {type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+            return False
+        if not root_id:
+            return False
+        binding.thread_id = str(root_id)
+        binding.root_message_id = str(root_id)
+        return True
 
     async def _maybe_mark_stale_tui_process_detached(self, session) -> bool:
         process_ref = _external_tui_process_ref(session)
@@ -4811,6 +4868,7 @@ def _build_transports(config: ChannelNativeConfig) -> dict[str, AgentTransport]:
             background_wait_ceiling_seconds=float(
                 claude_options.get("background_wait_ceiling_seconds", 3600.0)
             ),
+            environment_context=_channel_environment_context(config.channel.kind),
         )
         # Multi-UI sync (ADR 0046): the daemon transport rides alongside the
         # headless one — reply/subscribe against TUI-owned daemon workers.
@@ -4825,7 +4883,10 @@ def _build_transports(config: ChannelNativeConfig) -> dict[str, AgentTransport]:
             )
     elif kind == "codex_app_server":
         if shutil.which("codex"):
-            transports[kind] = CodexAppServerTransport(client=_build_codex_app_server_client(config))
+            transports[kind] = CodexAppServerTransport(
+                client=_build_codex_app_server_client(config),
+                environment_context=_channel_environment_context(config.channel.kind),
+            )
         else:
             transports[kind] = _UnavailableTransport(kind, "codex CLI is not installed")
     else:

@@ -2519,6 +2519,89 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
             self.assertEqual(len(final_hits), 1)  # dedupe: bubble once, no narration double
             self.assertLess(narration_hits[0], final_hits[0])
 
+    def test_rootless_lark_tui_binding_heals_on_load_pass(self):
+        # 2026-07-24/25 bare-venv outage fallout: the observation root message
+        # failed to send at creation, the binding persisted with an EMPTY
+        # root, and every mirrored message landed in the main chat forever
+        # (five sessions on work-claude, incl. the live 875ae58c one). The
+        # load-time pass must re-root such bindings.
+        from walkcode.channel_native import ChannelBinding as _CB
+        from walkcode.channel_native import ChannelCapabilities as _ChannelCaps
+        from walkcode.channel_native import FakeChannelAdapter as _FakeChannel
+        from walkcode.channel_native import Session as _Session
+        from walkcode.channel_native import WriterOwner as _WriterOwner
+
+        def _channel_caps() -> _ChannelCaps:
+            return _ChannelCaps(
+                thread_context=True,
+                editable_message=True,
+                interactive_message=True,
+                interactive_update=True,
+                private_callback_ack=True,
+                toast_or_ephemeral_notice=True,
+                force_reply=True,
+                attachment_download=True,
+                forum_or_topic=True,
+                max_text_chars=4096,
+                max_callback_payload_bytes=64,
+            )
+
+        class _HealHost:
+            _heal_rootless_lark_tui_binding = ChannelNativeRuntime._heal_rootless_lark_tui_binding
+
+        class _Cfg:
+            agent = "claude"
+
+        host = _HealHost()
+        host.config = _Cfg()
+        channel = _FakeChannel("lark", _channel_caps())
+        host.channels = {"lark": channel}
+
+        def _rootless_session(status="running"):
+            return _Session(
+                schema_version=1,
+                session_id="tui-claude-heal1",
+                transport_kind="external_tui",
+                transport_ref={
+                    "agent": "claude",
+                    "resume_ref": {"agent_session_id": "875ae58c-aaaa"},
+                },
+                cwd="/tmp",
+                channel_binding=_CB(
+                    channel_kind="lark",
+                    account_id="bot",
+                    chat_id="oc_chat",
+                    thread_id="",
+                    root_message_id="",
+                    capabilities={"origin": "external_tui", "status_card": True},
+                ),
+                status=status,
+                lifecycle_state="EXTERNAL_OBSERVED_READONLY",
+                writer_owner=_WriterOwner(kind="external_tui"),
+            )
+
+        session = _rootless_session()
+        healed = asyncio.run(host._heal_rootless_lark_tui_binding(session))
+        self.assertTrue(healed)
+        self.assertEqual(session.channel_binding.root_message_id, "msg-1")
+        self.assertEqual(session.channel_binding.thread_id, "msg-1")
+        notice = channel.sent_views[0]["view"]
+        self.assertIn("TUI", notice.get("text", ""))
+        # Already-rooted binding is left alone.
+        self.assertFalse(asyncio.run(host._heal_rootless_lark_tui_binding(session)))
+        # Stopped sessions never send heal notices for dead threads.
+        self.assertFalse(asyncio.run(host._heal_rootless_lark_tui_binding(_rootless_session(status="stopped"))))
+
+        # A failing channel leaves the binding rootless for the next pass.
+        class _FailingChannel(_FakeChannel):
+            async def send_view(self, binding, view_model):
+                raise RuntimeError("lark down")
+
+        host.channels = {"lark": _FailingChannel("lark", _channel_caps())}
+        broken = _rootless_session()
+        self.assertFalse(asyncio.run(host._heal_rootless_lark_tui_binding(broken)))
+        self.assertEqual(broken.channel_binding.root_message_id, "")
+
     def test_tui_permission_request_hook_sends_loud_notice_and_flips_health(self):
         with tempfile.TemporaryDirectory() as tmp:
             state_path = str(Path(tmp) / "state.json")
