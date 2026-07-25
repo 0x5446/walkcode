@@ -401,7 +401,9 @@ walkcode native hook PreToolUse --agent claude --defer < hook.json
 
 Channel environment context: every channel-driven agent conversation carries a
 preamble telling the agent the user is on Feishu/Telegram and cannot see the
-local machine (visuals must go INTO the chat or be reachable URLs). Claude
+local machine; anything the user must see goes into the reply as a URL
+reachable from their phone/browser (plain text replies are relayed
+automatically — the agent must not reach for chat/IM tools). Claude
 headless sessions get it appended to the system prompt via the SDK's
 `claude_code` preset on every launch/resume (post-takeover resumes included);
 Codex app-server threads get it prepended to the first turn of each
