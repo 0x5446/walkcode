@@ -408,10 +408,14 @@ transcript sync can continue while the IM ingress long-poll is slow or
 temporarily stuck. `--json` is only for manual debugging.
 
 For current fallback Codex TUI observation, `~/.codex/hooks.json` must include
-`SessionStart`, `UserPromptSubmit`, `MessageDisplay`, `PreToolUse`,
-`PostToolUse`, `PostToolUseFailure`, `PermissionRequest`, and `Stop`. Missing
-`UserPromptSubmit` means Telegram can show assistant output from later hooks
-but cannot show the user's TUI input.
+`SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`,
+`PermissionRequest`, and `Stop`. Missing `UserPromptSubmit` means the channel
+can show assistant output from later hooks but cannot show the user's TUI
+input. codex-cli (verified 0.144.5) does not emit `MessageDisplay` or
+`PostToolUseFailure` — configuring them is harmless but dead. Assistant text
+therefore has no codex hook carrier: mid-turn narration is mirrored
+incrementally from the rollout transcript (ADR 0055), and the turn-final text
+rides the `Stop` hook's `last_assistant_message`.
 
 The target Codex architecture is different: use a shared Codex app-server
 endpoint so the Codex TUI and WalkCode's Telegram runtime attach to the same
@@ -447,7 +451,8 @@ transport and skips process termination.
 
 Tool hooks from observed TUI sessions are compact progress signals, not full
 stdout/stderr mirrors. Configure `PreToolUse`, `PostToolUse`,
-`PostToolUseFailure`, and permission hooks with `--defer`; Telegram will update
+`PostToolUseFailure` (Claude only — codex never emits it), and permission
+hooks with `--defer`; Telegram will update
 one editable `Agent activity` message in the session topic when an observed
 session already exists.
 

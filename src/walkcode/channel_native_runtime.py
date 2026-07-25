@@ -128,19 +128,34 @@ TUI_HOOK_RECENT_PRIORITY_WINDOW_SECONDS = 300.0
 TUI_HOOK_DRAIN_INTERVAL_SECONDS = 1.0
 OUTBOX_FLUSH_INTERVAL_SECONDS = 1.0
 TUI_BINDING_REFRESH_INTERVAL_SECONDS = 5.0
+# codex-cli (verified against 0.144.5) only emits session_start, session_end,
+# user_prompt_submit, pre_tool_use, post_tool_use, permission_request and
+# stop; MessageDisplay / PostToolUseFailure are Claude-only event names that
+# codex silently ignores in hooks.json, so requiring them here would make the
+# doctor demand dead config. Assistant text therefore has NO codex hook
+# carrier — mid-turn narration is mirrored from the rollout transcript
+# (ADR 0055) and the turn-final text rides the stop hook's
+# last_assistant_message.
 CODEX_TUI_REQUIRED_HOOKS = (
     "SessionStart",
     "UserPromptSubmit",
-    "MessageDisplay",
     "PreToolUse",
     "PostToolUse",
-    "PostToolUseFailure",
     "PermissionRequest",
     "Stop",
 )
 
 
 class CodexStdioAppServerClient:
+    # thread/resume returns the thread metadata plus initialTurnsPage as a
+    # single JSON line; real sessions easily exceed asyncio's default 64 KiB
+    # StreamReader limit (observed 733 KiB for a 55 MB rollout). readline()
+    # then clears its buffer and raises ValueError, which used to surface as
+    # an opaque takeover "resume_failed". Raise the high-water mark instead —
+    # chunked readuntil accumulation is NOT cancellation-safe (a wait_for
+    # timeout mid-line would drop drained bytes and desync the stream).
+    _STDOUT_LIMIT = 64 * 1024 * 1024
+
     def __init__(
         self,
         *,
@@ -226,6 +241,7 @@ class CodexStdioAppServerClient:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=self._subprocess_env(),
+            limit=self._STDOUT_LIMIT,
         )
         await self._send(
             {
@@ -238,6 +254,24 @@ class CodexStdioAppServerClient:
             }
         )
         await self._read_response(0, timeout=self.request_timeout)
+
+    async def _discard_process(self) -> None:
+        # Callers hold self._lock. Clearing _process makes the next request
+        # start a fresh subprocess. Buffered notifications are KEPT: they are
+        # complete, validly-parsed events (agent text, turn/completed) that
+        # already happened — killing the transport does not un-happen them,
+        # and dropping them would silently lose session events.
+        process, self._process = self._process, None
+        if process is None or process.returncode is not None:
+            return
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
+        try:
+            await process.wait()
+        except Exception:
+            pass
 
     async def _send(self, message: dict[str, Any]) -> None:
         process = self._require_process()
@@ -267,6 +301,16 @@ class CodexStdioAppServerClient:
             line = await asyncio.wait_for(process.stdout.readline(), timeout=timeout)
         except asyncio.TimeoutError as exc:
             raise TimeoutError from exc
+        except ValueError as exc:
+            # readline() clears its buffer and raises ValueError when a line
+            # exceeds the stream limit; the stream is desynced beyond repair
+            # (the over-long line's tail is still in the pipe), so discard the
+            # process — _ensure_started would otherwise reuse it and parse
+            # that tail as the next response.
+            await self._discard_process()
+            raise TransportUnavailable(
+                f"Codex app-server response line exceeded {self._STDOUT_LIMIT} bytes"
+            ) from exc
         if not line:
             stderr = ""
             if process.stderr is not None:
@@ -2119,8 +2163,14 @@ class ChannelNativeRuntime:
                         # the card now instead of waiting for an unrelated
                         # later event.
                         await self.orchestrator.refresh_session_status_card(session)
-                await self._send_tui_hook_output(session, hook_type=hook_type, payload=payload)
-        except Exception:
+                await self._send_tui_hook_output(
+                    session, hook_type=hook_type, payload=payload, agent=agent_name
+                )
+        except BaseException:
+            # BaseException, not Exception: a drain-timeout cancellation
+            # (asyncio.CancelledError) must also release the ledger entry —
+            # an event stuck in_progress makes the replay look like a
+            # duplicate and the queued hook is then dropped as "processed".
             if ledger_started:
                 self.state.inbound_ledger.fail(event_id)
             raise
@@ -3983,7 +4033,9 @@ class ChannelNativeRuntime:
         while len(cursors) > 512:
             cursors.pop(next(iter(cursors)))
 
-    async def _send_tui_hook_output(self, session, *, hook_type: str, payload: dict[str, Any]) -> None:
+    async def _send_tui_hook_output(
+        self, session, *, hook_type: str, payload: dict[str, Any], agent: str = ""
+    ) -> None:
         tool_event = _tui_hook_tool_event(hook_type, payload)
         if tool_event is not None:
             session.last_event_seq += 1
@@ -4039,6 +4091,44 @@ class ChannelNativeRuntime:
             self.orchestrator._stamp_last_user_input(
                 session, float(payload.get("_walkcode_hook_captured_at") or 0.0)
             )
+        if hook_type == "stop" and agent == "codex":
+            # Codex (verified against codex-cli 0.144.5) has no MessageDisplay
+            # hook, so narration written after the turn's last tool call has
+            # no hook carrier at all — only last_assistant_message rides the
+            # stop bubble, and a turn that says several things would lose all
+            # but the last one. Drain the tail from the rollout here, dropping
+            # the stop-bubble text so it is not sent twice. Claude keeps the
+            # advance-only path: its MessageDisplay hook already mirrored this
+            # text, and draining it again would double every closing message.
+            #
+            # Loop: one drain call reads at most one batch, and the cursor
+            # advance below would skip whatever a single call left behind.
+            # Each iteration either moves the cursor or is the last, so the
+            # capture-time boundary bounds the loop.
+            pending: list[str] = []
+            while True:
+                cursor_before = self._tui_transcript_cursors.get(session.session_id)
+                pending.extend(await self._drain_tui_narration(session, payload))
+                if self._tui_transcript_cursors.get(session.session_id) == cursor_before:
+                    break
+            # Only the LAST match is the stop bubble; an earlier agent
+            # message that happens to repeat the same text is a real message.
+            final_text = text.strip()
+            if final_text:
+                for index in range(len(pending) - 1, -1, -1):
+                    if pending[index].strip() == final_text:
+                        del pending[index]
+                        break
+            for narration in pending:
+                self.orchestrator._seal_tool_progress_burst(session)
+                session.last_event_seq += 1
+                await self.orchestrator._send_session_view(
+                    session,
+                    {"type": "turn_delta", "text": narration},
+                    idempotency_key=(
+                        f"external_tui:narration:{session.generation}:{session.last_event_seq}"
+                    ),
+                )
         if hook_type in {"stop", "user-prompt-submit"}:
             # The turn-final text goes out as its own bubble below; skipping
             # the cursor past it keeps it from doubling as a narration line.
@@ -6099,7 +6189,12 @@ def _read_transcript_narration(
     cursor: tuple[Any, ...] | None,
     boundary: tuple[int, tuple[int, int] | None] | None = None,
 ) -> tuple[tuple[Any, ...] | None, list[str]]:
-    """Read new assistant narration texts from a Claude transcript (ADR 0055).
+    """Read new assistant narration texts from an agent transcript (ADR 0055).
+
+    Understands both transcript dialects: Claude session files (``type ==
+    "assistant"`` entries with ``message.content`` text blocks) and Codex
+    rollouts (``type == "event_msg"`` entries whose payload is an
+    ``agent_message``).
 
     ``cursor`` is (path, byte_offset, file_key, discarding) from the previous
     read, where file_key is (st_dev, st_ino): a replaced file at the same
@@ -6204,7 +6299,22 @@ def _read_transcript_narration(
             continue
         if not isinstance(entry, dict) or entry.get("isSidechain"):
             continue
-        if str(entry.get("type", "")) != "assistant":
+        entry_type = str(entry.get("type", ""))
+        if entry_type == "event_msg":
+            # Codex rollout line. The same assistant text appears TWICE in a
+            # rollout (event_msg/agent_message + response_item/message with
+            # role assistant), so only the event_msg form is read — parsing
+            # both would post every message twice.
+            codex_payload = entry.get("payload")
+            if (
+                isinstance(codex_payload, dict)
+                and str(codex_payload.get("type", "")) == "agent_message"
+            ):
+                codex_text = str(codex_payload.get("message", "") or "").strip()
+                if codex_text:
+                    texts.append(codex_text)
+            continue
+        if entry_type != "assistant":
             continue
         message = entry.get("message")
         if not isinstance(message, dict):

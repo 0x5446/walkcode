@@ -1,6 +1,7 @@
 import asyncio
 import json
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -1269,7 +1270,15 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
 
             self.assertFalse(status["tui_hook_status"]["ok"])
             self.assertIn("UserPromptSubmit", status["tui_hook_status"]["missing"])
-            self.assertIn("MessageDisplay", status["tui_hook_status"]["missing"])
+            self.assertIn("PreToolUse", status["tui_hook_status"]["missing"])
+            # codex-cli has no MessageDisplay / PostToolUseFailure events;
+            # the doctor must not demand dead config for them. The required
+            # list is pinned literally so dropping a REAL hook from the
+            # constant cannot slip through a constant-derived expectation.
+            self.assertEqual(
+                status["tui_hook_status"]["required"],
+                ["SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "PermissionRequest", "Stop"],
+            )
 
     def test_describe_accepts_complete_codex_tui_hooks(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2030,6 +2039,128 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
 
         self.assertIsNone(client._subprocess_env())
 
+    def test_codex_stdio_client_reads_response_lines_beyond_default_stream_limit(self):
+        # thread/resume responses carry the full initialTurnsPage in one JSON
+        # line; real sessions exceed asyncio's default 64 KiB readline limit,
+        # which used to raise ValueError and flatten into takeover
+        # "resume_failed". 733 KiB was observed on a 55 MB rollout, so the
+        # success sample must exceed that scale.
+        pad_bytes = 1024 * 1024
+        fake_server = (
+            "import json, sys\n"
+            "for line in sys.stdin:\n"
+            "    msg = json.loads(line)\n"
+            "    if msg.get('method') == 'initialize':\n"
+            "        sys.stdout.write(json.dumps({'id': msg['id'], 'result': {}}) + '\\n')\n"
+            "    elif msg.get('method') == 'thread/resume':\n"
+            "        result = {'thread': {'id': msg['params']['threadId']}, 'pad': 'x' * %d}\n"
+            "        sys.stdout.write(json.dumps({'id': msg['id'], 'result': result}) + '\\n')\n"
+            "    sys.stdout.flush()\n"
+        ) % pad_bytes
+
+        async def scenario(script_path: str) -> dict:
+            client = runtime_module.CodexStdioAppServerClient(
+                command=(sys.executable, script_path),
+            )
+            try:
+                return await client.request(
+                    "thread/resume", {"threadId": "t-big", "cwd": "/tmp"}
+                )
+            finally:
+                if client._process is not None:
+                    client._process.kill()
+                    await client._process.wait()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            script_path = str(Path(tmp) / "fake_app_server.py")
+            Path(script_path).write_text(fake_server, encoding="utf-8")
+            result = asyncio.run(scenario(script_path))
+
+        self.assertEqual(result["thread"]["id"], "t-big")
+        self.assertEqual(len(result["pad"]), pad_bytes)
+
+    def test_codex_stdio_client_discards_process_when_line_exceeds_limit(self):
+        # A line beyond the stream limit desyncs the stream beyond repair
+        # (readline drops its buffer, the line's tail stays in the pipe).
+        # The client must surface TransportUnavailable AND discard the
+        # process so the next request starts fresh instead of parsing the
+        # torn tail (deep-review round 1).
+        class _FakeStdout:
+            async def readline(self):
+                raise ValueError("Separator is not found, and chunk exceed the limit")
+
+        class _FakeProcess:
+            def __init__(self):
+                self.returncode = None
+                self.killed = False
+                self.stdout = _FakeStdout()
+                self.stderr = None
+                self.stdin = None
+
+            def kill(self):
+                self.killed = True
+                self.returncode = -9
+
+            async def wait(self):
+                return -9
+
+        client = runtime_module.CodexStdioAppServerClient()
+        fake = _FakeProcess()
+        client._process = fake
+        client._buffered_notifications.append({"method": "stale"})
+
+        with self.assertRaises(runtime_module.TransportUnavailable) as ctx:
+            asyncio.run(client._read_message(timeout=1.0))
+
+        self.assertIn(str(runtime_module.CodexStdioAppServerClient._STDOUT_LIMIT), str(ctx.exception))
+        self.assertIsNone(client._process)
+        self.assertTrue(fake.killed)
+        # Already-parsed notifications are real events that happened; the
+        # transport dying must not silently drop them (deep-review round 2).
+        self.assertEqual(client._buffered_notifications, [{"method": "stale"}])
+
+    def test_codex_stdio_client_overlimit_line_from_real_subprocess_discards_process(self):
+        # End-to-end over-limit path: a REAL subprocess emits a single line
+        # beyond the (patched-down) stream limit. The request must fail with
+        # TransportUnavailable and the desynced process must be discarded so
+        # the next request starts fresh.
+        limit = 128 * 1024
+        fake_server = (
+            "import json, sys\n"
+            "for line in sys.stdin:\n"
+            "    msg = json.loads(line)\n"
+            "    if msg.get('method') == 'initialize':\n"
+            "        sys.stdout.write(json.dumps({'id': msg['id'], 'result': {}}) + '\\n')\n"
+            "    elif msg.get('method') == 'thread/resume':\n"
+            "        sys.stdout.write(json.dumps({'id': msg['id'], 'result': {'pad': 'x' * %d}}) + '\\n')\n"
+            "    sys.stdout.flush()\n"
+        ) % (limit * 4)
+
+        async def scenario(script_path: str):
+            client = runtime_module.CodexStdioAppServerClient(
+                command=(sys.executable, script_path),
+            )
+            try:
+                with self.assertRaises(runtime_module.TransportUnavailable):
+                    await client.request("thread/resume", {"threadId": "t-huge", "cwd": "/tmp"})
+                self.assertIsNone(client._process)
+            finally:
+                if client._process is not None:
+                    client._process.kill()
+                    await client._process.wait()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            script_path = str(Path(tmp) / "fake_app_server.py")
+            Path(script_path).write_text(fake_server, encoding="utf-8")
+            with patch.object(runtime_module.CodexStdioAppServerClient, "_STDOUT_LIMIT", limit):
+                asyncio.run(scenario(script_path))
+
+    def test_codex_stdio_client_stdout_limit_covers_observed_resume_sizes(self):
+        # The 733 KiB thread/resume line observed on a 55 MB rollout is the
+        # incident this limit exists for; pin the production value so a
+        # future "tidy-up" cannot silently shrink it back below real sizes.
+        self.assertEqual(runtime_module.CodexStdioAppServerClient._STDOUT_LIMIT, 64 * 1024 * 1024)
+
     def test_launchd_service_label_profile_and_legacy_forms(self):
         self.assertEqual(
             runtime_module._launchd_service_label("telegram", "claude"),
@@ -2298,6 +2429,95 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
             ledger = snapshot.inbound_ledger.to_dict()
             self.assertEqual(ledger["in_progress"], {})
             self.assertEqual(len(ledger["completed"]), 2)
+
+    def test_codex_tui_stop_hook_drains_narration_through_real_entrypoint(self):
+        # Entry-level pin for the codex stop-drain wiring: the agent name
+        # must flow process_tui_hook -> _send_tui_hook_output, or the codex
+        # stop branch never runs and the tail narration is silently skipped
+        # (deep-review round 2: the unit tests alone call the inner method
+        # directly and would stay green if the wiring were dropped).
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = str(Path(tmp) / "state.json")
+            cfg = ChannelNativeConfig.from_env(
+                {
+                    "WALKCODE_CHANNEL": "telegram",
+                    "TELEGRAM_BOT_TOKEN": "fake",
+                    "WALKCODE_AGENT": "codex",
+                    "TELEGRAM_ALLOWED_CHAT_IDS": "123",
+                    "WALKCODE_STATE_PATH": state_path,
+                    "WALKCODE_CWD": tmp,
+                }
+            )
+            api = _FakeTelegramApi()
+            runtime = ChannelNativeRuntime.from_config(
+                cfg,
+                telegram_api=api,
+                transports={"codex_app_server": FakeAgentTransport("codex_app_server", _transport_caps())},
+            )
+            spawn = subprocess.run(
+                ["/bin/sh", "-c", "sleep 60 >/dev/null 2>&1 & echo $!"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            stand_in_pid = int(spawn.stdout.strip())
+            self.addCleanup(
+                lambda: subprocess.run(["kill", "-9", str(stand_in_pid)], capture_output=True)
+            )
+            rollout = Path(tmp) / "rollout.jsonl"
+
+            def _append_agent_message(text: str) -> None:
+                with open(rollout, "a", encoding="utf-8") as fh:
+                    fh.write(
+                        json.dumps(
+                            {"type": "event_msg", "payload": {"type": "agent_message", "message": text}},
+                            ensure_ascii=False,
+                        )
+                        + "\n"
+                    )
+
+            _append_agent_message("历史消息（不得重播）")
+            base_payload = {
+                "thread_id": "thread-codex-1",
+                "cwd": tmp,
+                "transcript_path": str(rollout),
+                "terminate_ref": {
+                    "controller_kind": "process",
+                    "process_ref": {"pid": stand_in_pid, "allow_terminate": True},
+                },
+            }
+            created = asyncio.run(
+                runtime.process_tui_hook(hook_type="sync", agent="codex", payload=dict(base_payload))
+            )
+            # First tool hook initializes the narration cursor (fast-forward,
+            # history must not replay).
+            pre_tool = asyncio.run(
+                runtime.process_tui_hook(
+                    hook_type="pre-tool",
+                    agent="codex",
+                    payload={**base_payload, "tool_name": "Bash", "tool_use_id": "t1"},
+                )
+            )
+            _append_agent_message("中段叙述")
+            _append_agent_message("最终回复")
+            stopped = asyncio.run(
+                runtime.process_tui_hook(
+                    hook_type="stop",
+                    agent="codex",
+                    payload={**base_payload, "last_assistant_message": "最终回复"},
+                )
+            )
+
+            self.assertTrue(created.accepted)
+            self.assertTrue(pre_tool.accepted)
+            self.assertTrue(stopped.accepted)
+            texts = [payload.get("text", "") for method, payload in api.calls if method == "sendMessage"]
+            self.assertNotIn("历史消息（不得重播）", "\n".join(texts))
+            narration_hits = [i for i, t in enumerate(texts) if "中段叙述" in t]
+            final_hits = [i for i, t in enumerate(texts) if "最终回复" in t]
+            self.assertEqual(len(narration_hits), 1)
+            self.assertEqual(len(final_hits), 1)  # dedupe: bubble once, no narration double
+            self.assertLess(narration_hits[0], final_hits[0])
 
     def test_tui_permission_request_hook_sends_loud_notice_and_flips_health(self):
         with tempfile.TemporaryDirectory() as tmp:
