@@ -51,6 +51,21 @@ class EnvironmentContextTemplateTests(unittest.TestCase):
         self.assertIn("URL reachable from their phone/browser", text)
         self.assertNotIn("send it into the chat", text)
         self.assertNotIn("send the login URL", text)
+        # Positive pins (deep-review): the tool ban itself, the login-URL
+        # rule, and the explicit carve-out for user-requested messaging.
+        self.assertIn("never invoke chat/IM tools just to deliver a reply", text)
+        self.assertIn("explicitly asks you to message someone else", text)
+        self.assertIn("put the login URL in your reply", text)
+
+    def test_group_chat_credential_rules_survive(self):
+        # Group-privacy floor (deep-review round 1, 3-dimension consensus):
+        # no QR codes or tokened links in shared chats, and the private-chat
+        # fallback must exist for flows that only offer tokened links.
+        text = _channel_environment_context("lark")
+        self.assertIn("no QR codes", text)
+        self.assertIn("login links carrying tokens", text)
+        self.assertIn("token-free URL", text)
+        self.assertIn("private chat", text)
 
 
 class _RecordingClient:
