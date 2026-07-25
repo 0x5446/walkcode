@@ -255,6 +255,23 @@ class CodexStdioAppServerClient:
         )
         await self._read_response(0, timeout=self.request_timeout)
 
+    async def _discard_process(self) -> None:
+        # Callers hold self._lock. Clearing _process makes the next request
+        # start a fresh subprocess; buffered notifications belong to the dead
+        # stream and would otherwise be replayed against the new one.
+        process, self._process = self._process, None
+        self._buffered_notifications.clear()
+        if process is None or process.returncode is not None:
+            return
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
+        try:
+            await process.wait()
+        except Exception:
+            pass
+
     async def _send(self, message: dict[str, Any]) -> None:
         process = self._require_process()
         assert process.stdin is not None
@@ -285,8 +302,11 @@ class CodexStdioAppServerClient:
             raise TimeoutError from exc
         except ValueError as exc:
             # readline() clears its buffer and raises ValueError when a line
-            # exceeds the stream limit; the stream is desynced beyond repair,
-            # so surface a diagnosable transport error instead of the raw one.
+            # exceeds the stream limit; the stream is desynced beyond repair
+            # (the over-long line's tail is still in the pipe), so discard the
+            # process — _ensure_started would otherwise reuse it and parse
+            # that tail as the next response.
+            await self._discard_process()
             raise TransportUnavailable(
                 f"Codex app-server response line exceeded {self._STDOUT_LIMIT} bytes"
             ) from exc
@@ -4072,14 +4092,29 @@ class ChannelNativeRuntime:
             # no hook carrier at all — only last_assistant_message rides the
             # stop bubble, and a turn that says several things would lose all
             # but the last one. Drain the tail from the rollout here, dropping
-            # the line that matches the stop bubble so it is not sent twice.
-            # Claude keeps the advance-only path: its MessageDisplay hook
-            # already mirrored this text, and draining it again would double
-            # every closing message.
+            # the stop-bubble text so it is not sent twice. Claude keeps the
+            # advance-only path: its MessageDisplay hook already mirrored this
+            # text, and draining it again would double every closing message.
+            #
+            # Loop: one drain call reads at most one batch, and the cursor
+            # advance below would skip whatever a single call left behind.
+            # Each iteration either moves the cursor or is the last, so the
+            # capture-time boundary bounds the loop.
+            pending: list[str] = []
+            while True:
+                cursor_before = self._tui_transcript_cursors.get(session.session_id)
+                pending.extend(await self._drain_tui_narration(session, payload))
+                if self._tui_transcript_cursors.get(session.session_id) == cursor_before:
+                    break
+            # Only the LAST match is the stop bubble; an earlier agent
+            # message that happens to repeat the same text is a real message.
             final_text = text.strip()
-            for narration in await self._drain_tui_narration(session, payload):
-                if narration.strip() == final_text:
-                    continue
+            if final_text:
+                for index in range(len(pending) - 1, -1, -1):
+                    if pending[index].strip() == final_text:
+                        del pending[index]
+                        break
+            for narration in pending:
                 self.orchestrator._seal_tool_progress_burst(session)
                 session.last_event_seq += 1
                 await self.orchestrator._send_session_view(

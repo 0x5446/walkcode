@@ -1272,9 +1272,13 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
             self.assertIn("UserPromptSubmit", status["tui_hook_status"]["missing"])
             self.assertIn("PreToolUse", status["tui_hook_status"]["missing"])
             # codex-cli has no MessageDisplay / PostToolUseFailure events;
-            # the doctor must not demand dead config for them.
-            self.assertNotIn("MessageDisplay", status["tui_hook_status"]["missing"])
-            self.assertNotIn("PostToolUseFailure", status["tui_hook_status"]["missing"])
+            # the doctor must not demand dead config for them. The required
+            # list is pinned literally so dropping a REAL hook from the
+            # constant cannot slip through a constant-derived expectation.
+            self.assertEqual(
+                status["tui_hook_status"]["required"],
+                ["SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "PermissionRequest", "Stop"],
+            )
 
     def test_describe_accepts_complete_codex_tui_hooks(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2073,6 +2077,44 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
 
         self.assertEqual(result["thread"]["id"], "t-big")
         self.assertEqual(len(result["pad"]), pad_bytes)
+
+    def test_codex_stdio_client_discards_process_when_line_exceeds_limit(self):
+        # A line beyond the stream limit desyncs the stream beyond repair
+        # (readline drops its buffer, the line's tail stays in the pipe).
+        # The client must surface TransportUnavailable AND discard the
+        # process so the next request starts fresh instead of parsing the
+        # torn tail (deep-review round 1).
+        class _FakeStdout:
+            async def readline(self):
+                raise ValueError("Separator is not found, and chunk exceed the limit")
+
+        class _FakeProcess:
+            def __init__(self):
+                self.returncode = None
+                self.killed = False
+                self.stdout = _FakeStdout()
+                self.stderr = None
+                self.stdin = None
+
+            def kill(self):
+                self.killed = True
+                self.returncode = -9
+
+            async def wait(self):
+                return -9
+
+        client = runtime_module.CodexStdioAppServerClient()
+        fake = _FakeProcess()
+        client._process = fake
+        client._buffered_notifications.append({"method": "stale"})
+
+        with self.assertRaises(runtime_module.TransportUnavailable) as ctx:
+            asyncio.run(client._read_message(timeout=1.0))
+
+        self.assertIn(str(runtime_module.CodexStdioAppServerClient._STDOUT_LIMIT), str(ctx.exception))
+        self.assertIsNone(client._process)
+        self.assertTrue(fake.killed)
+        self.assertEqual(client._buffered_notifications, [])
 
     def test_launchd_service_label_profile_and_legacy_forms(self):
         self.assertEqual(

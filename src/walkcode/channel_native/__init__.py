@@ -10826,6 +10826,10 @@ class Orchestrator:
                     )
                 )
             except Exception as exc:
+                # State first, log second: the takeover is already AUTHORIZED,
+                # so a raise out of the (stderr-writing) log call must not
+                # leave the transaction stuck mid-takeover.
+                self.sessions.fail_takeover(takeover_id, reason="resume_failed")
                 # ADR 0059 R1 fixed the writer path's flattened "resume_failed"
                 # hiding the real cause; the takeover path needs the same trace
                 # (e.g. oversized thread/resume response vs dead app-server).
@@ -10835,7 +10839,6 @@ class Orchestrator:
                     takeover_id=takeover_id,
                     error=exc,
                 )
-                self.sessions.fail_takeover(takeover_id, reason="resume_failed")
                 await self._send_session_view(
                     session,
                     ViewModelFactory.takeover_progress(

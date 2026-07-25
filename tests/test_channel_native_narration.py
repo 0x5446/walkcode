@@ -20,6 +20,7 @@ import json
 import os
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from walkcode.channel_native import (
     ActorRef,
@@ -859,6 +860,40 @@ class CodexStopDrainTests(unittest.TestCase):
         deltas = [v["view"]["text"] for v in self._views("turn_delta")]
         self.assertEqual(deltas, ["说到一半"])
         self.assertEqual(self._views("turn_completed"), [])
+
+    def test_stop_dedupe_keeps_earlier_message_with_same_text(self):
+        # Only the LAST match is the stop bubble: an earlier agent message
+        # that happens to repeat the final text is a real message and must
+        # not be swallowed by the dedupe (deep-review round 1).
+        self._run("pre-tool", self._stamped_payload(tool_name="Bash", tool_use_id="t1"))
+        self._append(_codex_agent_message("重复的话"))
+        self._append(_codex_agent_message("中间插一句"))
+        self._append(_codex_agent_message("重复的话"))
+        self._run("stop", self._stamped_payload(last_assistant_message="重复的话"))
+
+        deltas = [v["view"]["text"] for v in self._views("turn_delta")]
+        self.assertEqual(deltas, ["重复的话", "中间插一句"])
+        completed = [v["view"].get("message") for v in self._views("turn_completed")]
+        self.assertEqual(completed, ["重复的话"])
+
+    def test_stop_drains_past_single_batch_read_cap(self):
+        # One drain call reads at most _TRANSCRIPT_READ_MAX_BYTES; the stop
+        # path must LOOP until the cursor reaches the capture boundary, or
+        # the advance would silently skip everything after the first batch
+        # (deep-review round 1). Cap shrunk so each read consumes ~1 line.
+        import walkcode.channel_native_runtime as runtime_module
+
+        self._run("pre-tool", self._stamped_payload(tool_name="Bash", tool_use_id="t1"))
+        for i in range(5):
+            self._append(_codex_agent_message(f"第{i}段"))
+        self._append(_codex_agent_message("最终回复"))
+        with patch.object(runtime_module, "_TRANSCRIPT_READ_MAX_BYTES", 128):
+            self._run("stop", self._stamped_payload(last_assistant_message="最终回复"))
+
+        deltas = [v["view"]["text"] for v in self._views("turn_delta")]
+        self.assertEqual(deltas, [f"第{i}段" for i in range(5)])
+        completed = [v["view"].get("message") for v in self._views("turn_completed")]
+        self.assertEqual(completed, ["最终回复"])
 
 
 if __name__ == "__main__":
