@@ -309,7 +309,10 @@ else
   warn "$(msg "No release tag detected; installing from main." "未检测到 release tag；从 main 安装。")"
 fi
 
-run uv tool install --python "$PYTHON_SPEC" --with claude-agent-sdk --with lark-oapi "$source" \
+# claude-agent-sdk >= 0.2.124: earlier builds re-parse the accumulated
+# stream buffer on every chunk, which the 64 MiB max_buffer_size would
+# amplify into a CPU/memory hazard on large tool results.
+run uv tool install --python "$PYTHON_SPEC" --with 'claude-agent-sdk>=0.2.124' --with lark-oapi "$source" \
   --force --reinstall --refresh-package walkcode
 
 restart_v3_labels

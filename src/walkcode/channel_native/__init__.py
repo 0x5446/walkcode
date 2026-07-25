@@ -906,6 +906,28 @@ class Session:
     background_tasks: list[dict[str, Any]] = field(default_factory=list)
 
 
+_CHANNEL_ENVIRONMENT_CONTEXT_TEMPLATE = """<environment_context>
+Interaction context (important): The user is talking to you through {channel} chat via a relay. They are NOT at this machine and cannot see the local terminal, screen, browser windows, screenshots on disk, or any local file path.
+1. Never ask the user to look at, click, or scan anything on the local machine.
+2. Anything the user must see — images, QR codes, previews, files — must be delivered into the {channel} chat, or as a URL reachable from their phone/browser; local paths like /Users/... or file:// are useless to them.
+3. For QR-login flows: capture the QR as an image and send it into the chat (or send the login URL), then wait for the user's confirmation; re-send if it expires.
+4. Keep every reply self-contained — the user only sees what arrives in {channel}.
+5. If the chat may include people other than the user, never post credentials, QR codes, or login links carrying tokens there; share a token-free login URL instead, or ask the user to continue in a private chat first.
+</environment_context>"""
+
+_CHANNEL_DISPLAY_NAMES = {
+    "lark": "Feishu (Lark)",
+    "telegram": "Telegram",
+}
+
+
+def _channel_environment_context(channel_kind: str) -> str:
+    channel = _CHANNEL_DISPLAY_NAMES.get(
+        str(channel_kind or "").strip().lower(), "the remote chat"
+    )
+    return _CHANNEL_ENVIRONMENT_CONTEXT_TEMPLATE.format(channel=channel)
+
+
 def _session_is_external_tui_takeover_candidate(session: Session) -> bool:
     if session.transport_kind == "external_tui":
         return True
@@ -5837,6 +5859,10 @@ class _ClaudePermissionBridge:
 
 class ClaudeHeadlessTransport:
     kind = "claude_headless"
+    # Single stream-json message ceiling for the SDK subprocess transport
+    # (default is 1 MiB and real turns exceed it); matches the codex
+    # app-server _STDOUT_LIMIT rationale.
+    _SDK_MAX_BUFFER_SIZE = 64 * 1024 * 1024
 
     def __init__(
         self,
@@ -5851,6 +5877,7 @@ class ClaudeHeadlessTransport:
         permission_timeout: float = 1800.0,
         settle_grace_seconds: float = 5.0,
         background_wait_ceiling_seconds: float = 3600.0,
+        environment_context: str = "",
     ):
         self._client_factory = client_factory
         self._sdk_loader = sdk_loader or self._default_sdk_loader
@@ -5860,6 +5887,11 @@ class ClaudeHeadlessTransport:
         self.anthropic_base_url = anthropic_base_url
         self.permission_mode = permission_mode
         self.permission_timeout = permission_timeout
+        # Appended to the agent's system prompt on every worker launch AND
+        # resume: the user is on a remote chat channel and cannot see this
+        # machine. Covers native channel sessions and post-takeover resumes
+        # alike, because both paths build their client here.
+        self.environment_context = environment_context
         # Session-level settle policy (persistent listening): after a turn
         # ends, the event stream stays attached while background subagents run.
         # It only "goes off duty" when the ledger is empty and the stream stays
@@ -7564,6 +7596,24 @@ class ClaudeHeadlessTransport:
         if options_cls is not None and _options_supports_field(options_cls, "add_dirs"):
             existing = list(option_kwargs.get("add_dirs") or [])
             option_kwargs["add_dirs"] = [*existing, str(attachment_download_dir())]
+        if self.environment_context and options_cls is not None:
+            if _options_supports_field(options_cls, "append_system_prompt"):
+                option_kwargs["append_system_prompt"] = self.environment_context
+            elif _options_supports_field(options_cls, "system_prompt"):
+                # Current SDK shape: the claude_code preset keeps the standard
+                # system prompt and "append" adds the channel context to it.
+                option_kwargs["system_prompt"] = {
+                    "type": "preset",
+                    "preset": "claude_code",
+                    "append": self.environment_context,
+                }
+        if options_cls is not None and _options_supports_field(options_cls, "max_buffer_size"):
+            # The SDK's subprocess transport rejects any single stream-json
+            # message over 1 MiB ("Agent output stream failed: ... exceeded
+            # maximum buffer size"), which real turns hit (large tool results
+            # / attachments). Same class of failure as the codex 64 KiB
+            # readline limit; sized to match its 64 MiB ceiling.
+            option_kwargs["max_buffer_size"] = self._SDK_MAX_BUFFER_SIZE
         bridge: _ClaudePermissionBridge | None = None
         if options_cls is not None and self._permission_bridging_supported(sdk):
             bridge = _ClaudePermissionBridge(
@@ -7855,12 +7905,25 @@ class CodexAppServerTransport:
         approval_policy: str = "never",
         sandbox: str = "read-only",
         ephemeral: bool = False,
+        environment_context: str = "",
     ):
         self.client = client
         self.approval_policy = approval_policy
         self.sandbox = sandbox
         self.ephemeral = ephemeral
         self._pending_server_requests: dict[str, dict[str, Any]] = {}
+        # Codex app-server has no append-system-prompt surface
+        # (base_instructions REPLACES the built-in prompt wholesale), so the
+        # channel context rides the FIRST turn of each launched/resumed
+        # thread instead. Pending until a turn/start confirms; a runtime
+        # restart re-marks on the next resume — a repeated preamble in
+        # history is harmless, a missing one is not.
+        self.environment_context = environment_context
+        self._env_context_pending: set[str] = set()
+        # Threads that already received the context this runtime lifetime:
+        # writer reacquisition resumes the same thread over and over, and
+        # without this mark every resume would re-inject the preamble.
+        self._env_context_delivered: set[str] = set()
 
     def capabilities(self) -> TransportCapabilities:
         return TransportCapabilities(
@@ -7890,6 +7953,8 @@ class CodexAppServerTransport:
             },
         )
         thread_id = _codex_thread_id(result)
+        if self.environment_context and thread_id:
+            self._env_context_pending.add(thread_id)
         return TransportHandle(
             handle_id=f"codex-{uuid.uuid4().hex}",
             transport_kind=self.kind,
@@ -7901,6 +7966,8 @@ class CodexAppServerTransport:
             raise ValueError("thread_id is required for Codex resume")
         result = await self.client.request("thread/resume", {"threadId": thread_id, "cwd": cwd})
         resumed = _codex_thread_id(result) or thread_id
+        if self.environment_context and resumed not in self._env_context_delivered:
+            self._env_context_pending.add(resumed)
         return TransportHandle(
             handle_id=f"codex-{uuid.uuid4().hex}",
             transport_kind=self.kind,
@@ -7917,17 +7984,25 @@ class CodexAppServerTransport:
         turn: TurnInput,
         idempotency_key: str,
     ) -> None:
+        thread_id = handle.ref["thread_id"]
+        text = turn.text
+        if thread_id in self._env_context_pending:
+            text = f"{self.environment_context}\n\n{text}"
         await self.client.request(
             "turn/start",
             {
-                "threadId": handle.ref["thread_id"],
+                "threadId": thread_id,
                 "input": [
-                    {"type": "text", "text": turn.text, "text_elements": []},
+                    {"type": "text", "text": text, "text_elements": []},
                 ],
                 "approvalPolicy": self.approval_policy,
                 "idempotencyKey": idempotency_key,
             },
         )
+        # Only a confirmed turn/start clears the mark: a failed submit keeps
+        # the context pending so the retry carries it again.
+        self._env_context_pending.discard(thread_id)
+        self._env_context_delivered.add(thread_id)
 
     async def events(self, handle: TransportHandle) -> list[AgentEvent]:
         raw_events = await self.client.events(handle.ref["thread_id"])

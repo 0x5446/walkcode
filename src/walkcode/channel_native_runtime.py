@@ -48,6 +48,7 @@ from .channel_native import (
     LaunchSpec,
     LocalProcessController,
     Orchestrator,
+    _channel_environment_context,
     _command_executable_basename,
     _command_is_claude_headless_sdk_process,
     _command_is_claude_tui_process,
@@ -3729,6 +3730,7 @@ class ChannelNativeRuntime:
         if self._loaded_tui_observed_bindings_refreshed:
             return
         changed = False
+        heal_retry_needed = False
         summaries = [
             summary
             for kind in ("telegram", "lark")
@@ -3741,6 +3743,15 @@ class ChannelNativeRuntime:
                 "EXTERNAL_DETACHED_UNIMPORTABLE",
             }:
                 continue
+            # Rootless heal runs BEFORE the writer filter: a taken-over
+            # session (writer=orchestrator) with an observation-born rootless
+            # binding sprays the main chat just the same.
+            heal = await self._heal_rootless_lark_tui_binding(session)
+            if heal == "healed":
+                changed = True
+                await self.orchestrator.refresh_session_status_card(session)
+            elif heal == "retry":
+                heal_retry_needed = True
             if session.writer_owner is None or session.writer_owner.kind != "external_tui":
                 continue
             if session.channel_binding is not None:
@@ -3756,11 +3767,96 @@ class ChannelNativeRuntime:
             if self._ensure_tui_observed_binding_capabilities(session):
                 changed = True
             await self.orchestrator.refresh_session_status_card(session)
-        # Mark done only after a full pass: a cancelled/failed first pass must
-        # be retried on the next tick instead of silently skipping re-grants.
-        self._loaded_tui_observed_bindings_refreshed = True
+        # Mark done only after a full pass with no retryable heal failures: a
+        # cancelled/failed first pass must be retried on the next tick instead
+        # of silently skipping re-grants, and a heal that failed because the
+        # channel was still down must not be frozen until the next restart.
+        self._loaded_tui_observed_bindings_refreshed = not heal_retry_needed
         if changed:
             self.save_state()
+
+    async def _heal_rootless_lark_tui_binding(self, session) -> str:
+        """Re-root a Lark observation binding whose root message never sent.
+
+        _create_lark_tui_observed_binding degrades to an EMPTY root when the
+        notice send fails (e.g. the 2026-07-24/25 bare-venv outage windows),
+        and a rootless binding never healed afterwards — every mirrored
+        message landed in the main chat forever. Creation-time failure means
+        the channel was down, so the heal runs on the load-time pass; a pass
+        with a failed heal stays incomplete so the maintenance tick retries.
+
+        Returns "" (not applicable), "healed", or "retry" (send failed or the
+        session raced to stopped — try again next tick).
+        """
+        binding = session.channel_binding
+        if (
+            binding is None
+            or binding.channel_kind != "lark"
+            or binding.capabilities.get("origin") != "external_tui"
+            or binding.root_message_id
+            or binding.thread_id
+            or session.status == "stopped"
+        ):
+            return ""
+        channel = self.channels.get("lark")
+        if channel is None:
+            return ""
+        transport_ref = session.transport_ref if isinstance(session.transport_ref, dict) else {}
+        agent = _normalize_tui_agent(str(transport_ref.get("agent", "") or "")) or self.config.agent
+        resume_ref = transport_ref.get("resume_ref")
+        identity = (
+            _resume_ref_identity(_agent_to_transport_kind(agent), resume_ref)
+            if isinstance(resume_ref, dict)
+            else ""
+        )
+        try:
+            root_id = await channel.send_view(
+                ChannelBinding(
+                    channel_kind="lark",
+                    account_id=binding.account_id,
+                    chat_id=binding.chat_id,
+                    thread_id="",
+                    root_message_id="",
+                ),
+                {"type": "text", "text": f"👀 TUI: {agent} {identity}（补建话题根）"},
+            )
+        except Exception as exc:
+            _log_degrade(
+                "lark_tui_root_heal_failed",
+                session_id=session.session_id,
+                chat_id=binding.chat_id,
+                agent=agent,
+                error=exc,
+            )
+            return "retry"
+        if not root_id:
+            _log_degrade(
+                "lark_tui_root_heal_failed",
+                session_id=session.session_id,
+                chat_id=binding.chat_id,
+                agent=agent,
+                reason="empty_message_id",
+            )
+            return "retry"
+        if session.status == "stopped":
+            # The session raced to stopped while the notice was in flight;
+            # backfilling now would root a dead thread on a stale card.
+            return "retry"
+        # Rebuild + re-register instead of mutating in place: the binding KEY
+        # changes, and the registry's binding->session index would otherwise
+        # keep the rootless key — replies in the new thread would not resolve
+        # to this session and could spawn a second one. Card pointers reset so
+        # the status card is recreated inside the new thread (the old one
+        # stays behind in the main chat).
+        healed_binding = replace(
+            binding,
+            thread_id=str(root_id),
+            root_message_id=str(root_id),
+            health_message_id="",
+            last_message_id="",
+        )
+        self.state.sessions.update_channel_binding(session.session_id, healed_binding)
+        return "healed"
 
     async def _maybe_mark_stale_tui_process_detached(self, session) -> bool:
         process_ref = _external_tui_process_ref(session)
@@ -4811,6 +4907,7 @@ def _build_transports(config: ChannelNativeConfig) -> dict[str, AgentTransport]:
             background_wait_ceiling_seconds=float(
                 claude_options.get("background_wait_ceiling_seconds", 3600.0)
             ),
+            environment_context=_channel_environment_context(config.channel.kind),
         )
         # Multi-UI sync (ADR 0046): the daemon transport rides alongside the
         # headless one — reply/subscribe against TUI-owned daemon workers.
@@ -4825,7 +4922,10 @@ def _build_transports(config: ChannelNativeConfig) -> dict[str, AgentTransport]:
             )
     elif kind == "codex_app_server":
         if shutil.which("codex"):
-            transports[kind] = CodexAppServerTransport(client=_build_codex_app_server_client(config))
+            transports[kind] = CodexAppServerTransport(
+                client=_build_codex_app_server_client(config),
+                environment_context=_channel_environment_context(config.channel.kind),
+            )
         else:
             transports[kind] = _UnavailableTransport(kind, "codex CLI is not installed")
     else:
