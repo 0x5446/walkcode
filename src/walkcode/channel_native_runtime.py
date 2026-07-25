@@ -147,6 +147,15 @@ class CodexStdioAppServerClient:
         command: tuple[str, ...] = ("codex", "app-server", "--stdio"),
         request_timeout: float = 30.0,
         event_timeout: float = 180.0,
+    # thread/resume returns the thread metadata plus initialTurnsPage as a
+    # single JSON line; real sessions easily exceed asyncio's default 64 KiB
+    # StreamReader limit (observed 733 KiB for a 55 MB rollout). readline()
+    # then clears its buffer and raises ValueError, which used to surface as
+    # an opaque takeover "resume_failed". Raise the high-water mark instead —
+    # chunked readuntil accumulation is NOT cancellation-safe (a wait_for
+    # timeout mid-line would drop drained bytes and desync the stream).
+    _STDOUT_LIMIT = 64 * 1024 * 1024
+
         event_idle_timeout: float = 2.0,
         codex_home: str = "",
     ):
@@ -232,6 +241,7 @@ class CodexStdioAppServerClient:
                 "id": 0,
                 "method": "initialize",
                 "params": {
+            limit=self._STDOUT_LIMIT,
                     "clientInfo": {"name": "walkcode", "version": "channel-native-v3"},
                     "capabilities": {},
                 },
@@ -273,6 +283,13 @@ class CodexStdioAppServerClient:
                 try:
                     data = await asyncio.wait_for(process.stderr.read(), timeout=0.1)
                     stderr = data.decode("utf-8", errors="replace").strip()
+        except ValueError as exc:
+            # readline() clears its buffer and raises ValueError when a line
+            # exceeds the stream limit; the stream is desynced beyond repair,
+            # so surface a diagnosable transport error instead of the raw one.
+            raise TransportUnavailable(
+                f"Codex app-server response line exceeded {self._STDOUT_LIMIT} bytes"
+            ) from exc
                 except Exception:
                     stderr = ""
             reason = stderr or f"Codex app-server exited with code {process.returncode}"

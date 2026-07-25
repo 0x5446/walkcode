@@ -10825,7 +10825,16 @@ class Orchestrator:
                         resume_ref=transport_ref,
                     )
                 )
-            except Exception:
+            except Exception as exc:
+                # ADR 0059 R1 fixed the writer path's flattened "resume_failed"
+                # hiding the real cause; the takeover path needs the same trace
+                # (e.g. oversized thread/resume response vs dead app-server).
+                _log_degrade(
+                    "takeover_resume_failed",
+                    session_id=session.session_id,
+                    takeover_id=takeover_id,
+                    error=exc,
+                )
                 self.sessions.fail_takeover(takeover_id, reason="resume_failed")
                 await self._send_session_view(
                     session,

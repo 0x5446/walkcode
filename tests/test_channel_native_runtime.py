@@ -1,6 +1,7 @@
 import asyncio
 import json
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -2034,6 +2035,45 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
         self.assertEqual(
             runtime_module._launchd_service_label("telegram", "claude"),
             "com.walkcode.telegram-claude",
+    def test_codex_stdio_client_reads_response_lines_beyond_default_stream_limit(self):
+        # thread/resume responses carry the full initialTurnsPage in one JSON
+        # line; real sessions exceed asyncio's default 64 KiB readline limit,
+        # which used to raise ValueError and flatten into takeover
+        # "resume_failed". The client must accept multi-hundred-KiB lines.
+        pad_bytes = 256 * 1024
+        fake_server = (
+            "import json, sys\n"
+            "for line in sys.stdin:\n"
+            "    msg = json.loads(line)\n"
+            "    if msg.get('method') == 'initialize':\n"
+            "        sys.stdout.write(json.dumps({'id': msg['id'], 'result': {}}) + '\\n')\n"
+            "    elif msg.get('method') == 'thread/resume':\n"
+            "        result = {'thread': {'id': msg['params']['threadId']}, 'pad': 'x' * %d}\n"
+            "        sys.stdout.write(json.dumps({'id': msg['id'], 'result': result}) + '\\n')\n"
+            "    sys.stdout.flush()\n"
+        ) % pad_bytes
+
+        async def scenario(script_path: str) -> dict:
+            client = runtime_module.CodexStdioAppServerClient(
+                command=(sys.executable, script_path),
+            )
+            try:
+                return await client.request(
+                    "thread/resume", {"threadId": "t-big", "cwd": "/tmp"}
+                )
+            finally:
+                if client._process is not None:
+                    client._process.kill()
+                    await client._process.wait()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            script_path = str(Path(tmp) / "fake_app_server.py")
+            Path(script_path).write_text(fake_server, encoding="utf-8")
+            result = asyncio.run(scenario(script_path))
+
+        self.assertEqual(result["thread"]["id"], "t-big")
+        self.assertEqual(len(result["pad"]), pad_bytes)
+
         )
         self.assertEqual(
             runtime_module._launchd_service_label("lark", "claude", "work"),
