@@ -384,6 +384,23 @@ def _assistant_entry(blocks: list[dict], **extra) -> dict:
     return entry
 
 
+def _codex_agent_message(text: str) -> dict:
+    return {"type": "event_msg", "payload": {"type": "agent_message", "message": text}}
+
+
+def _codex_response_item(text: str) -> dict:
+    # Codex writes every assistant message a second time as a response_item;
+    # the reader must ignore this form or every message posts twice.
+    return {
+        "type": "response_item",
+        "payload": {
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": text}],
+        },
+    }
+
+
 class TranscriptNarrationReaderTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".jsonl")
@@ -679,6 +696,169 @@ class TranscriptNarrationReaderTests(unittest.TestCase):
         cursor, texts = _read_transcript_narration("/nonexistent/transcript.jsonl", None)
         self.assertEqual(texts, [])
         self.assertIsNone(cursor)
+
+
+class CodexRolloutNarrationReaderTests(unittest.TestCase):
+    """Codex rollouts carry assistant text as event_msg/agent_message records;
+    the reader used to parse only the Claude dialect and silently yielded
+    nothing for codex sessions — mid-turn narration never reached the channel
+    (2026-07-25 sigma-feishu-client incident)."""
+
+    def setUp(self):
+        self.tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".jsonl")
+        self.path = self.tmp.name
+        self.tmp.close()
+        self.addCleanup(lambda: os.path.exists(self.path) and os.unlink(self.path))
+
+    def _append(self, entry: dict) -> None:
+        with open(self.path, "ab") as fh:
+            fh.write(_transcript_line(entry))
+
+    def test_agent_message_yields_narration(self):
+        cursor, _ = _read_transcript_narration(self.path, None)
+        self._append(_codex_agent_message("你这四点都抓得对"))
+        cursor, texts = _read_transcript_narration(self.path, cursor)
+        self.assertEqual(texts, ["你这四点都抓得对"])
+        _, again = _read_transcript_narration(self.path, cursor)
+        self.assertEqual(again, [])
+
+    def test_response_item_duplicate_is_ignored(self):
+        cursor, _ = _read_transcript_narration(self.path, None)
+        self._append(_codex_agent_message("中段叙述"))
+        self._append(_codex_response_item("中段叙述"))
+        _, texts = _read_transcript_narration(self.path, cursor)
+        self.assertEqual(texts, ["中段叙述"])
+
+    def test_non_message_event_msg_records_are_ignored(self):
+        cursor, _ = _read_transcript_narration(self.path, None)
+        self._append({"type": "event_msg", "payload": {"type": "agent_reasoning", "text": "内心戏"}})
+        self._append({"type": "event_msg", "payload": {"type": "token_count", "info": {}}})
+        self._append({"type": "turn_context", "payload": {"model": "gpt-5.6-sol"}})
+        self._append({"type": "event_msg", "payload": "not-a-dict"})
+        self._append(_codex_agent_message("可见文本"))
+        _, texts = _read_transcript_narration(self.path, cursor)
+        self.assertEqual(texts, ["可见文本"])
+
+    def test_mixed_claude_and_codex_dialects_both_parse(self):
+        # One reader serves both agents; a rollout line must not break the
+        # Claude branch or vice versa.
+        cursor, _ = _read_transcript_narration(self.path, None)
+        self._append(_codex_agent_message("codex 叙述"))
+        self._append(_assistant_entry([{"type": "text", "text": "claude 叙述"}]))
+        _, texts = _read_transcript_narration(self.path, cursor)
+        self.assertEqual(texts, ["codex 叙述", "claude 叙述"])
+
+
+class CodexStopDrainTests(unittest.TestCase):
+    """A codex turn that says several things has no hook carrier for any of
+    them except the last (stop's last_assistant_message). The stop handler
+    must drain the un-mirrored tail from the rollout, minus the stop bubble
+    itself; Claude sessions keep the advance-only path (MessageDisplay already
+    mirrored their text)."""
+
+    def setUp(self):
+        import time as _time
+
+        from walkcode.channel_native_runtime import ChannelNativeRuntime
+
+        self.tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".jsonl")
+        self.path = self.tmp.name
+        self.tmp.close()
+        self.addCleanup(lambda: os.path.exists(self.path) and os.unlink(self.path))
+
+        orchestrator, _transport, channel, session = _orchestrator()
+        self.orchestrator = orchestrator
+        self.channel = channel
+        self.session = session
+
+        class _HookHost:
+            _send_tui_hook_output = ChannelNativeRuntime._send_tui_hook_output
+            _drain_tui_narration = ChannelNativeRuntime._drain_tui_narration
+            _advance_tui_narration_cursor = ChannelNativeRuntime._advance_tui_narration_cursor
+            _store_tui_narration_cursor = ChannelNativeRuntime._store_tui_narration_cursor
+
+        host = _HookHost()
+        host.orchestrator = orchestrator
+        host.channels = {"telegram": channel}
+        host._tui_transcript_cursors = {}
+        host._now = _time.time
+        self.host = host
+
+    def _append(self, entry: dict) -> None:
+        with open(self.path, "ab") as fh:
+            fh.write(_transcript_line(entry))
+
+    def _stamped_payload(self, **extra) -> dict:
+        info = os.stat(self.path)
+        payload = {
+            "transcript_path": self.path,
+            "_walkcode_transcript_size": int(info.st_size),
+            "_walkcode_transcript_file_key": [int(info.st_dev), int(info.st_ino)],
+        }
+        payload.update(extra)
+        return payload
+
+    def _views(self, kind: str) -> list:
+        return [v for v in self.channel.sent_views if v["view"].get("type") == kind]
+
+    def _run(self, hook_type: str, payload: dict, agent: str = "codex") -> None:
+        asyncio.run(
+            self.host._send_tui_hook_output(
+                self.session, hook_type=hook_type, payload=payload, agent=agent
+            )
+        )
+
+    def test_stop_drains_trailing_narration_and_dedupes_final_bubble(self):
+        # Cursor initialization (first sight fast-forwards, no replay).
+        self._run("pre-tool", self._stamped_payload(tool_name="Bash", tool_use_id="t1"))
+        # The turn then says something mid-stream AND closes with a final
+        # message; no tool hook follows, so stop is the only drain point.
+        self._append(_codex_agent_message("中段叙述，后面没有工具调用"))
+        self._append(_codex_agent_message("最终回复"))
+        self._append(_codex_response_item("最终回复"))
+        self._run("stop", self._stamped_payload(last_assistant_message="最终回复"))
+
+        deltas = [v["view"]["text"] for v in self._views("turn_delta")]
+        self.assertEqual(deltas, ["中段叙述，后面没有工具调用"])
+        completed = [v["view"].get("message") for v in self._views("turn_completed")]
+        self.assertEqual(completed, ["最终回复"])  # the stop bubble, exactly once
+
+        # A later hook must not re-read the drained region.
+        self._run("pre-tool", self._stamped_payload(tool_name="Bash", tool_use_id="t2"))
+        self.assertEqual(len(self._views("turn_delta")), 1)
+
+    def test_mid_turn_agent_message_drains_at_next_tool_hook(self):
+        # The primary carrier for mid-turn codex text: the drain that runs
+        # before every tool line (ADR 0055), now codex-format-aware.
+        self._run("pre-tool", self._stamped_payload(tool_name="Bash", tool_use_id="t1"))
+        self._append(_codex_agent_message("你这四点都抓得对"))
+        self._run("pre-tool", self._stamped_payload(tool_name="Bash", tool_use_id="t2"))
+
+        deltas = [v["view"]["text"] for v in self._views("turn_delta")]
+        self.assertEqual(deltas, ["你这四点都抓得对"])
+
+    def test_claude_stop_keeps_advance_only_path(self):
+        # Claude's closing text arrives via its MessageDisplay hook; draining
+        # at stop would double it. agent="claude" (and the legacy no-agent
+        # call) must keep skipping the tail instead of posting it.
+        self._run("pre-tool", self._stamped_payload(tool_name="Bash", tool_use_id="t1"), agent="claude")
+        self._append(_assistant_entry([{"type": "text", "text": "最终回复"}]))
+        self._run("stop", self._stamped_payload(last_assistant_message="最终回复"), agent="claude")
+
+        self.assertEqual(self._views("turn_delta"), [])
+        completed = [v["view"].get("message") for v in self._views("turn_completed")]
+        self.assertEqual(completed, ["最终回复"])
+
+    def test_stop_with_empty_final_text_still_drains_narration(self):
+        # An aborted codex turn can stop without last_assistant_message; the
+        # tail narration must still come out instead of being skipped.
+        self._run("pre-tool", self._stamped_payload(tool_name="Bash", tool_use_id="t1"))
+        self._append(_codex_agent_message("说到一半"))
+        self._run("stop", self._stamped_payload())
+
+        deltas = [v["view"]["text"] for v in self._views("turn_delta")]
+        self.assertEqual(deltas, ["说到一半"])
+        self.assertEqual(self._views("turn_completed"), [])
 
 
 if __name__ == "__main__":

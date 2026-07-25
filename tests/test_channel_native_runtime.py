@@ -1270,7 +1270,11 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
 
             self.assertFalse(status["tui_hook_status"]["ok"])
             self.assertIn("UserPromptSubmit", status["tui_hook_status"]["missing"])
-            self.assertIn("MessageDisplay", status["tui_hook_status"]["missing"])
+            self.assertIn("PreToolUse", status["tui_hook_status"]["missing"])
+            # codex-cli has no MessageDisplay / PostToolUseFailure events;
+            # the doctor must not demand dead config for them.
+            self.assertNotIn("MessageDisplay", status["tui_hook_status"]["missing"])
+            self.assertNotIn("PostToolUseFailure", status["tui_hook_status"]["missing"])
 
     def test_describe_accepts_complete_codex_tui_hooks(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2031,10 +2035,6 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
 
         self.assertIsNone(client._subprocess_env())
 
-    def test_launchd_service_label_profile_and_legacy_forms(self):
-        self.assertEqual(
-            runtime_module._launchd_service_label("telegram", "claude"),
-            "com.walkcode.telegram-claude",
     def test_codex_stdio_client_reads_response_lines_beyond_default_stream_limit(self):
         # thread/resume responses carry the full initialTurnsPage in one JSON
         # line; real sessions exceed asyncio's default 64 KiB readline limit,
@@ -2074,6 +2074,10 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
         self.assertEqual(result["thread"]["id"], "t-big")
         self.assertEqual(len(result["pad"]), pad_bytes)
 
+    def test_launchd_service_label_profile_and_legacy_forms(self):
+        self.assertEqual(
+            runtime_module._launchd_service_label("telegram", "claude"),
+            "com.walkcode.telegram-claude",
         )
         self.assertEqual(
             runtime_module._launchd_service_label("lark", "claude", "work"),
