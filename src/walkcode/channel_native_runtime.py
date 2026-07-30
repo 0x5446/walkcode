@@ -138,6 +138,15 @@ TUI_BINDING_REFRESH_INTERVAL_SECONDS = 5.0
 # carrier — mid-turn narration is mirrored from the rollout transcript
 # (ADR 0055) and the turn-final text rides the stop hook's
 # last_assistant_message.
+#
+# These hooks fire for turns the TUI process runs. They do NOT fire for turns
+# we submit through app-server, which is a different process: measured on
+# 0.144.5 with one CODEX_HOME and one hooks.json, `codex exec` reports
+# "hook: SessionStart Completed" while `codex app-server --stdio` emits hook
+# events only for source="plugin" — the user-level hooks.json is never loaded
+# there. So for a codex_app_server session the hook pipeline is not a second
+# delivery path: the event stream is the ONLY one, and giving up on it (the
+# 2026-07-30 loss) drops the turn's output with nothing behind it.
 CODEX_TUI_REQUIRED_HOOKS = (
     "SessionStart",
     "UserPromptSubmit",
