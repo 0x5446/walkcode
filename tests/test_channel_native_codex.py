@@ -21,6 +21,7 @@ from walkcode.channel_native import (
     LaunchSpec,
     Orchestrator,
     SessionRegistry,
+    TransportUnavailable,
     TurnInput,
 )
 from walkcode.channel_native_runtime import (
@@ -33,7 +34,7 @@ from walkcode.channel_native_runtime import (
 )
 
 
-def _drain_events(transport, handle):
+def _drain_events(transport, handle, stop_after=None):
     """Consume the transport's event generator to exhaustion.
 
     ``events()`` is a persistent listener: it re-enters the bounded collector
@@ -43,7 +44,12 @@ def _drain_events(transport, handle):
     """
 
     async def run():
-        return [event async for event in transport.events(handle)]
+        collected = []
+        async for event in transport.events(handle):
+            collected.append(event)
+            if stop_after is not None and len(collected) >= stop_after:
+                break
+        return collected
 
     return asyncio.run(run())
 
@@ -560,7 +566,7 @@ class CodexAppServerTransportTests(unittest.TestCase):
         transport = CodexAppServerTransport(client=client, event_silence_ceiling=0)
         handle = asyncio.run(transport.launch(LaunchSpec(cwd="/tmp/project", session_id="s1")))
 
-        events = _drain_events(transport, handle)
+        events = _drain_events(transport, handle, stop_after=1)
 
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0].type, AgentEventType.PERMISSION_REQUESTED)
@@ -595,7 +601,7 @@ class CodexAppServerTransportTests(unittest.TestCase):
         transport = CodexAppServerTransport(client=client, event_silence_ceiling=0)
         handle = asyncio.run(transport.launch(LaunchSpec(cwd="/tmp/project", session_id="s1")))
 
-        events = _drain_events(transport, handle)
+        events = _drain_events(transport, handle, stop_after=1)
 
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0].type, AgentEventType.PERMISSION_REQUESTED)
@@ -631,7 +637,7 @@ class CodexAppServerTransportTests(unittest.TestCase):
         transport = CodexAppServerTransport(client=client, event_silence_ceiling=0)
         handle = asyncio.run(transport.launch(LaunchSpec(cwd="/tmp/project", session_id="s1")))
 
-        events = _drain_events(transport, handle)
+        events = _drain_events(transport, handle, stop_after=1)
 
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0].type, AgentEventType.PERMISSION_REQUESTED)
@@ -699,8 +705,13 @@ class CodexAppServerTransportTests(unittest.TestCase):
         )
 
         self.assertTrue(result.accepted)
-        prompt = channel.sent_views[-1]["view"]
-        self.assertEqual(prompt["type"], "permission_prompt")
+        # Find the card, don't assume it is last: with the scripted batches
+        # exhausted the listener also emits its give-up notice behind it.
+        prompt = next(
+            sent["view"]
+            for sent in channel.sent_views
+            if sent["view"].get("type") == "permission_prompt"
+        )
         pending = orchestrator.hitls.pending_for_session(session.session_id)
         self.assertEqual(len(pending), 1)
         self.assertEqual(pending[0].transport_request_id, "approval-1")
@@ -752,7 +763,7 @@ class CodexAppServerTransportTests(unittest.TestCase):
         transport = CodexAppServerTransport(client=client, event_silence_ceiling=0)
         handle = asyncio.run(transport.launch(LaunchSpec(cwd="/tmp/project", session_id="s1")))
 
-        events = _drain_events(transport, handle)
+        events = _drain_events(transport, handle, stop_after=1)
 
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0].type, AgentEventType.ASK_USER_REQUESTED)
@@ -800,7 +811,7 @@ class CodexAppServerTransportTests(unittest.TestCase):
         transport = CodexAppServerTransport(client=client, event_silence_ceiling=0)
         handle = asyncio.run(transport.launch(LaunchSpec(cwd="/tmp/project", session_id="s1")))
 
-        events = _drain_events(transport, handle)
+        events = _drain_events(transport, handle, stop_after=1)
 
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0].type, AgentEventType.ASK_USER_REQUESTED)
@@ -997,9 +1008,8 @@ class CodexPersistentListenTests(unittest.TestCase):
         self.assertEqual(events[-1].type, AgentEventType.TURN_COMPLETED)
 
     def test_hitl_request_parks_the_turn_without_synthetic_completion(self):
-        # A permission card hands the turn to a human; the answer re-enters
-        # through a fresh drain. Closing the turn here would tell the channel
-        # the agent finished while it is actually blocked on the card.
+        # A permission card hands the turn to a human. Giving up on the listen
+        # here would strand everything the agent produces after the answer.
         client = _BatchScriptCodexClient(
             [
                 [
@@ -1016,9 +1026,56 @@ class CodexPersistentListenTests(unittest.TestCase):
 
         events = _drain_events(transport, handle)
 
-        self.assertEqual(client.event_calls, 1)
-        self.assertEqual(events[-1].type, AgentEventType.PERMISSION_REQUESTED)
-        self.assertNotIn(AgentEventType.TURN_COMPLETED, [event.type for event in events])
+        types = [event.type for event in events]
+        self.assertIn(AgentEventType.PERMISSION_REQUESTED, types)
+        # No fake completion: the turn really is unfinished.
+        self.assertNotIn(AgentEventType.TURN_COMPLETED, types)
+        # And the give-up notice says it is waiting on a person, not stalled.
+        self.assertIn("等你回应", events[-1].payload["text"])
+
+    def test_listen_continues_past_an_answered_hitl_card(self):
+        # Regression: returning at the HITL event ended the only consumer, so
+        # the agent's continuation after the human answered was never
+        # delivered — the same silent loss the whole change removes.
+        client = _BatchScriptCodexClient(
+            [
+                [
+                    {
+                        "id": "req-1",
+                        "method": "item/commandExecution/requestApproval",
+                        "params": {"threadId": "thread-1", "command": "ls"},
+                    }
+                ],
+                [
+                    {
+                        "method": "item/agentMessage/delta",
+                        "params": {"threadId": "thread-1", "turnId": "t1", "delta": "after approval"},
+                    }
+                ],
+                [
+                    {
+                        "method": "turn/completed",
+                        "params": {"threadId": "thread-1", "turn": {"id": "t1"}},
+                    }
+                ],
+            ]
+        )
+        transport = CodexAppServerTransport(client=client, event_silence_ceiling=3600)
+        transport._EMPTY_BATCH_MIN_INTERVAL = 0
+        handle = self._handle(transport)
+
+        events = _drain_events(transport, handle)
+
+        self.assertEqual(client.event_calls, 3)
+        self.assertEqual(
+            [event.type for event in events],
+            [
+                AgentEventType.PERMISSION_REQUESTED,
+                AgentEventType.TURN_DELTA,
+                AgentEventType.TURN_COMPLETED,
+            ],
+        )
+        self.assertEqual(events[1].payload["text"], "after approval")
 
     def test_empty_batches_are_throttled_against_a_hot_loop(self):
         # A client that returns empty instantly (closed transport, stub) must
@@ -1072,23 +1129,46 @@ class CodexEventRoutingTests(unittest.TestCase):
         # Several TUI sessions share one app-server process. An event with no
         # threadId used to go to whichever drain asked first, surfacing one
         # session's output in another session's channel.
-        client = _ScriptedWireCodexStdioClient(
-            [
-                {"type": "event_msg", "payload": {"type": "agent_message", "message": "whose?"}},
-            ]
-        )
+        client = _ScriptedWireCodexStdioClient([])
+        unaddressed = {"type": "event_msg", "payload": {"type": "agent_message", "message": "whose?"}}
 
         async def scenario():
-            # Two live threads: thread-b asks, and must not be given the
-            # unaddressed message.
-            client._queue_for("thread-a")
-            client._queue_for("thread-b")
-            return await client.events("thread-b")
+            # Both threads are genuinely listening when the message lands.
+            a = asyncio.ensure_future(client.events("thread-a"))
+            b = asyncio.ensure_future(client.events("thread-b"))
+            await asyncio.sleep(0.02)
+            self.assertEqual(sorted(client._live_listener_threads()), ["thread-a", "thread-b"])
+            client._dispatch(unaddressed)
+            return await a, await b
+
+        events_a, events_b = asyncio.run(scenario())
+
+        self.assertEqual(events_a, [])
+        self.assertEqual(events_b, [])
+        self.assertEqual(client._buffered_notifications, [unaddressed])
+
+    def test_buffered_thread_less_event_is_claimed_once_the_others_go_quiet(self):
+        # Regression: liveness was keyed on _thread_queues, which is never
+        # torn down. After two threads had ever run, every unaddressed message
+        # stayed in the buffer with no claimant — a silent loss of the exact
+        # final replies this design protects.
+        client = _ScriptedWireCodexStdioClient([])
+        final = {"type": "event_msg", "payload": {"type": "task_complete", "last_agent_message": "done"}}
+
+        async def scenario():
+            a = asyncio.ensure_future(client.events("thread-a"))
+            b = asyncio.ensure_future(client.events("thread-b"))
+            await asyncio.sleep(0.02)
+            client._dispatch(final)          # ambiguous: buffered
+            await a
+            await b                          # both listens end
+            self.assertEqual(client._live_listener_threads(), [])
+            return await client.events("thread-b")   # sole listener now
 
         events = asyncio.run(scenario())
 
-        self.assertEqual(events, [])
-        self.assertEqual(len(client._buffered_notifications), 1)
+        self.assertEqual(events, [final])
+        self.assertEqual(client._buffered_notifications, [])
 
     def test_thread_less_events_still_reach_a_solitary_thread(self):
         client = _ScriptedWireCodexStdioClient(
@@ -1142,3 +1222,81 @@ class CodexEventRoutingTests(unittest.TestCase):
         result = asyncio.run(scenario())
 
         self.assertEqual(result["turn"]["id"], "turn-1")
+
+
+class CodexStreamFailureTests(unittest.TestCase):
+    """The reader dying must never silently swallow already-received output."""
+
+    def test_events_received_before_the_failure_are_delivered_first(self):
+        # Regression: the error was raised out of band and jumped ahead of
+        # events already sitting in the queue, so a turn's final text was
+        # dropped in favour of the exception.
+        client = _ScriptedWireCodexStdioClient([])
+        delta = {
+            "method": "item/agentMessage/delta",
+            "params": {"threadId": "thread-1", "turnId": "t1", "delta": "half a sentence"},
+        }
+
+        async def scenario():
+            listen = asyncio.ensure_future(client.events("thread-1"))
+            await asyncio.sleep(0.02)
+            client._dispatch(delta)
+            client._fail_stream(TransportUnavailable("wire died"))
+            return await listen
+
+        events = asyncio.run(scenario())
+
+        self.assertEqual(events, [delta])
+
+    def test_the_failure_is_raised_on_the_next_call_not_swallowed(self):
+        # Regression: a reconnect ran _start_reader, which cleared
+        # _stream_error, so a mid-batch death never reached the drain and the
+        # broken turn looked merely quiet.
+        client = _ScriptedWireCodexStdioClient([])
+        delta = {
+            "method": "item/agentMessage/delta",
+            "params": {"threadId": "thread-1", "turnId": "t1", "delta": "half"},
+        }
+
+        async def scenario():
+            listen = asyncio.ensure_future(client.events("thread-1"))
+            await asyncio.sleep(0.02)
+            client._dispatch(delta)
+            client._fail_stream(TransportUnavailable("wire died"))
+            first = await listen
+            # A reconnect happens here (_ensure_started -> _start_reader).
+            with self.assertRaises(TransportUnavailable) as caught:
+                await client.events("thread-1")
+            return first, str(caught.exception)
+
+        first, message = asyncio.run(scenario())
+
+        self.assertEqual(first, [delta])
+        self.assertIn("wire died", message)
+
+    def test_failure_with_nothing_in_hand_raises_immediately(self):
+        client = _ScriptedWireCodexStdioClient([])
+
+        async def scenario():
+            listen = asyncio.ensure_future(client.events("thread-1"))
+            await asyncio.sleep(0.02)
+            client._fail_stream(TransportUnavailable("wire died"))
+            await listen
+
+        with self.assertRaises(TransportUnavailable):
+            asyncio.run(scenario())
+
+    def test_pending_requests_are_failed_when_the_reader_dies(self):
+        client = _ScriptedWireCodexStdioClient([])
+
+        async def scenario():
+            pending = asyncio.ensure_future(client.request("turn/start", {"threadId": "thread-1"}))
+            await asyncio.sleep(0.02)
+            client._fail_stream(TransportUnavailable("wire died"))
+            with self.assertRaises(TransportUnavailable):
+                await pending
+            return client._pending_responses
+
+        leftover = asyncio.run(scenario())
+
+        self.assertEqual(leftover, {}, "a dead reader must not leak pending futures")

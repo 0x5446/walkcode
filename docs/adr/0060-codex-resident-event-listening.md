@@ -61,14 +61,25 @@ walkcode 经 app-server 提交的 turn 由 app-server 进程执行，不是 TUI 
 改为 async generator（`_iter_transport_events` 早已支持 `__aiter__`，调用方
 无需改动）：turn 还开着就重新进入收集器，批次边界降级为实现细节。
 
-结束监听只有三种：
+结束监听只有两种：
 
 - `turn/completed` —— 回合真结束；
-- HITL 请求 —— 回合被人挡住，**保持 open**（它确实没完成），答复经新的
-  排水回来；
 - 静默到 `event_silence_ceiling`（默认 3600 秒，与 Claude 的
-  `background_wait_ceiling_seconds` 对齐）—— 先发告警，再补一个合成
-  `TURN_COMPLETED`，让排水读到关闭的回合而不是中途失败。
+  `background_wait_ceiling_seconds` 对齐）。
+
+**HITL 请求不结束监听。** 卡片 yield 出去后循环继续等：答复经
+`answer_request` 走同一条线回去，agent 的后续输出就出现在这条流上。
+若在此 return，唯一的消费者就没了——决定写回去了、agent 也继续跑了，
+但它之后产出的一切会滞留在队列里，直到某条无关的用户消息碰巧开启新排水。
+那正是本 ADR 要消灭的静默丢失。（main 上的旧实现就是 return，deep-review
+的 7 个维度独立判定它是 Critical。）
+
+ceiling 触发时按是否在等人分两种收尾：
+
+- 等人（出过 HITL 卡片）：只发"在等你回应"的告警，**不合成
+  `TURN_COMPLETED`** —— 回合确实没完成，ERROR_RECOVERABLE 是诚实状态；
+- 等 agent：发告警 + 合成 `TURN_COMPLETED`，让排水读到关闭的回合而不是
+  中途失败。
 
 空批次之间设最小间隔，防止立即返回空的 client（关闭的传输、stub）把
 ceiling 窗口空转成热循环。
@@ -88,6 +99,17 @@ ceiling 窗口空转成热循环。
 
 附带收益：两次排水之间产生的事件进队列，不再无人接收。
 
+**故障必须排在事件后面。** `_fail_stream` 不是直接抛，而是往每个 thread
+队列尾部放一个 `_StreamFailure` 哨兵：消费者先把真实事件取完，再看到故障。
+拿着事件时收到哨兵 → 先交付这批，把错误存进 `_thread_failures`，下次
+`events()` 进来第一件事就抛。两个方向都要守住：
+
+- 直接抛会**越过**队列里已经到达的最终回复（就是要保的那条）；
+- 只用一个全局 `_stream_error` 则会被下一次 `_start_reader()` 清掉——批次
+  中途死亡的故障永远到不了排水层，坏掉的回合被当成"安静"，一路等到一小时
+  ceiling 才合成正常结束。所以 `_start_reader()` 只清连接级
+  `_stream_error`，**不清** `_thread_failures`。
+
 ### 3. 事件路由收紧
 
 - `_notification_thread_id`：`params` 存在但为空时原实现直接 `return ""`，
@@ -95,6 +117,14 @@ ceiling 窗口空转成热循环。
 - 无 threadId 的消息原按"谁先问归谁"分配。多个 TUI 会话共用一个
   app-server 进程，这会把一个会话的事件送进另一个会话的频道。改为只有
   单活跃 thread 时才认领，多 thread 时留在共享缓冲并记 degrade 日志。
+
+"活跃"必须用 `_active_listeners`（进入 `events()` 时 +1，`finally` 时 -1），
+**不能**用 `_thread_queues`。队列的生命周期比监听者长——它要存住两次排水
+之间到达的事件，所以有内容时从不销毁。拿队列判活跃等于问"这个 thread 曾经
+跑过吗"：只要进程先后服务过两个 thread，此后每条无 threadId 的消息都会永久
+留在缓冲里没有认领者。那是又一条静默丢最终回复的路径（deep-review 7 个维度
+独立命中）。改用真实监听者计数后，其他会话安静下来时缓冲里的消息可以被重新
+认领；监听退出且队列已空时回收队列，避免无界增长。
 
 ### 4. Claude ceiling 告警文案
 
@@ -114,18 +144,31 @@ result（worker 中途出问题、被判 injected turn），此时文案与用�
 - 放弃监听时用户一定收到告警，且回合被合成事件正常关闭；
 - 飞书消息提交不再排在读侧后面；
 - 多会话共用 app-server 进程时事件不再串台；
+- 审批/提问答复后不再需要外部重新挂载排水，卡片往返在同一条监听里完成；
 - **未修**：`ERROR_RECOVERABLE` 仍然没有自愈 watchdog。本 ADR 消除的是
   codex 侧误判这一主要来源；真死场景（worker EOF、提交失败）继续依赖下一
   次用户输入恢复，与 Claude 侧现状一致。要根治需要单独的状态清扫器。
+- **已知限制（deep-review 提出，本次未修）**：
+  - `CodexAppServerTransport` 没有 `interrupt`，所以 ceiling 放弃监听时
+    服务端回合并未真正取消。整整一小时零事件后它几乎肯定已经死了，但迟到
+    事件会落在没有消费者的流上。要根治需要 app-server 侧的中断能力。
+  - `asyncio.Queue` 绑定创建它的事件循环，client 因此是单事件循环资源。
+    生产里 runtime 全程单循环，但跨 `asyncio.run` 复用同一个 client 会在
+    第二次 `queue.get()` 抛 `RuntimeError`。当前靠约定保证，未加显式护栏。
+  - `_convert_event` 返回 `None` 的未知事件仍被静默跳过，且会重置静默计时。
+    协议升级新增用户可见事件时，它们会无痕丢失。
 
 ## Verification
 
-- 单元：`tests/test_channel_native_codex.py` 新增
+- 单元：`tests/test_channel_native_codex.py` 新增三组——
   `CodexPersistentListenTests`（跨批次续听、静默 ceiling 告警+合成关闭、
-  HITL 驻留不合成、空批次节流）与 `CodexEventRoutingTests`（无 threadId 不
-  串台、单 thread 仍可认领、payload threadId 提取、events 不阻塞并发
-  request）；`tests/test_channel_native_core.py` 新增
-  `HumanizeSecondsTests`。全量 982 passed。
+  HITL 驻留不合成假完成、**答复后继续送达**、空批次节流）、
+  `CodexEventRoutingTests`（并发双 thread 时无 threadId 不串台、
+  **其他会话安静后缓冲消息仍被认领**、payload threadId 提取、events 不阻塞
+  并发 request）、`CodexStreamFailureTests`（故障前已收事件优先交付、故障
+  在下次调用抛出而非被重连吞掉、空手时立即抛、reader 死亡不泄漏 pending
+  future）；`tests/test_channel_native_core.py` 新增 `HumanizeSecondsTests`。
+  全量 988 passed。
 - 真实环境：用改造后的 client 驱动真实 `codex app-server --stdio`
   （gpt-5.6-sol，临时 CODEX_HOME），thread/start 2.6 秒返回，turn 提交后
   单批收到 29 个事件直至 `turn/completed`。

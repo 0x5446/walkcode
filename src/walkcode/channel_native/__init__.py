@@ -8064,6 +8064,7 @@ class CodexAppServerTransport:
         """
         thread_id = handle.ref["thread_id"]
         silent_since = time.monotonic()
+        parked_on_human = False
         while True:
             batch_started = time.monotonic()
             raw_events = await self.client.events(thread_id)
@@ -8079,12 +8080,16 @@ class CodexAppServerTransport:
                     yield AgentEvent(AgentEventType.TURN_DELTA, {"text": "".join(delta_parts)})
                     delta_parts = []
                 yield event
-                # A HITL prompt parks the turn on a human; the collector
-                # returns early for exactly that reason and the orchestrator
-                # takes over from here (the answer re-enters through a fresh
-                # drain). Leave the turn OPEN — it is genuinely unfinished.
+                # A HITL prompt parks the turn on a human. Keep listening: the
+                # answer goes back over the same wire (answer_request), and the
+                # agent's continuation arrives on this very stream. Returning
+                # here would end the only consumer — the decision would be
+                # written, the agent would resume, and everything it produced
+                # afterwards would sit in the queue until an unrelated user
+                # message happened to start a new drain. That is the same
+                # silent loss this whole change exists to remove.
                 if event.type in self._TURN_PARKING_EVENTS:
-                    return
+                    parked_on_human = True
                 if event.type == AgentEventType.TURN_COMPLETED:
                     turn_closed = True
             if delta_parts:
@@ -8109,7 +8114,24 @@ class CodexAppServerTransport:
                 "codex_event_silence_ceiling",
                 thread_id=thread_id,
                 ceiling_seconds=self.event_silence_ceiling,
+                parked_on_human=parked_on_human,
             )
+            if parked_on_human:
+                # Waiting on a person, not on a stalled agent. Say so, and do
+                # NOT synthesize a completion: the turn is genuinely unfinished
+                # and the card may still be answered. ERROR_RECOVERABLE is the
+                # honest state here — the next message resumes it.
+                yield AgentEvent(
+                    AgentEventType.TURN_DELTA,
+                    {
+                        "text": (
+                            f"⚠️ 这个回合在等你回应，已经等了 "
+                            f"{_humanize_seconds(self.event_silence_ceiling)}，先停止监听。"
+                            "直接回复可重新拉起会话。"
+                        )
+                    },
+                )
+                return
             yield AgentEvent(
                 AgentEventType.TURN_DELTA,
                 {
@@ -8123,6 +8145,11 @@ class CodexAppServerTransport:
             # Close the synthetic warning turn so the drain does not read the
             # ended stream as a mid-turn failure and flip the session to
             # ERROR_RECOVERABLE.
+            #
+            # Known limit: this transport exposes no interrupt, so the server
+            # side of the turn is not actually cancelled — after a full hour of
+            # total silence it is almost certainly dead, but a late event from
+            # it would arrive on a stream nobody is draining.
             yield AgentEvent(AgentEventType.TURN_COMPLETED, {"message": ""})
             return
 
