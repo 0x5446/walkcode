@@ -244,7 +244,7 @@ class PersistentStreamTests(unittest.TestCase):
         # turn is OPEN may be ABSORBED into that running turn by the CLI (one
         # result covers both submits) instead of queuing a steering turn.
         # The conservative counter then leaks a phantom pending, and the
-        # ceiling fired a false 1h "已提交的消息…没有得到任何响应" alarm on a
+        # ceiling fired a false 1h "…没等到完成回执" alarm on a
         # healthy idle session (observed live on 4 sessions). The fix keeps
         # the counter conservative (steering safety) but discriminates at the
         # ceiling: an accounted result AFTER the last submit + a whole quiet
@@ -280,7 +280,7 @@ class PersistentStreamTests(unittest.TestCase):
         # silent settle — no false alarm, no error event.
         self.assertNotIn(handle.handle_id, transport._pending_turns)
         texts = [e.payload.get("text", "") for e in events if e.type == AgentEventType.TURN_DELTA]
-        self.assertFalse(any("没有得到任何响应" in text for text in texts))
+        self.assertFalse(any("没等到完成回执" in text for text in texts))
         self.assertFalse(any(e.type == AgentEventType.SESSION_ERROR for e in events))
         self.assertFalse(transport.handle_is_live(handle.handle_id))
 
@@ -384,7 +384,7 @@ class PersistentStreamTests(unittest.TestCase):
 
         transport, handle, events = asyncio.run(scenario())
         texts = [e.payload.get("text", "") for e in events if e.type == AgentEventType.TURN_DELTA]
-        self.assertTrue(any("没有得到任何响应" in text for text in texts))
+        self.assertTrue(any("没等到完成回执" in text for text in texts))
 
     def test_pre_queued_second_submit_reports_pending_lost_at_eof(self):
         # EOF flavor of the pre-queued scenario: the leftover queued marker
@@ -496,7 +496,7 @@ class PersistentStreamTests(unittest.TestCase):
 
         transport, handle, events = asyncio.run(scenario())
         texts = [e.payload.get("text", "") for e in events if e.type == AgentEventType.TURN_DELTA]
-        self.assertTrue(any("没有得到任何响应" in text for text in texts))
+        self.assertTrue(any("没等到完成回执" in text for text in texts))
 
     def test_inflight_submit_failure_does_not_pollute_absorption_candidates(self):
         # Round-2 review: a mid-turn submit still awaiting the client write
@@ -557,7 +557,7 @@ class PersistentStreamTests(unittest.TestCase):
         # The leftover marker belongs to the pre-queued second message: the
         # ceiling alarm must fire — silence here would drop a real message.
         texts = [e.payload.get("text", "") for e in events if e.type == AgentEventType.TURN_DELTA]
-        self.assertTrue(any("没有得到任何响应" in text for text in texts))
+        self.assertTrue(any("没等到完成回执" in text for text in texts))
 
     def test_mixed_absorbed_and_steering_submits_settle_silently(self):
         # Round-2 review: a mixed mid-turn batch — one submit absorbed, one
@@ -598,7 +598,7 @@ class PersistentStreamTests(unittest.TestCase):
 
         transport, handle, events = asyncio.run(scenario())
         texts = [e.payload.get("text", "") for e in events if e.type == AgentEventType.TURN_DELTA]
-        self.assertFalse(any("没有得到任何响应" in text for text in texts))
+        self.assertFalse(any("没等到完成回执" in text for text in texts))
         self.assertFalse(any(e.type == AgentEventType.SESSION_ERROR for e in events))
         self.assertNotIn(handle.handle_id, transport._pending_turns)
 
@@ -734,7 +734,7 @@ class PersistentStreamTests(unittest.TestCase):
         # The leftover marker is the between-turns third message: silence
         # here would drop it — the ceiling alarm must fire.
         texts = [e.payload.get("text", "") for e in events if e.type == AgentEventType.TURN_DELTA]
-        self.assertTrue(any("没有得到任何响应" in text for text in texts))
+        self.assertTrue(any("没等到完成回执" in text for text in texts))
 
     def test_injected_turn_session_error_revokes_absorption_candidates(self):
         # Round-3 review: an injected turn ending in SESSION_ERROR must also
@@ -812,7 +812,7 @@ class PersistentStreamTests(unittest.TestCase):
 
         transport, handle, events = asyncio.run(scenario())
         texts = [e.payload.get("text", "") for e in events if e.type == AgentEventType.TURN_DELTA]
-        self.assertTrue(any("没有得到任何响应" in text for text in texts))
+        self.assertTrue(any("没等到完成回执" in text for text in texts))
 
     def test_bare_result_steering_turn_deducts_stale_candidate(self):
         # Final verify panel: a steering turn that produces ONLY a bare
@@ -853,7 +853,7 @@ class PersistentStreamTests(unittest.TestCase):
 
         transport, handle, events = asyncio.run(scenario())
         texts = [e.payload.get("text", "") for e in events if e.type == AgentEventType.TURN_DELTA]
-        self.assertTrue(any("没有得到任何响应" in text for text in texts))
+        self.assertTrue(any("没等到完成回执" in text for text in texts))
 
     def test_task_only_traffic_blocks_absorbed_classification_at_eof(self):
         # Final verify panel round 2: a queued turn may be visible ONLY
@@ -1026,7 +1026,7 @@ class PersistentStreamTests(unittest.TestCase):
         transport, handle, events = asyncio.run(scenario())
         texts = [e.payload.get("text", "") for e in events if e.type == AgentEventType.TURN_DELTA]
         self.assertTrue(
-            any("没有得到任何响应" in text or "后台任务等待超时" in text for text in texts)
+            any("没等到完成回执" in text or "后台任务等待超时" in text for text in texts)
         )
         self.assertFalse(any(e.type == AgentEventType.SESSION_ERROR for e in events))
 
@@ -1930,7 +1930,7 @@ class TakeoverInjectedTurnRegressionTests(unittest.TestCase):
 
         transport, handle, events = asyncio.run(scenario())
         texts = [e.payload.get("text", "") for e in events if e.type == AgentEventType.TURN_DELTA]
-        self.assertTrue(any("没有得到任何响应" in text for text in texts), texts)
+        self.assertTrue(any("没等到完成回执" in text for text in texts), texts)
         self.assertFalse(transport.handle_is_live(handle.handle_id))
 
     def test_injected_turn_with_assistant_text_does_not_consume_submit(self):

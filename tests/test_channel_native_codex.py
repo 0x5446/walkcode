@@ -30,6 +30,21 @@ from walkcode.channel_native_runtime import (
 )
 
 
+def _drain_events(transport, handle):
+    """Consume the transport's event generator to exhaustion.
+
+    ``events()`` is a persistent listener: it re-enters the bounded collector
+    while the turn stays open. Tests hand it a fake client whose batches run
+    dry, so the silence ceiling is pinned to 0 at construction — the listen
+    then ends on the first empty batch instead of waiting an hour.
+    """
+
+    async def run():
+        return [event async for event in transport.events(handle)]
+
+    return asyncio.run(run())
+
+
 class _FakeCodexClient:
     def __init__(self):
         self.requests = []
@@ -337,7 +352,7 @@ class CodexAppServerTransportTests(unittest.TestCase):
 
     def test_launch_and_submit_use_app_server_shapes(self):
         client = _FakeCodexClient()
-        transport = CodexAppServerTransport(client=client)
+        transport = CodexAppServerTransport(client=client, event_silence_ceiling=0)
 
         handle = asyncio.run(transport.launch(LaunchSpec(cwd="/tmp/project", session_id="s1")))
         asyncio.run(transport.submit_turn(handle, TurnInput(text="hello"), "idem-1"))
@@ -364,10 +379,10 @@ class CodexAppServerTransportTests(unittest.TestCase):
             {"method": "thread/tokenUsage/updated", "params": {"threadId": "thread-1"}},
             {"method": "turn/completed", "params": {"threadId": "thread-1", "turn": {"id": "turn-1"}}},
         ]
-        transport = CodexAppServerTransport(client=client)
+        transport = CodexAppServerTransport(client=client, event_silence_ceiling=0)
         handle = asyncio.run(transport.launch(LaunchSpec(cwd="/tmp/project", session_id="s1")))
 
-        events = asyncio.run(transport.events(handle))
+        events = _drain_events(transport, handle)
 
         self.assertEqual(len(events), 2)
         self.assertEqual(events[0].type, AgentEventType.TURN_DELTA)
@@ -396,10 +411,10 @@ class CodexAppServerTransportTests(unittest.TestCase):
                 },
             },
         ]
-        transport = CodexAppServerTransport(client=client)
+        transport = CodexAppServerTransport(client=client, event_silence_ceiling=0)
         handle = asyncio.run(transport.launch(LaunchSpec(cwd="/tmp/project", session_id="s1")))
 
-        events = asyncio.run(transport.events(handle))
+        events = _drain_events(transport, handle)
 
         self.assertEqual(len(events), 2)
         self.assertEqual(events[0].type, AgentEventType.TURN_DELTA)
@@ -421,10 +436,10 @@ class CodexAppServerTransportTests(unittest.TestCase):
             },
             {"method": "turn/completed", "params": {"threadId": "thread-1"}},
         ]
-        transport = CodexAppServerTransport(client=client)
+        transport = CodexAppServerTransport(client=client, event_silence_ceiling=0)
         handle = asyncio.run(transport.launch(LaunchSpec(cwd="/tmp/project", session_id="s1")))
 
-        events = asyncio.run(transport.events(handle))
+        events = _drain_events(transport, handle)
 
         self.assertEqual(len(events), 2)
         self.assertEqual(events[0].type, AgentEventType.TURN_DELTA)
@@ -454,10 +469,10 @@ class CodexAppServerTransportTests(unittest.TestCase):
             },
             {"method": "turn/completed", "params": {"threadId": "thread-1"}},
         ]
-        transport = CodexAppServerTransport(client=client)
+        transport = CodexAppServerTransport(client=client, event_silence_ceiling=0)
         handle = asyncio.run(transport.launch(LaunchSpec(cwd="/tmp/project", session_id="s1")))
 
-        events = asyncio.run(transport.events(handle))
+        events = _drain_events(transport, handle)
 
         self.assertEqual(events[0].type, AgentEventType.TOOL_STARTED)
         self.assertEqual(events[0].payload["tool_name"], "shell")
@@ -493,10 +508,10 @@ class CodexAppServerTransportTests(unittest.TestCase):
             },
             {"method": "turn/completed", "params": {"threadId": "thread-1"}},
         ]
-        transport = CodexAppServerTransport(client=client)
+        transport = CodexAppServerTransport(client=client, event_silence_ceiling=0)
         handle = asyncio.run(transport.launch(LaunchSpec(cwd="/tmp/project", session_id="s1")))
 
-        events = asyncio.run(transport.events(handle))
+        events = _drain_events(transport, handle)
 
         self.assertEqual(events[0].type, AgentEventType.TOOL_STARTED)
         self.assertEqual(events[0].payload["tool_name"], "command")
@@ -524,10 +539,10 @@ class CodexAppServerTransportTests(unittest.TestCase):
                 },
             }
         ]
-        transport = CodexAppServerTransport(client=client)
+        transport = CodexAppServerTransport(client=client, event_silence_ceiling=0)
         handle = asyncio.run(transport.launch(LaunchSpec(cwd="/tmp/project", session_id="s1")))
 
-        events = asyncio.run(transport.events(handle))
+        events = _drain_events(transport, handle)
 
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0].type, AgentEventType.PERMISSION_REQUESTED)
@@ -559,10 +574,10 @@ class CodexAppServerTransportTests(unittest.TestCase):
                 },
             }
         ]
-        transport = CodexAppServerTransport(client=client)
+        transport = CodexAppServerTransport(client=client, event_silence_ceiling=0)
         handle = asyncio.run(transport.launch(LaunchSpec(cwd="/tmp/project", session_id="s1")))
 
-        events = asyncio.run(transport.events(handle))
+        events = _drain_events(transport, handle)
 
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0].type, AgentEventType.PERMISSION_REQUESTED)
@@ -595,10 +610,10 @@ class CodexAppServerTransportTests(unittest.TestCase):
                 },
             }
         ]
-        transport = CodexAppServerTransport(client=client)
+        transport = CodexAppServerTransport(client=client, event_silence_ceiling=0)
         handle = asyncio.run(transport.launch(LaunchSpec(cwd="/tmp/project", session_id="s1")))
 
-        events = asyncio.run(transport.events(handle))
+        events = _drain_events(transport, handle)
 
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0].type, AgentEventType.PERMISSION_REQUESTED)
@@ -642,7 +657,7 @@ class CodexAppServerTransportTests(unittest.TestCase):
                 },
             }
         ]
-        transport = CodexAppServerTransport(client=client)
+        transport = CodexAppServerTransport(client=client, event_silence_ceiling=0)
         channel = FakeChannelAdapter("telegram", _channel_caps())
         orchestrator = Orchestrator(
             sessions=SessionRegistry(),
@@ -716,10 +731,10 @@ class CodexAppServerTransportTests(unittest.TestCase):
                 },
             }
         ]
-        transport = CodexAppServerTransport(client=client)
+        transport = CodexAppServerTransport(client=client, event_silence_ceiling=0)
         handle = asyncio.run(transport.launch(LaunchSpec(cwd="/tmp/project", session_id="s1")))
 
-        events = asyncio.run(transport.events(handle))
+        events = _drain_events(transport, handle)
 
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0].type, AgentEventType.ASK_USER_REQUESTED)
@@ -764,10 +779,10 @@ class CodexAppServerTransportTests(unittest.TestCase):
                 },
             }
         ]
-        transport = CodexAppServerTransport(client=client)
+        transport = CodexAppServerTransport(client=client, event_silence_ceiling=0)
         handle = asyncio.run(transport.launch(LaunchSpec(cwd="/tmp/project", session_id="s1")))
 
-        events = asyncio.run(transport.events(handle))
+        events = _drain_events(transport, handle)
 
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0].type, AgentEventType.ASK_USER_REQUESTED)
@@ -794,7 +809,7 @@ class CodexAppServerTransportTests(unittest.TestCase):
 
     def test_codex_question_answer_can_rebuild_shape_from_persisted_question_metadata(self):
         client = _FakeCodexClient()
-        transport = CodexAppServerTransport(client=client)
+        transport = CodexAppServerTransport(client=client, event_silence_ceiling=0)
 
         asyncio.run(
             transport.answer_user_question(
@@ -814,7 +829,7 @@ class CodexAppServerTransportTests(unittest.TestCase):
 
     def test_codex_permission_answer_can_rebuild_permissions_response_from_persisted_metadata(self):
         client = _FakeCodexClient()
-        transport = CodexAppServerTransport(client=client)
+        transport = CodexAppServerTransport(client=client, event_silence_ceiling=0)
 
         asyncio.run(
             transport.approve_permission(
@@ -851,7 +866,7 @@ class CodexAppServerTransportTests(unittest.TestCase):
 
     def test_resume_requires_thread_id(self):
         client = _FakeCodexClient()
-        transport = CodexAppServerTransport(client=client)
+        transport = CodexAppServerTransport(client=client, event_silence_ceiling=0)
 
         with self.assertRaises(ValueError):
             asyncio.run(transport.resume_thread("", cwd="/tmp/project"))
@@ -861,10 +876,152 @@ class CodexAppServerTransportTests(unittest.TestCase):
         self.assertEqual(client.requests[-1][0], "thread/resume")
 
     def test_unverified_capabilities_are_disabled(self):
-        transport = CodexAppServerTransport(client=_FakeCodexClient())
+        transport = CodexAppServerTransport(client=_FakeCodexClient(), event_silence_ceiling=0)
         caps = transport.capabilities()
 
         self.assertTrue(caps.permission_callback)
         self.assertTrue(caps.ask_user_question)
         self.assertFalse(caps.multi_client_observe)
         self.assertFalse(caps.resume_active_turn)
+
+
+class _BatchScriptCodexClient(_FakeCodexClient):
+    """Fake whose ``events()`` hands out one scripted batch per call.
+
+    The real collector is bounded: it returns after its own timeout whether or
+    not the turn finished, so a single turn spans several batches. This fake
+    reproduces that shape; ``[]`` stands for "the collector waited and nothing
+    arrived".
+    """
+
+    def __init__(self, batches):
+        super().__init__()
+        self.batches = list(batches)
+        self.event_calls = 0
+
+    async def events(self, thread_id):
+        self.event_calls += 1
+        return self.batches.pop(0) if self.batches else []
+
+
+class CodexPersistentListenTests(unittest.TestCase):
+    def _handle(self, transport):
+        return asyncio.run(transport.launch(LaunchSpec(cwd="/tmp/project", session_id="s1")))
+
+    def test_listen_spans_collector_batches_until_turn_completed(self):
+        # The 2026-07-30 loss: a 68-minute turn outlived the collector's
+        # window, the drain read the batch end as a broken stream, and the
+        # final answer (produced 39s later) never reached the channel.
+        client = _BatchScriptCodexClient(
+            [
+                [
+                    {
+                        "method": "item/agentMessage/delta",
+                        "params": {"threadId": "thread-1", "turnId": "t1", "delta": "wor"},
+                    }
+                ],
+                [],
+                [
+                    {
+                        "method": "item/agentMessage/delta",
+                        "params": {"threadId": "thread-1", "turnId": "t1", "delta": "king"},
+                    }
+                ],
+                [
+                    {
+                        "method": "turn/completed",
+                        "params": {"threadId": "thread-1", "turn": {"id": "t1"}},
+                    }
+                ],
+            ]
+        )
+        transport = CodexAppServerTransport(client=client, event_silence_ceiling=3600)
+        transport._EMPTY_BATCH_MIN_INTERVAL = 0
+        handle = self._handle(transport)
+
+        events = _drain_events(transport, handle)
+
+        self.assertEqual(client.event_calls, 4)
+        self.assertEqual(
+            [event.type for event in events],
+            [
+                AgentEventType.TURN_DELTA,
+                AgentEventType.TURN_DELTA,
+                AgentEventType.TURN_COMPLETED,
+            ],
+        )
+        self.assertEqual(events[0].payload["text"], "wor")
+        self.assertEqual(events[1].payload["text"], "king")
+
+    def test_silence_ceiling_warns_and_closes_the_turn(self):
+        # Giving up must be loud AND must close the turn: a stream that ends
+        # mid-turn is what flips the session to ERROR_RECOVERABLE, and that
+        # state has no self-healing path.
+        client = _BatchScriptCodexClient(
+            [
+                [
+                    {
+                        "method": "item/agentMessage/delta",
+                        "params": {"threadId": "thread-1", "turnId": "t1", "delta": "hi"},
+                    }
+                ]
+            ]
+        )
+        transport = CodexAppServerTransport(client=client, event_silence_ceiling=0)
+        handle = self._handle(transport)
+
+        events = _drain_events(transport, handle)
+
+        self.assertEqual(events[0].type, AgentEventType.TURN_DELTA)
+        self.assertEqual(events[0].payload["text"], "hi")
+        self.assertIn("已静默", events[-2].payload["text"])
+        self.assertIn("直接回复可重新拉起会话", events[-2].payload["text"])
+        self.assertEqual(events[-1].type, AgentEventType.TURN_COMPLETED)
+
+    def test_hitl_request_parks_the_turn_without_synthetic_completion(self):
+        # A permission card hands the turn to a human; the answer re-enters
+        # through a fresh drain. Closing the turn here would tell the channel
+        # the agent finished while it is actually blocked on the card.
+        client = _BatchScriptCodexClient(
+            [
+                [
+                    {
+                        "id": "req-1",
+                        "method": "item/commandExecution/requestApproval",
+                        "params": {"threadId": "thread-1", "command": "rm -rf /tmp/x"},
+                    }
+                ]
+            ]
+        )
+        transport = CodexAppServerTransport(client=client, event_silence_ceiling=0)
+        handle = self._handle(transport)
+
+        events = _drain_events(transport, handle)
+
+        self.assertEqual(client.event_calls, 1)
+        self.assertEqual(events[-1].type, AgentEventType.PERMISSION_REQUESTED)
+        self.assertNotIn(AgentEventType.TURN_COMPLETED, [event.type for event in events])
+
+    def test_empty_batches_are_throttled_against_a_hot_loop(self):
+        # A client that returns empty instantly (closed transport, stub) must
+        # not spin the ceiling window at full CPU.
+        client = _BatchScriptCodexClient([])
+        transport = CodexAppServerTransport(client=client, event_silence_ceiling=0.05)
+        transport._EMPTY_BATCH_MIN_INTERVAL = 0.01
+        handle = self._handle(transport)
+        slept: list[float] = []
+        real_sleep = asyncio.sleep
+
+        async def recording_sleep(delay, *args, **kwargs):
+            slept.append(delay)
+            return await real_sleep(0, *args, **kwargs)
+
+        asyncio.sleep = recording_sleep
+        try:
+            events = _drain_events(transport, handle)
+        finally:
+            asyncio.sleep = real_sleep
+
+        self.assertTrue(slept, "empty batches must be throttled")
+        self.assertTrue(all(delay <= 0.01 for delay in slept), slept)
+        self.assertEqual(events[-1].type, AgentEventType.TURN_COMPLETED)
