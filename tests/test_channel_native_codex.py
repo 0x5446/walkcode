@@ -1338,3 +1338,57 @@ class CodexStreamFailureTests(unittest.TestCase):
         leftover = asyncio.run(scenario())
 
         self.assertEqual(leftover, {}, "a dead reader must not leak pending futures")
+
+
+class CodexAbortedListenTests(unittest.TestCase):
+    def test_carried_failure_survives_the_reconnect_it_triggers(self):
+        # Regression: the carried error was checked AFTER _ensure_started(),
+        # which reconnects a dead reader and bumps the generation — so the
+        # error looked stale, was dropped, and the caller got an empty batch.
+        # The open turn then looked merely quiet.
+        client = _ScriptedWireCodexStdioClient([])
+        delta = {
+            "method": "item/agentMessage/delta",
+            "params": {"threadId": "thread-1", "turnId": "t1", "delta": "half"},
+        }
+
+        async def scenario():
+            listen = asyncio.ensure_future(client.events("thread-1"))
+            await asyncio.sleep(0.02)
+            client._dispatch(delta)
+            client._fail_stream(TransportUnavailable("wire died"))
+            first = await listen
+            self.assertEqual(first, [delta])
+            # Kill the reader for real, so the next call must reconnect.
+            await client._stop_reader()
+            with self.assertRaises(TransportUnavailable) as caught:
+                await client.events("thread-1")
+            return str(caught.exception)
+
+        message = asyncio.run(scenario())
+
+        self.assertIn("wire died", message)
+
+    def test_cancelling_a_listen_does_not_eat_events_it_already_took(self):
+        # queue.get() is destructive: a drain cancelled at a handoff would
+        # otherwise take its collected events to the grave.
+        client = _ScriptedWireCodexStdioClient([])
+        delta = {
+            "method": "item/agentMessage/delta",
+            "params": {"threadId": "thread-1", "turnId": "t1", "delta": "keep me"},
+        }
+
+        async def scenario():
+            listen = asyncio.ensure_future(client.events("thread-1"))
+            await asyncio.sleep(0.02)
+            client._dispatch(delta)
+            await asyncio.sleep(0.02)          # let the listen pull it off
+            listen.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await listen
+            # A fresh listen must still see it.
+            return await client.events("thread-1")
+
+        events = asyncio.run(scenario())
+
+        self.assertEqual(events, [delta])

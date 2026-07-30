@@ -166,6 +166,9 @@ result（worker 中途出问题、被判 injected turn），此时文案与用�
     （ADR 0058）机制，该回合只能等到 ceiling。
   - HITL 卡片默认 10 分钟过期，而等待上限沿用 1 小时 ceiling，卡片失效后
     监听还会空等一段时间才收尾。
+  - 共享缓冲里的无归属终止事件可能越过本 thread 队列里更早的正文（缓冲与
+    队列之间没有统一序号）。当前 codex 版本下不可达：无 threadId 的只有
+    元事件，新旧两种事件格式不会在同一条流里混用。
   - `CodexAppServerTransport` 没有 `interrupt`，所以 ceiling 放弃监听时
     服务端回合并未真正取消。整整一小时零事件后它几乎肯定已经死了，但迟到
     事件会落在没有消费者的流上。要根治需要 app-server 侧的中断能力。
@@ -183,11 +186,12 @@ result（worker 中途出问题、被判 injected turn），此时文案与用�
   `CodexEventRoutingTests`（并发双 thread 时无 threadId 不串台、
   **其他会话安静后缓冲消息仍被认领**、payload threadId 提取、events 不阻塞
   并发 request）、`CodexStreamFailureTests`（故障前已收事件优先交付、故障
-  在下次调用抛出而非被重连吞掉、空手时立即抛、reader 死亡不泄漏 pending
-  future）；`tests/test_channel_native_core.py` 新增 `HumanizeSecondsTests`。
-  全量 988 passed。
-- 真实环境：用改造后的 client 驱动真实 `codex app-server --stdio`
-  （gpt-5.6-sol，临时 CODEX_HOME），thread/start 2.6 秒返回，turn 提交后
-  单批收到 29 个事件直至 `turn/completed`。
+  在下次调用抛出而非被重连吞掉、陈旧哨兵不拖累新连接上的回合、空手时立即
+  抛、reader 死亡不泄漏 pending future）；`tests/test_channel_native_core.py` 新增 `HumanizeSecondsTests`。
+  全量 991 passed。
+- 真实环境：用改造后的 client + transport 驱动真实
+  `codex app-server --stdio`（gpt-5.6-sol，临时 CODEX_HOME）。常驻监听运行
+  期间提交新回合耗时 **0.00 秒**（拆锁前它会排在最长 180 秒的读之后），
+  事件流式送达 5 条直至 `turn.completed`，监听干净退出。
 - hook 对照实验：见上表，同一 CODEX_HOME 下 CLI 与 app-server 的 user
   hooks 加载行为差异。

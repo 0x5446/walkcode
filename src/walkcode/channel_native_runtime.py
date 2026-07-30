@@ -228,6 +228,10 @@ class CodexStdioAppServerClient:
         # is pinned to the connection that broke so it cannot leak onto a
         # later turn running over a healthy wire.
         self._thread_failures: dict[str, tuple[int, BaseException]] = {}
+        # Events pulled off a queue by a call that then died (cancelled at a
+        # handoff, raised mid-batch). queue.get() is destructive, so they are
+        # parked here and re-served, in order, ahead of the queue.
+        self._thread_pushback: dict[str, list[dict[str, Any]]] = {}
         # Bumped on every reader start. Everything the previous wire left
         # behind (queued failure markers, carried errors) is stale once this
         # moves.
@@ -274,22 +278,29 @@ class CodexStdioAppServerClient:
         whether or not anyone is inside this call, so events produced between
         two drains land in the queue instead of going unread.
         """
+        # A failure the previous call could not deliver (it had events in hand,
+        # and delivering them came first) is raised BEFORE _ensure_started().
+        # Order matters: a dead reader makes _ensure_started() reconnect, which
+        # bumps the generation — checking afterwards would find the carried
+        # error "stale", drop it, and hand the caller an empty batch. The open
+        # turn would then look merely quiet and get a synthetic completion,
+        # which is the very swallowing this carry-over exists to prevent.
+        carried = self._thread_failures.pop(thread_id, None)
+        if carried is not None and carried[0] == self._connection_generation:
+            raise _as_transport_unavailable(carried[1])
         async with self._lock:
             await self._ensure_started()
         queue = self._queue_for(thread_id)
         self._active_listeners[thread_id] = self._active_listeners.get(thread_id, 0) + 1
+        delivered = False
+        collected: list[dict[str, Any]] = []
         try:
-            # A failure the previous call could not deliver (it had events in
-            # hand and delivering them came first) is raised now, before this
-            # call can mistake a dead wire for a quiet one.
-            carried = self._thread_failures.pop(thread_id, None)
-            if carried is not None and carried[0] == self._connection_generation:
-                raise _as_transport_unavailable(carried[1])
             collected = self._take_buffered(thread_id)
             if _contains_codex_turn_completed(collected, thread_id) or _contains_codex_hitl_server_request(
                 collected,
                 thread_id,
             ):
+                delivered = True
                 return collected
             deadline = time.monotonic() + self.event_timeout
             while time.monotonic() < deadline:
@@ -319,15 +330,26 @@ class CodexStdioAppServerClient:
                     # the turn output this whole change exists to protect.
                     if collected:
                         self._thread_failures[thread_id] = (message.generation, message.error)
+                        delivered = True
                         return collected
                     raise _as_transport_unavailable(message.error)
                 collected.append(message)
                 if _is_codex_hitl_server_request_message(message):
+                    delivered = True
                     return collected
                 if _notification_method(message) == "turn/completed":
+                    delivered = True
                     return collected
+            delivered = True
             return collected
         finally:
+            if not delivered and collected:
+                # Cancelled or raised while holding events taken off the queue.
+                # queue.get() is destructive, so without this they would be
+                # gone for good — a drain cancelled by a handoff would silently
+                # eat whatever it had already pulled. Stash them ahead of the
+                # queue for the next call on this thread.
+                self._thread_pushback.setdefault(thread_id, []).extend(collected)
             remaining = self._active_listeners.get(thread_id, 1) - 1
             if remaining > 0:
                 self._active_listeners[thread_id] = remaining
@@ -587,6 +609,9 @@ class CodexStdioAppServerClient:
         return message
 
     def _take_buffered(self, thread_id: str) -> list[dict[str, Any]]:
+        # Anything a previous, aborted call had already taken comes first —
+        # it is strictly older than what is still queued.
+        taken = self._thread_pushback.pop(thread_id, [])
         # Thread-less messages may only be claimed when nobody else is
         # listening. Several TUI sessions share one app-server process, so the
         # permissive "no threadId means mine" rule would hand one session's
@@ -600,7 +625,6 @@ class CodexStdioAppServerClient:
             if count > 0 and other != thread_id
         ]
         kept: list[dict[str, Any]] = []
-        taken: list[dict[str, Any]] = []
         for message in self._buffered_notifications:
             message_thread_id = _notification_thread_id(message)
             if message_thread_id == thread_id or (not message_thread_id and claim_unaddressed):
