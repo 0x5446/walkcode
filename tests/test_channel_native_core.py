@@ -20,6 +20,7 @@ from walkcode.channel_native import (
     TransportUnavailable,
     TurnInput,
 )
+from walkcode.channel_native import _humanize_seconds
 
 
 class _Clock:
@@ -810,3 +811,20 @@ class ChannelNativeInboundTests(unittest.TestCase):
         )
 
         self.assertEqual(event.binding_key(), ("fake", "bot", "chat-1", "topic-1", "root-1"))
+
+
+class HumanizeSecondsTests(unittest.TestCase):
+    def test_renders_spans_a_human_reads_once(self):
+        self.assertEqual(_humanize_seconds(0), "0 秒")
+        self.assertEqual(_humanize_seconds(45), "45 秒")
+        self.assertEqual(_humanize_seconds(60), "1 分钟")
+        self.assertEqual(_humanize_seconds(90), "1 分 30 秒")
+        self.assertEqual(_humanize_seconds(600), "10 分钟")
+        self.assertEqual(_humanize_seconds(3600), "1 小时")
+        self.assertEqual(_humanize_seconds(5400), "1 小时 30 分钟")
+
+    def test_negative_and_fractional_do_not_leak(self):
+        # Ceilings arrive as floats from config and can be clamped to <= 0 to
+        # disable the guard; the renderer must never emit "-1 秒".
+        self.assertEqual(_humanize_seconds(-5), "0 秒")
+        self.assertEqual(_humanize_seconds(59.9), "59 秒")

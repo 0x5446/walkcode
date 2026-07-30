@@ -4348,6 +4348,23 @@ def _title_from_text(text: str, *, limit: int = 80) -> str:
     return collapsed[: max(0, limit - 3)].rstrip() + "..."
 
 
+def _humanize_seconds(seconds: float) -> str:
+    """Render a timeout as a human span ("1 小时"), not a raw second count.
+
+    "3600 秒" reads as a machine constant and forces the reader to divide;
+    every one of these strings lands in a channel message a human skims once.
+    """
+    total = int(max(0.0, seconds))
+    if total < 60:
+        return f"{total} 秒"
+    if total < 3600:
+        minutes, rest = divmod(total, 60)
+        return f"{minutes} 分钟" if not rest else f"{minutes} 分 {rest} 秒"
+    hours, rest = divmod(total, 3600)
+    minutes = rest // 60
+    return f"{hours} 小时" if not minutes else f"{hours} 小时 {minutes} 分钟"
+
+
 def _is_takeover_command(text: str) -> bool:
     first = str(text or "").strip().split(maxsplit=1)[0].lower() if str(text or "").strip() else ""
     command = first.split("@", 1)[0]
@@ -6854,9 +6871,17 @@ class ClaudeHeadlessTransport:
                             yield AgentEvent(
                                 AgentEventType.TURN_DELTA,
                                 {
+                                    # 不能说"没有得到任何响应"：pending_submits
+                                    # 是"提交数减去已核销的 result 数"，不是流量
+                                    # 计数。回合完全可能流出过 delta/工具事件却
+                                    # 始终等不到 result（worker 中途出问题、被判
+                                    # injected turn），此时旧文案会与用户亲眼看到
+                                    # 的输出直接矛盾。只陈述两件可验证的事：流上
+                                    # 静默多久，以及这条消息没等到完成回执。
                                     "text": (
-                                        f"⚠️ 已提交的消息在 {int(self.background_wait_ceiling_seconds)} 秒内"
-                                        "没有得到任何响应，已停止本次会话监听。直接回复可重新拉起会话。"
+                                        f"⚠️ 会话已静默 {_humanize_seconds(self.background_wait_ceiling_seconds)}"
+                                        "——没有任何新输出，你的消息也没等到完成回执，"
+                                        "已停止本次会话监听。直接回复可重新拉起会话。"
                                     )
                                 },
                             )
@@ -6896,7 +6921,7 @@ class ClaudeHeadlessTransport:
                             {
                                 "text": (
                                     f"⚠️ 后台任务等待超时：仍有 {count} 个后台任务（{titles}）在 "
-                                    f"{int(self.background_wait_ceiling_seconds)} 秒内没有任何进展，"
+                                    f"{_humanize_seconds(self.background_wait_ceiling_seconds)}内没有任何进展，"
                                     "已停止等待并关闭本次会话监听。它们的结果将不会自动送达；"
                                     "你可以直接回复继续对话。"
                                 )
@@ -7897,6 +7922,14 @@ class CodexAppServerTransport:
         "item/tool/requestUserInput",
         "mcpServer/elicitation/request",
     }
+    # Events that hand the turn to a human. The collector returns early on
+    # these by design, and the answer arrives through a separate call — so the
+    # listen must stop WITHOUT closing the turn (it is parked, not finished).
+    _TURN_PARKING_EVENTS = frozenset(
+        {AgentEventType.PERMISSION_REQUESTED, AgentEventType.ASK_USER_REQUESTED}
+    )
+    # Floor between two empty collector batches — anti-spin only.
+    _EMPTY_BATCH_MIN_INTERVAL = 1.0
 
     def __init__(
         self,
@@ -7906,11 +7939,16 @@ class CodexAppServerTransport:
         sandbox: str = "read-only",
         ephemeral: bool = False,
         environment_context: str = "",
+        event_silence_ceiling: float = 3600.0,
     ):
         self.client = client
         self.approval_policy = approval_policy
         self.sandbox = sandbox
         self.ephemeral = ephemeral
+        # Total silence for this long ends the listen (matches the Claude
+        # background-wait ceiling). This is NOT the per-batch collector
+        # timeout: batches roll over transparently while the turn is alive.
+        self.event_silence_ceiling = event_silence_ceiling
         self._pending_server_requests: dict[str, dict[str, Any]] = {}
         # Codex app-server has no append-system-prompt surface
         # (base_instructions REPLACES the built-in prompt wholesale), so the
@@ -8004,23 +8042,122 @@ class CodexAppServerTransport:
         self._env_context_pending.discard(thread_id)
         self._env_context_delivered.add(thread_id)
 
-    async def events(self, handle: TransportHandle) -> list[AgentEvent]:
-        raw_events = await self.client.events(handle.ref["thread_id"])
-        events: list[AgentEvent] = []
-        delta_parts: list[str] = []
-        for event in (self._convert_event(raw_event) for raw_event in raw_events):
-            if event is None:
-                continue
-            if event.type == AgentEventType.TURN_DELTA:
-                delta_parts.append(str(event.payload.get("text", "")))
-                continue
+    async def events(self, handle: TransportHandle):
+        """Listen until the turn really ends — not until one batch returns.
+
+        ``client.events()`` is a BOUNDED collector: it returns after
+        ``event_timeout`` seconds whether or not the turn finished. Treating
+        one batch as the whole stream is what made a long turn look like a
+        broken one — ``_drain_events`` saw the iteration end mid-turn and
+        flipped the session to ERROR_RECOVERABLE, which has no self-healing
+        path, so everything the agent produced afterwards was dropped and only
+        the user's next message could resume it (2026-07-30: a 68-minute turn
+        completed normally at 09:50:03, its final answer never reached the
+        channel because the drain had given up at 09:49:24).
+
+        So the batch boundary is an implementation detail here, not a stream
+        end: keep re-entering the collector while the turn stays open. Only a
+        genuinely silent worker ends the listen, and it says so out loud —
+        with a synthetic TURN_COMPLETED, exactly like the Claude ceiling path
+        (see ``_bridged_event_stream``), so the drain reads a closed turn
+        instead of a mid-turn failure.
+        """
+        thread_id = handle.ref["thread_id"]
+        silent_since = time.monotonic()
+        parked_on_human = False
+        while True:
+            batch_started = time.monotonic()
+            raw_events = await self.client.events(thread_id)
+            turn_closed = False
+            delta_parts: list[str] = []
+            for event in (self._convert_event(raw_event) for raw_event in raw_events):
+                if event is None:
+                    continue
+                if event.type == AgentEventType.TURN_DELTA:
+                    delta_parts.append(str(event.payload.get("text", "")))
+                    continue
+                if delta_parts:
+                    yield AgentEvent(AgentEventType.TURN_DELTA, {"text": "".join(delta_parts)})
+                    delta_parts = []
+                yield event
+                # A HITL prompt parks the turn on a human. Keep listening: the
+                # answer goes back over the same wire (answer_request), and the
+                # agent's continuation arrives on this very stream. Returning
+                # here would end the only consumer — the decision would be
+                # written, the agent would resume, and everything it produced
+                # afterwards would sit in the queue until an unrelated user
+                # message happened to start a new drain. That is the same
+                # silent loss this whole change exists to remove.
+                if event.type in self._TURN_PARKING_EVENTS:
+                    parked_on_human = True
+                else:
+                    # The agent produced something, so it is running again —
+                    # the card was answered (or withdrawn). Clearing this
+                    # matters for how a LATER silence is reported: a stalled
+                    # agent must not be described as "waiting for you".
+                    parked_on_human = False
+                if event.type == AgentEventType.TURN_COMPLETED:
+                    turn_closed = True
             if delta_parts:
-                events.append(AgentEvent(AgentEventType.TURN_DELTA, {"text": "".join(delta_parts)}))
-                delta_parts = []
-            events.append(event)
-        if delta_parts:
-            events.append(AgentEvent(AgentEventType.TURN_DELTA, {"text": "".join(delta_parts)}))
-        return events
+                yield AgentEvent(AgentEventType.TURN_DELTA, {"text": "".join(delta_parts)})
+            if turn_closed:
+                return
+            if raw_events:
+                # Any traffic at all proves the worker is alive and working.
+                silent_since = time.monotonic()
+                continue
+            if time.monotonic() - silent_since < self.event_silence_ceiling:
+                # A real collector already blocked for its own timeout before
+                # returning empty, so this loop is normally self-throttling.
+                # Do not rely on that: a client that returns empty instantly
+                # (a closed transport, a stub) would spin a hot loop for the
+                # whole ceiling window.
+                idle = time.monotonic() - batch_started
+                if idle < self._EMPTY_BATCH_MIN_INTERVAL:
+                    await asyncio.sleep(self._EMPTY_BATCH_MIN_INTERVAL - idle)
+                continue
+            _log_degrade(
+                "codex_event_silence_ceiling",
+                thread_id=thread_id,
+                ceiling_seconds=self.event_silence_ceiling,
+                parked_on_human=parked_on_human,
+            )
+            if parked_on_human:
+                # Waiting on a person, not on a stalled agent. Say so, and do
+                # NOT synthesize a completion: the turn is genuinely unfinished
+                # and the card may still be answered. ERROR_RECOVERABLE is the
+                # honest state here — the next message resumes it.
+                yield AgentEvent(
+                    AgentEventType.TURN_DELTA,
+                    {
+                        "text": (
+                            f"⚠️ 这个回合在等你回应，已经等了 "
+                            f"{_humanize_seconds(self.event_silence_ceiling)}，先停止监听。"
+                            "直接回复可重新拉起会话。"
+                        )
+                    },
+                )
+                return
+            yield AgentEvent(
+                AgentEventType.TURN_DELTA,
+                {
+                    "text": (
+                        f"⚠️ 会话已静默 {_humanize_seconds(self.event_silence_ceiling)}"
+                        "——没有任何新输出，回合也没有结束，已停止本次会话监听。"
+                        "直接回复可重新拉起会话。"
+                    )
+                },
+            )
+            # Close the synthetic warning turn so the drain does not read the
+            # ended stream as a mid-turn failure and flip the session to
+            # ERROR_RECOVERABLE.
+            #
+            # Known limit: this transport exposes no interrupt, so the server
+            # side of the turn is not actually cancelled — after a full hour of
+            # total silence it is almost certainly dead, but a late event from
+            # it would arrive on a stream nobody is draining.
+            yield AgentEvent(AgentEventType.TURN_COMPLETED, {"message": ""})
+            return
 
     async def approve_permission(self, handle: TransportHandle | None, rid: str, decision: dict[str, Any]) -> None:
         responder = getattr(self.client, "answer_request", None)

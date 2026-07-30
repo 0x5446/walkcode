@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import contextlib
 import hashlib
 import json
 import os
@@ -20,14 +21,37 @@ from walkcode.channel_native import (
     LaunchSpec,
     Orchestrator,
     SessionRegistry,
+    TransportUnavailable,
     TurnInput,
 )
 from walkcode.channel_native_runtime import (
     CodexManagedAppServerClient,
     CodexStdioAppServerClient,
+    _notification_matches_thread,
+    _notification_thread_id,
     _read_websocket_frame,
     _websocket_frame,
 )
+
+
+def _drain_events(transport, handle, stop_after=None):
+    """Consume the transport's event generator to exhaustion.
+
+    ``events()`` is a persistent listener: it re-enters the bounded collector
+    while the turn stays open. Tests hand it a fake client whose batches run
+    dry, so the silence ceiling is pinned to 0 at construction — the listen
+    then ends on the first empty batch instead of waiting an hour.
+    """
+
+    async def run():
+        collected = []
+        async for event in transport.events(handle):
+            collected.append(event)
+            if stop_after is not None and len(collected) >= stop_after:
+                break
+        return collected
+
+    return asyncio.run(run())
 
 
 class _FakeCodexClient:
@@ -67,11 +91,18 @@ class _IdleGapCodexStdioClient(CodexStdioAppServerClient):
         ]
 
     async def _ensure_started(self):
-        return None
+        if not self._reader_alive():
+            self._start_reader()
 
     async def _read_message(self, *, timeout):
+        if not self.messages:
+            # Idle wire: the resident reader blocks here in production.
+            await asyncio.sleep(0.01)
+            raise TimeoutError()
         message = self.messages.pop(0)
         if isinstance(message, Exception):
+            # A scripted idle gap between two real messages.
+            await asyncio.sleep(0.01)
             raise message
         return message
 
@@ -99,10 +130,12 @@ class _EventMsgCodexStdioClient(CodexStdioAppServerClient):
         ]
 
     async def _ensure_started(self):
-        return None
+        if not self._reader_alive():
+            self._start_reader()
 
     async def _read_message(self, *, timeout):
         if not self.messages:
+            await asyncio.sleep(0.01)
             raise TimeoutError()
         return self.messages.pop(0)
 
@@ -128,10 +161,12 @@ class _ServerRequestCodexStdioClient(CodexStdioAppServerClient):
         ]
 
     async def _ensure_started(self):
-        return None
+        if not self._reader_alive():
+            self._start_reader()
 
     async def _read_message(self, *, timeout):
         if not self.messages:
+            await asyncio.sleep(0.01)
             raise TimeoutError()
         return self.messages.pop(0)
 
@@ -152,6 +187,10 @@ class _ManagedClientNoProcess(CodexManagedAppServerClient):
 
     async def _send(self, message):
         self.sent.append(message)
+        # No wire and no reader here: answer the request the way the resident
+        # reader would, so request() resolves its future.
+        if "id" in message:
+            self._dispatch({"id": message["id"], "result": {"thread": {"id": "thread-managed"}}})
 
     async def _read_response(self, request_id, *, timeout):
         return {"id": request_id, "result": {"thread": {"id": "thread-managed"}}}
@@ -337,7 +376,7 @@ class CodexAppServerTransportTests(unittest.TestCase):
 
     def test_launch_and_submit_use_app_server_shapes(self):
         client = _FakeCodexClient()
-        transport = CodexAppServerTransport(client=client)
+        transport = CodexAppServerTransport(client=client, event_silence_ceiling=0)
 
         handle = asyncio.run(transport.launch(LaunchSpec(cwd="/tmp/project", session_id="s1")))
         asyncio.run(transport.submit_turn(handle, TurnInput(text="hello"), "idem-1"))
@@ -364,10 +403,10 @@ class CodexAppServerTransportTests(unittest.TestCase):
             {"method": "thread/tokenUsage/updated", "params": {"threadId": "thread-1"}},
             {"method": "turn/completed", "params": {"threadId": "thread-1", "turn": {"id": "turn-1"}}},
         ]
-        transport = CodexAppServerTransport(client=client)
+        transport = CodexAppServerTransport(client=client, event_silence_ceiling=0)
         handle = asyncio.run(transport.launch(LaunchSpec(cwd="/tmp/project", session_id="s1")))
 
-        events = asyncio.run(transport.events(handle))
+        events = _drain_events(transport, handle)
 
         self.assertEqual(len(events), 2)
         self.assertEqual(events[0].type, AgentEventType.TURN_DELTA)
@@ -396,10 +435,10 @@ class CodexAppServerTransportTests(unittest.TestCase):
                 },
             },
         ]
-        transport = CodexAppServerTransport(client=client)
+        transport = CodexAppServerTransport(client=client, event_silence_ceiling=0)
         handle = asyncio.run(transport.launch(LaunchSpec(cwd="/tmp/project", session_id="s1")))
 
-        events = asyncio.run(transport.events(handle))
+        events = _drain_events(transport, handle)
 
         self.assertEqual(len(events), 2)
         self.assertEqual(events[0].type, AgentEventType.TURN_DELTA)
@@ -421,10 +460,10 @@ class CodexAppServerTransportTests(unittest.TestCase):
             },
             {"method": "turn/completed", "params": {"threadId": "thread-1"}},
         ]
-        transport = CodexAppServerTransport(client=client)
+        transport = CodexAppServerTransport(client=client, event_silence_ceiling=0)
         handle = asyncio.run(transport.launch(LaunchSpec(cwd="/tmp/project", session_id="s1")))
 
-        events = asyncio.run(transport.events(handle))
+        events = _drain_events(transport, handle)
 
         self.assertEqual(len(events), 2)
         self.assertEqual(events[0].type, AgentEventType.TURN_DELTA)
@@ -454,10 +493,10 @@ class CodexAppServerTransportTests(unittest.TestCase):
             },
             {"method": "turn/completed", "params": {"threadId": "thread-1"}},
         ]
-        transport = CodexAppServerTransport(client=client)
+        transport = CodexAppServerTransport(client=client, event_silence_ceiling=0)
         handle = asyncio.run(transport.launch(LaunchSpec(cwd="/tmp/project", session_id="s1")))
 
-        events = asyncio.run(transport.events(handle))
+        events = _drain_events(transport, handle)
 
         self.assertEqual(events[0].type, AgentEventType.TOOL_STARTED)
         self.assertEqual(events[0].payload["tool_name"], "shell")
@@ -493,10 +532,10 @@ class CodexAppServerTransportTests(unittest.TestCase):
             },
             {"method": "turn/completed", "params": {"threadId": "thread-1"}},
         ]
-        transport = CodexAppServerTransport(client=client)
+        transport = CodexAppServerTransport(client=client, event_silence_ceiling=0)
         handle = asyncio.run(transport.launch(LaunchSpec(cwd="/tmp/project", session_id="s1")))
 
-        events = asyncio.run(transport.events(handle))
+        events = _drain_events(transport, handle)
 
         self.assertEqual(events[0].type, AgentEventType.TOOL_STARTED)
         self.assertEqual(events[0].payload["tool_name"], "command")
@@ -524,10 +563,10 @@ class CodexAppServerTransportTests(unittest.TestCase):
                 },
             }
         ]
-        transport = CodexAppServerTransport(client=client)
+        transport = CodexAppServerTransport(client=client, event_silence_ceiling=0)
         handle = asyncio.run(transport.launch(LaunchSpec(cwd="/tmp/project", session_id="s1")))
 
-        events = asyncio.run(transport.events(handle))
+        events = _drain_events(transport, handle, stop_after=1)
 
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0].type, AgentEventType.PERMISSION_REQUESTED)
@@ -559,10 +598,10 @@ class CodexAppServerTransportTests(unittest.TestCase):
                 },
             }
         ]
-        transport = CodexAppServerTransport(client=client)
+        transport = CodexAppServerTransport(client=client, event_silence_ceiling=0)
         handle = asyncio.run(transport.launch(LaunchSpec(cwd="/tmp/project", session_id="s1")))
 
-        events = asyncio.run(transport.events(handle))
+        events = _drain_events(transport, handle, stop_after=1)
 
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0].type, AgentEventType.PERMISSION_REQUESTED)
@@ -595,10 +634,10 @@ class CodexAppServerTransportTests(unittest.TestCase):
                 },
             }
         ]
-        transport = CodexAppServerTransport(client=client)
+        transport = CodexAppServerTransport(client=client, event_silence_ceiling=0)
         handle = asyncio.run(transport.launch(LaunchSpec(cwd="/tmp/project", session_id="s1")))
 
-        events = asyncio.run(transport.events(handle))
+        events = _drain_events(transport, handle, stop_after=1)
 
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0].type, AgentEventType.PERMISSION_REQUESTED)
@@ -642,7 +681,7 @@ class CodexAppServerTransportTests(unittest.TestCase):
                 },
             }
         ]
-        transport = CodexAppServerTransport(client=client)
+        transport = CodexAppServerTransport(client=client, event_silence_ceiling=0)
         channel = FakeChannelAdapter("telegram", _channel_caps())
         orchestrator = Orchestrator(
             sessions=SessionRegistry(),
@@ -666,8 +705,13 @@ class CodexAppServerTransportTests(unittest.TestCase):
         )
 
         self.assertTrue(result.accepted)
-        prompt = channel.sent_views[-1]["view"]
-        self.assertEqual(prompt["type"], "permission_prompt")
+        # Find the card, don't assume it is last: with the scripted batches
+        # exhausted the listener also emits its give-up notice behind it.
+        prompt = next(
+            sent["view"]
+            for sent in channel.sent_views
+            if sent["view"].get("type") == "permission_prompt"
+        )
         pending = orchestrator.hitls.pending_for_session(session.session_id)
         self.assertEqual(len(pending), 1)
         self.assertEqual(pending[0].transport_request_id, "approval-1")
@@ -716,10 +760,10 @@ class CodexAppServerTransportTests(unittest.TestCase):
                 },
             }
         ]
-        transport = CodexAppServerTransport(client=client)
+        transport = CodexAppServerTransport(client=client, event_silence_ceiling=0)
         handle = asyncio.run(transport.launch(LaunchSpec(cwd="/tmp/project", session_id="s1")))
 
-        events = asyncio.run(transport.events(handle))
+        events = _drain_events(transport, handle, stop_after=1)
 
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0].type, AgentEventType.ASK_USER_REQUESTED)
@@ -764,10 +808,10 @@ class CodexAppServerTransportTests(unittest.TestCase):
                 },
             }
         ]
-        transport = CodexAppServerTransport(client=client)
+        transport = CodexAppServerTransport(client=client, event_silence_ceiling=0)
         handle = asyncio.run(transport.launch(LaunchSpec(cwd="/tmp/project", session_id="s1")))
 
-        events = asyncio.run(transport.events(handle))
+        events = _drain_events(transport, handle, stop_after=1)
 
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0].type, AgentEventType.ASK_USER_REQUESTED)
@@ -794,7 +838,7 @@ class CodexAppServerTransportTests(unittest.TestCase):
 
     def test_codex_question_answer_can_rebuild_shape_from_persisted_question_metadata(self):
         client = _FakeCodexClient()
-        transport = CodexAppServerTransport(client=client)
+        transport = CodexAppServerTransport(client=client, event_silence_ceiling=0)
 
         asyncio.run(
             transport.answer_user_question(
@@ -814,7 +858,7 @@ class CodexAppServerTransportTests(unittest.TestCase):
 
     def test_codex_permission_answer_can_rebuild_permissions_response_from_persisted_metadata(self):
         client = _FakeCodexClient()
-        transport = CodexAppServerTransport(client=client)
+        transport = CodexAppServerTransport(client=client, event_silence_ceiling=0)
 
         asyncio.run(
             transport.approve_permission(
@@ -851,7 +895,7 @@ class CodexAppServerTransportTests(unittest.TestCase):
 
     def test_resume_requires_thread_id(self):
         client = _FakeCodexClient()
-        transport = CodexAppServerTransport(client=client)
+        transport = CodexAppServerTransport(client=client, event_silence_ceiling=0)
 
         with self.assertRaises(ValueError):
             asyncio.run(transport.resume_thread("", cwd="/tmp/project"))
@@ -861,10 +905,490 @@ class CodexAppServerTransportTests(unittest.TestCase):
         self.assertEqual(client.requests[-1][0], "thread/resume")
 
     def test_unverified_capabilities_are_disabled(self):
-        transport = CodexAppServerTransport(client=_FakeCodexClient())
+        transport = CodexAppServerTransport(client=_FakeCodexClient(), event_silence_ceiling=0)
         caps = transport.capabilities()
 
         self.assertTrue(caps.permission_callback)
         self.assertTrue(caps.ask_user_question)
         self.assertFalse(caps.multi_client_observe)
         self.assertFalse(caps.resume_active_turn)
+
+
+class _BatchScriptCodexClient(_FakeCodexClient):
+    """Fake whose ``events()`` hands out one scripted batch per call.
+
+    The real collector is bounded: it returns after its own timeout whether or
+    not the turn finished, so a single turn spans several batches. This fake
+    reproduces that shape; ``[]`` stands for "the collector waited and nothing
+    arrived".
+    """
+
+    def __init__(self, batches):
+        super().__init__()
+        self.batches = list(batches)
+        self.event_calls = 0
+
+    async def events(self, thread_id):
+        self.event_calls += 1
+        return self.batches.pop(0) if self.batches else []
+
+
+class CodexPersistentListenTests(unittest.TestCase):
+    def _handle(self, transport):
+        return asyncio.run(transport.launch(LaunchSpec(cwd="/tmp/project", session_id="s1")))
+
+    def test_listen_spans_collector_batches_until_turn_completed(self):
+        # The 2026-07-30 loss: a 68-minute turn outlived the collector's
+        # window, the drain read the batch end as a broken stream, and the
+        # final answer (produced 39s later) never reached the channel.
+        client = _BatchScriptCodexClient(
+            [
+                [
+                    {
+                        "method": "item/agentMessage/delta",
+                        "params": {"threadId": "thread-1", "turnId": "t1", "delta": "wor"},
+                    }
+                ],
+                [],
+                [
+                    {
+                        "method": "item/agentMessage/delta",
+                        "params": {"threadId": "thread-1", "turnId": "t1", "delta": "king"},
+                    }
+                ],
+                [
+                    {
+                        "method": "turn/completed",
+                        "params": {"threadId": "thread-1", "turn": {"id": "t1"}},
+                    }
+                ],
+            ]
+        )
+        transport = CodexAppServerTransport(client=client, event_silence_ceiling=3600)
+        transport._EMPTY_BATCH_MIN_INTERVAL = 0
+        handle = self._handle(transport)
+
+        events = _drain_events(transport, handle)
+
+        self.assertEqual(client.event_calls, 4)
+        self.assertEqual(
+            [event.type for event in events],
+            [
+                AgentEventType.TURN_DELTA,
+                AgentEventType.TURN_DELTA,
+                AgentEventType.TURN_COMPLETED,
+            ],
+        )
+        self.assertEqual(events[0].payload["text"], "wor")
+        self.assertEqual(events[1].payload["text"], "king")
+
+    def test_silence_ceiling_warns_and_closes_the_turn(self):
+        # Giving up must be loud AND must close the turn: a stream that ends
+        # mid-turn is what flips the session to ERROR_RECOVERABLE, and that
+        # state has no self-healing path.
+        client = _BatchScriptCodexClient(
+            [
+                [
+                    {
+                        "method": "item/agentMessage/delta",
+                        "params": {"threadId": "thread-1", "turnId": "t1", "delta": "hi"},
+                    }
+                ]
+            ]
+        )
+        transport = CodexAppServerTransport(client=client, event_silence_ceiling=0)
+        handle = self._handle(transport)
+
+        events = _drain_events(transport, handle)
+
+        self.assertEqual(events[0].type, AgentEventType.TURN_DELTA)
+        self.assertEqual(events[0].payload["text"], "hi")
+        self.assertIn("已静默", events[-2].payload["text"])
+        self.assertIn("直接回复可重新拉起会话", events[-2].payload["text"])
+        self.assertEqual(events[-1].type, AgentEventType.TURN_COMPLETED)
+
+    def test_hitl_request_parks_the_turn_without_synthetic_completion(self):
+        # A permission card hands the turn to a human. Giving up on the listen
+        # here would strand everything the agent produces after the answer.
+        client = _BatchScriptCodexClient(
+            [
+                [
+                    {
+                        "id": "req-1",
+                        "method": "item/commandExecution/requestApproval",
+                        "params": {"threadId": "thread-1", "command": "rm -rf /tmp/x"},
+                    }
+                ]
+            ]
+        )
+        transport = CodexAppServerTransport(client=client, event_silence_ceiling=0)
+        handle = self._handle(transport)
+
+        events = _drain_events(transport, handle)
+
+        types = [event.type for event in events]
+        self.assertIn(AgentEventType.PERMISSION_REQUESTED, types)
+        # No fake completion: the turn really is unfinished.
+        self.assertNotIn(AgentEventType.TURN_COMPLETED, types)
+        # And the give-up notice says it is waiting on a person, not stalled.
+        self.assertIn("等你回应", events[-1].payload["text"])
+
+    def test_listen_continues_past_an_answered_hitl_card(self):
+        # Regression: returning at the HITL event ended the only consumer, so
+        # the agent's continuation after the human answered was never
+        # delivered — the same silent loss the whole change removes.
+        client = _BatchScriptCodexClient(
+            [
+                [
+                    {
+                        "id": "req-1",
+                        "method": "item/commandExecution/requestApproval",
+                        "params": {"threadId": "thread-1", "command": "ls"},
+                    }
+                ],
+                [
+                    {
+                        "method": "item/agentMessage/delta",
+                        "params": {"threadId": "thread-1", "turnId": "t1", "delta": "after approval"},
+                    }
+                ],
+                [
+                    {
+                        "method": "turn/completed",
+                        "params": {"threadId": "thread-1", "turn": {"id": "t1"}},
+                    }
+                ],
+            ]
+        )
+        transport = CodexAppServerTransport(client=client, event_silence_ceiling=3600)
+        transport._EMPTY_BATCH_MIN_INTERVAL = 0
+        handle = self._handle(transport)
+
+        events = _drain_events(transport, handle)
+
+        self.assertEqual(client.event_calls, 3)
+        self.assertEqual(
+            [event.type for event in events],
+            [
+                AgentEventType.PERMISSION_REQUESTED,
+                AgentEventType.TURN_DELTA,
+                AgentEventType.TURN_COMPLETED,
+            ],
+        )
+        self.assertEqual(events[1].payload["text"], "after approval")
+
+    def test_empty_batches_are_throttled_against_a_hot_loop(self):
+        # A client that returns empty instantly (closed transport, stub) must
+        # not spin the ceiling window at full CPU.
+        client = _BatchScriptCodexClient([])
+        transport = CodexAppServerTransport(client=client, event_silence_ceiling=0.05)
+        transport._EMPTY_BATCH_MIN_INTERVAL = 0.01
+        handle = self._handle(transport)
+        slept: list[float] = []
+        real_sleep = asyncio.sleep
+
+        async def recording_sleep(delay, *args, **kwargs):
+            slept.append(delay)
+            return await real_sleep(0, *args, **kwargs)
+
+        asyncio.sleep = recording_sleep
+        try:
+            events = _drain_events(transport, handle)
+        finally:
+            asyncio.sleep = real_sleep
+
+        self.assertTrue(slept, "empty batches must be throttled")
+        self.assertTrue(all(delay <= 0.01 for delay in slept), slept)
+        self.assertEqual(events[-1].type, AgentEventType.TURN_COMPLETED)
+
+
+class _ScriptedWireCodexStdioClient(CodexStdioAppServerClient):
+    """Stdio client whose wire is a scripted list instead of a subprocess."""
+
+    def __init__(self, wire):
+        super().__init__(request_timeout=1, event_timeout=0.2, event_idle_timeout=0.01)
+        self.wire = list(wire)
+        self.sent: list[dict] = []
+
+    async def _ensure_started(self):
+        if not self._reader_alive():
+            self._start_reader()
+
+    async def _send(self, message):
+        self.sent.append(message)
+
+    async def _read_message(self, *, timeout):
+        if not self.wire:
+            await asyncio.sleep(0.01)
+            raise TimeoutError()
+        return self.wire.pop(0)
+
+
+class CodexEventRoutingTests(unittest.TestCase):
+    def test_thread_less_events_are_not_handed_to_a_foreign_thread(self):
+        # Several TUI sessions share one app-server process. An event with no
+        # threadId used to go to whichever drain asked first, surfacing one
+        # session's output in another session's channel.
+        client = _ScriptedWireCodexStdioClient([])
+        unaddressed = {"type": "event_msg", "payload": {"type": "agent_message", "message": "whose?"}}
+
+        async def scenario():
+            # Both threads are genuinely listening when the message lands.
+            a = asyncio.ensure_future(client.events("thread-a"))
+            b = asyncio.ensure_future(client.events("thread-b"))
+            await asyncio.sleep(0.02)
+            self.assertEqual(sorted(client._live_listener_threads()), ["thread-a", "thread-b"])
+            client._dispatch(unaddressed)
+            return await a, await b
+
+        events_a, events_b = asyncio.run(scenario())
+
+        self.assertEqual(events_a, [])
+        self.assertEqual(events_b, [])
+        self.assertEqual(client._buffered_notifications, [unaddressed])
+
+    def test_buffered_thread_less_event_is_claimed_once_the_others_go_quiet(self):
+        # Regression: liveness was keyed on _thread_queues, which is never
+        # torn down. After two threads had ever run, every unaddressed message
+        # stayed in the buffer with no claimant — a silent loss of the exact
+        # final replies this design protects.
+        client = _ScriptedWireCodexStdioClient([])
+        final = {"type": "event_msg", "payload": {"type": "task_complete", "last_agent_message": "done"}}
+
+        async def scenario():
+            a = asyncio.ensure_future(client.events("thread-a"))
+            b = asyncio.ensure_future(client.events("thread-b"))
+            await asyncio.sleep(0.02)
+            client._dispatch(final)          # ambiguous: buffered
+            await a
+            await b                          # both listens end
+            self.assertEqual(client._live_listener_threads(), [])
+            return await client.events("thread-b")   # sole listener now
+
+        events = asyncio.run(scenario())
+
+        self.assertEqual(events, [final])
+        self.assertEqual(client._buffered_notifications, [])
+
+    def test_thread_less_events_still_reach_a_solitary_thread(self):
+        client = _ScriptedWireCodexStdioClient(
+            [
+                {
+                    "type": "event_msg",
+                    "payload": {"type": "task_complete", "last_agent_message": "done"},
+                },
+            ]
+        )
+
+        events = asyncio.run(client.events("thread-only"))
+
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["payload"]["type"], "task_complete")
+
+    def test_event_msg_thread_id_is_read_from_the_payload(self):
+        # `params` is absent on the event_msg shape, and the old extractor
+        # returned "" from the params branch before ever reaching payload.
+        message = {
+            "type": "event_msg",
+            "payload": {"type": "agent_message", "threadId": "thread-x", "message": "hi"},
+        }
+
+        self.assertEqual(_notification_thread_id(message), "thread-x")
+        self.assertFalse(_notification_matches_thread(message, "thread-y"))
+        self.assertTrue(_notification_matches_thread(message, "thread-x"))
+
+    def test_events_do_not_block_a_concurrent_request(self):
+        # The old events() held the client lock for its whole window, so a
+        # message sent from the channel could wait minutes to be submitted.
+        client = _ScriptedWireCodexStdioClient([])
+
+        async def scenario():
+            listen = asyncio.ensure_future(client.events("thread-1"))
+            await asyncio.sleep(0.01)
+
+            async def answer_later():
+                await asyncio.sleep(0.01)
+                client._dispatch({"id": 1, "result": {"turn": {"id": "turn-1"}}})
+
+            asyncio.ensure_future(answer_later())
+            result = await asyncio.wait_for(
+                client.request("turn/start", {"threadId": "thread-1"}), timeout=1
+            )
+            listen.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await listen
+            return result
+
+        result = asyncio.run(scenario())
+
+        self.assertEqual(result["turn"]["id"], "turn-1")
+
+
+class CodexStreamFailureTests(unittest.TestCase):
+    """The reader dying must never silently swallow already-received output."""
+
+    def test_events_received_before_the_failure_are_delivered_first(self):
+        # Regression: the error was raised out of band and jumped ahead of
+        # events already sitting in the queue, so a turn's final text was
+        # dropped in favour of the exception.
+        client = _ScriptedWireCodexStdioClient([])
+        delta = {
+            "method": "item/agentMessage/delta",
+            "params": {"threadId": "thread-1", "turnId": "t1", "delta": "half a sentence"},
+        }
+
+        async def scenario():
+            listen = asyncio.ensure_future(client.events("thread-1"))
+            await asyncio.sleep(0.02)
+            client._dispatch(delta)
+            client._fail_stream(TransportUnavailable("wire died"))
+            return await listen
+
+        events = asyncio.run(scenario())
+
+        self.assertEqual(events, [delta])
+
+    def test_the_failure_is_raised_on_the_next_call_not_swallowed(self):
+        # Regression: a reconnect ran _start_reader, which cleared
+        # _stream_error, so a mid-batch death never reached the drain and the
+        # broken turn looked merely quiet. The carried failure must survive to
+        # the next call on the SAME connection.
+        client = _ScriptedWireCodexStdioClient([])
+        delta = {
+            "method": "item/agentMessage/delta",
+            "params": {"threadId": "thread-1", "turnId": "t1", "delta": "half"},
+        }
+
+        async def scenario():
+            listen = asyncio.ensure_future(client.events("thread-1"))
+            await asyncio.sleep(0.02)
+            generation = client._connection_generation
+            client._dispatch(delta)
+            client._fail_stream(TransportUnavailable("wire died"))
+            first = await listen
+            self.assertEqual(
+                client._connection_generation, generation, "no reconnect expected yet"
+            )
+            with self.assertRaises(TransportUnavailable) as caught:
+                await client.events("thread-1")
+            return first, str(caught.exception)
+
+        first, message = asyncio.run(scenario())
+
+        self.assertEqual(first, [delta])
+        self.assertIn("wire died", message)
+
+    def test_a_stale_failure_marker_cannot_fail_a_turn_on_a_new_wire(self):
+        # Regression: the terminal event of a turn returns ahead of the
+        # failure marker queued behind it, leaving the marker in the queue.
+        # After a reconnect it would surface on the NEXT turn — failing a turn
+        # running over a perfectly healthy wire.
+        client = _ScriptedWireCodexStdioClient([])
+        completed = {
+            "method": "turn/completed",
+            "params": {"threadId": "thread-1", "turn": {"id": "t1"}},
+        }
+        next_turn_delta = {
+            "method": "item/agentMessage/delta",
+            "params": {"threadId": "thread-1", "turnId": "t2", "delta": "new turn"},
+        }
+
+        async def scenario():
+            listen = asyncio.ensure_future(client.events("thread-1"))
+            await asyncio.sleep(0.02)
+            client._dispatch(completed)
+            client._fail_stream(TransportUnavailable("wire died"))
+            first = await listen                      # returns at turn/completed
+            self.assertEqual(first, [completed])
+            # Reconnect: a fresh reader owns the wire from here.
+            client._start_reader()
+            await asyncio.sleep(0)
+            second = asyncio.ensure_future(client.events("thread-1"))
+            await asyncio.sleep(0.02)
+            client._dispatch(next_turn_delta)
+            return await second
+
+        events = asyncio.run(scenario())
+
+        self.assertEqual(events, [next_turn_delta])
+
+    def test_failure_with_nothing_in_hand_raises_immediately(self):
+        client = _ScriptedWireCodexStdioClient([])
+
+        async def scenario():
+            listen = asyncio.ensure_future(client.events("thread-1"))
+            await asyncio.sleep(0.02)
+            client._fail_stream(TransportUnavailable("wire died"))
+            await listen
+
+        with self.assertRaises(TransportUnavailable):
+            asyncio.run(scenario())
+
+    def test_pending_requests_are_failed_when_the_reader_dies(self):
+        client = _ScriptedWireCodexStdioClient([])
+
+        async def scenario():
+            pending = asyncio.ensure_future(client.request("turn/start", {"threadId": "thread-1"}))
+            await asyncio.sleep(0.02)
+            client._fail_stream(TransportUnavailable("wire died"))
+            with self.assertRaises(TransportUnavailable):
+                await pending
+            return client._pending_responses
+
+        leftover = asyncio.run(scenario())
+
+        self.assertEqual(leftover, {}, "a dead reader must not leak pending futures")
+
+
+class CodexAbortedListenTests(unittest.TestCase):
+    def test_carried_failure_survives_the_reconnect_it_triggers(self):
+        # Regression: the carried error was checked AFTER _ensure_started(),
+        # which reconnects a dead reader and bumps the generation — so the
+        # error looked stale, was dropped, and the caller got an empty batch.
+        # The open turn then looked merely quiet.
+        client = _ScriptedWireCodexStdioClient([])
+        delta = {
+            "method": "item/agentMessage/delta",
+            "params": {"threadId": "thread-1", "turnId": "t1", "delta": "half"},
+        }
+
+        async def scenario():
+            listen = asyncio.ensure_future(client.events("thread-1"))
+            await asyncio.sleep(0.02)
+            client._dispatch(delta)
+            client._fail_stream(TransportUnavailable("wire died"))
+            first = await listen
+            self.assertEqual(first, [delta])
+            # Kill the reader for real, so the next call must reconnect.
+            await client._stop_reader()
+            with self.assertRaises(TransportUnavailable) as caught:
+                await client.events("thread-1")
+            return str(caught.exception)
+
+        message = asyncio.run(scenario())
+
+        self.assertIn("wire died", message)
+
+    def test_cancelling_a_listen_does_not_eat_events_it_already_took(self):
+        # queue.get() is destructive: a drain cancelled at a handoff would
+        # otherwise take its collected events to the grave.
+        client = _ScriptedWireCodexStdioClient([])
+        delta = {
+            "method": "item/agentMessage/delta",
+            "params": {"threadId": "thread-1", "turnId": "t1", "delta": "keep me"},
+        }
+
+        async def scenario():
+            listen = asyncio.ensure_future(client.events("thread-1"))
+            await asyncio.sleep(0.02)
+            client._dispatch(delta)
+            await asyncio.sleep(0.02)          # let the listen pull it off
+            listen.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await listen
+            # A fresh listen must still see it.
+            return await client.events("thread-1")
+
+        events = asyncio.run(scenario())
+
+        self.assertEqual(events, [delta])

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import hashlib
 import json
 import os
@@ -137,6 +138,15 @@ TUI_BINDING_REFRESH_INTERVAL_SECONDS = 5.0
 # carrier — mid-turn narration is mirrored from the rollout transcript
 # (ADR 0055) and the turn-final text rides the stop hook's
 # last_assistant_message.
+#
+# These hooks fire for turns the TUI process runs. They do NOT fire for turns
+# we submit through app-server, which is a different process: measured on
+# 0.144.5 with one CODEX_HOME and one hooks.json, `codex exec` reports
+# "hook: SessionStart Completed" while `codex app-server --stdio` emits hook
+# events only for source="plugin" — the user-level hooks.json is never loaded
+# there. So for a codex_app_server session the hook pipeline is not a second
+# delivery path: the event stream is the ONLY one, and giving up on it (the
+# 2026-07-30 loss) drops the turn's output with nothing behind it.
 CODEX_TUI_REQUIRED_HOOKS = (
     "SessionStart",
     "UserPromptSubmit",
@@ -145,6 +155,31 @@ CODEX_TUI_REQUIRED_HOOKS = (
     "PermissionRequest",
     "Stop",
 )
+
+
+class _StreamFailure:
+    """Queued marker that the wire died at this point in the stream.
+
+    Sent through the per-thread queue rather than raised out of band so a
+    failure cannot overtake the events that arrived before it.
+
+    ``generation`` pins it to the connection that died. A marker left over
+    from an earlier wire — the turn it belonged to ended before the queue was
+    drained past it — must not surface on a later turn running over a healthy
+    reconnected wire.
+    """
+
+    __slots__ = ("error", "generation")
+
+    def __init__(self, error: BaseException, generation: int):
+        self.error = error
+        self.generation = generation
+
+
+def _as_transport_unavailable(error: BaseException) -> TransportUnavailable:
+    if isinstance(error, TransportUnavailable):
+        return error
+    return TransportUnavailable(str(error) or "Codex app-server stream failed")
 
 
 class CodexStdioAppServerClient:
@@ -173,8 +208,37 @@ class CodexStdioAppServerClient:
         self.codex_home = codex_home
         self._process: asyncio.subprocess.Process | None = None
         self._next_id = 1
+        # Guards startup and the WRITE side only. Reading is owned by the
+        # resident reader task below — the two must not share a lock: a read
+        # that holds it for the whole event window (the old shape) blocks
+        # every turn/start and approval answer behind it, which is why a
+        # message sent from the channel could sit unseen for minutes.
         self._lock = asyncio.Lock()
         self._buffered_notifications: list[dict[str, Any]] = []
+        self._reader_task: asyncio.Task | None = None
+        self._pending_responses: dict[int, asyncio.Future] = {}
+        self._thread_queues: dict[str, asyncio.Queue] = {}
+        # Who is listening RIGHT NOW, by thread. Deliberately separate from
+        # _thread_queues: a queue outlives its listener (it holds events that
+        # arrive between two drains), so "a queue exists" says nothing about
+        # whether that thread is still live. Routing decisions must use this.
+        self._active_listeners: dict[str, int] = {}
+        # Per-thread stream failure awaiting delivery, as (generation, error).
+        # Survives a reconnect for the consumer that has not seen it yet, but
+        # is pinned to the connection that broke so it cannot leak onto a
+        # later turn running over a healthy wire.
+        self._thread_failures: dict[str, tuple[int, BaseException]] = {}
+        # Events pulled off a queue by a call that then died (cancelled at a
+        # handoff, raised mid-batch). queue.get() is destructive, so they are
+        # parked here and re-served, in order, ahead of the queue.
+        self._thread_pushback: dict[str, list[dict[str, Any]]] = {}
+        # Bumped on every reader start. Everything the previous wire left
+        # behind (queued failure markers, carried errors) is stale once this
+        # moves.
+        self._connection_generation = 0
+        # Set when the reader dies; replayed to every later caller so a dead
+        # transport fails loudly instead of hanging on an empty queue.
+        self._stream_error: BaseException | None = None
 
     def _subprocess_env(self) -> dict[str, str] | None:
         # CODEX_HOME pins the profile's auth/config/daemon state; None keeps
@@ -184,49 +248,232 @@ class CodexStdioAppServerClient:
         return {**os.environ, "CODEX_HOME": self.codex_home}
 
     async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+        # Only the send is serialized; the answer arrives through the reader
+        # task, so a long event window can no longer delay a submit.
         async with self._lock:
             await self._ensure_started()
             request_id = self._next_id
             self._next_id += 1
-            await self._send({"id": request_id, "method": method, "params": params})
-            response = await self._read_response(request_id, timeout=self.request_timeout)
-            result = response.get("result", {})
-            return result if isinstance(result, dict) else {"value": result}
+            future: asyncio.Future = asyncio.get_running_loop().create_future()
+            self._pending_responses[request_id] = future
+            try:
+                await self._send({"id": request_id, "method": method, "params": params})
+            except BaseException:
+                self._pending_responses.pop(request_id, None)
+                raise
+        try:
+            response = await asyncio.wait_for(future, timeout=self.request_timeout)
+        except asyncio.TimeoutError as exc:
+            raise TransportUnavailable("Codex app-server request timed out") from exc
+        finally:
+            self._pending_responses.pop(request_id, None)
+        result = response.get("result", {})
+        return result if isinstance(result, dict) else {"value": result}
 
     async def events(self, thread_id: str) -> list[dict[str, Any]]:
+        """Collect this thread's events for up to ``event_timeout`` seconds.
+
+        Still bounded — the caller re-enters while the turn stays open — but
+        it no longer owns the wire. The resident reader task does, and it runs
+        whether or not anyone is inside this call, so events produced between
+        two drains land in the queue instead of going unread.
+        """
+        # A failure the previous call could not deliver (it had events in hand,
+        # and delivering them came first) is raised BEFORE _ensure_started().
+        # Order matters: a dead reader makes _ensure_started() reconnect, which
+        # bumps the generation — checking afterwards would find the carried
+        # error "stale", drop it, and hand the caller an empty batch. The open
+        # turn would then look merely quiet and get a synthetic completion,
+        # which is the very swallowing this carry-over exists to prevent.
+        carried = self._thread_failures.pop(thread_id, None)
+        if carried is not None and carried[0] == self._connection_generation:
+            raise _as_transport_unavailable(carried[1])
         async with self._lock:
             await self._ensure_started()
+        queue = self._queue_for(thread_id)
+        self._active_listeners[thread_id] = self._active_listeners.get(thread_id, 0) + 1
+        delivered = False
+        collected: list[dict[str, Any]] = []
+        try:
             collected = self._take_buffered(thread_id)
             if _contains_codex_turn_completed(collected, thread_id) or _contains_codex_hitl_server_request(
                 collected,
                 thread_id,
             ):
+                delivered = True
                 return collected
             deadline = time.monotonic() + self.event_timeout
             while time.monotonic() < deadline:
+                if not collected and queue.empty():
+                    # Nothing in hand and nothing queued: a dead wire can be
+                    # reported straight away. With anything queued we must go
+                    # through the queue instead — the failure sentinel sits
+                    # behind the real events, and short-circuiting here would
+                    # skip them, which is the loss this design prevents.
+                    self._raise_stream_error_if_dead()
                 timeout = min(self.event_idle_timeout, max(0.0, deadline - time.monotonic()))
                 try:
-                    message = await self._read_message(timeout=timeout)
-                except TimeoutError:
+                    message = await asyncio.wait_for(queue.get(), timeout=timeout)
+                except (asyncio.TimeoutError, TimeoutError):
                     continue
-                if _is_response_message(message):
-                    self._buffered_notifications.append(message)
-                    continue
+                if isinstance(message, _StreamFailure):
+                    if message.generation != self._connection_generation:
+                        # Left over from a wire that has since been replaced:
+                        # the turn it belonged to already ended (its terminal
+                        # event returned ahead of this marker). Raising it now
+                        # would fail a healthy turn on the new connection.
+                        continue
+                    # The failure was queued BEHIND the events that arrived
+                    # before it, so everything real has already been collected.
+                    # Deliver those first and carry the error to the next call
+                    # — dropping them to raise immediately would lose exactly
+                    # the turn output this whole change exists to protect.
+                    if collected:
+                        self._thread_failures[thread_id] = (message.generation, message.error)
+                        delivered = True
+                        return collected
+                    raise _as_transport_unavailable(message.error)
+                collected.append(message)
                 if _is_codex_hitl_server_request_message(message):
-                    if _notification_matches_thread(message, thread_id):
-                        collected.append(message)
-                        return collected
-                    self._buffered_notifications.append(message)
-                    continue
-                if not _is_notification_message(message):
-                    continue
-                if _notification_matches_thread(message, thread_id):
-                    collected.append(message)
-                    if _notification_method(message) == "turn/completed":
-                        return collected
-                else:
-                    self._buffered_notifications.append(message)
+                    delivered = True
+                    return collected
+                if _notification_method(message) == "turn/completed":
+                    delivered = True
+                    return collected
+            delivered = True
             return collected
+        finally:
+            if not delivered and collected:
+                # Cancelled or raised while holding events taken off the queue.
+                # queue.get() is destructive, so without this they would be
+                # gone for good — a drain cancelled by a handoff would silently
+                # eat whatever it had already pulled. Stash them ahead of the
+                # queue for the next call on this thread.
+                self._thread_pushback.setdefault(thread_id, []).extend(collected)
+            remaining = self._active_listeners.get(thread_id, 1) - 1
+            if remaining > 0:
+                self._active_listeners[thread_id] = remaining
+            else:
+                self._active_listeners.pop(thread_id, None)
+                # Reclaim the queue only when it holds nothing: a non-empty
+                # queue is undelivered output for this thread, and the next
+                # drain must still find it.
+                if queue.empty() and self._thread_queues.get(thread_id) is queue:
+                    self._thread_queues.pop(thread_id, None)
+
+    def _queue_for(self, thread_id: str) -> asyncio.Queue:
+        queue = self._thread_queues.get(thread_id)
+        if queue is None:
+            queue = asyncio.Queue()
+            self._thread_queues[thread_id] = queue
+        return queue
+
+    def _live_listener_threads(self) -> list[str]:
+        return [thread_id for thread_id, count in self._active_listeners.items() if count > 0]
+
+    def _raise_stream_error_if_dead(self) -> None:
+        # Fast path for a wire that died before anything reached this thread.
+        # Callers must check that both their batch AND the queue are empty
+        # first — undelivered events always outrank the failure.
+        error = self._stream_error
+        if error is None:
+            return
+        raise _as_transport_unavailable(error)
+
+    async def _reader_loop(self) -> None:
+        """Own the read side for the transport's whole lifetime.
+
+        One reader, always running: responses go to their waiting future,
+        everything else is routed to a thread queue. Nothing depends on a
+        drain being in progress at the moment a message arrives.
+        """
+        try:
+            while True:
+                try:
+                    message = await self._read_message(timeout=None)
+                except (asyncio.TimeoutError, TimeoutError):
+                    # An unbounded read should never time out; if a transport
+                    # reports one anyway, that is "nothing yet", not a death.
+                    continue
+                self._dispatch(message)
+        except asyncio.CancelledError:
+            raise
+        except BaseException as exc:  # noqa: BLE001 - replayed to every caller
+            self._fail_stream(exc)
+
+    def _dispatch(self, message: dict[str, Any]) -> None:
+        if _is_response_message(message) or _is_error_message(message):
+            future = self._pending_responses.pop(message.get("id"), None)
+            if future is not None and not future.done():
+                if _is_error_message(message):
+                    error = message.get("error", {})
+                    detail = (
+                        str(error.get("message", "Codex app-server request failed"))
+                        if isinstance(error, dict)
+                        else "Codex app-server request failed"
+                    )
+                    future.set_exception(TransportUnavailable(detail))
+                else:
+                    future.set_result(message)
+            return
+        if not _is_codex_hitl_server_request_message(message) and not _is_notification_message(message):
+            return
+        thread_id = _notification_thread_id(message)
+        if thread_id:
+            self._queue_for(thread_id).put_nowait(message)
+            return
+        # No threadId on the message. With exactly one thread listening right
+        # now it can only be that one; otherwise guessing would cross-talk
+        # sessions (they share one app-server process), so park it in the
+        # shared buffer for whichever drain can unambiguously claim it later.
+        #
+        # The liveness test is _active_listeners, NOT _thread_queues: queues
+        # are never torn down while they hold undelivered events, so "a queue
+        # exists" would mean "some thread once ran here" and, after two
+        # threads had ever run, every unaddressed message would be buffered
+        # forever with no claimant — a silent loss of exactly the final replies
+        # this change exists to protect.
+        live = self._live_listener_threads()
+        if len(live) == 1:
+            self._queue_for(live[0]).put_nowait(message)
+            return
+        _log_degrade(
+            "codex_event_without_thread_id",
+            method=_notification_method(message),
+            live_listeners=len(live),
+            buffered=len(self._buffered_notifications) + 1,
+        )
+        self._buffered_notifications.append(message)
+
+    def _fail_stream(self, exc: BaseException) -> None:
+        self._stream_error = exc
+        _log_degrade(
+            "codex_reader_stream_failed",
+            error=f"{type(exc).__name__}: {exc}",
+            pending_requests=len(self._pending_responses),
+            live_listeners=len(self._live_listener_threads()),
+            queued_threads=len(self._thread_queues),
+            buffered=len(self._buffered_notifications),
+        )
+        # Queue the failure behind whatever each thread has already received,
+        # so a consumer drains its real events first and only then learns the
+        # wire is gone. Raising out of band instead would let the error jump
+        # ahead of undelivered output.
+        failure = _StreamFailure(exc, self._connection_generation)
+        for queue in self._thread_queues.values():
+            queue.put_nowait(failure)
+        for future in list(self._pending_responses.values()):
+            if not future.done():
+                future.set_exception(_as_transport_unavailable(exc))
+        self._pending_responses.clear()
+
+    async def _stop_reader(self) -> None:
+        task, self._reader_task = self._reader_task, None
+        if task is None:
+            return
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await task
 
     async def answer_request(self, request_id: str, result: dict[str, Any]) -> None:
         async with self._lock:
@@ -234,8 +481,13 @@ class CodexStdioAppServerClient:
             await self._send({"id": request_id, "result": result})
 
     async def _ensure_started(self) -> None:
-        if self._process is not None and self._process.returncode is None:
+        if self._process is not None and self._process.returncode is None and self._reader_alive():
             return
+        # A live process whose reader died is unusable: nothing would ever
+        # route its responses. Tear it down and rebuild both together.
+        await self._stop_reader()
+        if self._process is not None:
+            await self._discard_process()
         self._process = await asyncio.create_subprocess_exec(
             *self.command,
             stdin=asyncio.subprocess.PIPE,
@@ -244,6 +496,14 @@ class CodexStdioAppServerClient:
             env=self._subprocess_env(),
             limit=self._STDOUT_LIMIT,
         )
+        await self._handshake()
+
+    async def _handshake(self) -> None:
+        """Initialize, then hand the wire to the reader task.
+
+        The handshake response is read inline on purpose: the reader must not
+        be running yet, or it would consume the reply before this call sees it.
+        """
         await self._send(
             {
                 "id": 0,
@@ -255,13 +515,29 @@ class CodexStdioAppServerClient:
             }
         )
         await self._read_response(0, timeout=self.request_timeout)
+        self._start_reader()
+
+    def _reader_alive(self) -> bool:
+        return self._reader_task is not None and not self._reader_task.done()
+
+    def _start_reader(self) -> None:
+        # A fresh wire clears the connection-level failure so new callers do
+        # not inherit the dead transport's error. _thread_failures is NOT
+        # cleared: those belong to consumers that have not seen them yet, and
+        # a reconnect does not un-break the stream they were reading.
+        self._stream_error = None
+        self._connection_generation += 1
+        self._reader_task = asyncio.ensure_future(self._reader_loop())
 
     async def _discard_process(self) -> None:
-        # Callers hold self._lock. Clearing _process makes the next request
-        # start a fresh subprocess. Buffered notifications are KEPT: they are
-        # complete, validly-parsed events (agent text, turn/completed) that
-        # already happened — killing the transport does not un-happen them,
-        # and dropping them would silently lose session events.
+        # Startup/shutdown callers hold self._lock; the reader task also lands
+        # here on an unrecoverable desync, without it (it is about to fail the
+        # stream anyway, and a racing _send just gets TransportUnavailable).
+        # Clearing _process makes the next request start a fresh subprocess.
+        # Buffered notifications are KEPT: they are complete, validly-parsed
+        # events (agent text, turn/completed) that already happened — killing
+        # the transport does not un-happen them, and dropping them would
+        # silently lose session events.
         process, self._process = self._process, None
         if process is None or process.returncode is not None:
             return
@@ -295,7 +571,9 @@ class CodexStdioAppServerClient:
                 self._buffered_notifications.append(message)
         raise TransportUnavailable("Codex app-server request timed out")
 
-    async def _read_message(self, *, timeout: float) -> dict[str, Any]:
+    async def _read_message(self, *, timeout: float | None) -> dict[str, Any]:
+        # timeout=None waits indefinitely — the resident reader has no deadline
+        # of its own; a turn may legitimately think for an hour.
         process = self._require_process()
         assert process.stdout is not None
         try:
@@ -331,10 +609,25 @@ class CodexStdioAppServerClient:
         return message
 
     def _take_buffered(self, thread_id: str) -> list[dict[str, Any]]:
+        # Anything a previous, aborted call had already taken comes first —
+        # it is strictly older than what is still queued.
+        taken = self._thread_pushback.pop(thread_id, [])
+        # Thread-less messages may only be claimed when nobody else is
+        # listening. Several TUI sessions share one app-server process, so the
+        # permissive "no threadId means mine" rule would hand one session's
+        # events to whichever drain happened to run first. Keying this on
+        # CURRENT listeners (not on queues, which outlive their listeners)
+        # keeps a message claimable once the other sessions have gone quiet,
+        # instead of stranding it in the buffer forever.
+        claim_unaddressed = not [
+            other
+            for other, count in self._active_listeners.items()
+            if count > 0 and other != thread_id
+        ]
         kept: list[dict[str, Any]] = []
-        taken: list[dict[str, Any]] = []
         for message in self._buffered_notifications:
-            if _notification_matches_thread(message, thread_id):
+            message_thread_id = _notification_thread_id(message)
+            if message_thread_id == thread_id or (not message_thread_id and claim_unaddressed):
                 taken.append(message)
             else:
                 kept.append(message)
@@ -379,8 +672,11 @@ class CodexManagedAppServerClient(CodexStdioAppServerClient):
         if not self._daemon_checked:
             await self._start_daemon()
             self._daemon_checked = True
-        if self._writer is not None and not self._writer.is_closing():
+        if self._writer is not None and not self._writer.is_closing() and self._reader_alive():
             return
+        # Same rule as the stdio client: a connection whose reader died routes
+        # nothing, so rebuild the pair rather than reusing the socket.
+        await self._stop_reader()
         await self._connect_websocket()
         await self._send(
             {
@@ -394,6 +690,7 @@ class CodexManagedAppServerClient(CodexStdioAppServerClient):
         )
         await self._read_response(0, timeout=self.request_timeout)
         await self._send({"method": "initialized", "params": {}})
+        self._start_reader()
 
     async def _start_daemon(self) -> None:
         process = await asyncio.create_subprocess_exec(
@@ -450,11 +747,14 @@ class CodexManagedAppServerClient(CodexStdioAppServerClient):
         writer.write(_websocket_text_frame(json.dumps(message)))
         await writer.drain()
 
-    async def _read_message(self, *, timeout: float) -> dict[str, Any]:
+    async def _read_message(self, *, timeout: float | None) -> dict[str, Any]:
+        # timeout=None waits indefinitely, for the resident reader task; a
+        # deadline of +inf keeps the ping/pong and non-text-frame skips on the
+        # single loop below instead of forking a second code path.
         reader = self._require_reader()
-        deadline = time.monotonic() + timeout
+        deadline = float("inf") if timeout is None else time.monotonic() + timeout
         while time.monotonic() < deadline:
-            remaining = max(0.0, deadline - time.monotonic())
+            remaining = None if deadline == float("inf") else max(0.0, deadline - time.monotonic())
             try:
                 opcode, payload = await asyncio.wait_for(_read_websocket_frame(reader), timeout=remaining)
             except asyncio.TimeoutError as exc:
@@ -670,7 +970,12 @@ def _notification_method(message: dict[str, Any]) -> str:
 def _notification_thread_id(message: dict[str, Any]) -> str:
     params = message.get("params", {})
     if isinstance(params, dict):
-        return str(params.get("threadId", "") or params.get("thread_id", "") or "")
+        # `params` is present but empty on the event_msg shape, so returning
+        # here unconditionally (the original) made the payload branch below
+        # dead code and every event_msg look thread-less.
+        thread_id = str(params.get("threadId", "") or params.get("thread_id", "") or "")
+        if thread_id:
+            return thread_id
     payload = message.get("payload", {})
     if isinstance(payload, dict):
         return str(payload.get("threadId", "") or payload.get("thread_id", "") or "")
@@ -678,6 +983,14 @@ def _notification_thread_id(message: dict[str, Any]) -> str:
 
 
 def _notification_matches_thread(message: dict[str, Any], thread_id: str) -> bool:
+    """Permissive match: a thread-less message belongs to whoever asks.
+
+    Only safe on messages that were ALREADY routed to this thread (the
+    dispatcher decided ownership) or when a single thread is live. Do not use
+    it to claim messages out of a shared buffer while several threads share
+    one app-server process — that is how one session's events surface in
+    another's channel.
+    """
     notification_thread_id = _notification_thread_id(message)
     return not notification_thread_id or notification_thread_id == thread_id
 
