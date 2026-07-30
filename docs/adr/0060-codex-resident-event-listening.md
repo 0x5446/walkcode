@@ -99,8 +99,12 @@ ceiling 窗口空转成热循环。
 
 附带收益：两次排水之间产生的事件进队列，不再无人接收。
 
-**故障必须排在事件后面。** `_fail_stream` 不是直接抛，而是往每个 thread
-队列尾部放一个 `_StreamFailure` 哨兵：消费者先把真实事件取完，再看到故障。
+**故障必须排在事件后面，且只对自己那条连接有效。** `_fail_stream` 不是直接
+抛，而是往每个 thread 队列尾部放一个 `_StreamFailure` 哨兵，哨兵带连接代次
+（`_connection_generation`，每次 `_start_reader()` 递增）：消费者先把真实
+事件取完，再看到故障；代次对不上的哨兵直接丢弃——回合的终止事件会抢在哨兵
+之前返回，把哨兵留在队列里，重连之后它会浮到下一个回合头上，让一条健康
+连接上的回合无故失败。
 拿着事件时收到哨兵 → 先交付这批，把错误存进 `_thread_failures`，下次
 `events()` 进来第一件事就抛。两个方向都要守住：
 
@@ -149,6 +153,19 @@ result（worker 中途出问题、被判 injected turn），此时文案与用�
   codex 侧误判这一主要来源；真死场景（worker EOF、提交失败）继续依赖下一
   次用户输入恢复，与 Claude 侧现状一致。要根治需要单独的状态清扫器。
 - **已知限制（deep-review 提出，本次未修）**：
+  - 无 threadId 消息的认领仍是启发式：多监听时进缓冲，等到只剩一个监听者
+    再认领。归属并非确证，只是把"立刻可能错投"换成"更晚、更少可能错投"。
+    根治要 turnId→threadId 映射。缓解事实：实测 0.144.5 的无 threadId 消息
+    只有 `remoteControl/status/changed`、`thread/started` 这类元事件，内容
+    事件（agentMessage/delta、turn/completed）都带 threadId。
+  - 同一 thread 允许多个并发监听者，而队列是破坏性读取——句柄替换的窗口里
+    两个排水会分走彼此的事件。main 上同样存在（两个并发 `events()` 抢同一
+    条 wire），本次未收窄。
+  - 流在"回合已提交、但该 thread 还没有队列"时死亡，故障无处投递，重连会
+    清掉连接级错误。codex 侧缺少 Claude 那样的 `pending_turn_lost`
+    （ADR 0058）机制，该回合只能等到 ceiling。
+  - HITL 卡片默认 10 分钟过期，而等待上限沿用 1 小时 ceiling，卡片失效后
+    监听还会空等一段时间才收尾。
   - `CodexAppServerTransport` 没有 `interrupt`，所以 ceiling 放弃监听时
     服务端回合并未真正取消。整整一小时零事件后它几乎肯定已经死了，但迟到
     事件会落在没有消费者的流上。要根治需要 app-server 侧的中断能力。

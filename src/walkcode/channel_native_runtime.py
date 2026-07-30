@@ -162,12 +162,18 @@ class _StreamFailure:
 
     Sent through the per-thread queue rather than raised out of band so a
     failure cannot overtake the events that arrived before it.
+
+    ``generation`` pins it to the connection that died. A marker left over
+    from an earlier wire — the turn it belonged to ended before the queue was
+    drained past it — must not surface on a later turn running over a healthy
+    reconnected wire.
     """
 
-    __slots__ = ("error",)
+    __slots__ = ("error", "generation")
 
-    def __init__(self, error: BaseException):
+    def __init__(self, error: BaseException, generation: int):
         self.error = error
+        self.generation = generation
 
 
 def _as_transport_unavailable(error: BaseException) -> TransportUnavailable:
@@ -217,10 +223,15 @@ class CodexStdioAppServerClient:
         # arrive between two drains), so "a queue exists" says nothing about
         # whether that thread is still live. Routing decisions must use this.
         self._active_listeners: dict[str, int] = {}
-        # Per-thread stream failure awaiting delivery. Survives a reconnect —
-        # a new wire does not un-break the old one for a consumer that has not
-        # seen the error yet.
-        self._thread_failures: dict[str, BaseException] = {}
+        # Per-thread stream failure awaiting delivery, as (generation, error).
+        # Survives a reconnect for the consumer that has not seen it yet, but
+        # is pinned to the connection that broke so it cannot leak onto a
+        # later turn running over a healthy wire.
+        self._thread_failures: dict[str, tuple[int, BaseException]] = {}
+        # Bumped on every reader start. Everything the previous wire left
+        # behind (queued failure markers, carried errors) is stale once this
+        # moves.
+        self._connection_generation = 0
         # Set when the reader dies; replayed to every later caller so a dead
         # transport fails loudly instead of hanging on an empty queue.
         self._stream_error: BaseException | None = None
@@ -272,8 +283,8 @@ class CodexStdioAppServerClient:
             # hand and delivering them came first) is raised now, before this
             # call can mistake a dead wire for a quiet one.
             carried = self._thread_failures.pop(thread_id, None)
-            if carried is not None:
-                raise _as_transport_unavailable(carried)
+            if carried is not None and carried[0] == self._connection_generation:
+                raise _as_transport_unavailable(carried[1])
             collected = self._take_buffered(thread_id)
             if _contains_codex_turn_completed(collected, thread_id) or _contains_codex_hitl_server_request(
                 collected,
@@ -295,13 +306,19 @@ class CodexStdioAppServerClient:
                 except (asyncio.TimeoutError, TimeoutError):
                     continue
                 if isinstance(message, _StreamFailure):
+                    if message.generation != self._connection_generation:
+                        # Left over from a wire that has since been replaced:
+                        # the turn it belonged to already ended (its terminal
+                        # event returned ahead of this marker). Raising it now
+                        # would fail a healthy turn on the new connection.
+                        continue
                     # The failure was queued BEHIND the events that arrived
                     # before it, so everything real has already been collected.
                     # Deliver those first and carry the error to the next call
                     # — dropping them to raise immediately would lose exactly
                     # the turn output this whole change exists to protect.
                     if collected:
-                        self._thread_failures[thread_id] = message.error
+                        self._thread_failures[thread_id] = (message.generation, message.error)
                         return collected
                     raise _as_transport_unavailable(message.error)
                 collected.append(message)
@@ -420,7 +437,7 @@ class CodexStdioAppServerClient:
         # so a consumer drains its real events first and only then learns the
         # wire is gone. Raising out of band instead would let the error jump
         # ahead of undelivered output.
-        failure = _StreamFailure(exc)
+        failure = _StreamFailure(exc, self._connection_generation)
         for queue in self._thread_queues.values():
             queue.put_nowait(failure)
         for future in list(self._pending_responses.values()):
@@ -487,6 +504,7 @@ class CodexStdioAppServerClient:
         # cleared: those belong to consumers that have not seen them yet, and
         # a reconnect does not un-break the stream they were reading.
         self._stream_error = None
+        self._connection_generation += 1
         self._reader_task = asyncio.ensure_future(self._reader_loop())
 
     async def _discard_process(self) -> None:

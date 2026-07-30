@@ -1251,7 +1251,8 @@ class CodexStreamFailureTests(unittest.TestCase):
     def test_the_failure_is_raised_on_the_next_call_not_swallowed(self):
         # Regression: a reconnect ran _start_reader, which cleared
         # _stream_error, so a mid-batch death never reached the drain and the
-        # broken turn looked merely quiet.
+        # broken turn looked merely quiet. The carried failure must survive to
+        # the next call on the SAME connection.
         client = _ScriptedWireCodexStdioClient([])
         delta = {
             "method": "item/agentMessage/delta",
@@ -1261,10 +1262,13 @@ class CodexStreamFailureTests(unittest.TestCase):
         async def scenario():
             listen = asyncio.ensure_future(client.events("thread-1"))
             await asyncio.sleep(0.02)
+            generation = client._connection_generation
             client._dispatch(delta)
             client._fail_stream(TransportUnavailable("wire died"))
             first = await listen
-            # A reconnect happens here (_ensure_started -> _start_reader).
+            self.assertEqual(
+                client._connection_generation, generation, "no reconnect expected yet"
+            )
             with self.assertRaises(TransportUnavailable) as caught:
                 await client.events("thread-1")
             return first, str(caught.exception)
@@ -1273,6 +1277,40 @@ class CodexStreamFailureTests(unittest.TestCase):
 
         self.assertEqual(first, [delta])
         self.assertIn("wire died", message)
+
+    def test_a_stale_failure_marker_cannot_fail_a_turn_on_a_new_wire(self):
+        # Regression: the terminal event of a turn returns ahead of the
+        # failure marker queued behind it, leaving the marker in the queue.
+        # After a reconnect it would surface on the NEXT turn — failing a turn
+        # running over a perfectly healthy wire.
+        client = _ScriptedWireCodexStdioClient([])
+        completed = {
+            "method": "turn/completed",
+            "params": {"threadId": "thread-1", "turn": {"id": "t1"}},
+        }
+        next_turn_delta = {
+            "method": "item/agentMessage/delta",
+            "params": {"threadId": "thread-1", "turnId": "t2", "delta": "new turn"},
+        }
+
+        async def scenario():
+            listen = asyncio.ensure_future(client.events("thread-1"))
+            await asyncio.sleep(0.02)
+            client._dispatch(completed)
+            client._fail_stream(TransportUnavailable("wire died"))
+            first = await listen                      # returns at turn/completed
+            self.assertEqual(first, [completed])
+            # Reconnect: a fresh reader owns the wire from here.
+            client._start_reader()
+            await asyncio.sleep(0)
+            second = asyncio.ensure_future(client.events("thread-1"))
+            await asyncio.sleep(0.02)
+            client._dispatch(next_turn_delta)
+            return await second
+
+        events = asyncio.run(scenario())
+
+        self.assertEqual(events, [next_turn_delta])
 
     def test_failure_with_nothing_in_hand_raises_immediately(self):
         client = _ScriptedWireCodexStdioClient([])

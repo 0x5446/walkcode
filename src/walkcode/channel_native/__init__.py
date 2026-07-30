@@ -8090,6 +8090,12 @@ class CodexAppServerTransport:
                 # silent loss this whole change exists to remove.
                 if event.type in self._TURN_PARKING_EVENTS:
                     parked_on_human = True
+                else:
+                    # The agent produced something, so it is running again —
+                    # the card was answered (or withdrawn). Clearing this
+                    # matters for how a LATER silence is reported: a stalled
+                    # agent must not be described as "waiting for you".
+                    parked_on_human = False
                 if event.type == AgentEventType.TURN_COMPLETED:
                     turn_closed = True
             if delta_parts:
