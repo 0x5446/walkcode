@@ -1,6 +1,6 @@
 [project]
 name = "walkcode"
-version = "0.14.16"
+version = "0.14.17"
 description = "Channel-native Telegram/Lark runtime for Claude Code and Codex"
 readme = "README.md"
 requires-python = ">=3.13"
