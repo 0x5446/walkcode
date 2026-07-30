@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import contextlib
 import hashlib
 import json
 import os
@@ -25,6 +26,8 @@ from walkcode.channel_native import (
 from walkcode.channel_native_runtime import (
     CodexManagedAppServerClient,
     CodexStdioAppServerClient,
+    _notification_matches_thread,
+    _notification_thread_id,
     _read_websocket_frame,
     _websocket_frame,
 )
@@ -82,11 +85,18 @@ class _IdleGapCodexStdioClient(CodexStdioAppServerClient):
         ]
 
     async def _ensure_started(self):
-        return None
+        if not self._reader_alive():
+            self._start_reader()
 
     async def _read_message(self, *, timeout):
+        if not self.messages:
+            # Idle wire: the resident reader blocks here in production.
+            await asyncio.sleep(0.01)
+            raise TimeoutError()
         message = self.messages.pop(0)
         if isinstance(message, Exception):
+            # A scripted idle gap between two real messages.
+            await asyncio.sleep(0.01)
             raise message
         return message
 
@@ -114,10 +124,12 @@ class _EventMsgCodexStdioClient(CodexStdioAppServerClient):
         ]
 
     async def _ensure_started(self):
-        return None
+        if not self._reader_alive():
+            self._start_reader()
 
     async def _read_message(self, *, timeout):
         if not self.messages:
+            await asyncio.sleep(0.01)
             raise TimeoutError()
         return self.messages.pop(0)
 
@@ -143,10 +155,12 @@ class _ServerRequestCodexStdioClient(CodexStdioAppServerClient):
         ]
 
     async def _ensure_started(self):
-        return None
+        if not self._reader_alive():
+            self._start_reader()
 
     async def _read_message(self, *, timeout):
         if not self.messages:
+            await asyncio.sleep(0.01)
             raise TimeoutError()
         return self.messages.pop(0)
 
@@ -167,6 +181,10 @@ class _ManagedClientNoProcess(CodexManagedAppServerClient):
 
     async def _send(self, message):
         self.sent.append(message)
+        # No wire and no reader here: answer the request the way the resident
+        # reader would, so request() resolves its future.
+        if "id" in message:
+            self._dispatch({"id": message["id"], "result": {"thread": {"id": "thread-managed"}}})
 
     async def _read_response(self, request_id, *, timeout):
         return {"id": request_id, "result": {"thread": {"id": "thread-managed"}}}
@@ -1025,3 +1043,102 @@ class CodexPersistentListenTests(unittest.TestCase):
         self.assertTrue(slept, "empty batches must be throttled")
         self.assertTrue(all(delay <= 0.01 for delay in slept), slept)
         self.assertEqual(events[-1].type, AgentEventType.TURN_COMPLETED)
+
+
+class _ScriptedWireCodexStdioClient(CodexStdioAppServerClient):
+    """Stdio client whose wire is a scripted list instead of a subprocess."""
+
+    def __init__(self, wire):
+        super().__init__(request_timeout=1, event_timeout=0.2, event_idle_timeout=0.01)
+        self.wire = list(wire)
+        self.sent: list[dict] = []
+
+    async def _ensure_started(self):
+        if not self._reader_alive():
+            self._start_reader()
+
+    async def _send(self, message):
+        self.sent.append(message)
+
+    async def _read_message(self, *, timeout):
+        if not self.wire:
+            await asyncio.sleep(0.01)
+            raise TimeoutError()
+        return self.wire.pop(0)
+
+
+class CodexEventRoutingTests(unittest.TestCase):
+    def test_thread_less_events_are_not_handed_to_a_foreign_thread(self):
+        # Several TUI sessions share one app-server process. An event with no
+        # threadId used to go to whichever drain asked first, surfacing one
+        # session's output in another session's channel.
+        client = _ScriptedWireCodexStdioClient(
+            [
+                {"type": "event_msg", "payload": {"type": "agent_message", "message": "whose?"}},
+            ]
+        )
+
+        async def scenario():
+            # Two live threads: thread-b asks, and must not be given the
+            # unaddressed message.
+            client._queue_for("thread-a")
+            client._queue_for("thread-b")
+            return await client.events("thread-b")
+
+        events = asyncio.run(scenario())
+
+        self.assertEqual(events, [])
+        self.assertEqual(len(client._buffered_notifications), 1)
+
+    def test_thread_less_events_still_reach_a_solitary_thread(self):
+        client = _ScriptedWireCodexStdioClient(
+            [
+                {
+                    "type": "event_msg",
+                    "payload": {"type": "task_complete", "last_agent_message": "done"},
+                },
+            ]
+        )
+
+        events = asyncio.run(client.events("thread-only"))
+
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["payload"]["type"], "task_complete")
+
+    def test_event_msg_thread_id_is_read_from_the_payload(self):
+        # `params` is absent on the event_msg shape, and the old extractor
+        # returned "" from the params branch before ever reaching payload.
+        message = {
+            "type": "event_msg",
+            "payload": {"type": "agent_message", "threadId": "thread-x", "message": "hi"},
+        }
+
+        self.assertEqual(_notification_thread_id(message), "thread-x")
+        self.assertFalse(_notification_matches_thread(message, "thread-y"))
+        self.assertTrue(_notification_matches_thread(message, "thread-x"))
+
+    def test_events_do_not_block_a_concurrent_request(self):
+        # The old events() held the client lock for its whole window, so a
+        # message sent from the channel could wait minutes to be submitted.
+        client = _ScriptedWireCodexStdioClient([])
+
+        async def scenario():
+            listen = asyncio.ensure_future(client.events("thread-1"))
+            await asyncio.sleep(0.01)
+
+            async def answer_later():
+                await asyncio.sleep(0.01)
+                client._dispatch({"id": 1, "result": {"turn": {"id": "turn-1"}}})
+
+            asyncio.ensure_future(answer_later())
+            result = await asyncio.wait_for(
+                client.request("turn/start", {"threadId": "thread-1"}), timeout=1
+            )
+            listen.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await listen
+            return result
+
+        result = asyncio.run(scenario())
+
+        self.assertEqual(result["turn"]["id"], "turn-1")

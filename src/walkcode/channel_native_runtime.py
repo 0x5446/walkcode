@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import hashlib
 import json
 import os
@@ -173,8 +174,19 @@ class CodexStdioAppServerClient:
         self.codex_home = codex_home
         self._process: asyncio.subprocess.Process | None = None
         self._next_id = 1
+        # Guards startup and the WRITE side only. Reading is owned by the
+        # resident reader task below — the two must not share a lock: a read
+        # that holds it for the whole event window (the old shape) blocks
+        # every turn/start and approval answer behind it, which is why a
+        # message sent from the channel could sit unseen for minutes.
         self._lock = asyncio.Lock()
         self._buffered_notifications: list[dict[str, Any]] = []
+        self._reader_task: asyncio.Task | None = None
+        self._pending_responses: dict[int, asyncio.Future] = {}
+        self._thread_queues: dict[str, asyncio.Queue] = {}
+        # Set when the reader dies; replayed to every later caller so a dead
+        # transport fails loudly instead of hanging on an empty queue.
+        self._stream_error: BaseException | None = None
 
     def _subprocess_env(self) -> dict[str, str] | None:
         # CODEX_HOME pins the profile's auth/config/daemon state; None keeps
@@ -184,49 +196,154 @@ class CodexStdioAppServerClient:
         return {**os.environ, "CODEX_HOME": self.codex_home}
 
     async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+        # Only the send is serialized; the answer arrives through the reader
+        # task, so a long event window can no longer delay a submit.
         async with self._lock:
             await self._ensure_started()
             request_id = self._next_id
             self._next_id += 1
-            await self._send({"id": request_id, "method": method, "params": params})
-            response = await self._read_response(request_id, timeout=self.request_timeout)
-            result = response.get("result", {})
-            return result if isinstance(result, dict) else {"value": result}
+            future: asyncio.Future = asyncio.get_running_loop().create_future()
+            self._pending_responses[request_id] = future
+            try:
+                await self._send({"id": request_id, "method": method, "params": params})
+            except BaseException:
+                self._pending_responses.pop(request_id, None)
+                raise
+        try:
+            response = await asyncio.wait_for(future, timeout=self.request_timeout)
+        except asyncio.TimeoutError as exc:
+            raise TransportUnavailable("Codex app-server request timed out") from exc
+        finally:
+            self._pending_responses.pop(request_id, None)
+        result = response.get("result", {})
+        return result if isinstance(result, dict) else {"value": result}
 
     async def events(self, thread_id: str) -> list[dict[str, Any]]:
+        """Collect this thread's events for up to ``event_timeout`` seconds.
+
+        Still bounded — the caller re-enters while the turn stays open — but
+        it no longer owns the wire. The resident reader task does, and it runs
+        whether or not anyone is inside this call, so events produced between
+        two drains land in the queue instead of going unread.
+        """
         async with self._lock:
             await self._ensure_started()
-            collected = self._take_buffered(thread_id)
-            if _contains_codex_turn_completed(collected, thread_id) or _contains_codex_hitl_server_request(
-                collected,
-                thread_id,
-            ):
-                return collected
-            deadline = time.monotonic() + self.event_timeout
-            while time.monotonic() < deadline:
-                timeout = min(self.event_idle_timeout, max(0.0, deadline - time.monotonic()))
-                try:
-                    message = await self._read_message(timeout=timeout)
-                except TimeoutError:
-                    continue
-                if _is_response_message(message):
-                    self._buffered_notifications.append(message)
-                    continue
-                if _is_codex_hitl_server_request_message(message):
-                    if _notification_matches_thread(message, thread_id):
-                        collected.append(message)
-                        return collected
-                    self._buffered_notifications.append(message)
-                    continue
-                if not _is_notification_message(message):
-                    continue
-                if _notification_matches_thread(message, thread_id):
-                    collected.append(message)
-                    if _notification_method(message) == "turn/completed":
-                        return collected
-                else:
-                    self._buffered_notifications.append(message)
+        queue = self._queue_for(thread_id)
+        collected = self._take_buffered(thread_id)
+        if _contains_codex_turn_completed(collected, thread_id) or _contains_codex_hitl_server_request(
+            collected,
+            thread_id,
+        ):
             return collected
+        deadline = time.monotonic() + self.event_timeout
+        while time.monotonic() < deadline:
+            if not collected:
+                self._raise_stream_error_if_dead()
+            timeout = min(self.event_idle_timeout, max(0.0, deadline - time.monotonic()))
+            try:
+                message = await asyncio.wait_for(queue.get(), timeout=timeout)
+            except (asyncio.TimeoutError, TimeoutError):
+                continue
+            collected.append(message)
+            if _is_codex_hitl_server_request_message(message):
+                return collected
+            if _notification_method(message) == "turn/completed":
+                return collected
+        return collected
+
+    def _queue_for(self, thread_id: str) -> asyncio.Queue:
+        queue = self._thread_queues.get(thread_id)
+        if queue is None:
+            queue = asyncio.Queue()
+            self._thread_queues[thread_id] = queue
+        return queue
+
+    def _raise_stream_error_if_dead(self) -> None:
+        # Only surfaced when the caller has nothing in hand: events already
+        # collected are real and must be delivered before the failure.
+        error = self._stream_error
+        if error is None:
+            return
+        if isinstance(error, TransportUnavailable):
+            raise error
+        raise TransportUnavailable(str(error) or "Codex app-server stream failed") from error
+
+    async def _reader_loop(self) -> None:
+        """Own the read side for the transport's whole lifetime.
+
+        One reader, always running: responses go to their waiting future,
+        everything else is routed to a thread queue. Nothing depends on a
+        drain being in progress at the moment a message arrives.
+        """
+        try:
+            while True:
+                try:
+                    message = await self._read_message(timeout=None)
+                except (asyncio.TimeoutError, TimeoutError):
+                    # An unbounded read should never time out; if a transport
+                    # reports one anyway, that is "nothing yet", not a death.
+                    continue
+                self._dispatch(message)
+        except asyncio.CancelledError:
+            raise
+        except BaseException as exc:  # noqa: BLE001 - replayed to every caller
+            self._fail_stream(exc)
+
+    def _dispatch(self, message: dict[str, Any]) -> None:
+        if _is_response_message(message) or _is_error_message(message):
+            future = self._pending_responses.pop(message.get("id"), None)
+            if future is not None and not future.done():
+                if _is_error_message(message):
+                    error = message.get("error", {})
+                    detail = (
+                        str(error.get("message", "Codex app-server request failed"))
+                        if isinstance(error, dict)
+                        else "Codex app-server request failed"
+                    )
+                    future.set_exception(TransportUnavailable(detail))
+                else:
+                    future.set_result(message)
+            return
+        if not _is_codex_hitl_server_request_message(message) and not _is_notification_message(message):
+            return
+        thread_id = _notification_thread_id(message)
+        if thread_id:
+            self._queue_for(thread_id).put_nowait(message)
+            return
+        # No threadId on the message. With exactly one live thread it can only
+        # be that one; with several, guessing would cross-talk sessions (they
+        # share one app-server process), so park it in the shared buffer where
+        # the next _take_buffered can claim it rather than delivering it to an
+        # arbitrary reader.
+        live = list(self._thread_queues)
+        if len(live) == 1:
+            self._queue_for(live[0]).put_nowait(message)
+            return
+        _log_degrade(
+            "codex_event_without_thread_id",
+            method=_notification_method(message),
+            live_threads=len(live),
+        )
+        self._buffered_notifications.append(message)
+
+    def _fail_stream(self, exc: BaseException) -> None:
+        self._stream_error = exc
+        for future in list(self._pending_responses.values()):
+            if not future.done():
+                future.set_exception(
+                    exc
+                    if isinstance(exc, TransportUnavailable)
+                    else TransportUnavailable(str(exc) or "Codex app-server stream failed")
+                )
+        self._pending_responses.clear()
+
+    async def _stop_reader(self) -> None:
+        task, self._reader_task = self._reader_task, None
+        if task is None:
+            return
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await task
 
     async def answer_request(self, request_id: str, result: dict[str, Any]) -> None:
         async with self._lock:
@@ -234,8 +351,13 @@ class CodexStdioAppServerClient:
             await self._send({"id": request_id, "result": result})
 
     async def _ensure_started(self) -> None:
-        if self._process is not None and self._process.returncode is None:
+        if self._process is not None and self._process.returncode is None and self._reader_alive():
             return
+        # A live process whose reader died is unusable: nothing would ever
+        # route its responses. Tear it down and rebuild both together.
+        await self._stop_reader()
+        if self._process is not None:
+            await self._discard_process()
         self._process = await asyncio.create_subprocess_exec(
             *self.command,
             stdin=asyncio.subprocess.PIPE,
@@ -244,6 +366,14 @@ class CodexStdioAppServerClient:
             env=self._subprocess_env(),
             limit=self._STDOUT_LIMIT,
         )
+        await self._handshake()
+
+    async def _handshake(self) -> None:
+        """Initialize, then hand the wire to the reader task.
+
+        The handshake response is read inline on purpose: the reader must not
+        be running yet, or it would consume the reply before this call sees it.
+        """
         await self._send(
             {
                 "id": 0,
@@ -255,13 +385,26 @@ class CodexStdioAppServerClient:
             }
         )
         await self._read_response(0, timeout=self.request_timeout)
+        self._start_reader()
+
+    def _reader_alive(self) -> bool:
+        return self._reader_task is not None and not self._reader_task.done()
+
+    def _start_reader(self) -> None:
+        # A fresh wire clears the previous failure: callers must not inherit
+        # the dead transport's error after a successful restart.
+        self._stream_error = None
+        self._reader_task = asyncio.ensure_future(self._reader_loop())
 
     async def _discard_process(self) -> None:
-        # Callers hold self._lock. Clearing _process makes the next request
-        # start a fresh subprocess. Buffered notifications are KEPT: they are
-        # complete, validly-parsed events (agent text, turn/completed) that
-        # already happened — killing the transport does not un-happen them,
-        # and dropping them would silently lose session events.
+        # Startup/shutdown callers hold self._lock; the reader task also lands
+        # here on an unrecoverable desync, without it (it is about to fail the
+        # stream anyway, and a racing _send just gets TransportUnavailable).
+        # Clearing _process makes the next request start a fresh subprocess.
+        # Buffered notifications are KEPT: they are complete, validly-parsed
+        # events (agent text, turn/completed) that already happened — killing
+        # the transport does not un-happen them, and dropping them would
+        # silently lose session events.
         process, self._process = self._process, None
         if process is None or process.returncode is not None:
             return
@@ -295,7 +438,9 @@ class CodexStdioAppServerClient:
                 self._buffered_notifications.append(message)
         raise TransportUnavailable("Codex app-server request timed out")
 
-    async def _read_message(self, *, timeout: float) -> dict[str, Any]:
+    async def _read_message(self, *, timeout: float | None) -> dict[str, Any]:
+        # timeout=None waits indefinitely — the resident reader has no deadline
+        # of its own; a turn may legitimately think for an hour.
         process = self._require_process()
         assert process.stdout is not None
         try:
@@ -331,10 +476,16 @@ class CodexStdioAppServerClient:
         return message
 
     def _take_buffered(self, thread_id: str) -> list[dict[str, Any]]:
+        # Thread-less messages may only be claimed when this is the only live
+        # thread. Several TUI sessions share one app-server process, so the
+        # permissive "no threadId means mine" rule would hand one session's
+        # events to whichever drain happened to run first.
+        claim_unaddressed = len(self._thread_queues) <= 1
         kept: list[dict[str, Any]] = []
         taken: list[dict[str, Any]] = []
         for message in self._buffered_notifications:
-            if _notification_matches_thread(message, thread_id):
+            message_thread_id = _notification_thread_id(message)
+            if message_thread_id == thread_id or (not message_thread_id and claim_unaddressed):
                 taken.append(message)
             else:
                 kept.append(message)
@@ -379,8 +530,11 @@ class CodexManagedAppServerClient(CodexStdioAppServerClient):
         if not self._daemon_checked:
             await self._start_daemon()
             self._daemon_checked = True
-        if self._writer is not None and not self._writer.is_closing():
+        if self._writer is not None and not self._writer.is_closing() and self._reader_alive():
             return
+        # Same rule as the stdio client: a connection whose reader died routes
+        # nothing, so rebuild the pair rather than reusing the socket.
+        await self._stop_reader()
         await self._connect_websocket()
         await self._send(
             {
@@ -394,6 +548,7 @@ class CodexManagedAppServerClient(CodexStdioAppServerClient):
         )
         await self._read_response(0, timeout=self.request_timeout)
         await self._send({"method": "initialized", "params": {}})
+        self._start_reader()
 
     async def _start_daemon(self) -> None:
         process = await asyncio.create_subprocess_exec(
@@ -450,11 +605,14 @@ class CodexManagedAppServerClient(CodexStdioAppServerClient):
         writer.write(_websocket_text_frame(json.dumps(message)))
         await writer.drain()
 
-    async def _read_message(self, *, timeout: float) -> dict[str, Any]:
+    async def _read_message(self, *, timeout: float | None) -> dict[str, Any]:
+        # timeout=None waits indefinitely, for the resident reader task; a
+        # deadline of +inf keeps the ping/pong and non-text-frame skips on the
+        # single loop below instead of forking a second code path.
         reader = self._require_reader()
-        deadline = time.monotonic() + timeout
+        deadline = float("inf") if timeout is None else time.monotonic() + timeout
         while time.monotonic() < deadline:
-            remaining = max(0.0, deadline - time.monotonic())
+            remaining = None if deadline == float("inf") else max(0.0, deadline - time.monotonic())
             try:
                 opcode, payload = await asyncio.wait_for(_read_websocket_frame(reader), timeout=remaining)
             except asyncio.TimeoutError as exc:
@@ -670,7 +828,12 @@ def _notification_method(message: dict[str, Any]) -> str:
 def _notification_thread_id(message: dict[str, Any]) -> str:
     params = message.get("params", {})
     if isinstance(params, dict):
-        return str(params.get("threadId", "") or params.get("thread_id", "") or "")
+        # `params` is present but empty on the event_msg shape, so returning
+        # here unconditionally (the original) made the payload branch below
+        # dead code and every event_msg look thread-less.
+        thread_id = str(params.get("threadId", "") or params.get("thread_id", "") or "")
+        if thread_id:
+            return thread_id
     payload = message.get("payload", {})
     if isinstance(payload, dict):
         return str(payload.get("threadId", "") or payload.get("thread_id", "") or "")
@@ -678,6 +841,14 @@ def _notification_thread_id(message: dict[str, Any]) -> str:
 
 
 def _notification_matches_thread(message: dict[str, Any], thread_id: str) -> bool:
+    """Permissive match: a thread-less message belongs to whoever asks.
+
+    Only safe on messages that were ALREADY routed to this thread (the
+    dispatcher decided ownership) or when a single thread is live. Do not use
+    it to claim messages out of a shared buffer while several threads share
+    one app-server process — that is how one session's events surface in
+    another's channel.
+    """
     notification_thread_id = _notification_thread_id(message)
     return not notification_thread_id or notification_thread_id == thread_id
 
