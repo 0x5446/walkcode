@@ -52,9 +52,42 @@ battle-tested and is ported rather than reinvented
   `editCard` patch — the first version does not return inline raw cards, which
   avoids racing the patch path. Inline card flips are a later polish item.
 - **Placement**: one session per reply chain. A non-reply message roots a new
-  session at its own message id; thread replies resolve through the existing
-  binding. No topic-creation API is needed (contrast: ADR 0033's Telegram
-  forum topics).
+  session; thread replies resolve through the existing binding. No
+  topic-creation API is needed (contrast: ADR 0033's Telegram forum topics).
+- **The root should be a health card, and that card is also the status card**
+  (amended 2026-08-03; originally the chain rooted on the triggering message
+  itself, and the TUI-observed path rooted on a plain text notice). Both
+  placement paths now try to send a bot-owned health card and set
+  `root_message_id == health_message_id`; the channel-initiated path forwards
+  the user's original text into the thread as the first reply. Rationale: the
+  collapsed thread list renders the root, so the root is the only surface a
+  live session title can occupy — and Feishu's text-message edit API is capped
+  (sender-only, 20 edits, admin-set window; error codes 230071/230072/230075)
+  whereas card patches are uncapped.
+
+  **This equality is best-effort, not an invariant**: if the root card cannot
+  be sent, the channel-initiated path roots on the user's own message (no later
+  heal), and the TUI-observed path may start rootless (the maintenance tick
+  heals that one). Consumers must test the equality, never assume it. Two
+  behaviours are conditioned on it:
+  - when the status card IS the root, a failed edit does not fall back to
+    sending a replacement card. Feishu has no "replace thread root" API, so the
+    replacement lands as a child and the root stays frozen on its old title.
+    Keep the pointer, log the degrade, retry on the next refresh — but bound
+    the retry (`ROOT_CARD_EDIT_RETRY_BUDGET`; a `PermanentDeliveryError` skips
+    the budget). A deleted or expired root fails identically forever, so on
+    exhaustion the session demotes to a child status card rather than leaving
+    the user with a card that never updates again.
+  - the status-card dedup cache is keyed by `(message_id, fingerprint)`. A
+    session can change status cards mid-life (rootless heal, demotion,
+    send-fallback); a session-only key would match the old card's fingerprint
+    and freeze the new card at whatever it was created with.
+- **Session title on the root card** (2026-08-03): `Session.cached_title` is
+  refreshed at turn end via one entry point and ranked by source
+  (`tui_hook` < `turn_digest` < `initial_user_input` < `llm_summary`, reserved).
+  Rank upgrades apply immediately; same-rank overwrites are throttled and only
+  allowed for rolling sources, so the user's first prompt is not repainted by
+  later ones. See ARCHITECTURE.md "Session titles" for the four feeding paths.
 - Ingress protection: `LARK_ALLOWED_CHAT_IDS` / `LARK_ALLOWED_OPEN_IDS`
   allowlists; `WALKCODE_E2E_LARK_CHAT_ID` restricts the runtime by default the
   same way the Telegram E2E chat id does. Redelivered WS events are absorbed
