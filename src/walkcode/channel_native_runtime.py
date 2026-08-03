@@ -4131,7 +4131,21 @@ class ChannelNativeRuntime:
                     thread_id="",
                     root_message_id="",
                 ),
-                {"type": "text", "text": f"👀 TUI: {agent} {identity}（补建话题根）"},
+                # Card, matching the creation path: the healed root is also the
+                # status card, so a title refresh patches it rather than
+                # stacking a second card under it.
+                ViewModelFactory.health_view(
+                    status="running",
+                    title=(
+                        session.cached_title
+                        or _telegram_session_topic_name(agent, f"TUI {identity}")
+                    ),
+                    session_id=session.session_id,
+                    transport=session.transport_kind,
+                    elapsed=0.0,
+                    cwd=session.cwd,
+                    readonly=True,
+                ),
             )
         except Exception as exc:
             _log_degrade(
@@ -4158,17 +4172,20 @@ class ChannelNativeRuntime:
         # Rebuild + re-register instead of mutating in place: the binding KEY
         # changes, and the registry's binding->session index would otherwise
         # keep the rootless key — replies in the new thread would not resolve
-        # to this session and could spawn a second one. Card pointers reset so
-        # the status card is recreated inside the new thread (the old one
-        # stays behind in the main chat).
+        # to this session and could spawn a second one. The card just sent is
+        # the new status card (the old one stays behind in the main chat), so
+        # the pointer moves to it rather than being cleared.
         healed_binding = replace(
             binding,
             thread_id=str(root_id),
             root_message_id=str(root_id),
-            health_message_id="",
+            health_message_id=str(root_id),
             last_message_id="",
         )
         self.state.sessions.update_channel_binding(session.session_id, healed_binding)
+        # No fingerprint bookkeeping here: the cache is keyed by (message_id,
+        # fingerprint), so moving the status card onto the new root already
+        # invalidates the entry belonging to the card left in the main chat.
         return "healed"
 
     async def _maybe_mark_stale_tui_process_detached(self, session) -> bool:
@@ -4319,8 +4336,18 @@ class ChannelNativeRuntime:
             )
         channel = self.channels["lark"]
         # Lark has no topic-creation API; the observation thread is rooted at a
-        # bot-sent notice message so the session's transcript lands in one
-        # reply chain instead of the chat root.
+        # bot-sent message so the session's transcript lands in one reply chain
+        # instead of the chat root.
+        #
+        # That root is a health CARD, not text, and doubles as the session's
+        # status card. Two reasons it cannot be text: Lark only lets a bot edit
+        # its own text message 20 times and inside an admin-set window
+        # (230072/230075), which a per-turn title refresh burns through, while
+        # card patches are uncapped; and the thread's collapsed view shows the
+        # root, so a text root would pin the raw session uuid there forever.
+        # Channel-originated sessions already root on a card
+        # (_ensure_lark_session_root_card) — this puts the observed path on the
+        # same footing.
         root_id = ""
         try:
             root_id = await channel.send_view(
@@ -4331,17 +4358,25 @@ class ChannelNativeRuntime:
                     thread_id="",
                     root_message_id="",
                 ),
-                {
-                    "type": "text",
-                    "text": (
-                        f"👀 TUI: {agent_name} "
-                        f"{_resume_ref_identity(transport_kind, resume_ref)}"
+                ViewModelFactory.health_view(
+                    status="running",
+                    # Same string the caller stamps as cached_title, so the
+                    # card does not re-title itself on the first refresh. The
+                    # first prompt replaces it with something readable.
+                    title=_telegram_session_topic_name(
+                        agent_name,
+                        f"TUI {_resume_ref_identity(transport_kind, resume_ref)}",
                     ),
-                },
+                    session_id="",
+                    transport="external_tui",
+                    elapsed=0.0,
+                    cwd=str(self.config.cwd),
+                    readonly=True,
+                ),
             )
         except Exception as exc:
             print(
-                f"lark TUI observation root message failed; falling back to chat root: "
+                f"lark TUI observation root card failed; falling back to chat root: "
                 f"{type(exc).__name__}: {exc}",
                 file=sys.stderr,
             )
@@ -4351,6 +4386,9 @@ class ChannelNativeRuntime:
             chat_id=chat_id,
             thread_id=root_id,
             root_message_id=root_id,
+            # The root IS the status card: refreshes patch it in place instead
+            # of sending a second card into the thread.
+            health_message_id=root_id,
             # No static_status_card: Lark card patches are uncapped, so the
             # observation card keeps refreshing (e.g. drops the Take over
             # button once the session is taken over).
@@ -4564,6 +4602,17 @@ class ChannelNativeRuntime:
             return
         # A user prompt / turn end breaks the tool burst; next tools open a new card.
         self.orchestrator._seal_tool_progress_burst(session)
+        if hook_type in {"user-prompt-submit", "stop"}:
+            # Turn-end signal for the two TUI paths (claude and codex both
+            # deliver it through hooks.json). The prompt is the stronger
+            # material — the stop bubble's last_assistant_message only has to
+            # cover sessions we attached to mid-flight, where the first prompt
+            # was submitted before the hook pipeline was watching.
+            await self.orchestrator._maybe_refresh_session_title(
+                session,
+                user_text=text if hook_type == "user-prompt-submit" else "",
+                assistant_text=text if hook_type == "stop" else "",
+            )
         await self.orchestrator.refresh_session_status_card(session)
         # A prompt injected from the channel via daemon reply echoes back as a
         # user-prompt-submit hook; re-posting it would repeat the sender's own

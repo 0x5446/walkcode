@@ -1089,20 +1089,63 @@ class LarkTuiObservationTests(_LarkRuntimeHarness):
 
         self.assertTrue(created.accepted)
         self.assertTrue(stopped.accepted)
+        # The root is a card, not text: Lark caps text edits at 20 and the
+        # thread's collapsed view shows the root, so the title has to live on
+        # a surface that can be patched for the life of the session.
         root_call = api.calls[0]
-        self.assertEqual(root_call[0], "sendMessage")
+        self.assertEqual(root_call[0], "sendCard")
         self.assertEqual(root_call[1]["chat_id"], "oc_chat")
-        self.assertIn("👀 TUI: ", root_call[1]["text"])
+        self.assertEqual(root_call[1]["view"]["type"], "health")
+        self.assertEqual(root_call[1]["view"]["title"], "claude: TUI claude-session-1")
         summaries = runtime.state.sessions.list_sessions(channel_kind="lark")
         self.assertEqual(len(summaries), 1)
         session = runtime.state.sessions.get(summaries[0].session_id)
         self.assertEqual(session.channel_binding.chat_id, "oc_chat")
         self.assertEqual(session.channel_binding.root_message_id, "lark-msg-1")
+        # Root doubles as the status card, so refreshes patch it in place.
+        self.assertEqual(session.channel_binding.health_message_id, "lark-msg-1")
         self.assertEqual(session.lifecycle_state, "EXTERNAL_OBSERVED_READONLY")
         self.assertEqual(session.writer_owner.kind, "external_tui")
         forwarded = [p for m, p in api.calls if m == "sendMessage" and p.get("text") == "finished from TUI"]
         self.assertEqual(len(forwarded), 1)
         self.assertEqual(forwarded[0]["root_id"], "lark-msg-1")
+
+    def test_first_prompt_patches_the_root_card_title(self):
+        # The point of rooting on a card: the thread's collapsed view starts
+        # out showing the session uuid and has to become readable once the
+        # user's first prompt arrives.
+        runtime, api, transport = self._runtime(
+            env_extra={"LARK_ALLOWED_CHAT_IDS": "oc_chat"}
+        )
+
+        asyncio.run(
+            runtime.process_tui_hook(
+                hook_type="sync", agent="claude", payload=self._tui_payload(self._tmp.name)
+            )
+        )
+        self.assertEqual(api.calls[0][1]["view"]["title"], "claude: TUI claude-session-1")
+
+        asyncio.run(
+            runtime.process_tui_hook(
+                hook_type="UserPromptSubmit",
+                agent="claude",
+                payload=self._tui_payload(self._tmp.name, prompt="把话题根标题改成有意义的"),
+            )
+        )
+
+        session = runtime.state.sessions.get(
+            runtime.state.sessions.list_sessions(channel_kind="lark")[0].session_id
+        )
+        self.assertEqual(session.cached_title, "把话题根标题改成有意义的")
+        self.assertEqual(session.title_source, "initial_user_input")
+        # Patched in place — the root message id never changes.
+        retitled = [
+            payload
+            for method, payload in api.calls
+            if method == "editCard" and payload["view"].get("title") == "把话题根标题改成有意义的"
+        ]
+        self.assertTrue(retitled)
+        self.assertEqual(retitled[-1]["message_id"], "lark-msg-1")
 
     def test_tui_hook_without_lark_chat_raises_config_error(self):
         runtime, api, transport = self._runtime()

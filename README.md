@@ -27,7 +27,9 @@ WalkCode V3 是 channel-native 的 Coding Agent runtime。它把 IM 当成一等
 同一时刻只有一端 UI 是会话的 master，另一端只读观察：
 
 - **TUI master**：终端裸启动的会话由 hook 只读观察，飞书话题实时渲染
-  内容与状态卡，但不可直写；
+  内容与状态卡，但不可直写；话题根就是那张状态卡，标题会在回合结束时
+  刷新成会话在做的事（首个提问优先，抓不到才用助手最后一句），折叠列表里
+  看到的就不再是一串 session id；
 - **takeover → 飞书独占**：飞书想写先点接管卡——walkcode 终止 TUI 进程、
   headless resume、提交被阻塞的消息；接管前悬空的提问/权限卡会收到过期
   通知，且悬空的提问默认自动以新卡重现（`WALKCODE_HANDOFF_CONTINUE=auto`，

@@ -2602,10 +2602,14 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
         # thread would not resolve to this session (deep-review round 1).
         self.assertEqual(registry.resolve_binding(healed_binding.key()), session.session_id)
         self.assertIsNone(registry.resolve_binding(rootless_key))
-        # Card pointers reset so the status card is recreated in the thread.
-        self.assertEqual(healed_binding.health_message_id, "")
+        # The healed root IS the status card, so the pointer moves onto it.
+        # (The fingerprint cache needs no cleanup: it is keyed by message_id,
+        # so pointing at a new card invalidates the old entry by itself —
+        # see StatusCardFingerprintTests.)
+        self.assertEqual(healed_binding.health_message_id, "msg-1")
         notice = channel.sent_views[0]["view"]
-        self.assertIn("TUI", notice.get("text", ""))
+        self.assertEqual(notice.get("type"), "health")
+        self.assertIn("TUI", notice.get("title", ""))
         # Already-rooted binding is left alone.
         self.assertEqual(asyncio.run(host._heal_rootless_lark_tui_binding(session)), "")
         # Stopped sessions never send heal notices for dead threads.

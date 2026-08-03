@@ -885,6 +885,11 @@ class Session:
     blocked_inputs: dict[str, BlockedInput] = field(default_factory=dict)
     cached_title: str = ""
     title_source: str = ""
+    # Throttle watermark for same-rank title refreshes. Lives on the session,
+    # not the transport: one codex thread hops between TUI hooks and the
+    # app-server event stream (takeover/handback), and a transport-scoped
+    # watermark would reset on every hop and let the title churn.
+    title_refreshed_at: float = 0.0
     status: Literal["running", "stopped"] = "running"
     stop_reason: str = ""
     interrupt_reason: str = ""
@@ -949,6 +954,70 @@ _CHANNEL_REVIVAL_STOP_REASONS = frozenset({"runtime_restart", "revive_failed"})
 TURN_REPLAY_DELAYS: tuple[float, ...] = (30.0, 300.0)
 # 水位比较容差：等值意味着水位就是这条输入自己盖的章，不算"被更新输入推进"。
 _TURN_REPLAY_WATERMARK_TOLERANCE_SECONDS = 0.5
+
+# 会话标题：来源分级 + 同级刷新节流。
+#
+# 话题根卡片显示的就是这个标题。四条产生路径（claude TUI hook、codex TUI
+# hook、codex app-server 事件流、claude headless 事件流）都汇到
+# Orchestrator._maybe_refresh_session_title，用 rank 决定谁能盖谁：
+#
+#   tui_hook            观测会话建根时的 uuid 占位，最弱，任何真素材都该盖掉
+#   turn_digest         最近一条助手消息的截断，没抓到用户首问时的兜底
+#   initial_user_input  用户原话，比助手消息更接近"这个会话在干嘛"
+#   llm_summary         预留给小模型精炼（当前生成器还不产出这一档）
+#
+# 升级（rank 变大）立刻生效，"首轮必刷"就是靠它，不受节流约束；同级覆盖才
+# 走节流，避免每个回合都为标题改动 patch 一次卡片。
+SESSION_TITLE_SOURCE_RANKS: dict[str, int] = {
+    "": 0,
+    "tui_hook": 1,
+    "turn_digest": 2,
+    "initial_user_input": 3,
+    "llm_summary": 4,
+}
+SESSION_TITLE_REFRESH_INTERVAL_SECONDS = 120.0
+SESSION_TITLE_MAX_CHARS = 40
+# 每回合最多为标题攒这么多字符的助手正文。标题只取第一个非空行的前 40 字，
+# 攒够开头就足够，长回合不该把整段 transcript 留在内存里。
+SESSION_TITLE_MATERIAL_CHARS = 1000
+# 根卡片连续编辑失败多少次后放弃原地重试、降级到子状态卡。瞬时抖动值得等，
+# 但根消息被撤回/删除/超出编辑窗口时每个事件都重试一遍只会烧配额——用户看着
+# 一张永不更新的状态卡，比看到一个标题过时的根更糟。永久错误不占预算，直接降级。
+ROOT_CARD_EDIT_RETRY_BUDGET = 3
+# 同级可以再刷新的来源（滚动型）。initial_user_input 不在其中：话题根标题锁在
+# 用户的第一个问题上，不跟着后续追问漂移——频道主动发起那条路径也是这个语义
+# （建根卡片时取首行，之后不再改）。
+SESSION_TITLE_ROLLING_SOURCES = frozenset({"turn_digest", "llm_summary"})
+
+
+def _session_title_source_rank(source: str) -> int:
+    return SESSION_TITLE_SOURCE_RANKS.get(str(source or ""), 0)
+
+
+def _clean_session_title(value: str) -> str:
+    """First non-blank line, whitespace-collapsed, clipped to card width."""
+    for line in str(value or "").splitlines():
+        text = " ".join(line.split())
+        if text:
+            return text[:SESSION_TITLE_MAX_CHARS]
+    return ""
+
+
+def compose_session_title(*, user_text: str = "", assistant_text: str = "") -> tuple[str, str]:
+    """Build ``(title, source)`` from one turn's material.
+
+    Placeholder generator: no model call, just the user's own words with the
+    assistant's last message as fallback. Swapping in an LLM means replacing
+    this function (same two inputs) and returning source ``"llm_summary"`` so
+    the rank table lets the sharper title win.
+    """
+    title = _clean_session_title(user_text)
+    if title:
+        return title, "initial_user_input"
+    title = _clean_session_title(assistant_text)
+    if title:
+        return title, "turn_digest"
+    return "", ""
 
 
 def _durable_resume_ref(session: Session) -> dict[str, Any]:
@@ -1428,6 +1497,7 @@ def _session_to_dict(session: Session) -> dict[str, Any]:
         },
         "cached_title": session.cached_title,
         "title_source": session.title_source,
+        "title_refreshed_at": session.title_refreshed_at,
         "status": session.status,
         "stop_reason": session.stop_reason,
         "interrupt_reason": session.interrupt_reason,
@@ -1465,6 +1535,7 @@ def _session_from_dict(data: dict[str, Any]) -> Session:
         },
         cached_title=str(data.get("cached_title", "")),
         title_source=str(data.get("title_source", "")),
+        title_refreshed_at=float(data.get("title_refreshed_at", 0.0)),
         status=data.get("status", "running"),
         stop_reason=str(data.get("stop_reason", "")),
         interrupt_reason=str(data.get("interrupt_reason", "")),
@@ -9170,7 +9241,8 @@ class Orchestrator:
         # the card materially says — skipping identical sends is what keeps
         # Lark's monthly API quota alive (a busy session used to emit
         # thousands of no-op card patches per day).
-        self._status_card_fingerprints: dict[str, str] = {}
+        # session_id -> (status card message_id, view fingerprint)
+        self._status_card_fingerprints: dict[str, tuple[str, str]] = {}
 
     async def start_session(
         self,
@@ -10138,6 +10210,99 @@ class Orchestrator:
                 data[key] = "external_tui.activity"
         return json.dumps(data, sort_keys=True, ensure_ascii=False)
 
+    def _root_card_edit_may_retry(
+        self,
+        binding: ChannelBinding,
+        session: Session,
+        message_id: str,
+        error: BaseException | None,
+    ) -> bool:
+        """True when a failed root-card edit should be retried in place.
+
+        The status card IS the thread root here. A replacement card can only
+        be sent as a reply UNDER that root (Lark has no "replace the root
+        message" API), so the generic fallback would move the pointer onto a
+        child card forever: later refreshes would edit the child while the
+        root — what the collapsed thread list shows — stays frozen at whatever
+        it was created with, typically the raw session id. So a transient
+        failure keeps the pointer and retries; the caller deliberately does
+        not record a fingerprint, which is what lets the retry through.
+
+        But retrying forever is its own outage: a root that is deleted,
+        recalled, or past its edit window fails identically on every event,
+        burning API quota while the user watches a status card that never
+        updates again. A permanent delivery error, or a spent retry budget,
+        therefore gives up on the root and lets the caller demote to a child
+        card — a stale root headline beats no live status at all.
+        """
+        permanent = isinstance(error, PermanentDeliveryError)
+        failures = int(binding.capabilities.get("root_card_edit_failures", 0) or 0) + 1
+        binding.capabilities["root_card_edit_failures"] = failures
+        if not permanent and failures < ROOT_CARD_EDIT_RETRY_BUDGET:
+            _log_degrade(
+                "status_card_root_edit_failed",
+                session_id=session.session_id,
+                message_id=message_id,
+                failures=failures,
+                fallback="retry_next_refresh",
+            )
+            return True
+        _log_degrade(
+            "status_card_root_demoted",
+            session_id=session.session_id,
+            message_id=message_id,
+            failures=failures,
+            permanent=permanent,
+            fallback="child_status_card",
+        )
+        return False
+
+    async def _maybe_refresh_session_title(
+        self,
+        session: Session,
+        *,
+        user_text: str = "",
+        assistant_text: str = "",
+    ) -> bool:
+        """Single entry point for session-title updates; True if it changed.
+
+        Every path that ends a turn funnels through here — TUI hooks for the
+        two CLIs, the event stream for the two structured transports — so the
+        rank and throttle rules live in one place instead of being re-derived
+        per transport. Callers refresh the status card right after; the card's
+        fingerprint check swallows the no-op when the title is unchanged.
+
+        Async on purpose even though the current generator is pure: the LLM
+        version replaces compose_session_title with an awaited call and no
+        call site has to change.
+        """
+        title, source = compose_session_title(
+            user_text=user_text, assistant_text=assistant_text
+        )
+        if not title:
+            return False
+        new_rank = _session_title_source_rank(source)
+        current_rank = _session_title_source_rank(session.title_source)
+        if new_rank < current_rank:
+            # A weaker source never overwrites a stronger one. This is what
+            # keeps a codex takeover/handback from repainting an LLM title
+            # with the raw first prompt every time ownership flips.
+            return False
+        now = self._now()
+        if new_rank == current_rank:
+            if source not in SESSION_TITLE_ROLLING_SOURCES:
+                # One-shot source already spent: the first prompt stays the
+                # title, later prompts in the same session do not repaint it.
+                return False
+            if title == session.cached_title:
+                return False
+            if now - session.title_refreshed_at < SESSION_TITLE_REFRESH_INTERVAL_SECONDS:
+                return False
+        session.cached_title = title
+        session.title_source = source
+        session.title_refreshed_at = now
+        return True
+
     async def refresh_session_status_card(self, session: Session) -> None:
         binding = session.channel_binding
         if binding is None or not bool(binding.capabilities.get("status_card")):
@@ -10152,23 +10317,44 @@ class Orchestrator:
         if message_id and bool(binding.capabilities.get("static_status_card")):
             return
         fingerprint = self._status_card_fingerprint(view)
-        if message_id and self._status_card_fingerprints.get(session.session_id) == fingerprint:
+        # Keyed by the message the fingerprint was taken ON, not just the
+        # session: a session can change status cards mid-life (the rootless
+        # Lark thread heals onto a fresh root card, an edit fails and falls
+        # back to a new send). A session-only key would match the OLD card's
+        # fingerprint and skip the first refresh of the new one, freezing it
+        # at whatever it was created with. Comparing the pair makes a card
+        # swap self-invalidating instead of something each caller must
+        # remember to clear.
+        if (
+            message_id
+            and self._status_card_fingerprints.get(session.session_id)
+            == (message_id, fingerprint)
+        ):
             return
         if message_id and channel.capabilities().editable_message:
+            edit_error: BaseException | None = None
             try:
                 edited = await channel.edit_view(binding, message_id, view)
             except Exception as exc:
                 edited = False
+                edit_error = exc
                 _log_degrade(
                     "status_card_edit_failed",
                     session_id=session.session_id,
                     message_id=message_id,
                     error=exc,
-                    fallback="send_new_card",
                 )
             if edited:
-                self._status_card_fingerprints[session.session_id] = fingerprint
+                # A working edit clears the root-card failure budget: the
+                # budget exists to escape a broken root, not to count lifetime
+                # blips on a healthy one.
+                binding.capabilities.pop("root_card_edit_failures", None)
+                self._status_card_fingerprints[session.session_id] = (message_id, fingerprint)
                 await self._sync_readonly_topic_state(session)
+                return
+            if message_id == binding.root_message_id and self._root_card_edit_may_retry(
+                binding, session, message_id, edit_error
+            ):
                 return
             binding.health_message_id = ""
         try:
@@ -10187,7 +10373,10 @@ class Orchestrator:
         if new_message_id:
             binding.health_message_id = str(new_message_id)
             binding.last_message_id = str(new_message_id)
-            self._status_card_fingerprints[session.session_id] = fingerprint
+            self._status_card_fingerprints[session.session_id] = (
+                str(new_message_id),
+                fingerprint,
+            )
         await self._pin_status_card_if_requested(channel, binding)
         await self._sync_readonly_topic_state(session)
 
@@ -11722,6 +11911,16 @@ class Orchestrator:
         last_visible_text = ""
         saw_any_event = False
         open_turn = False
+        # Title material for the turn in flight. codex app-server's JSON-RPC
+        # `turn/completed` carries only threadId + turn — the assistant text
+        # arrived earlier as separate `item/agentMessage/delta` events — so a
+        # title built from the completion payload alone would always be empty
+        # on that transport. Accumulate the deltas and fall back to them.
+        # (The event_msg shape's `task_complete` DOES carry
+        # last_agent_message, and Claude's completion carries its own text;
+        # those keep winning because the payload is checked first.)
+        turn_text_parts: list[str] = []
+        turn_text_len = 0
         async for event in self._iter_transport_events(transport, handle):
             if (
                 session.generation != expected_generation
@@ -11757,6 +11956,19 @@ class Orchestrator:
                 AgentEventType.TOOL_FAILED,
             }:
                 open_turn = True
+            if event.type == AgentEventType.TURN_DELTA and turn_text_len < SESSION_TITLE_MATERIAL_CHARS:
+                # Sliced to the remaining budget, not merely checked before
+                # appending: the transport coalesces a whole batch of deltas
+                # into ONE event, so a single event can carry an entire long
+                # answer and a check-then-append-whole would blow the cap by
+                # orders of magnitude. Only the first non-blank line survives
+                # into a 40-char title, so a prefix is all this ever needs.
+                delta = str(event.payload.get("text", "") or "")[
+                    : SESSION_TITLE_MATERIAL_CHARS - turn_text_len
+                ]
+                if delta:
+                    turn_text_parts.append(delta)
+                    turn_text_len += len(delta)
             self._record_session_progress(session, event)
             if (
                 event.type == AgentEventType.SESSION_ERROR
@@ -11799,6 +12011,31 @@ class Orchestrator:
                         )
             view = self._event_to_view(session, event)
             session.last_event_seq += 1
+            if event.type == AgentEventType.TURN_COMPLETED:
+                # Turn-end signal for the two structured transports. codex
+                # app-server never loads the user-level hooks.json (it only
+                # emits hook events for source="plugin"), so unlike the TUI
+                # paths there is no Stop hook to hang the title refresh off —
+                # this stream is the only place the turn is known to be over.
+                #
+                # .strip() before the fallback, not a bare `or`: a completion
+                # whose message is whitespace is truthy, and would shadow the
+                # accumulated deltas with something that cleans down to "".
+                completion_text = str(event.payload.get("message", "") or "").strip()
+                await self._maybe_refresh_session_title(
+                    session,
+                    assistant_text=completion_text or "".join(turn_text_parts),
+                )
+            if event.type in {
+                AgentEventType.TURN_COMPLETED,
+                AgentEventType.SESSION_ERROR,
+            }:
+                # BOTH are turn ends (see the listen loop's result handling: an
+                # error result closes the turn too). Resetting only on
+                # completion would let a failed turn's text leak into the next
+                # turn's title on this long-lived stream.
+                turn_text_parts.clear()
+                turn_text_len = 0
             await self.refresh_session_status_card(session)
             if view.get("type") in {"tool_progress", "turn_narration"}:
                 # Narration joins the rolling burst card as a 💬 line — never

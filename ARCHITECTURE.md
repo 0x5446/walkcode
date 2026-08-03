@@ -67,8 +67,59 @@ and button-state changes go through the durable outbox's `im.v1.message.patch`
 edits. View models are rendered to Feishu interactive cards / post markdown by
 `channel_native/lark_cards.py`, which ports the V2-proven card layouts
 (permission three-button card, AskUserQuestion three modes, health card).
-Session placement is one session per reply chain: a non-reply message roots a
-new session at its own message id.
+Session placement is one session per reply chain. Both placement paths *try* to
+root the chain on a bot-sent **health card** that doubles as the session's
+status card (`root_message_id == health_message_id`):
+
+- channel-initiated: the user's non-reply message triggers a root card, and the
+  user's own text is forwarded into the thread as the first reply;
+- TUI-observed: the hook that first sees a terminal session sends the root card
+  (a rootless binding is healed onto one by the maintenance tick).
+
+Rooting on a card rather than on text is a hard requirement, not a preference:
+Feishu caps text-message edits (sender-only, 20 edits, admin-set time window —
+error codes 230071/230072/230075) while card patches are uncapped, and the
+collapsed thread list shows the root, so the root is the surface a session
+title has to live on for the life of the session.
+
+**The equality is a best case, not an invariant.** If the root card cannot be
+sent, the channel-initiated path falls back to rooting on the user's own
+message (and does not later heal), and the TUI-observed path may start rootless
+(the maintenance tick does heal that one). Code must therefore test
+`health_message_id == root_message_id` rather than assume it. Two behaviours
+hang off that test:
+
+- when the status card IS the root, a failed edit does not fall back to sending
+  a replacement card — Feishu cannot replace a thread root, so the replacement
+  would land as a child and strand the root on its old title. The pointer is
+  kept and the next refresh retries. That retry is bounded
+  (`ROOT_CARD_EDIT_RETRY_BUDGET`, and a `PermanentDeliveryError` skips the
+  budget entirely): a deleted or edit-window-expired root would otherwise fail
+  identically forever, so the session gives up on the root and demotes to a
+  child status card — a stale headline beats no live status at all;
+- the status-card dedup cache is keyed by `(message_id, fingerprint)`, so
+  moving the card (heal, demotion, send-fallback) invalidates the old entry by
+  itself.
+
+## Session titles
+
+`Session.cached_title` is what the root card shows. It is refreshed at turn end
+through one entry point (`Orchestrator._maybe_refresh_session_title`), fed by
+all four turn-end signals: hooks.json `Stop` / `UserPromptSubmit` for the two
+TUI paths, and the event stream's `TURN_COMPLETED` for codex app-server and
+claude headless (those two never load the user-level hooks.json). On the codex
+JSON-RPC shape the completion notification carries no assistant text, so the
+drain loop accumulates `item/agentMessage/delta` text as fallback material.
+
+Which title wins is decided by source rank, not by arrival order
+(`SESSION_TITLE_SOURCE_RANKS`): `tui_hook` (session-id placeholder) <
+`turn_digest` (last assistant message) < `initial_user_input` (the user's first
+prompt) < `llm_summary` (reserved). A rank upgrade applies immediately; a
+same-rank overwrite is throttled and only allowed for rolling sources —
+`initial_user_input` is one-shot, so later prompts never repaint the title.
+The throttle watermark (`Session.title_refreshed_at`) is persisted on the
+session rather than the transport, because one codex thread hops between TUI
+and app-server across takeover/handback.
 
 Telegram is a peer `ChannelAdapter` kept as the architecture-validation
 channel (code and tests stay; no further UX investment). Telegram session
