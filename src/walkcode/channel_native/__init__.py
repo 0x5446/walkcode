@@ -8274,6 +8274,12 @@ class CodexAppServerTransport:
                     parked_on_human = False
                 if event.type == AgentEventType.TURN_COMPLETED:
                     turn_closed = True
+            if turn_closed and thread_id:
+                # The turn is over: this thread's model is now baked into the
+                # session record (via the TURN_COMPLETED payload above). Drop
+                # the cache entry so a long-lived runtime cannot accumulate
+                # one ~100B mapping per finished thread forever.
+                self._thread_models.pop(thread_id, None)
             if delta_parts:
                 delta_payload: dict[str, Any] = {"text": "".join(delta_parts)}
                 if delta_model:
