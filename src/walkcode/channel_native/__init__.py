@@ -612,6 +612,20 @@ def _configured_agent_options(source: Any) -> dict[str, dict[str, Any]]:
     codex_app_server_socket = str(source.get("WALKCODE_CODEX_APP_SERVER_SOCKET") or "").strip()
     if codex_app_server_socket:
         codex["app_server_socket"] = str(Path(codex_app_server_socket).expanduser())
+    codex_sandbox = str(source.get("WALKCODE_CODEX_SANDBOX") or "").strip()
+    if codex_sandbox:
+        # Mirrors the app-server protocol's SandboxMode enum (read-only /
+        # workspace-write / danger-full-access). The old behavior hardcoded
+        # read-only in CodexAppServerTransport, silently overriding the user's
+        # `sandbox_mode` in ~/.codex/config.toml for every channel-launched
+        # thread (curl/networking died, filesystem read-only). The default
+        # stays read-only when the env is unset.
+        if codex_sandbox not in {"read-only", "workspace-write", "danger-full-access"}:
+            raise ChannelConfigError(
+                f"invalid WALKCODE_CODEX_SANDBOX: {codex_sandbox}; "
+                "use one of read-only, workspace-write, danger-full-access"
+            )
+        codex["sandbox"] = codex_sandbox
     return {
         "claude": claude,
         "codex": codex,
@@ -5431,6 +5445,82 @@ class LarkChannelAdapter:
             "model_choice",
         }
 
+    # A forwarded chat log can carry hundreds of messages; render a bounded
+    # prefix so one forward cannot blow up the turn's input.
+    _MAX_RENDERED_MESSAGES = 60
+    _MAX_RENDERED_CHARS_PER_MESSAGE = 500
+
+    async def fetch_message(self, message_id: str) -> list[dict[str, Any]]:
+        """Read one message. For merge_forward this also returns its children.
+
+        Lark's GET /im/v1/messages/:id documents that a merge_forward query
+        yields "1 forward message plus N child messages" in the same items
+        array — which is why unpacking a forward needs no per-child fetch.
+        """
+        if not str(message_id or "").strip():
+            return []
+        result = await self.api.call("getMessage", {"message_id": str(message_id)})
+        items = (result.get("data", {}) or {}).get("items", [])
+        return [item for item in items if isinstance(item, dict)]
+
+    async def fetch_thread_messages(
+        self, root_message_id: str, *, limit: int = 50
+    ) -> list[dict[str, Any]]:
+        """Read a topic's replies oldest-first, capped at `limit` messages."""
+        if not str(root_message_id or "").strip():
+            return []
+        collected: list[dict[str, Any]] = []
+        page_token = ""
+        while len(collected) < limit:
+            result = await self.api.call(
+                "listThreadMessages",
+                {
+                    "container_id": str(root_message_id),
+                    "page_size": min(50, limit - len(collected)),
+                    "page_token": page_token,
+                },
+            )
+            data = result.get("data", {}) or {}
+            collected.extend(item for item in data.get("items", []) if isinstance(item, dict))
+            page_token = str(data.get("page_token", "") or "")
+            if not data.get("has_more") or not page_token:
+                break
+        return collected[:limit]
+
+    @classmethod
+    def render_message_log(cls, items: list[dict[str, Any]], *, skip_message_id: str = "") -> str:
+        """Render fetched messages as a "who said what" transcript.
+
+        Deleted messages and the container message itself are dropped; text is
+        clipped per message and the whole list is capped, with the truncation
+        stated inline rather than silently.
+        """
+        lines: list[str] = []
+        dropped = 0
+        for item in items:
+            if item.get("deleted"):
+                continue
+            message_id = str(item.get("message_id", "") or "")
+            if skip_message_id and message_id == skip_message_id:
+                continue
+            if str(item.get("msg_type", "") or "") == "merge_forward":
+                # The container of a forward carries no prose of its own.
+                continue
+            text = cls._parse_message_text(cls._decode_content(item.get("content", "")))
+            text = " ".join(str(text or "").split())
+            if not text:
+                continue
+            if len(lines) >= cls._MAX_RENDERED_MESSAGES:
+                dropped += 1
+                continue
+            if len(text) > cls._MAX_RENDERED_CHARS_PER_MESSAGE:
+                text = text[: cls._MAX_RENDERED_CHARS_PER_MESSAGE] + "…"
+            speaker = str(item.get("sender_id", "") or "") or "unknown"
+            lines.append(f"{speaker}: {text}")
+        if dropped:
+            lines.append(f"[另有 {dropped} 条消息超出上限未展开]")
+        return "\n".join(lines)
+
     @staticmethod
     def _decode_content(content: Any) -> Any:
         if not content:
@@ -8033,6 +8123,13 @@ class CodexAppServerTransport:
         # writer reacquisition resumes the same thread over and over, and
         # without this mark every resume would re-inject the preamble.
         self._env_context_delivered: set[str] = set()
+        # Last model seen per thread. The app-server event stream carries the
+        # model on thread_settings_applied / turn_context event_msg records,
+        # NOT on agent_message / task_complete — so /status showed 模型: — for
+        # every channel-launched codex session. We cache it here and backfill
+        # it onto the converted events; _record_session_progress then writes
+        # session.model from event.payload["model"].
+        self._thread_models: dict[str, str] = {}
 
     def capabilities(self) -> TransportCapabilities:
         return TransportCapabilities(
@@ -8141,15 +8238,23 @@ class CodexAppServerTransport:
             raw_events = await self.client.events(thread_id)
             turn_closed = False
             delta_parts: list[str] = []
-            for event in (self._convert_event(raw_event) for raw_event in raw_events):
+            delta_model = ""
+            for raw_event in raw_events:
+                event = self._convert_event(raw_event, thread_id=thread_id)
                 if event is None:
                     continue
                 if event.type == AgentEventType.TURN_DELTA:
                     delta_parts.append(str(event.payload.get("text", "")))
+                    if not delta_model:
+                        delta_model = str(event.payload.get("model", "") or "")
                     continue
                 if delta_parts:
-                    yield AgentEvent(AgentEventType.TURN_DELTA, {"text": "".join(delta_parts)})
+                    delta_payload: dict[str, Any] = {"text": "".join(delta_parts)}
+                    if delta_model:
+                        delta_payload["model"] = delta_model
+                    yield AgentEvent(AgentEventType.TURN_DELTA, delta_payload)
                     delta_parts = []
+                    delta_model = ""
                 yield event
                 # A HITL prompt parks the turn on a human. Keep listening: the
                 # answer goes back over the same wire (answer_request), and the
@@ -8169,8 +8274,17 @@ class CodexAppServerTransport:
                     parked_on_human = False
                 if event.type == AgentEventType.TURN_COMPLETED:
                     turn_closed = True
+            if turn_closed and thread_id:
+                # The turn is over: this thread's model is now baked into the
+                # session record (via the TURN_COMPLETED payload above). Drop
+                # the cache entry so a long-lived runtime cannot accumulate
+                # one ~100B mapping per finished thread forever.
+                self._thread_models.pop(thread_id, None)
             if delta_parts:
-                yield AgentEvent(AgentEventType.TURN_DELTA, {"text": "".join(delta_parts)})
+                delta_payload: dict[str, Any] = {"text": "".join(delta_parts)}
+                if delta_model:
+                    delta_payload["model"] = delta_model
+                yield AgentEvent(AgentEventType.TURN_DELTA, delta_payload)
             if turn_closed:
                 return
             if raw_events:
@@ -8256,7 +8370,7 @@ class CodexAppServerTransport:
     async def rewind_checkpoint(self, handle: TransportHandle, checkpoint_id: str) -> ControlResult:
         raise CapabilityUnsupported("Codex app-server checkpoint rewind is not verified")
 
-    def _convert_event(self, event: dict[str, Any]) -> AgentEvent | None:
+    def _convert_event(self, event: dict[str, Any], *, thread_id: str = "") -> AgentEvent | None:
         event_type = str(event.get("type", "") or event.get("method", ""))
         if self._is_hitl_server_request(event):
             rid = str(event.get("id", "") or "")
@@ -8282,22 +8396,36 @@ class CodexAppServerTransport:
             if not isinstance(event_payload, dict):
                 return None
             codex_event_type = str(event_payload.get("type", "") or "")
+            if codex_event_type == "thread_settings_applied":
+                settings = event_payload.get("thread_settings", {})
+                if isinstance(settings, dict):
+                    model = str(settings.get("model", "") or "")
+                    if model and thread_id:
+                        self._thread_models[thread_id] = model
+            elif codex_event_type == "turn_context":
+                model = str(event_payload.get("model", "") or "")
+                if model and thread_id:
+                    self._thread_models[thread_id] = model
+            model = self._thread_models.get(thread_id, "") if thread_id else ""
             if codex_event_type == "agent_message":
                 message = str(event_payload.get("message", "") or "")
                 if not message:
                     return None
-                return AgentEvent(AgentEventType.TURN_DELTA, {"text": message})
+                payload_out: dict[str, Any] = {"text": message}
+                if model:
+                    payload_out["model"] = model
+                return AgentEvent(AgentEventType.TURN_DELTA, payload_out)
             if codex_event_type == "task_complete":
-                return AgentEvent(
-                    AgentEventType.TURN_COMPLETED,
-                    {
-                        "message": str(event_payload.get("last_agent_message", "") or ""),
-                        "usage": event_payload.get("usage", {}),
-                        "status": "completed",
-                        "thread_id": str(event_payload.get("threadId", "") or event_payload.get("thread_id", "") or ""),
-                        "turn_id": str(event_payload.get("turn_id", "") or event_payload.get("turnId", "") or ""),
-                    },
-                )
+                payload_out = {
+                    "message": str(event_payload.get("last_agent_message", "") or ""),
+                    "usage": event_payload.get("usage", {}),
+                    "status": "completed",
+                    "thread_id": str(event_payload.get("threadId", "") or event_payload.get("thread_id", "") or ""),
+                    "turn_id": str(event_payload.get("turn_id", "") or event_payload.get("turnId", "") or ""),
+                }
+                if model:
+                    payload_out["model"] = model
+                return AgentEvent(AgentEventType.TURN_COMPLETED, payload_out)
             tool_event = _codex_tool_event(codex_event_type, event_payload)
             if tool_event is not None:
                 return tool_event
@@ -8305,20 +8433,41 @@ class CodexAppServerTransport:
         payload = event.get("params", event)
         if not isinstance(payload, dict):
             payload = {"value": payload}
+        # The app-server ALSO emits bare turn_context records (they live in
+        # the rollout; some wire paths surface them as top-level objects).
+        # Absorb the model the same way as the event_msg variant so the cache
+        # is populated no matter which shape arrives first.
+        if event_type == "turn_context":
+            context_payload = event.get("payload", {})
+            if not isinstance(context_payload, dict):
+                context_payload = payload
+            model = str(context_payload.get("model", "") or "")
+            if model and thread_id:
+                self._thread_models[thread_id] = model
+        if event_type == "thread/settings/updated":
+            settings = payload.get("threadSettings", {})
+            if isinstance(settings, dict):
+                model = str(settings.get("model", "") or "")
+                if model and thread_id:
+                    self._thread_models[thread_id] = model
+        model = self._thread_models.get(thread_id, "") if thread_id else ""
         if event_type == "item/agentMessage/delta":
-            return AgentEvent(AgentEventType.TURN_DELTA, {"text": str(payload.get("delta", ""))})
+            payload_out: dict[str, Any] = {"text": str(payload.get("delta", ""))}
+            if model:
+                payload_out["model"] = model
+            return AgentEvent(AgentEventType.TURN_DELTA, payload_out)
         tool_event = _codex_tool_event(event_type, payload)
         if tool_event is not None:
             return tool_event
         if event_type == "turn/completed":
-            return AgentEvent(
-                AgentEventType.TURN_COMPLETED,
-                {
-                    "message": str(payload.get("message", "")),
-                    "usage": payload.get("usage", {}),
-                    "status": payload.get("status", "completed"),
-                },
-            )
+            payload_out = {
+                "message": str(payload.get("message", "")),
+                "usage": payload.get("usage", {}),
+                "status": payload.get("status", "completed"),
+            }
+            if model:
+                payload_out["model"] = model
+            return AgentEvent(AgentEventType.TURN_COMPLETED, payload_out)
         return None
 
     @classmethod
@@ -10190,9 +10339,32 @@ class Orchestrator:
     # Progress events that flip on every observed tool/message beat. They only
     # add churn to the card's "进展" line; the tool-progress card is where that
     # detail lives. Folding them keeps the fingerprint stable through a turn.
+    #
+    # Two families reach `last_progress_event`, and for a long time this only
+    # covered one of them:
+    #   `external_tui.<hook>`  — written by the TUI hook path
+    #   `<AgentEventType>`     — written by _record_session_progress from the
+    #                            event stream, i.e. "tool.started",
+    #                            "turn.delta", …
+    # The second family matched nothing, so every single tool event changed the
+    # fingerprint and cost one status-card patch. Measured 2026-08-04: that was
+    # the largest single consumer of a 10000/month Lark quota — one tool call
+    # billed two patches (started + completed) for a card whose only visible
+    # delta was the "进展" line.
+    #
+    # turn.completed and the permission/ask/error types are deliberately NOT
+    # folded: those are real state changes the card exists to show.
     _STATUS_NOISE_PROGRESS = re.compile(
-        r"^external_tui\.(pre-tool|post-tool|post-tool-failure|post-tool-batch|"
-        r"message-display|notification|user-prompt-submit)$"
+        r"^(?:"
+        r"external_tui\.(?:pre-tool|post-tool|post-tool-failure|post-tool-batch|"
+        r"message-display|notification|user-prompt-submit)"
+        # daemon tempo carries a free-text detail ("…daemon_working:Bash"),
+        # which would otherwise put arbitrary strings in the fingerprint.
+        r"|external_tui\.daemon_[^:]*(?::.*)?"
+        r"|tool\.(?:started|completed|failed)"
+        r"|turn\.(?:delta|narration)"
+        r"|background\.tasks"
+        r")$"
     )
 
     @classmethod
@@ -10209,6 +10381,31 @@ class Orchestrator:
             if cls._STATUS_NOISE_PROGRESS.match(value):
                 data[key] = "external_tui.activity"
         return json.dumps(data, sort_keys=True, ensure_ascii=False)
+
+    # Once a binding is proven undeliverable (bot removed from the chat, or the
+    # tenant's monthly API quota is gone), every further send fails the same
+    # way. Non-essential surfaces check this first so a dead binding costs one
+    # failure instead of one per agent event — the 2026-08-04 logs had ~5100
+    # such failures, most of a 10000/month quota, from exactly this pattern.
+    _DELIVERY_DEAD_KEY = "delivery_dead"
+
+    @staticmethod
+    def _mark_delivery_dead(binding: ChannelBinding, error: BaseException) -> None:
+        if isinstance(error, PermanentDeliveryError):
+            binding.capabilities[Orchestrator._DELIVERY_DEAD_KEY] = str(error)[:200]
+
+    @staticmethod
+    def _delivery_is_dead(binding: ChannelBinding) -> str:
+        return str(binding.capabilities.get(Orchestrator._DELIVERY_DEAD_KEY, "") or "")
+
+    @staticmethod
+    def revive_delivery(binding: ChannelBinding) -> None:
+        """Clear the dead-delivery latch.
+
+        Called when the channel proves it can reach us again (an inbound event
+        on this binding): the bot was re-added, or the quota month rolled over.
+        """
+        binding.capabilities.pop(Orchestrator._DELIVERY_DEAD_KEY, None)
 
     def _root_card_edit_may_retry(
         self,
@@ -10307,6 +10504,8 @@ class Orchestrator:
         binding = session.channel_binding
         if binding is None or not bool(binding.capabilities.get("status_card")):
             return
+        if self._delivery_is_dead(binding):
+            return
         channel = self.channels.get(binding.channel_kind)
         if channel is None:
             return
@@ -10363,11 +10562,13 @@ class Orchestrator:
             # The status card is the only surface where "idle but background
             # tasks running" shows up; a silent drop here would make that
             # state undiagnosable.
+            self._mark_delivery_dead(binding, exc)
             _log_degrade(
                 "status_card_send_failed",
                 session_id=session.session_id,
                 error=exc,
                 drop=True,
+                delivery_dead=bool(self._delivery_is_dead(binding)),
             )
             return
         if new_message_id:
@@ -10448,6 +10649,14 @@ class Orchestrator:
         if self.inbound_ledger is not None and not self.inbound_ledger.start(inbound.event_id):
             return SubmitResult(False, BlockedReason.DUPLICATE_INBOUND)
         ledger_started = self.inbound_ledger is not None
+        # Traffic on this binding proves the channel can reach us again — the
+        # bot was re-added, or the quota month rolled over. Lift the latch so
+        # status cards and progress cards resume.
+        resolved = self.sessions.resolve_binding(inbound.binding_key())
+        if resolved:
+            revived = self.sessions.get(resolved)
+            if revived is not None and revived.channel_binding is not None:
+                self.revive_delivery(revived.channel_binding)
         try:
             if inbound.callback:
                 await self._ack_callback_event(inbound)
@@ -12080,7 +12289,7 @@ class Orchestrator:
         view: dict[str, Any],
     ) -> None:
         binding = session.channel_binding
-        if binding is None:
+        if binding is None or self._delivery_is_dead(binding):
             return
         # Accumulate a burst of consecutive tool events into one card that is
         # patched in place. A tool_result (completed/failed) updates its own
@@ -12158,6 +12367,7 @@ class Orchestrator:
         except Exception as exc:
             # Progress cards are ephemeral by design (no outbox retry), but the
             # drop must leave a trace or the missing card is undebuggable.
+            self._mark_delivery_dead(binding, exc)
             _log_degrade(
                 "tool_progress_send_failed",
                 session_id=session.session_id,
@@ -12165,6 +12375,7 @@ class Orchestrator:
                 status=status,
                 error=exc,
                 drop=True,
+                delivery_dead=bool(self._delivery_is_dead(binding)),
             )
             return
         if new_message_id:

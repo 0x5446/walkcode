@@ -1392,3 +1392,88 @@ class CodexAbortedListenTests(unittest.TestCase):
         events = asyncio.run(scenario())
 
         self.assertEqual(events, [delta])
+
+
+class CodexAppServerModelBackfillTests(unittest.TestCase):
+    def test_event_msg_stream_backfills_model_from_thread_settings_applied(self):
+        client = _FakeCodexClient()
+        client.event_batches["thread-1"] = [
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "thread_settings_applied",
+                    "thread_settings": {"model": "gpt-5.6-sol", "model_provider_id": "azure"},
+                },
+            },
+            {
+                "type": "event_msg",
+                "payload": {"type": "agent_message", "message": "hello"},
+            },
+            {
+                "type": "event_msg",
+                "payload": {"type": "task_complete", "turn_id": "turn-1", "last_agent_message": "done"},
+            },
+        ]
+        transport = CodexAppServerTransport(client=client, event_silence_ceiling=0)
+        handle = asyncio.run(transport.launch(LaunchSpec(cwd="/tmp/project", session_id="s1")))
+
+        events = _drain_events(transport, handle)
+
+        self.assertEqual(len(events), 2)
+        self.assertEqual(events[0].payload["model"], "gpt-5.6-sol")
+        self.assertEqual(events[1].payload["model"], "gpt-5.6-sol")
+
+    def test_event_msg_stream_backfills_model_from_turn_context(self):
+        client = _FakeCodexClient()
+        client.event_batches["thread-1"] = [
+            {"type": "turn_context", "payload": {"turn_id": "turn-1", "model": "gpt-5.6-sol"}},
+            {
+                "type": "event_msg",
+                "payload": {"type": "task_complete", "turn_id": "turn-1", "last_agent_message": "done"},
+            },
+        ]
+        transport = CodexAppServerTransport(client=client, event_silence_ceiling=0)
+        handle = asyncio.run(transport.launch(LaunchSpec(cwd="/tmp/project", session_id="s1")))
+
+        events = _drain_events(transport, handle)
+
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].payload["model"], "gpt-5.6-sol")
+
+    def test_event_msg_without_model_source_leaves_model_absent(self):
+        client = _FakeCodexClient()
+        client.event_batches["thread-1"] = [
+            {"type": "event_msg", "payload": {"type": "agent_message", "message": "no model yet"}},
+        ]
+        transport = CodexAppServerTransport(client=client, event_silence_ceiling=0)
+        handle = asyncio.run(transport.launch(LaunchSpec(cwd="/tmp/project", session_id="s1")))
+
+        # events() is a persistent listener: without a task_complete the drain
+        # only ends on the silence ceiling (synthetic TURN_COMPLETED). We only
+        # care about the first converted agent_message here.
+        events = _drain_events(transport, handle, stop_after=1)
+
+        self.assertEqual(len(events), 1)
+        self.assertNotIn("model", events[0].payload)
+
+    def test_jsonrpc_stream_backfills_model_from_thread_settings_updated(self):
+        client = _FakeCodexClient()
+        client.event_batches["thread-1"] = [
+            {
+                "method": "thread/settings/updated",
+                "params": {
+                    "threadId": "thread-1",
+                    "threadSettings": {"model": "gpt-5.6-sol"},
+                },
+            },
+            {"method": "item/agentMessage/delta", "params": {"threadId": "thread-1", "delta": "hi"}},
+            {"method": "turn/completed", "params": {"threadId": "thread-1", "turn": {"id": "turn-1"}}},
+        ]
+        transport = CodexAppServerTransport(client=client, event_silence_ceiling=0)
+        handle = asyncio.run(transport.launch(LaunchSpec(cwd="/tmp/project", session_id="s1")))
+
+        events = _drain_events(transport, handle)
+
+        self.assertEqual(len(events), 2)
+        self.assertEqual(events[0].payload["model"], "gpt-5.6-sol")
+        self.assertEqual(events[1].payload["model"], "gpt-5.6-sol")
