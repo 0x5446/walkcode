@@ -36,11 +36,29 @@ from typing import Any, Callable
 from . import PermanentDeliveryError, TransientDeliveryError
 from .lark_cards import render_lark_message
 
-# Lark IM error codes caused by the request content itself; retrying the same
-# payload fails identically and would wedge the outbox. Everything else (rate
-# limit, 5xx, gateway, unknown) stays transient on purpose: when unsure,
-# prefer retry over dropping agent output.
-PERMANENT_LARK_CODES = frozenset({230001})
+# Lark IM error codes where retrying the SAME request fails identically, so a
+# retry only burns quota. Everything else (5xx, gateway, unknown) stays
+# transient on purpose: when unsure, prefer retry over dropping agent output.
+#
+# Measured on 2026-08-04, from ~5100 failed calls in the runtime logs that ate
+# most of a 10000/month Standard F3 quota:
+#   230001                  request content itself is rejected
+#   230002  (2064 failures) "Bot/User can NOT be out of the chat" — the bot is
+#                           no longer in that chat. No amount of retrying puts
+#                           it back; every attempt was pure waste.
+#   230031                  "Message can only be updated within fourteen days"
+#                           — an old card is frozen for good; the caller must
+#                           send a new one instead of patching forever.
+#   99991403 (856 failures) "This month's API call quota has been exceeded" —
+#                           retrying the very error that says you are out of
+#                           budget is a death spiral: the retries spend the
+#                           headroom that would otherwise serve real traffic.
+#                           It self-heals next month, not next second, so the
+#                           only useful response is to stop.
+PERMANENT_LARK_CODES = frozenset({230001, 230002, 230031, 99991403})
+# Quota exhaustion is worth calling out separately from content errors: it is
+# not this message's fault, and the operator needs to know the app is muted.
+LARK_QUOTA_EXCEEDED_CODE = 99991403
 
 DEFAULT_ACK_TIMEOUT = 2.5
 
@@ -99,7 +117,56 @@ def build_operation(method: str, payload: dict[str, Any]) -> dict[str, Any]:
             "file_key": str(payload.get("file_key", "") or ""),
             "type": str(payload.get("type", "") or "file"),
         }
+    if method == "getMessage":
+        # Reading a merge_forward message returns the forward itself PLUS its
+        # N child messages in one shot, which is the whole reason this exists:
+        # a forwarded chat log otherwise reaches the agent as nothing but its
+        # placeholder title.
+        return {"kind": "get_message", "message_id": str(payload.get("message_id", "") or "")}
+    if method == "listThreadMessages":
+        # container_id_type=thread is the only way to read a topic's replies;
+        # `chat` returns just the root. Lark also rejects start_time/end_time
+        # for thread containers, so this operation deliberately has no time
+        # window — bound the read with page_size/page_token instead.
+        return {
+            "kind": "list_thread",
+            "container_id": str(payload.get("container_id", "") or ""),
+            "page_size": max(1, min(50, int(payload.get("page_size", 50) or 50))),
+            "page_token": str(payload.get("page_token", "") or ""),
+        }
     raise PermanentDeliveryError(f"unknown Lark api method: {method}")
+
+
+def message_item_to_dict(item: Any) -> dict[str, Any]:
+    """Flatten one lark-oapi Message object into plain data.
+
+    Keeps the adapter and everything above it testable without the SDK
+    installed, matching how the send path already returns plain dicts.
+    """
+    sender = getattr(item, "sender", None)
+    body = getattr(item, "body", None)
+    mentions = getattr(item, "mentions", None) or []
+    return {
+        "message_id": str(getattr(item, "message_id", "") or ""),
+        "msg_type": str(getattr(item, "msg_type", "") or ""),
+        "chat_id": str(getattr(item, "chat_id", "") or ""),
+        "root_id": str(getattr(item, "root_id", "") or ""),
+        "parent_id": str(getattr(item, "parent_id", "") or ""),
+        "create_time": str(getattr(item, "create_time", "") or ""),
+        "deleted": bool(getattr(item, "deleted", False)),
+        "sender_id": str(getattr(sender, "id", "") or ""),
+        "sender_name": str(getattr(sender, "sender_name", "") or ""),
+        "sender_type": str(getattr(sender, "sender_type", "") or ""),
+        "content": str(getattr(body, "content", "") or ""),
+        "mentions": [
+            {
+                "key": str(getattr(mention, "key", "") or ""),
+                "id": str(getattr(mention, "id", "") or ""),
+                "name": str(getattr(mention, "name", "") or ""),
+            }
+            for mention in mentions
+        ],
+    }
 
 
 class AckRegistry:
@@ -202,6 +269,10 @@ class SdkTransport:
                 return self._reaction(operation)
             if kind == "download":
                 return self._download(operation)
+            if kind == "get_message":
+                return self._get_message(operation)
+            if kind == "list_thread":
+                return self._list_thread(operation)
         except (TransientDeliveryError, PermanentDeliveryError):
             raise
         except _PROGRAMMING_ERRORS:
@@ -296,6 +367,41 @@ class SdkTransport:
         return {
             "content": resp.file.read(),
             "file_name": str(getattr(resp, "file_name", "") or ""),
+        }
+
+    def _get_message(self, operation: dict[str, Any]) -> dict[str, Any]:
+        _, im_v1 = self._sdk()
+        request = (
+            im_v1.GetMessageRequest.builder()
+            .message_id(operation["message_id"])
+            .build()
+        )
+        resp = self._check(self._ensure_client().im.v1.message.get(request), "Lark get message")
+        items = getattr(getattr(resp, "data", None), "items", None) or []
+        return {"data": {"items": [message_item_to_dict(item) for item in items]}}
+
+    def _list_thread(self, operation: dict[str, Any]) -> dict[str, Any]:
+        _, im_v1 = self._sdk()
+        builder = (
+            im_v1.ListMessageRequest.builder()
+            .container_id_type("thread")
+            .container_id(operation["container_id"])
+            .sort_type("ByCreateTimeAsc")
+            .page_size(operation["page_size"])
+        )
+        if operation.get("page_token"):
+            builder = builder.page_token(operation["page_token"])
+        resp = self._check(
+            self._ensure_client().im.v1.message.list(builder.build()), "Lark list thread"
+        )
+        data = getattr(resp, "data", None)
+        items = getattr(data, "items", None) or []
+        return {
+            "data": {
+                "items": [message_item_to_dict(item) for item in items],
+                "has_more": bool(getattr(data, "has_more", False)),
+                "page_token": str(getattr(data, "page_token", "") or ""),
+            }
         }
 
 

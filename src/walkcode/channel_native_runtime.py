@@ -130,6 +130,9 @@ TUI_HOOK_RECENT_PRIORITY_WINDOW_SECONDS = 300.0
 TUI_HOOK_DRAIN_INTERVAL_SECONDS = 1.0
 OUTBOX_FLUSH_INTERVAL_SECONDS = 1.0
 TUI_BINDING_REFRESH_INTERVAL_SECONDS = 5.0
+# 被 @ 进别人的飞书话题时，最多读回多少条既有讨论作为首轮上下文。够覆盖一场
+# 有来有回的讨论，又不至于让一个长话题把整个回合的输入撑爆。
+LARK_THREAD_CONTEXT_MESSAGE_LIMIT = 50
 # codex-cli (verified against 0.144.5) only emits session_start, session_end,
 # user_prompt_submit, pre_tool_use, post_tool_use, permission_request and
 # stop; MessageDisplay / PostToolUseFailure are Claude-only event names that
@@ -1681,6 +1684,83 @@ class ChannelNativeRuntime:
             return True
         return str(sender_id) in allowed
 
+    @staticmethod
+    def _lark_message_type(inbound) -> str:
+        raw = inbound.raw if isinstance(inbound.raw, dict) else {}
+        event = raw.get("event", {}) if isinstance(raw.get("event"), dict) else {}
+        message = event.get("message", {}) if isinstance(event.get("message"), dict) else {}
+        return str(message.get("message_type", "") or message.get("msg_type", "") or "")
+
+    async def _expand_lark_merge_forward(self, channel, inbound):
+        """Replace a forwarded chat log's placeholder title with its content.
+
+        A merge_forward message's content is only ``{"title": ...,
+        "message_id_list": [...]}``, so the inbound text parser falls through
+        to the title — the agent receives "群聊的聊天记录" and none of the
+        conversation. Reading the message back returns the forward plus every
+        child in one call, which is what actually gets rendered in.
+
+        Failure keeps the original inbound: a forward that reaches the agent
+        as its title is what happens today, so a degraded fetch must not also
+        drop the turn.
+        """
+        if self._lark_message_type(inbound) != "merge_forward":
+            return inbound
+        try:
+            items = await channel.fetch_message(inbound.message_id)
+        except Exception as exc:
+            _log_degrade(
+                "lark_merge_forward_fetch_failed",
+                message_id=inbound.message_id,
+                chat_id=inbound.chat_id,
+                error=exc,
+                fallback="placeholder_title_only",
+            )
+            return inbound
+        log = channel.render_message_log(items, skip_message_id=inbound.message_id)
+        if not log:
+            return inbound
+        title = " ".join(str(inbound.text or "").split())
+        header = f"[合并转发：{title}]" if title else "[合并转发]"
+        return replace(inbound, text=f"{header}\n{log}")
+
+    async def _maybe_seed_lark_thread_context(self, channel, inbound):
+        """Prepend an existing topic's discussion when the bot is first @-ed in.
+
+        Being mentioned inside somebody else's thread used to deliver exactly
+        one line — the mention — while the ten replies above it, which are the
+        reason the bot was called, stayed invisible. Read them once, at the
+        moment the session is about to be created for this thread.
+
+        Only once: as soon as a session owns the binding, later replies resolve
+        to it and the history is already in the transcript. Failure degrades to
+        the mention alone, which is the pre-existing behaviour.
+        """
+        resolution = self.state.sessions.resolve_active_binding(inbound.binding_key())
+        if resolution.session_id or resolution.reason:
+            return inbound
+        try:
+            items = await channel.fetch_thread_messages(
+                inbound.root_message_id, limit=LARK_THREAD_CONTEXT_MESSAGE_LIMIT
+            )
+        except Exception as exc:
+            _log_degrade(
+                "lark_thread_context_fetch_failed",
+                root_message_id=inbound.root_message_id,
+                chat_id=inbound.chat_id,
+                error=exc,
+                fallback="mention_only",
+            )
+            return inbound
+        log = channel.render_message_log(items, skip_message_id=inbound.message_id)
+        if not log:
+            return inbound
+        request = str(inbound.text or "").strip()
+        return replace(
+            inbound,
+            text=f"[话题已有讨论]\n{log}\n\n[本次请求]\n{request}" if request else f"[话题已有讨论]\n{log}",
+        )
+
     async def process_lark_event(self, payload: dict[str, Any]) -> SubmitResult:
         channel = self.channels.get("lark")
         if not isinstance(channel, LarkChannelAdapter):
@@ -1718,6 +1798,9 @@ class ChannelNativeRuntime:
         if inbound.callback is None:
             if not self._lark_sender_allowed(inbound.sender_id):
                 return SubmitResult(False, BlockedReason.UNAUTHORIZED)
+            # After the authz gates on purpose: expanding costs an API call,
+            # and an unauthorized sender must not be able to spend it.
+            inbound = await self._expand_lark_merge_forward(channel, inbound)
             reply_binding = ChannelBinding(
                 channel_kind=inbound.channel_kind,
                 account_id=inbound.account_id,
@@ -1861,7 +1944,10 @@ class ChannelNativeRuntime:
         if inbound.callback is not None:
             return inbound
         if inbound.root_message_id and inbound.root_message_id != inbound.message_id:
-            return inbound
+            # A reply inside an existing topic. Either it belongs to one of our
+            # sessions (nothing to do) or the bot has just been pulled into
+            # somebody else's discussion, where the history is the whole point.
+            return await self._maybe_seed_lark_thread_context(channel, inbound)
         resolution = self.state.sessions.resolve_active_binding(inbound.binding_key())
         if resolution.session_id or resolution.reason:
             return inbound
@@ -5284,8 +5370,10 @@ def _build_transports(config: ChannelNativeConfig) -> dict[str, AgentTransport]:
             )
     elif kind == "codex_app_server":
         if shutil.which("codex"):
+            codex_options = config.agent_options.get("codex", {})
             transports[kind] = CodexAppServerTransport(
                 client=_build_codex_app_server_client(config),
+                sandbox=str(codex_options.get("sandbox", "") or "read-only"),
                 environment_context=_channel_environment_context(config.channel.kind),
             )
         else:
@@ -6524,6 +6612,21 @@ def _tui_event_id(
     payload: dict[str, Any],
 ) -> str:
     identity = _resume_ref_identity(transport_kind, resume_ref)
+    # Tool lifecycle hooks (PreToolUse/PostToolUse/...) carry a per-call
+    # tool_use_id that is unique within the task. Using turn_id here — which
+    # codex 0.144+ keeps CONSTANT across every tool in one turn — made the
+    # 2nd+ tool event of a long task look like a duplicate of the first and
+    # got silently dropped (TUI codex output stopped syncing to Feishu).
+    if _tui_hook_is_tool_lifecycle(hook_type):
+        tool_id = str(
+            _tui_payload_first(
+                payload,
+                ("tool_use_id", "tool_id", "toolCallId", "tool_call_id", "request_id", "id"),
+            )
+            or ""
+        )
+        if tool_id:
+            return f"external_tui:{hook_type}:{transport_kind}:{identity}:{tool_id}"
     explicit = (
         payload.get("event_id")
         or payload.get("hook_event_id")

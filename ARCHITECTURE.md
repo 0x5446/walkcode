@@ -101,6 +101,36 @@ hang off that test:
   moving the card (heal, demotion, send-fallback) invalidates the old entry by
   itself.
 
+### Reading messages back
+
+The Lark adapter is mostly write-only (send / edit / react / ack) plus
+attachment bytes. Two inbound shapes need an actual read, and both use the
+same capability:
+
+- **merge_forward**: a forwarded chat log's content is only
+  `{"title", "message_id_list"}`, so the text parser falls through to the
+  title and the agent would receive "群聊的聊天记录" with none of the
+  conversation. `GET /im/v1/messages/:id` on a forward returns the forward
+  *plus every child message* in one call, so unpacking needs no per-child
+  fetch;
+- **being @-ed into an existing topic**: the mention is the only message the
+  event carries; the replies above it — the reason the bot was called — are
+  invisible. `GET /im/v1/messages?container_id_type=thread` reads them
+  (`chat` would return only the root, and thread containers reject
+  start_time/end_time, so the read is bounded by page size instead).
+
+Both render through `LarkChannelAdapter.render_message_log`, which drops
+deleted messages and the container itself, clips per message, caps the total,
+and states the truncation inline. Thread history is seeded **once**, at the
+moment the session for that thread is created; later replies resolve to the
+session and are already in its transcript.
+
+Both reads require the bot to hold `im:message` or `im:message:readonly`
+(group history also needs `im:message.group_msg`) and to be a member of the
+chat. Without them the fetch raises and the inbound degrades to exactly what
+shipped before — the placeholder title, or the bare mention — so a missing
+scope costs context, never the turn.
+
 ## Session titles
 
 `Session.cached_title` is what the root card shows. It is refreshed at turn end

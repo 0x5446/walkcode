@@ -5018,3 +5018,170 @@ class OrphanHeadlessSweepTests(unittest.TestCase):
             self.assertEqual(session.status, "stopped")
             self.assertEqual(session.stop_reason, "runtime_restart")
             self.assertEqual(session.lifecycle_state, "STOPPED")
+
+
+class CodexSandboxConfigTests(unittest.TestCase):
+    def test_walkcode_codex_sandbox_flows_into_app_server_transport(self):
+        cfg = ChannelNativeConfig.from_env(
+            {
+                "WALKCODE_CHANNEL": "telegram",
+                "TELEGRAM_BOT_TOKEN": "fake",
+                "WALKCODE_AGENT": "codex",
+                "WALKCODE_CODEX_APP_SERVER_MODE": "stdio",
+                "WALKCODE_CODEX_SANDBOX": "danger-full-access",
+            }
+        )
+        original = runtime_module.shutil.which
+        runtime_module.shutil.which = lambda name: "/usr/bin/codex" if name == "codex" else original(name)
+        try:
+            transports = runtime_module._build_transports(cfg)
+        finally:
+            runtime_module.shutil.which = original
+
+        transport = transports["codex_app_server"]
+        self.assertIsInstance(transport, runtime_module.CodexAppServerTransport)
+        self.assertEqual(transport.sandbox, "danger-full-access")
+
+    def test_default_codex_sandbox_stays_read_only(self):
+        cfg = ChannelNativeConfig.from_env(
+            {
+                "WALKCODE_CHANNEL": "telegram",
+                "TELEGRAM_BOT_TOKEN": "fake",
+                "WALKCODE_AGENT": "codex",
+                "WALKCODE_CODEX_APP_SERVER_MODE": "stdio",
+            }
+        )
+        original = runtime_module.shutil.which
+        runtime_module.shutil.which = lambda name: "/usr/bin/codex" if name == "codex" else original(name)
+        try:
+            transports = runtime_module._build_transports(cfg)
+        finally:
+            runtime_module.shutil.which = original
+
+        self.assertEqual(transports["codex_app_server"].sandbox, "read-only")
+
+    def test_invalid_codex_sandbox_is_rejected_at_config_time(self):
+        from walkcode.channel_native import ChannelConfigError as _CCE
+
+        with self.assertRaisesRegex(_CCE, "invalid WALKCODE_CODEX_SANDBOX"):
+            ChannelNativeConfig.from_env(
+                {
+                    "WALKCODE_CHANNEL": "telegram",
+                    "TELEGRAM_BOT_TOKEN": "fake",
+                    "WALKCODE_AGENT": "codex",
+                    "WALKCODE_CODEX_SANDBOX": "bogus",
+                }
+            )
+
+    def test_launch_sends_configured_sandbox_to_thread_start(self):
+        # End-to-end: the transport's sandbox lands in the thread/start RPC.
+        from walkcode.channel_native import CodexAppServerTransport as _T
+        from walkcode.channel_native import LaunchSpec as _LS
+
+        class _Client:
+            def __init__(self):
+                self.requests = []
+
+            async def request(self, method, params):
+                self.requests.append((method, params))
+                return {"thread": {"id": "thread-1"}}
+
+            async def events(self, thread_id):
+                return []
+
+        client = _Client()
+        transport = _T(client=client, sandbox="workspace-write", event_silence_ceiling=0)
+        handle = asyncio.run(transport.launch(_LS(cwd="/tmp/project", session_id="s1")))
+        self.assertEqual(client.requests[0][0], "thread/start")
+        self.assertEqual(client.requests[0][1]["sandbox"], "workspace-write")
+        self.assertEqual(handle.ref["thread_id"], "thread-1")
+
+
+class TuiHookToolEventDedupKeyTests(unittest.TestCase):
+    def test_tool_lifecycle_hooks_use_tool_use_id_instead_of_shared_turn_id(self):
+        # codex 0.144+ keeps turn_id CONSTANT across all tools in one turn;
+        # keying dedupe on it silently dropped the 2nd+ PreToolUse/PostToolUse
+        # of a long task (TUI codex output stopped syncing to Feishu).
+        transport_kind = "codex_app_server"
+        resume_ref = {"thread_id": "thread-codex-1"}
+        base = {"thread_id": "thread-codex-1", "turn_id": "shared-turn-1"}
+
+        a = runtime_module._tui_event_id(
+            "pre-tool", transport_kind, resume_ref,
+            {**base, "tool_use_id": "tool-1", "tool_name": "Bash"},
+        )
+        b = runtime_module._tui_event_id(
+            "pre-tool", transport_kind, resume_ref,
+            {**base, "tool_use_id": "tool-2", "tool_name": "Read"},
+        )
+        c = runtime_module._tui_event_id(
+            "post-tool", transport_kind, resume_ref,
+            {**base, "tool_use_id": "tool-1", "tool_name": "Bash"},
+        )
+
+        self.assertNotEqual(a, b)  # two calls in the same turn must NOT collide
+        self.assertNotEqual(a, c)  # different lifecycle stages must NOT collide
+        self.assertIn("tool-1", a)
+        self.assertIn("tool-2", b)
+
+    def test_tool_hook_without_tool_use_id_falls_back_to_turn_id(self):
+        transport_kind = "codex_app_server"
+        resume_ref = {"thread_id": "thread-codex-1"}
+        base = {"thread_id": "thread-codex-1", "turn_id": "shared-turn-1"}
+        a = runtime_module._tui_event_id(
+            "pre-tool", transport_kind, resume_ref, dict(base)
+        )
+        b = runtime_module._tui_event_id(
+            "pre-tool", transport_kind, resume_ref, dict(base)
+        )
+        self.assertEqual(a, b)
+
+    def test_non_tool_hooks_keep_turn_id_dedup(self):
+        transport_kind = "claude_headless"
+        resume_ref = {"agent_session_id": "claude-session-1"}
+        payload = {"session_id": "claude-session-1", "turn_id": "turn-1", "message": "same"}
+        a = runtime_module._tui_event_id("stop", transport_kind, resume_ref, dict(payload))
+        b = runtime_module._tui_event_id("stop", transport_kind, resume_ref, dict(payload))
+        self.assertEqual(a, b)
+
+    def test_process_tui_hook_accepts_two_tools_sharing_one_turn_id(self):
+        # End-to-end pin: two PreToolUse hooks with the same turn_id but
+        # different tool_use_id must BOTH be accepted (not DUPLICATE_INBOUND).
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = str(Path(tmp) / "state.json")
+            cfg = ChannelNativeConfig.from_env(
+                {
+                    "WALKCODE_CHANNEL": "telegram",
+                    "TELEGRAM_BOT_TOKEN": "fake",
+                    "WALKCODE_AGENT": "codex",
+                    "TELEGRAM_ALLOWED_CHAT_IDS": "123",
+                    "WALKCODE_STATE_PATH": state_path,
+                    "WALKCODE_CWD": tmp,
+                }
+            )
+            api = _FakeTelegramApi()
+            runtime = ChannelNativeRuntime.from_config(
+                cfg,
+                telegram_api=api,
+                transports={"codex_app_server": FakeAgentTransport("codex_app_server", _transport_caps())},
+            )
+            base = {"thread_id": "thread-codex-1", "turn_id": "shared-turn-1", "cwd": tmp}
+
+            first = asyncio.run(
+                runtime.process_tui_hook(
+                    hook_type="PreToolUse",
+                    agent="codex",
+                    payload={**base, "tool_use_id": "tool-1", "tool_name": "Bash"},
+                )
+            )
+            second = asyncio.run(
+                runtime.process_tui_hook(
+                    hook_type="PreToolUse",
+                    agent="codex",
+                    payload={**base, "tool_use_id": "tool-2", "tool_name": "Read"},
+                )
+            )
+
+            self.assertTrue(first.accepted)
+            self.assertTrue(second.accepted)
+            self.assertNotEqual(second.reason, BlockedReason.DUPLICATE_INBOUND)

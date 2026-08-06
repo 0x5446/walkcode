@@ -88,6 +88,19 @@ battle-tested and is ported rather than reinvented
   Rank upgrades apply immediately; same-rank overwrites are throttled and only
   allowed for rolling sources, so the user's first prompt is not repainted by
   later ones. See ARCHITECTURE.md "Session titles" for the four feeding paths.
+- **Message read-back** (added 2026-08-03): the adapter gains two read
+  operations — `getMessage` (`GET /im/v1/messages/:id`) and
+  `listThreadMessages` (`GET /im/v1/messages?container_id_type=thread`).
+  Motivation: a `merge_forward` message's content is only
+  `{"title", "message_id_list"}`, so a forwarded chat log reached the agent as
+  its placeholder title; and a bot @-ed into an existing topic saw only the
+  mention, never the discussion that prompted it. A forward read returns the
+  container plus all children in one call, so no per-child fetch is needed.
+  Thread history is seeded once, when the session for that thread is created.
+  Requires `im:message` or `im:message:readonly` (group history also
+  `im:message.group_msg`); on any failure the inbound degrades to the previous
+  behaviour rather than dropping the turn. Rendering is bounded (per-message
+  clip + total cap) with truncation stated inline.
 - Ingress protection: `LARK_ALLOWED_CHAT_IDS` / `LARK_ALLOWED_OPEN_IDS`
   allowlists; `WALKCODE_E2E_LARK_CHAT_ID` restricts the runtime by default the
   same way the Telegram E2E chat id does. Redelivered WS events are absorbed
