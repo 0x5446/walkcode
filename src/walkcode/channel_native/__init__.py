@@ -6547,7 +6547,7 @@ class ClaudeHeadlessTransport:
             # named by absolute path in the prompt for Claude to open with
             # Read. Without this an attachment-only message reaches Claude as
             # empty text.
-            text = self._compose_turn_text(turn)
+            text = _compose_turn_text(turn)
             try:
                 await _maybe_await(query(text, session_id="default"))
             except TypeError:
@@ -6578,10 +6578,6 @@ class ClaudeHeadlessTransport:
                 self._inflight_submits[handle.handle_id] = inflight
             else:
                 self._inflight_submits.pop(handle.handle_id, None)
-
-    # Module-level helper (shared with CodexAppServerTransport); kept as a
-    # staticmethod because callers already reach for it through this class.
-    _compose_turn_text = staticmethod(_compose_turn_text)
 
     def handle_supports_reuse(self, handle_id: str) -> bool:
         """True when the handle's worker can accept another turn in place.
@@ -9705,7 +9701,7 @@ class Orchestrator:
                 fallback="takeover_prompt",
             )
             return None
-        composed = ClaudeHeadlessTransport._compose_turn_text(turn)
+        composed = _compose_turn_text(turn)
         self._daemon_reply_echoes[session.session_id] = (composed.strip(), self._now())
         session.last_progress_at = self._now()
         session.last_progress_event = "external_tui.daemon_reply"
@@ -12289,6 +12285,9 @@ class Orchestrator:
                 turn_text_parts.clear()
                 turn_text_len = 0
                 turn_produced_output = False
+                turn_ended = True
+            else:
+                turn_ended = False
             await self.refresh_session_status_card(session)
             if view.get("type") in {"tool_progress", "turn_narration"}:
                 # Narration joins the rolling burst card as a 💬 line — never
@@ -12307,8 +12306,11 @@ class Orchestrator:
             # visible text, or the next turn's tools edit last turn's card.
             self._seal_tool_progress_burst(session)
             visible_text = render_view_text(view)
-            silent_turn_notice = False
-            if not visible_text:
+            # .strip(): a whitespace-only delta is not something a human can
+            # read, and counting it as output would let a turn whose entire
+            # payload was "\n\n" close without the notice below — while also
+            # posting a blank bubble.
+            if not visible_text.strip():
                 if not silent_turn:
                     continue
                 # The turn ended having produced nothing the user could see.
@@ -12320,17 +12322,16 @@ class Orchestrator:
                 )
                 view = {"type": "turn_completed", "message": EMPTY_TURN_NOTICE}
                 visible_text = EMPTY_TURN_NOTICE
-                silent_turn_notice = True
-            if (
-                not silent_turn_notice
-                and event.type == AgentEventType.TURN_COMPLETED
-                and visible_text == last_visible_text
-            ):
+            if event.type == AgentEventType.TURN_COMPLETED and visible_text == last_visible_text:
                 # The completion is repeating text the deltas already showed.
-                # Exempt the notice: two silent turns in a row must produce two
-                # warnings, not one warning and one more silence.
+                last_visible_text = ""
                 continue
-            last_visible_text = visible_text
+            # The watermark is per-turn, cleared as the turn ends. Letting it
+            # live for the whole drain was silent data loss on this resident
+            # cross-turn stream (ADR 0060): whenever two turns in a row
+            # answered the same thing, the second reply was dropped — exactly
+            # the class of silence the notice above exists to end.
+            last_visible_text = "" if turn_ended else visible_text
             if event.type not in {
                 AgentEventType.TURN_COMPLETED,
                 AgentEventType.SESSION_ERROR,

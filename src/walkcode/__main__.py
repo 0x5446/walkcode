@@ -10,6 +10,7 @@ import shlex
 import subprocess
 import sys
 import tomllib
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -30,6 +31,17 @@ def _run(cmd: str, **kwargs) -> None:
 _SEMVER_TAG = re.compile(r"^v(\d+)\.(\d+)\.(\d+)$")
 
 
+def _validated_tag(tag: str | None) -> str | None:
+    """Accept only `vX.Y.Z`.
+
+    Every source here is remote-controlled and the result is interpolated into
+    a `uv tool install "walkcode @ git+<url>@<tag>"` shell command, so the
+    shape is checked once, centrally, rather than trusted per source.
+    """
+    tag = (tag or "").strip()
+    return tag if _SEMVER_TAG.match(tag) else None
+
+
 def _latest_tag_via_gh() -> str | None:
     """Authenticated release lookup. The only source that knows which release
     GitHub calls "latest" (a hotfix on an older line must not win)."""
@@ -42,8 +54,7 @@ def _latest_tag_via_gh() -> str | None:
         )
     except Exception:
         return None
-    tag = result.stdout.strip() if result.returncode == 0 else ""
-    return tag or None
+    return _validated_tag(result.stdout if result.returncode == 0 else "")
 
 
 def _latest_tag_via_api() -> str | None:
@@ -51,36 +62,40 @@ def _latest_tag_via_api() -> str | None:
     try:
         req = urllib.request.Request(url, headers={"Accept": "application/vnd.github+json"})
         with urllib.request.urlopen(req, timeout=10) as resp:
-            return json.loads(resp.read()).get("tag_name") or None
+            return _validated_tag(json.loads(resp.read()).get("tag_name"))
     except Exception:
         return None
 
 
-def _latest_tag_via_ls_remote() -> str | None:
-    """Highest vX.Y.Z tag on the remote. No API, so no rate limit — this is
-    what keeps upgrades working when the anonymous API budget is exhausted."""
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def _latest_tag_via_release_redirect() -> str | None:
+    """Latest release from the HTML redirect: no API, so no rate limit.
+
+    `github.com/<repo>/releases/latest` 302s to `/releases/tag/<tag>`. Reading
+    the tag list over `git ls-remote` would be simpler but wrong: `release.sh`
+    pushes the tag BEFORE creating the Release, so a failed `gh release create`
+    leaves a tag with no Release behind — and AGENTS.md is explicit that
+    upgrade installs *Releases*. This endpoint can only ever name a real one.
+    """
+    url = f"https://github.com/{_GITHUB_REPO}/releases/latest"
+    opener = urllib.request.build_opener(_NoRedirect)
     try:
-        result = subprocess.run(
-            ["git", "ls-remote", "--tags", "--refs", _GITHUB_URL, "v*"],
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
+        opener.open(url, timeout=10)
+    except urllib.error.HTTPError as exc:
+        location = (exc.headers or {}).get("Location", "")
     except Exception:
         return None
-    if result.returncode != 0:
+    else:
+        # 200 without a redirect means no release exists (or the page shape
+        # changed): either way there is nothing trustworthy to install.
         return None
-    best: tuple[int, int, int] | None = None
-    best_tag: str | None = None
-    for line in result.stdout.splitlines():
-        ref = line.split("refs/tags/")[-1].strip()
-        match = _SEMVER_TAG.match(ref)
-        if not match:
-            continue
-        parsed = (int(match.group(1)), int(match.group(2)), int(match.group(3)))
-        if best is None or parsed > best:
-            best, best_tag = parsed, ref
-    return best_tag
+    if "/releases/tag/" not in location:
+        return None
+    return _validated_tag(location.rstrip("/").rsplit("/", 1)[-1])
 
 
 def _get_latest_tag() -> str | None:
@@ -90,9 +105,9 @@ def _get_latest_tag() -> str | None:
     (observed 2026-08-07). When it did, the old single-source lookup fell
     through to "install from the default branch" without saying anything —
     an upgrade that silently ships unreleased code. Try gh (authenticated),
-    then the anonymous API, then the tag list over plain git.
+    then the anonymous API, then the release-page redirect.
     """
-    for resolve in (_latest_tag_via_gh, _latest_tag_via_api, _latest_tag_via_ls_remote):
+    for resolve in (_latest_tag_via_gh, _latest_tag_via_api, _latest_tag_via_release_redirect):
         tag = resolve()
         if tag:
             return tag
@@ -338,8 +353,8 @@ def cmd_upgrade(_args) -> None:
         # turns "upgrade to the release" into "ship whatever is on main".
         print(
             "Could not resolve the latest release tag (gh, the anonymous API and "
-            "git ls-remote all failed). Refusing to install from the default branch: "
-            "authenticate gh (`gh auth login`) or set WALKCODE_ALLOW_MAIN=1 to override."
+            "the release-page redirect all failed). Refusing to install from the default "
+            "branch: authenticate gh (`gh auth login`) or set WALKCODE_ALLOW_MAIN=1 to override."
         )
         raise SystemExit(1)
 

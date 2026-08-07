@@ -20,6 +20,7 @@ from walkcode.channel_native import (
     AuthorizationStore,
     ChannelBinding,
     ChannelCapabilities,
+    CodexAppServerTransport,
     DurableOutbox,
     FakeAgentTransport,
     FakeChannelAdapter,
@@ -30,6 +31,8 @@ from walkcode.channel_native import (
     TurnInput,
     render_view_text,
 )
+
+from test_channel_native_codex import _FakeCodexClient
 
 
 def _actor() -> ActorRef:
@@ -157,16 +160,146 @@ class SilentTurnNoticeTests(unittest.TestCase):
 
         self.assertEqual(_notice_count(channel), 0)
 
-    def test_two_silent_turns_in_a_row_warn_twice(self):
-        # The turn_completed dedupe (same text as the last bubble) must not
-        # swallow the second warning — that is the outage all over again.
-        orchestrator, transport, channel, session = _orchestrator([_completed("")])
+    def test_two_silent_turns_in_one_drain_warn_twice(self):
+        # Both completions arrive inside ONE drain, which is how the resident
+        # codex listener actually delivers them (ADR 0060). Re-entering the
+        # drain per submit would reset the dedupe watermark and pass even if
+        # the per-turn scoping regressed.
+        orchestrator, _transport, channel, session = _orchestrator(
+            [_completed(""), _completed("")]
+        )
 
         _submit(orchestrator, session)
-        transport._scripted_events = [_completed("")]
-        _submit(orchestrator, session, text="再试一次")
 
         self.assertEqual(_notice_count(channel), 2)
+
+    def test_whitespace_only_output_still_counts_as_silence(self):
+        # A "\n\n" delta is not something a human can read: it must not
+        # suppress the notice, and it must not post a blank bubble either.
+        orchestrator, _transport, channel, session = _orchestrator(
+            [AgentEvent(AgentEventType.TURN_DELTA, {"text": "   \n"}), _completed("")]
+        )
+
+        _submit(orchestrator, session)
+
+        self.assertEqual(_notice_count(channel), 1)
+        self.assertEqual(len(_sent_texts(channel)), 1)
+
+    def test_two_turns_answering_the_same_thing_both_reach_the_channel(self):
+        # The dedupe watermark used to live for the whole drain, so on this
+        # cross-turn stream the second turn's completion looked like a repeat
+        # of the first and was dropped — silence of exactly the kind this
+        # module exists to prevent.
+        orchestrator, _transport, channel, session = _orchestrator(
+            [_completed("同一个答复"), _completed("同一个答复")]
+        )
+
+        _submit(orchestrator, session)
+
+        self.assertEqual(_sent_texts(channel), ["同一个答复", "同一个答复"])
+
+    def test_completion_repeating_its_own_delta_is_still_deduped(self):
+        # Within one turn the completion echoes what the deltas already
+        # streamed; that duplicate must stay suppressed.
+        orchestrator, _transport, channel, session = _orchestrator(
+            [AgentEvent(AgentEventType.TURN_DELTA, {"text": "答案"}), _completed("答案")]
+        )
+
+        _submit(orchestrator, session)
+
+        self.assertEqual(_sent_texts(channel), ["答案"])
+
+
+class SilentTurnOverRealCodexEventsTests(unittest.TestCase):
+    """Same behaviour, driven through CodexAppServerTransport's own conversion.
+
+    docs/review/.review-learnings.md: a FakeAgentTransport test cannot prove
+    the real protocol path works — codex's `turn/completed` carries no message
+    and the answer only ever arrives as `item/agentMessage/delta`.
+    """
+
+    def _orchestrator_with_codex(self, raw_events):
+        client = _FakeCodexClient()
+        client.event_batches["thread-1"] = list(raw_events)
+        transport = CodexAppServerTransport(client=client, event_silence_ceiling=0)
+        channel = FakeChannelAdapter("telegram", _channel_caps())
+        orchestrator = Orchestrator(
+            sessions=SessionRegistry(),
+            interactions=InteractionStore(),
+            outbox=DurableOutbox(),
+            channels={"telegram": channel},
+            transports={"codex_app_server": transport},
+            authz=AuthorizationStore(),
+        )
+        session = asyncio.run(
+            orchestrator.start_session(
+                _binding(), "codex_app_server", "/tmp/project", _actor()
+            )
+        )
+        channel.sent_views.clear()
+        return orchestrator, channel, session
+
+    def test_codex_task_complete_without_message_warns(self):
+        # The outage shape verbatim: six upstream 400s, then task_complete
+        # with last_agent_message = null and no delta anywhere.
+        orchestrator, channel, session = self._orchestrator_with_codex(
+            [
+                {
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "task_complete",
+                        "turn_id": "turn-1",
+                        "last_agent_message": None,
+                    },
+                }
+            ]
+        )
+
+        _submit(orchestrator, session)
+
+        self.assertEqual(_notice_count(channel), 1)
+
+    def test_codex_jsonrpc_turn_completed_without_delta_warns(self):
+        # The JSON-RPC wire shape: `turn/completed` never carries the answer,
+        # so an empty turn looks identical to a normal one at this layer.
+        orchestrator, channel, session = self._orchestrator_with_codex(
+            [
+                {
+                    "method": "turn/completed",
+                    "params": {"threadId": "thread-1", "turn": {"id": "turn-1"}},
+                }
+            ]
+        )
+
+        _submit(orchestrator, session)
+
+        self.assertEqual(_notice_count(channel), 1)
+
+    def test_codex_delta_then_bare_completion_stays_silent(self):
+        # The normal shape: the answer rides `item/agentMessage/delta` and the
+        # completion is bare. This must NOT warn.
+        orchestrator, channel, session = self._orchestrator_with_codex(
+            [
+                {
+                    "method": "item/agentMessage/delta",
+                    "params": {
+                        "threadId": "thread-1",
+                        "turnId": "turn-1",
+                        "itemId": "item-1",
+                        "delta": "真实答复",
+                    },
+                },
+                {
+                    "method": "turn/completed",
+                    "params": {"threadId": "thread-1", "turn": {"id": "turn-1"}},
+                },
+            ]
+        )
+
+        _submit(orchestrator, session)
+
+        self.assertEqual(_notice_count(channel), 0)
+        self.assertTrue(any("真实答复" in text for text in _sent_texts(channel)))
 
 
 if __name__ == "__main__":

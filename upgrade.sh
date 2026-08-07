@@ -64,9 +64,14 @@ current_version() {
 # 2026-08-07); when it did, this function returned empty and the caller
 # silently installed from main — an "upgrade to the release" that ships
 # unreleased code. Three sources now, and an empty result is fatal below.
+# Every source below is remote-controlled and the result is interpolated into
+# a `uv tool install "walkcode @ git+<url>@<tag>"` command, so the shape is
+# checked once, centrally, rather than trusted per source.
+validated_tag() { grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$'; }
+
 latest_tag_via_gh() {
   command -v gh >/dev/null 2>&1 || return 1
-  gh api "repos/${REPO}/releases/latest" --jq '.tag_name' 2>/dev/null
+  gh api "repos/${REPO}/releases/latest" --jq '.tag_name' 2>/dev/null | validated_tag
 }
 
 latest_tag_via_api() {
@@ -85,21 +90,23 @@ with urllib.request.urlopen(req, timeout=10) as resp:
 PY
 }
 
-latest_tag_via_ls_remote() {
-  # No API, so no rate limit. `sort -V` is not portable to older macOS sort,
-  # hence the explicit field sort (v0.14.9 must lose to v0.14.19).
-  git ls-remote --tags --refs "$GITHUB_URL" 'v*' 2>/dev/null \
-    | awk '{print $2}' \
-    | sed 's#refs/tags/##' \
-    | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
-    | sort -t. -k1.2,1n -k2,2n -k3,3n \
-    | tail -1
+latest_tag_via_release_redirect() {
+  # No API, so no rate limit: /releases/latest 302s to /releases/tag/<tag>.
+  # Reading the tag list over `git ls-remote` would be simpler but wrong —
+  # release.sh pushes the tag BEFORE creating the Release, so a failed
+  # `gh release create` leaves a tag with no Release behind, and AGENTS.md is
+  # explicit that upgrade installs *Releases*. This endpoint can only ever
+  # name a real one.
+  curl -fsS -o /dev/null -w '%{redirect_url}' \
+       "https://github.com/${REPO}/releases/latest" 2>/dev/null \
+    | sed -n 's#^.*/releases/tag/##p' \
+    | validated_tag
 }
 
 latest_tag() {
-  local tag
-  for source in latest_tag_via_gh latest_tag_via_api latest_tag_via_ls_remote; do
-    tag="$("$source" 2>/dev/null | tr -d '[:space:]' || true)"
+  local tag src
+  for src in latest_tag_via_gh latest_tag_via_api latest_tag_via_release_redirect; do
+    tag="$("$src" 2>/dev/null | tr -d '[:space:]' || true)"
     if [ -n "$tag" ]; then
       printf '%s\n' "$tag"
       return 0
@@ -344,8 +351,8 @@ elif [ "${WALKCODE_ALLOW_MAIN:-}" = "1" ]; then
     "未检测到 release tag；WALKCODE_ALLOW_MAIN=1 → 从 main 安装。")"
 else
   die "$(msg \
-    "could not resolve the latest release tag (gh, the anonymous API and git ls-remote all failed). Refusing to install from main: run \`gh auth login\`, or set WALKCODE_ALLOW_MAIN=1 to override." \
-    "无法解析最新 release tag（gh、匿名 API、git ls-remote 全部失败）。拒绝从 main 安装：请先 \`gh auth login\`，或设 WALKCODE_ALLOW_MAIN=1 强制覆盖。")"
+    "could not resolve the latest release tag (gh, the anonymous API and the release-page redirect all failed). Refusing to install from main: run \`gh auth login\`, or set WALKCODE_ALLOW_MAIN=1 to override." \
+    "无法解析最新 release tag（gh、匿名 API、release 页跳转全部失败）。拒绝从 main 安装：请先 \`gh auth login\`，或设 WALKCODE_ALLOW_MAIN=1 强制覆盖。")"
 fi
 
 # claude-agent-sdk >= 0.2.124: earlier builds re-parse the accumulated

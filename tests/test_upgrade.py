@@ -1,8 +1,8 @@
 """Regression tests for the V3 `walkcode upgrade` command."""
 
 import argparse
-import subprocess
 import unittest
+import urllib.error
 from pathlib import Path
 from unittest.mock import patch
 
@@ -218,32 +218,51 @@ class LatestTagResolutionTests(unittest.TestCase):
     2026-08-07; the old single-source lookup then silently installed from the
     default branch instead of the release."""
 
-    def test_falls_back_to_ls_remote_when_gh_and_api_fail(self):
+    def test_falls_back_to_release_redirect_when_gh_and_api_fail(self):
         with patch.object(m, "_latest_tag_via_gh", lambda: None), \
              patch.object(m, "_latest_tag_via_api", lambda: None), \
-             patch.object(m, "_latest_tag_via_ls_remote", lambda: "v0.14.19"):
+             patch.object(m, "_latest_tag_via_release_redirect", lambda: "v0.14.19"):
             self.assertEqual(m._get_latest_tag(), "v0.14.19")
 
     def test_gh_wins_over_the_other_sources(self):
         with patch.object(m, "_latest_tag_via_gh", lambda: "v1.2.3"), \
              patch.object(m, "_latest_tag_via_api", lambda: "v0.0.1"), \
-             patch.object(m, "_latest_tag_via_ls_remote", lambda: "v0.0.2"):
+             patch.object(m, "_latest_tag_via_release_redirect", lambda: "v0.0.2"):
             self.assertEqual(m._get_latest_tag(), "v1.2.3")
 
-    def test_ls_remote_sorts_numerically_not_lexically(self):
-        # v0.14.9 must lose to v0.14.19.
-        stdout = "\n".join(
-            [
-                "aaa\trefs/tags/v0.14.9",
-                "bbb\trefs/tags/v0.14.19",
-                "ccc\trefs/tags/v0.9.30",
-                "ddd\trefs/tags/v0.14.19^{}",
-                "eee\trefs/tags/nightly",
-            ]
-        )
-        completed = subprocess.CompletedProcess([], 0, stdout=stdout, stderr="")
-        with patch.object(m.subprocess, "run", lambda *a, **kw: completed):
-            self.assertEqual(m._latest_tag_via_ls_remote(), "v0.14.19")
+    def _redirect_opener(self, location):
+        """Stand in for the 302 that /releases/latest answers with."""
+        class _Opener:
+            def open(self, url, timeout=None):
+                raise urllib.error.HTTPError(
+                    url, 302, "Found", {"Location": location}, None
+                )
+
+        return _Opener()
+
+    def test_release_redirect_reads_the_tag_from_the_location_header(self):
+        opener = self._redirect_opener("https://github.com/o/r/releases/tag/v0.14.19")
+        with patch.object(m.urllib.request, "build_opener", lambda *a: opener):
+            self.assertEqual(m._latest_tag_via_release_redirect(), "v0.14.19")
+
+    def test_release_redirect_rejects_a_non_semver_target(self):
+        # A moved/renamed page must not become an installable "tag".
+        opener = self._redirect_opener("https://github.com/o/r/releases")
+        with patch.object(m.urllib.request, "build_opener", lambda *a: opener):
+            self.assertIsNone(m._latest_tag_via_release_redirect())
+
+    def test_tag_sources_reject_shapes_that_are_not_semver(self):
+        # The tag is interpolated into a shell `uv tool install` command.
+        for raw in ("main", "v1.2", "v1.2.3; rm -rf /", "", None, "  v1.2.3  "):
+            with self.subTest(raw=raw):
+                got = m._validated_tag(raw)
+                self.assertEqual(got, "v1.2.3" if raw == "  v1.2.3  " else None)
+
+    def test_ls_remote_is_no_longer_a_tag_source(self):
+        # release.sh pushes the tag BEFORE creating the Release, so a bare tag
+        # list can name a version that was never released (AGENTS.md: upgrade
+        # installs Releases).
+        self.assertFalse(hasattr(m, "_latest_tag_via_ls_remote"))
 
     def test_upgrade_refuses_to_install_from_main_when_no_tag_resolves(self):
         calls = []

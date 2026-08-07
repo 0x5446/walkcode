@@ -37,6 +37,7 @@ from . import (
     CapabilityUnsupported,
     ClaudeHeadlessTransport,
     ControlResult,
+    _compose_turn_text,
     LaunchSpec,
     ResumeSpec,
     TransportCapabilities,
@@ -1017,7 +1018,7 @@ class ClaudeDaemonTransport:
         short = str(handle.ref.get("short", "")) or claude_daemon_short_from_resume_ref(handle.ref)
         if not short:
             raise CapabilityUnsupported("Claude daemon reply requires a job short id")
-        text = ClaudeHeadlessTransport._compose_turn_text(turn)
+        text = _compose_turn_text(turn)
         await self.client.reply(short, text)
 
     # -- v3 notify-gate registry (keystroke injection route) ------------------
