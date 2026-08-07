@@ -6035,6 +6035,46 @@ class _ClaudePermissionBridge:
         ]
 
 
+# What a turn carrying neither text nor a usable attachment becomes before it
+# reaches an agent. An empty string must NEVER be submitted: codex persists it
+# in the thread history, and every later turn replays it — the commandcode
+# relay's Chat Completions upstream then rejects the WHOLE request with
+# `400 user message must have content` (2026-08-07: one attachment-only Lark
+# message bricked thread 019fd743 permanently, six silent retries per turn).
+EMPTY_TURN_PLACEHOLDER = "（用户发来一条空消息）"
+
+# Shown when a turn ends without ever putting anything in the channel — no
+# delta, no tool card, no completion text. Dropping that completion silently
+# is what made the 2026-08-07 relay outage invisible: the upstream answered
+# `400 user message must have content` six times per turn, codex closed the
+# turn with `last_agent_message: null`, and the channel showed nothing at all
+# for hours. A turn that produced nothing must say so.
+EMPTY_TURN_NOTICE = (
+    "⚠️ 本轮代理没有返回任何内容（通常是模型/上游接口异常，例如 provider 或 "
+    "relay 报错）。可以直接重发重试；连续多轮为空请查 agent provider 日志。"
+)
+
+
+def _compose_turn_text(turn: TurnInput) -> str:
+    """Turn text plus the downloaded attachment paths, never empty.
+
+    No transport has an attachment channel, so downloaded files are named by
+    absolute path in the prompt for the agent to open with Read. Without this
+    an attachment-only message reaches the agent as empty text.
+    """
+    paths = [
+        str(a.local_path)
+        for a in (turn.attachments or [])
+        if getattr(a, "local_path", "")
+    ]
+    text = turn.text or ""
+    if not paths:
+        return text if text.strip() else EMPTY_TURN_PLACEHOLDER
+    refs = "\n".join(f"- {p}" for p in paths)
+    note = f"[用户发送了附件，已下载到本地，可用 Read 工具查看]\n{refs}"
+    return f"{text}\n\n{note}" if text.strip() else note
+
+
 class ClaudeHeadlessTransport:
     kind = "claude_headless"
     # Single stream-json message ceiling for the SDK subprocess transport
@@ -6539,19 +6579,9 @@ class ClaudeHeadlessTransport:
             else:
                 self._inflight_submits.pop(handle.handle_id, None)
 
-    @staticmethod
-    def _compose_turn_text(turn: TurnInput) -> str:
-        paths = [
-            str(a.local_path)
-            for a in (turn.attachments or [])
-            if getattr(a, "local_path", "")
-        ]
-        text = turn.text or ""
-        if not paths:
-            return text
-        refs = "\n".join(f"- {p}" for p in paths)
-        note = f"[用户发送了附件，已下载到本地，可用 Read 工具查看]\n{refs}"
-        return f"{text}\n\n{note}" if text.strip() else note
+    # Module-level helper (shared with CodexAppServerTransport); kept as a
+    # staticmethod because callers already reach for it through this class.
+    _compose_turn_text = staticmethod(_compose_turn_text)
 
     def handle_supports_reuse(self, handle_id: str) -> bool:
         """True when the handle's worker can accept another turn in place.
@@ -8191,9 +8221,14 @@ class CodexAppServerTransport:
         idempotency_key: str,
     ) -> None:
         thread_id = handle.ref["thread_id"]
-        text = turn.text
+        # Attachment paths must ride the prompt (no attachment channel here),
+        # and the result must never be blank — see EMPTY_TURN_PLACEHOLDER:
+        # a blank turn/start input poisons the thread's history for good.
+        text = _compose_turn_text(turn)
         if thread_id in self._env_context_pending:
             text = f"{self.environment_context}\n\n{text}"
+        if not text.strip():
+            text = EMPTY_TURN_PLACEHOLDER
         await self.client.request(
             "turn/start",
             {
@@ -12130,6 +12165,10 @@ class Orchestrator:
         # those keep winning because the payload is checked first.)
         turn_text_parts: list[str] = []
         turn_text_len = 0
+        # Did anything from the turn in flight reach the channel? Tracked so a
+        # turn that ends having produced nothing at all can say so instead of
+        # closing in silence (see EMPTY_TURN_NOTICE).
+        turn_produced_output = False
         async for event in self._iter_transport_events(transport, handle):
             if (
                 session.generation != expected_generation
@@ -12220,6 +12259,7 @@ class Orchestrator:
                         )
             view = self._event_to_view(session, event)
             session.last_event_seq += 1
+            silent_turn = False
             if event.type == AgentEventType.TURN_COMPLETED:
                 # Turn-end signal for the two structured transports. codex
                 # app-server never loads the user-level hooks.json (it only
@@ -12235,6 +12275,9 @@ class Orchestrator:
                     session,
                     assistant_text=completion_text or "".join(turn_text_parts),
                 )
+                # Read BEFORE the turn-end reset below, and only for a real
+                # completion: a SESSION_ERROR already speaks for itself.
+                silent_turn = not turn_produced_output
             if event.type in {
                 AgentEventType.TURN_COMPLETED,
                 AgentEventType.SESSION_ERROR,
@@ -12245,12 +12288,14 @@ class Orchestrator:
                 # turn's title on this long-lived stream.
                 turn_text_parts.clear()
                 turn_text_len = 0
+                turn_produced_output = False
             await self.refresh_session_status_card(session)
             if view.get("type") in {"tool_progress", "turn_narration"}:
                 # Narration joins the rolling burst card as a 💬 line — never
                 # a bubble, and it must NOT seal the burst (the tools it
                 # narrates land right after it).
                 await self._upsert_tool_progress_view(session, channel, view)
+                turn_produced_output = True
                 continue
             if view.get("type") == "background_tasks":
                 # Ledger beat: status card is already refreshed above; it must
@@ -12262,11 +12307,35 @@ class Orchestrator:
             # visible text, or the next turn's tools edit last turn's card.
             self._seal_tool_progress_burst(session)
             visible_text = render_view_text(view)
+            silent_turn_notice = False
             if not visible_text:
-                continue
-            if event.type == AgentEventType.TURN_COMPLETED and visible_text == last_visible_text:
+                if not silent_turn:
+                    continue
+                # The turn ended having produced nothing the user could see.
+                # Say so rather than dropping the completion (EMPTY_TURN_NOTICE).
+                _log_degrade(
+                    "turn_completed_without_output",
+                    session_id=session.session_id,
+                    transport_kind=session.transport_kind,
+                )
+                view = {"type": "turn_completed", "message": EMPTY_TURN_NOTICE}
+                visible_text = EMPTY_TURN_NOTICE
+                silent_turn_notice = True
+            if (
+                not silent_turn_notice
+                and event.type == AgentEventType.TURN_COMPLETED
+                and visible_text == last_visible_text
+            ):
+                # The completion is repeating text the deltas already showed.
+                # Exempt the notice: two silent turns in a row must produce two
+                # warnings, not one warning and one more silence.
                 continue
             last_visible_text = visible_text
+            if event.type not in {
+                AgentEventType.TURN_COMPLETED,
+                AgentEventType.SESSION_ERROR,
+            }:
+                turn_produced_output = True
             self.outbox.enqueue(
                 channel_binding_key=session.channel_binding.key(),
                 view_model=view,

@@ -59,8 +59,18 @@ current_version() {
   walkcode --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true
 }
 
-latest_tag() {
-  python3 - "$REPO" <<'PY' 2>/dev/null || true
+# Resolve the release to install, hardest source first. The anonymous
+# releases API is rate-limited per IP and DOES return 403 (observed
+# 2026-08-07); when it did, this function returned empty and the caller
+# silently installed from main — an "upgrade to the release" that ships
+# unreleased code. Three sources now, and an empty result is fatal below.
+latest_tag_via_gh() {
+  command -v gh >/dev/null 2>&1 || return 1
+  gh api "repos/${REPO}/releases/latest" --jq '.tag_name' 2>/dev/null
+}
+
+latest_tag_via_api() {
+  python3 - "$REPO" <<'PY' 2>/dev/null
 import json
 import sys
 import urllib.request
@@ -73,6 +83,29 @@ req = urllib.request.Request(
 with urllib.request.urlopen(req, timeout=10) as resp:
     print(json.loads(resp.read()).get("tag_name", ""))
 PY
+}
+
+latest_tag_via_ls_remote() {
+  # No API, so no rate limit. `sort -V` is not portable to older macOS sort,
+  # hence the explicit field sort (v0.14.9 must lose to v0.14.19).
+  git ls-remote --tags --refs "$GITHUB_URL" 'v*' 2>/dev/null \
+    | awk '{print $2}' \
+    | sed 's#refs/tags/##' \
+    | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
+    | sort -t. -k1.2,1n -k2,2n -k3,3n \
+    | tail -1
+}
+
+latest_tag() {
+  local tag
+  for source in latest_tag_via_gh latest_tag_via_api latest_tag_via_ls_remote; do
+    tag="$("$source" 2>/dev/null | tr -d '[:space:]' || true)"
+    if [ -n "$tag" ]; then
+      printf '%s\n' "$tag"
+      return 0
+    fi
+  done
+  return 1
 }
 
 detect_legacy_remnants() {
@@ -300,13 +333,19 @@ else
     "升级到 V3 runtime 前必须先清理旧版残留")"
 fi
 
-tag="$(latest_tag)"
+tag="$(latest_tag || true)"
 if [ -n "$tag" ]; then
   source="walkcode @ git+${GITHUB_URL}@${tag}"
   info "$(msg "Latest release: $tag" "最新版本: ${tag}")"
-else
+elif [ "${WALKCODE_ALLOW_MAIN:-}" = "1" ]; then
   source="walkcode @ git+${GITHUB_URL}"
-  warn "$(msg "No release tag detected; installing from main." "未检测到 release tag；从 main 安装。")"
+  warn "$(msg \
+    "No release tag detected; WALKCODE_ALLOW_MAIN=1 → installing from main." \
+    "未检测到 release tag；WALKCODE_ALLOW_MAIN=1 → 从 main 安装。")"
+else
+  die "$(msg \
+    "could not resolve the latest release tag (gh, the anonymous API and git ls-remote all failed). Refusing to install from main: run \`gh auth login\`, or set WALKCODE_ALLOW_MAIN=1 to override." \
+    "无法解析最新 release tag（gh、匿名 API、git ls-remote 全部失败）。拒绝从 main 安装：请先 \`gh auth login\`，或设 WALKCODE_ALLOW_MAIN=1 强制覆盖。")"
 fi
 
 # claude-agent-sdk >= 0.2.124: earlier builds re-parse the accumulated

@@ -8,8 +8,10 @@ import unittest
 import uuid
 
 from walkcode.channel_native import (
+    EMPTY_TURN_PLACEHOLDER,
     ActorRef,
     AgentEventType,
+    AttachmentRef,
     AuthorizationStore,
     ChannelBinding,
     ChannelCapabilities,
@@ -391,6 +393,61 @@ class CodexAppServerTransportTests(unittest.TestCase):
             [{"type": "text", "text": "hello", "text_elements": []}],
         )
         self.assertEqual(client.requests[1][1]["idempotencyKey"], "idem-1")
+
+    def test_submit_turn_carries_attachment_paths(self):
+        # An attachment-only message used to reach codex as text "" — the
+        # image was dropped AND the blank user message poisoned the thread.
+        client = _FakeCodexClient()
+        transport = CodexAppServerTransport(client=client, event_silence_ceiling=0)
+
+        handle = asyncio.run(transport.launch(LaunchSpec(cwd="/tmp/project", session_id="s1")))
+        asyncio.run(
+            transport.submit_turn(
+                handle,
+                TurnInput(
+                    text="",
+                    attachments=[
+                        AttachmentRef(
+                            source_id="img-1",
+                            mime="image/png",
+                            local_path="/tmp/walkcode-attachments/a.png",
+                        )
+                    ],
+                ),
+                "idem-attach",
+            )
+        )
+
+        text = client.requests[1][1]["input"][0]["text"]
+        self.assertIn("/tmp/walkcode-attachments/a.png", text)
+        self.assertTrue(text.strip())
+
+    def test_submit_turn_never_sends_empty_text(self):
+        # `400 user message must have content` from the relay's Chat
+        # Completions upstream bricks the thread for every later turn.
+        client = _FakeCodexClient()
+        transport = CodexAppServerTransport(client=client, event_silence_ceiling=0)
+
+        handle = asyncio.run(transport.launch(LaunchSpec(cwd="/tmp/project", session_id="s1")))
+        asyncio.run(transport.submit_turn(handle, TurnInput(text="   "), "idem-blank"))
+
+        self.assertEqual(
+            client.requests[1][1]["input"],
+            [{"type": "text", "text": EMPTY_TURN_PLACEHOLDER, "text_elements": []}],
+        )
+
+    def test_submit_turn_with_env_context_still_never_blank(self):
+        client = _FakeCodexClient()
+        transport = CodexAppServerTransport(
+            client=client, event_silence_ceiling=0, environment_context="CTX"
+        )
+
+        handle = asyncio.run(transport.launch(LaunchSpec(cwd="/tmp/project", session_id="s1")))
+        asyncio.run(transport.submit_turn(handle, TurnInput(text=""), "idem-ctx"))
+
+        text = client.requests[1][1]["input"][0]["text"]
+        self.assertIn("CTX", text)
+        self.assertIn(EMPTY_TURN_PLACEHOLDER, text)
 
     def test_events_convert_delta_and_completed(self):
         client = _FakeCodexClient()
