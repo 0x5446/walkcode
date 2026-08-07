@@ -30,7 +30,7 @@ import random
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Literal, Protocol
+from typing import Any, Literal, NamedTuple, Protocol
 
 from . import claude_gate
 
@@ -4744,7 +4744,13 @@ def render_view_text(view_model: dict[str, Any]) -> str:
     return str(view_model)
 
 
-def _compact_tool_summary(value: Any, *, limit: int = 160) -> str:
+# Characters a tool card's summary may occupy. Shared so callers that
+# pre-render a summary (e.g. _codex_file_change_summary) budget against the
+# same number that finally truncates it.
+_TOOL_SUMMARY_LIMIT = 160
+
+
+def _compact_tool_summary(value: Any, *, limit: int = _TOOL_SUMMARY_LIMIT) -> str:
     if isinstance(value, dict):
         raw = ", ".join(f"{key}={value[key]!r}" for key in sorted(value)[:4])
     elif isinstance(value, list):
@@ -8494,6 +8500,7 @@ class CodexAppServerTransport:
         tool_event = _codex_tool_event(event_type, payload)
         if tool_event is not None:
             return tool_event
+        item_type = _codex_item_type(payload)
         if event_type == "turn/completed":
             payload_out = {
                 "message": str(payload.get("message", "")),
@@ -8505,10 +8512,10 @@ class CodexAppServerTransport:
             return AgentEvent(AgentEventType.TURN_COMPLETED, payload_out)
         if event_type == "error":
             return self._turn_error_event(payload)
-        self._log_unhandled_event_type(event_type)
+        self._log_unhandled_event_type(event_type, item_type=item_type)
         return None
 
-    def _log_unhandled_event_type(self, event_type: str) -> None:
+    def _log_unhandled_event_type(self, event_type: str, *, item_type: str = "") -> None:
         """Say — once per type — that codex told us something we ignore.
 
         Everything unrecognised used to be dropped without a trace, so a whole
@@ -8516,11 +8523,26 @@ class CodexAppServerTransport:
         2026-08-07 outage sat behind exactly that blind spot. Once per type per
         process keeps a chatty stream (token_count, sub_agent_activity) from
         flooding the log while still surfacing the vocabulary we don't cover.
+
+        The key carries the item type because `item/started` and
+        `item/completed` are envelopes, not types: one `agentMessage` claims
+        the key and every later item subtype — including a tool type codex
+        adds in the next release — goes dark. Deduping per subtype keeps the
+        stream just as quiet while making the coverage gap visible, which is
+        the whole point of the log (ADR 0062/0063).
         """
-        if not event_type or event_type in self._logged_unhandled_types:
+        if not event_type:
             return
-        self._logged_unhandled_types.add(event_type)
-        _log_degrade("codex_event_type_unhandled", event_type=event_type)
+        key = f"{event_type}/{item_type}" if item_type else event_type
+        if key in self._logged_unhandled_types:
+            return
+        self._logged_unhandled_types.add(key)
+        if item_type:
+            _log_degrade(
+                "codex_event_type_unhandled", event_type=event_type, item_type=item_type
+            )
+        else:
+            _log_degrade("codex_event_type_unhandled", event_type=event_type)
 
     @staticmethod
     def _turn_error_event(payload: dict[str, Any]) -> AgentEvent:
@@ -8838,24 +8860,30 @@ def _codex_tool_event(event_type: str, payload: dict[str, Any]) -> AgentEvent | 
     normalized = event_type.lower()
     normalized_compact = re.sub(r"[^a-z0-9]+", "", normalized)
     item = payload.get("item")
-    item_type = ""
-    if isinstance(item, dict):
-        item_type = str(item.get("type", "") or "")
+    item_type = _codex_item_type(payload)
     item_type_compact = re.sub(r"[^a-z0-9]+", "", item_type.lower())
     event_is_tool_like = _codex_tool_like_name(normalized_compact)
-    item_is_tool_like = _codex_tool_like_name(item_type_compact)
-    if not event_is_tool_like and not item_is_tool_like:
+    spec = _CODEX_TOOL_ITEM_SPECS.get(item_type_compact)
+    if not event_is_tool_like and spec is None:
         return None
     if isinstance(item, dict):
         payload = {**payload, **item}
         normalized = f"{normalized}/{item_type.lower()}"
         normalized_compact = re.sub(r"[^a-z0-9]+", "", normalized)
+    # One summary for the whole card, computed once. It has to outlive the
+    # branch split: the progress card upserts by tool_id, so a completion that
+    # falls back to "Tool completed" *overwrites* what the start event showed.
+    # A web search that ends therefore used to lose its query.
+    item_summary: Any = spec.summary(payload) if spec is not None else None
     tool_name = str(
         payload.get("toolName")
         or payload.get("tool_name")
         or payload.get("name")
+        # mcpToolCall / dynamicToolCall / collabAgentToolCall spell it `tool`.
+        or payload.get("tool")
         or payload.get("commandName")
         or payload.get("command_name")
+        or (spec.name if spec is not None else "")
         or ("command" if payload.get("command") else "")
         or "tool"
     )
@@ -8866,43 +8894,53 @@ def _codex_tool_event(event_type: str, payload: dict[str, Any]) -> AgentEvent | 
         or payload.get("id")
         or ""
     )
+    # The item's own status outranks the method name. codex reports a *declined*
+    # patch as `item/completed` with `status: "declined"`; going by the method
+    # name alone turned a rejected edit into a success card.
     status = str(payload.get("status", "") or "").lower()
-    if (
-        any(token in normalized_compact for token in ("failed", "error", "errored"))
-        or status in {"failed", "error", "errored"}
-        or payload.get("error") is not None
-    ):
+    state = _CODEX_TOOL_STATUS_STATES.get(status, "")
+    if not state:
+        state = _codex_tool_state_from_event_name(normalized_compact)
+    if payload.get("error") is not None:
+        state = "failed"
+    if state == "failed":
         return AgentEvent(
             AgentEventType.TOOL_FAILED,
             {
                 "tool_id": tool_id,
                 "tool_name": tool_name,
-                "summary": _compact_tool_summary(payload.get("error") or payload.get("reason") or "Tool failed"),
+                "summary": _compact_tool_summary(
+                    payload.get("error")
+                    or payload.get("reason")
+                    # Keep the paths/query on the failure card too — "which
+                    # patch was rejected" is the first thing anyone asks.
+                    or item_summary
+                    or "Tool failed"
+                ),
             },
         )
-    if (
-        any(token in normalized_compact for token in ("completed", "succeeded", "success", "done", "result", "end"))
-        or status in {"completed", "succeeded", "success", "done"}
-    ):
+    if state == "completed":
         return AgentEvent(
             AgentEventType.TOOL_COMPLETED,
             {
                 "tool_id": tool_id,
                 "tool_name": tool_name,
-                "summary": _compact_tool_summary(payload.get("summary") or "Tool completed"),
+                # The type's own extractor wins: a generic `summary` field
+                # would otherwise be free to carry a whole patch onto the card.
+                "summary": _compact_tool_summary(
+                    item_summary or payload.get("summary") or "Tool completed"
+                ),
             },
         )
-    if (
-        any(token in normalized_compact for token in ("started", "start", "call", "created", "begin", "running"))
-        or status in {"running", "inprogress", "in_progress"}
-    ):
+    if state == "started":
         return AgentEvent(
             AgentEventType.TOOL_STARTED,
             {
                 "tool_id": tool_id,
                 "tool_name": tool_name,
                 "summary": _compact_tool_summary(
-                    payload.get("arguments")
+                    item_summary
+                    or payload.get("arguments")
                     or payload.get("args")
                     or payload.get("input")
                     or payload.get("command")
@@ -9074,6 +9112,119 @@ def _codex_tool_like_name(value: str) -> bool:
     if value in {"usermessage", "agentmessage", "reasoning"}:
         return False
     return any(token in value for token in ("tool", "function", "command", "exec", "shell", "bash"))
+
+
+class _CodexToolItemSpec(NamedTuple):
+    """How one codex `ThreadItem` variant renders as a tool card.
+
+    `name` is the fallback card title — the payload's own `toolName`/`tool`
+    wins when it has one. `summary` extracts what the card body should say,
+    and is used by the started/completed/failed branches alike so a card never
+    loses its subject halfway through.
+    """
+
+    name: str
+    summary: Callable[[dict[str, Any]], Any]
+
+
+def _codex_file_change_summary(changes: Any, *, limit: int = _TOOL_SUMMARY_LIMIT) -> str:
+    """Paths that fit, then a count of the ones that don't.
+
+    A `fileChange` item carries the full diff of every change; the patch body
+    must stay off the card for the same reason command output does.
+
+    The count has to be computed *inside* the same budget `_compact_tool_summary`
+    enforces, not appended and hoped for: long paths would otherwise push the
+    "+N more" tail past the limit and get chopped off, leaving a card that both
+    cuts a path mid-word and hides how big the edit was — the exact thing the
+    tail exists to prevent.
+    """
+    if not isinstance(changes, list):
+        return ""
+    paths = [
+        str(change["path"])
+        for change in changes
+        if isinstance(change, dict) and change.get("path")
+    ]
+    if not paths:
+        return ""
+    total = len(paths)
+    for shown in range(min(_CODEX_FILE_CHANGE_PATHS_SHOWN, total), 0, -1):
+        rendered = ", ".join(paths[:shown])
+        if shown < total:
+            rendered += f" (+{total - shown} more, {total} files)"
+        if len(rendered) <= limit:
+            return rendered
+    # Even one path overflows: keep the count, drop the path list.
+    return f"{total} files" if total > 1 else paths[0][:limit]
+
+
+# How many paths a fileChange card lists before switching to a count; fewer are
+# shown when they do not fit the summary budget.
+_CODEX_FILE_CHANGE_PATHS_SHOWN = 5
+
+# Every `ThreadItem` variant that is agent tool activity, taken from the
+# app-server schema (`codex app-server generate-json-schema` → ThreadItem) —
+# NOT inferred from the type's spelling. The substring probe above still runs
+# for legacy `event_msg` event names, but item types are matched exactly here.
+#
+# Exactness is the point: a bare "search" or "file" token would swallow
+# `fuzzyFileSearch/sessionCompleted`, the file picker's autocomplete push,
+# and turn every keystroke into a card.
+#
+# Deliberately absent (schema variants that are not tool activity, or have no
+# user-facing form yet): userMessage, hookPrompt, agentMessage, reasoning and
+# plan (rendered by their own paths), imageGeneration, imageView, sleep,
+# subAgentActivity, enteredReviewMode, exitedReviewMode, contextCompaction.
+# `test_codex_tool_item_specs_cover_every_schema_variant` fails when codex adds
+# a variant that appears in neither list.
+_CODEX_TOOL_ITEM_SPECS: dict[str, _CodexToolItemSpec] = {
+    "commandexecution": _CodexToolItemSpec("command", lambda p: p.get("command")),
+    "mcptoolcall": _CodexToolItemSpec("mcp_tool", lambda p: p.get("arguments")),
+    "dynamictoolcall": _CodexToolItemSpec("tool", lambda p: p.get("arguments")),
+    "collabagenttoolcall": _CodexToolItemSpec("collab_agent", lambda p: p.get("prompt")),
+    "websearch": _CodexToolItemSpec("web_search", lambda p: p.get("query")),
+    "filechange": _CodexToolItemSpec(
+        "apply_patch", lambda p: _codex_file_change_summary(p.get("changes"))
+    ),
+}
+
+# `PatchApplyStatus` / `McpToolCallStatus` values → card state. Checked before
+# the method name, because `item/completed` is the envelope for a declined
+# patch too.
+_CODEX_TOOL_STATUS_STATES = {
+    "failed": "failed",
+    "error": "failed",
+    "errored": "failed",
+    "declined": "failed",
+    "completed": "completed",
+    "succeeded": "completed",
+    "success": "completed",
+    "done": "completed",
+    "running": "started",
+    "inprogress": "started",
+    "in_progress": "started",
+}
+
+
+def _codex_tool_state_from_event_name(normalized_compact: str) -> str:
+    """Fall back to the method name when the item carries no status."""
+    for state, tokens in (
+        ("failed", ("failed", "error", "errored")),
+        ("completed", ("completed", "succeeded", "success", "done", "result", "end")),
+        ("started", ("started", "start", "call", "created", "begin", "running")),
+    ):
+        if any(token in normalized_compact for token in tokens):
+            return state
+    return ""
+
+
+def _codex_item_type(payload: dict[str, Any]) -> str:
+    """The `item.type` of an `item/*` notification, or "" when there is none."""
+    item = payload.get("item")
+    if not isinstance(item, dict):
+        return ""
+    return str(item.get("type", "") or "")
 
 
 def _codex_thread_id(result: dict[str, Any]) -> str:

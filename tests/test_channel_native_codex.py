@@ -4,8 +4,13 @@ import contextlib
 import hashlib
 import json
 import os
+import re
+import shutil
+import subprocess
+import tempfile
 import unittest
 import uuid
+from pathlib import Path
 from unittest.mock import patch
 
 import walkcode.channel_native as walkcode_channel_native
@@ -814,6 +819,375 @@ class CodexAppServerTransportTests(unittest.TestCase):
         self.assertEqual(events[1].type, AgentEventType.TOOL_COMPLETED)
         self.assertNotIn("large output", events[1].payload["summary"])
         self.assertEqual(events[2].type, AgentEventType.TURN_COMPLETED)
+
+    def test_events_convert_web_search_items(self):
+        """`webSearch` is tool activity even though its name shares no root.
+
+        The tool-like probe looks for tool/function/command/exec/shell/bash and
+        `webSearch` hits none of them, so a server-executed search produced no
+        card at all — just a one-shot `codex_event_type_unhandled` line. Item
+        shape per `codex app-server generate-json-schema`: {id, query, action?}.
+        """
+        client = _FakeCodexClient()
+        client.event_batches["thread-1"] = [
+            {
+                "method": "item/started",
+                "params": {
+                    "threadId": "thread-1",
+                    "item": {
+                        "type": "webSearch",
+                        "id": "ws-1",
+                        "query": "InfLoRA continual learning",
+                        "action": None,
+                    },
+                },
+            },
+            {
+                "method": "item/completed",
+                "params": {
+                    "threadId": "thread-1",
+                    "item": {
+                        "type": "webSearch",
+                        "id": "ws-1",
+                        "query": "InfLoRA continual learning",
+                        "action": {"type": "search", "query": "InfLoRA continual learning"},
+                    },
+                },
+            },
+            {"method": "turn/completed", "params": {"threadId": "thread-1"}},
+        ]
+        transport = CodexAppServerTransport(client=client, event_silence_ceiling=0)
+        handle = asyncio.run(transport.launch(LaunchSpec(cwd="/tmp/project", session_id="s1")))
+
+        events = _drain_events(transport, handle)
+
+        self.assertEqual(events[0].type, AgentEventType.TOOL_STARTED)
+        self.assertEqual(events[0].payload["tool_name"], "web_search")
+        self.assertIn("InfLoRA continual learning", events[0].payload["summary"])
+        self.assertEqual(events[1].type, AgentEventType.TOOL_COMPLETED)
+        self.assertEqual(events[1].payload["tool_id"], "ws-1")
+        self.assertEqual(events[1].payload["tool_name"], "web_search")
+        # The completion must keep the query. The progress card upserts by
+        # tool_id, so a generic "Tool completed" here overwrites what the user
+        # was reading and the finished card says nothing about the search.
+        self.assertIn("InfLoRA continual learning", events[1].payload["summary"])
+        self.assertEqual(events[2].type, AgentEventType.TURN_COMPLETED)
+
+    def test_events_convert_file_change_items_with_paths_not_diffs(self):
+        """`fileChange` gets a card too, and the card must not carry the patch."""
+        client = _FakeCodexClient()
+        changes = [
+            {"path": "src/a.py", "kind": {"type": "update"}, "diff": "@@ -1 +1 @@\n-old\n+new"},
+            {"path": "src/b.py", "kind": {"type": "add"}, "diff": "@@ -0,0 +1 @@\n+brand new"},
+        ]
+        client.event_batches["thread-1"] = [
+            {
+                "method": "item/started",
+                "params": {
+                    "threadId": "thread-1",
+                    "item": {
+                        "type": "fileChange",
+                        "id": "patch-1",
+                        "status": "inProgress",
+                        "changes": changes,
+                    },
+                },
+            },
+            {
+                "method": "item/completed",
+                "params": {
+                    "threadId": "thread-1",
+                    "item": {
+                        "type": "fileChange",
+                        "id": "patch-1",
+                        "status": "completed",
+                        "changes": changes,
+                    },
+                },
+            },
+            {"method": "turn/completed", "params": {"threadId": "thread-1"}},
+        ]
+        transport = CodexAppServerTransport(client=client, event_silence_ceiling=0)
+        handle = asyncio.run(transport.launch(LaunchSpec(cwd="/tmp/project", session_id="s1")))
+
+        events = _drain_events(transport, handle)
+
+        for event in events[:2]:
+            self.assertEqual(event.payload["tool_name"], "apply_patch")
+            self.assertIn("src/a.py", event.payload["summary"])
+            self.assertIn("src/b.py", event.payload["summary"])
+            self.assertNotIn("brand new", event.payload["summary"])
+            self.assertNotIn("@@", event.payload["summary"])
+        self.assertEqual(events[0].type, AgentEventType.TOOL_STARTED)
+        self.assertEqual(events[1].type, AgentEventType.TOOL_COMPLETED)
+        self.assertEqual(events[2].type, AgentEventType.TURN_COMPLETED)
+
+    def test_declined_file_change_is_a_failed_card_not_a_completed_one(self):
+        """codex reports a rejected patch as `item/completed` + status declined.
+
+        Going by the method name alone turned "the user said no" into a green
+        card claiming the edit landed.
+        """
+        transport = CodexAppServerTransport(client=_FakeCodexClient(), event_silence_ceiling=0)
+
+        event = transport._convert_event(
+            {
+                "method": "item/completed",
+                "params": {
+                    "threadId": "thread-1",
+                    "item": {
+                        "type": "fileChange",
+                        "id": "patch-1",
+                        "status": "declined",
+                        "changes": [
+                            {"path": "src/a.py", "kind": {"type": "update"}, "diff": "@@"}
+                        ],
+                    },
+                },
+            },
+            thread_id="thread-1",
+        )
+
+        self.assertEqual(event.type, AgentEventType.TOOL_FAILED)
+        self.assertEqual(event.payload["tool_name"], "apply_patch")
+        # Which patch was rejected is the first thing anyone asks.
+        self.assertIn("src/a.py", event.payload["summary"])
+
+    def test_bulk_file_change_summary_counts_the_files_it_cannot_show(self):
+        """Truncating a joined path list hides how big the edit was."""
+        transport = CodexAppServerTransport(client=_FakeCodexClient(), event_silence_ceiling=0)
+
+        event = transport._convert_event(
+            {
+                "method": "item/started",
+                "params": {
+                    "threadId": "thread-1",
+                    "item": {
+                        "type": "fileChange",
+                        "id": "patch-1",
+                        "status": "inProgress",
+                        "changes": [
+                            {"path": f"src/module_{n:02d}.py", "kind": {"type": "update"}, "diff": "@@"}
+                            for n in range(50)
+                        ],
+                    },
+                },
+            },
+            thread_id="thread-1",
+        )
+
+        summary = event.payload["summary"]
+        self.assertIn("50 files", summary)
+        self.assertIn("+45 more", summary)
+        self.assertLessEqual(len(summary), 160)
+        self.assertNotIn("...", summary)
+
+    def test_long_paths_keep_the_file_count_instead_of_being_chopped(self):
+        """The count must be budgeted for, not appended and hoped for.
+
+        With deep paths, a "+N more" tail computed outside the summary limit
+        gets truncated away — leaving a card that both cuts a path mid-word and
+        hides how big the edit was.
+        """
+        transport = CodexAppServerTransport(client=_FakeCodexClient(), event_silence_ceiling=0)
+
+        long_paths = [
+            f"services/backend/internal/domain/scheduling/handlers/very_long_handler_{n:02d}.py"
+            for n in range(12)
+        ]
+        event = transport._convert_event(
+            {
+                "method": "item/started",
+                "params": {
+                    "threadId": "thread-1",
+                    "item": {
+                        "type": "fileChange",
+                        "id": "patch-1",
+                        "status": "inProgress",
+                        "changes": [
+                            {"path": path, "kind": {"type": "update"}, "diff": "@@"}
+                            for path in long_paths
+                        ],
+                    },
+                },
+            },
+            thread_id="thread-1",
+        )
+
+        summary = event.payload["summary"]
+        self.assertLessEqual(len(summary), 160)
+        self.assertIn("12 files", summary)
+        self.assertNotIn("...", summary)
+        # Whatever paths made the cut must be whole.
+        listed = summary.split(" (+")[0]
+        for path in listed.split(", "):
+            self.assertIn(path, long_paths)
+
+    def test_file_change_card_prefers_paths_over_a_generic_summary_field(self):
+        """A generic `summary` must not be able to push a patch onto the card."""
+        transport = CodexAppServerTransport(client=_FakeCodexClient(), event_silence_ceiling=0)
+
+        event = transport._convert_event(
+            {
+                "method": "item/completed",
+                "params": {
+                    "threadId": "thread-1",
+                    "item": {
+                        "type": "fileChange",
+                        "id": "patch-1",
+                        "status": "completed",
+                        "summary": "@@ -1 +1 @@\n-old secret\n+new secret",
+                        "changes": [
+                            {"path": "src/a.py", "kind": {"type": "update"}, "diff": "@@"}
+                        ],
+                    },
+                },
+            },
+            thread_id="thread-1",
+        )
+
+        self.assertEqual(event.payload["summary"], "src/a.py")
+
+    def test_mcp_tool_call_item_is_named_after_the_tool(self):
+        """`mcpToolCall` spells its name `tool`, which the generic chain missed."""
+        transport = CodexAppServerTransport(client=_FakeCodexClient(), event_silence_ceiling=0)
+
+        event = transport._convert_event(
+            {
+                "method": "item/started",
+                "params": {
+                    "threadId": "thread-1",
+                    "item": {
+                        "type": "mcpToolCall",
+                        "id": "mcp-1",
+                        "server": "exa",
+                        "tool": "web_search_exa",
+                        "status": "inProgress",
+                        "arguments": {"query": "InfLoRA"},
+                    },
+                },
+            },
+            thread_id="thread-1",
+        )
+
+        self.assertEqual(event.type, AgentEventType.TOOL_STARTED)
+        self.assertEqual(event.payload["tool_name"], "web_search_exa")
+
+    # Generated from the installed codex, not hand-written:
+    #   codex app-server generate-json-schema --out <dir>
+    #   → codex_app_server_protocol.v2.schemas.json → ThreadItem variants
+    # `test_codex_thread_item_snapshot_matches_installed_codex` re-derives it
+    # from the binary and fails when the two drift apart. A hand-maintained
+    # list here would be worthless: upgrading codex would not change it, so
+    # the "new variant fails the build" guarantee would be a lie.
+    _THREAD_ITEM_SNAPSHOT = Path(__file__).parent / "data" / "codex_thread_item_variants.json"
+
+    @classmethod
+    def _schema_thread_item_variants(cls) -> set[str]:
+        payload = json.loads(cls._THREAD_ITEM_SNAPSHOT.read_text())
+        return set(payload["thread_item_variants"])
+
+    @staticmethod
+    def _thread_item_variants_from_schema_dir(schema_dir) -> set[str]:
+        schema = json.loads(
+            (Path(schema_dir) / "codex_app_server_protocol.v2.schemas.json").read_text()
+        )
+        defs = schema.get("definitions") or schema["$defs"]
+        thread_item = defs["ThreadItem"]
+        found: set[str] = set()
+        for variant in thread_item.get("oneOf") or thread_item.get("anyOf") or []:
+            type_schema = variant.get("properties", {}).get("type", {})
+            names = type_schema.get("enum") or (
+                [type_schema["const"]] if "const" in type_schema else []
+            )
+            found.update(names)
+        return found
+
+    def test_codex_thread_item_snapshot_matches_installed_codex(self):
+        """The snapshot must track the codex actually installed here.
+
+        Skipped where codex is absent (CI), which is exactly why the snapshot
+        is committed — but on a developer box, an upgrade that adds a
+        ThreadItem variant fails here and forces the classification decision.
+        """
+        codex = shutil.which("codex")
+        if codex is None:
+            self.skipTest("codex CLI not installed")
+        with tempfile.TemporaryDirectory() as tmp:
+            result = subprocess.run(
+                [codex, "app-server", "generate-json-schema", "--out", tmp],
+                capture_output=True,
+                text=True,
+            )
+            if result.returncode != 0:
+                self.skipTest(f"codex could not emit its schema: {result.stderr.strip()[:200]}")
+            live = self._thread_item_variants_from_schema_dir(tmp)
+
+        self.assertEqual(
+            live,
+            self._schema_thread_item_variants(),
+            "codex changed its ThreadItem variants — regenerate "
+            "tests/data/codex_thread_item_variants.json and classify the new ones "
+            "in _CODEX_TOOL_ITEM_SPECS or in this test's not_tool_activity set",
+        )
+
+    def test_codex_tool_item_specs_cover_every_schema_variant(self):
+        """Every `ThreadItem` variant is classified on purpose, not by spelling.
+
+        The 2026-08-07 outage was a tool item nobody had classified; this is
+        the guard that turns the next one into a red test.
+        """
+        schema_variants = self._schema_thread_item_variants()
+        # Variants that are deliberately not tool cards: they are either
+        # rendered by another path (messages, reasoning, plan) or have no
+        # user-facing form yet.
+        not_tool_activity = {
+            "userMessage",
+            "hookPrompt",
+            "agentMessage",
+            "plan",
+            "reasoning",
+            "subAgentActivity",
+            "imageView",
+            "sleep",
+            "imageGeneration",
+            "enteredReviewMode",
+            "exitedReviewMode",
+            "contextCompaction",
+        }
+        compact = {
+            variant: re.sub(r"[^a-z0-9]+", "", variant.lower()) for variant in schema_variants
+        }
+        mapped = {
+            variant
+            for variant, key in compact.items()
+            if key in walkcode_channel_native._CODEX_TOOL_ITEM_SPECS
+        }
+
+        self.assertEqual(mapped, schema_variants - not_tool_activity)
+        self.assertEqual(
+            set(walkcode_channel_native._CODEX_TOOL_ITEM_SPECS),
+            {compact[variant] for variant in mapped},
+            "the spec table must not carry keys that no schema variant produces",
+        )
+
+    def test_fuzzy_file_search_notification_is_not_a_tool_card(self):
+        """The file picker's own notification is not agent tool activity.
+
+        `fuzzyFileSearch/sessionCompleted` is codex asking the *client* to
+        render an autocomplete list. Matching item types on a bare "search" or
+        "file" substring would turn every keystroke into a TOOL_COMPLETED card,
+        so the extra types are matched exactly instead.
+        """
+        transport = CodexAppServerTransport(client=_FakeCodexClient(), event_silence_ceiling=0)
+
+        for method in ("fuzzyFileSearch/sessionCompleted", "fuzzyFileSearch/sessionUpdated"):
+            with self.subTest(method=method):
+                event = transport._convert_event(
+                    {"method": method, "params": {"threadId": "thread-1", "query": "chan"}},
+                    thread_id="thread-1",
+                )
+                self.assertIsNone(event)
 
     def test_events_convert_command_approval_request_and_answer_original_request_id(self):
         client = _FakeCodexClient()

@@ -619,6 +619,136 @@ class ChannelNativeDebugScriptTests(unittest.TestCase):
         self.assertEqual(payload["error"], "agent_session_error")
         self.assertEqual(payload["messages"], ["authentication_failed"])
 
+    @staticmethod
+    def _streaming_runtime(events, *, wrap_in_coroutine=False):
+        """A runtime whose transport streams events like codex's does.
+
+        `wrap_in_coroutine` mimics ClaudeHeadlessTransport: `events()` is a
+        coroutine that *resolves to* the async generator, so the smoke has to
+        await before it can recognise a stream.
+        """
+        closed: list[bool] = []
+
+        async def stream():
+            try:
+                for event in events:
+                    yield event
+                    await asyncio.sleep(0)
+            finally:
+                closed.append(True)
+
+        class _Transport:
+            async def launch(self, _spec):
+                return "handle"
+
+            async def submit_turn(self, _handle, _turn, idempotency_key):
+                self.idempotency_key = idempotency_key
+
+            if wrap_in_coroutine:
+
+                async def events(self, _handle):
+                    return stream()
+
+            else:
+
+                def events(self, _handle):
+                    return stream()
+
+        class _Runtime:
+            config = type("Config", (), {"agent": "codex", "cwd": "/tmp/project"})()
+            transports = {"codex_app_server": _Transport()}
+
+            def describe(self):
+                return {
+                    "agent": "codex",
+                    "agent_status": {"available": True, "capabilities": {}},
+                }
+
+        return _Runtime(), closed
+
+    def _run_streaming_smoke(self, events, *, wrap_in_coroutine=False, timeout=1.0):
+        runtime, closed = self._streaming_runtime(events, wrap_in_coroutine=wrap_in_coroutine)
+        with patch.object(channel_native_debug.ChannelNativeRuntime, "from_env", return_value=runtime):
+            payload = asyncio.run(
+                channel_native_debug.debug_agent_smoke(
+                    agent="", live=True, prompt="hello", timeout=timeout
+                )
+            )
+        return payload, closed
+
+    def test_agent_smoke_live_drains_streaming_transport(self):
+        """codex's `events()` is an async generator; `list()` on it raises.
+
+        That TypeError killed the codex smoke before it reached the agent, so
+        the release gate's real-environment check never ran.
+        """
+        payload, closed = self._run_streaming_smoke(
+            [
+                AgentEvent(
+                    AgentEventType.TOOL_STARTED,
+                    {"tool_id": "p1", "tool_name": "apply_patch", "summary": "src/a.py"},
+                ),
+                AgentEvent(
+                    AgentEventType.TOOL_COMPLETED,
+                    {"tool_id": "p1", "tool_name": "apply_patch", "summary": "src/a.py"},
+                ),
+                AgentEvent(AgentEventType.TURN_COMPLETED, {}),
+            ]
+        )
+
+        self.assertTrue(payload["ok"], payload)
+        self.assertNotIn("drain_error", payload)
+        self.assertEqual(payload["event_count"], 3)
+        self.assertEqual(
+            payload["tool_events"],
+            [
+                {"kind": "started", "tool_name": "apply_patch", "summary": "src/a.py"},
+                {"kind": "completed", "tool_name": "apply_patch", "summary": "src/a.py"},
+            ],
+        )
+        self.assertTrue(closed, "the event stream must be closed")
+
+    def test_agent_smoke_live_fails_when_turn_never_closes(self):
+        """A half-drained turn is not a pass — false green here hides outages."""
+        payload, _ = self._run_streaming_smoke(
+            [
+                AgentEvent(
+                    AgentEventType.TOOL_STARTED,
+                    {"tool_id": "p1", "tool_name": "apply_patch", "summary": "src/a.py"},
+                )
+            ]
+        )
+
+        self.assertFalse(payload["ok"], payload)
+        self.assertEqual(payload["error"], "agent_drain_incomplete")
+        self.assertIn("without a turn-closing event", payload["drain_error"])
+        self.assertEqual(payload["event_count"], 1)
+
+    def test_agent_smoke_live_times_out_instead_of_reporting_success(self):
+        """A stalled stream must fail, not return the events it managed to get."""
+
+        async def stalling():
+            yield AgentEvent(AgentEventType.TOOL_STARTED, {"tool_id": "p1", "tool_name": "shell"})
+            await asyncio.sleep(30)
+            yield AgentEvent(AgentEventType.TURN_COMPLETED, {})
+
+        events, error = asyncio.run(
+            channel_native_debug._drain_agent_events(stalling(), timeout=0.05)
+        )
+
+        self.assertEqual(len(events), 1)
+        self.assertIn("timed out", error)
+
+    def test_agent_smoke_live_awaits_before_detecting_the_stream(self):
+        """ClaudeHeadlessTransport returns a coroutine that yields the stream."""
+        payload, closed = self._run_streaming_smoke(
+            [AgentEvent(AgentEventType.TURN_COMPLETED, {})], wrap_in_coroutine=True
+        )
+
+        self.assertTrue(payload["ok"], payload)
+        self.assertEqual(payload["event_count"], 1)
+        self.assertTrue(closed)
+
     def test_runtime_debug_reports_competing_consumers_without_full_command(self):
         ps_output = "\n".join(
             [

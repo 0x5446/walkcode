@@ -61,6 +61,22 @@ scripts; orchestration and gates live in the skill.
   `_log_degrade("codex_event_type_unhandled")`. When adding transports, keep
   that rule: an agent's error channel must never be dropped silently. The
   protocol is discoverable — `codex app-server generate-json-schema --out <dir>`.
+- **Item-type mapping (ADR 0063)**: `item.type` is classified by an exhaustive
+  table, `_CODEX_TOOL_ITEM_SPECS` — every `ThreadItem` variant is either in it or
+  in the test's not-tool-activity list. The guard has two halves and needs both:
+  `tests/data/codex_thread_item_variants.json` is *generated* from
+  `codex app-server generate-json-schema` (regenerate it after a codex upgrade),
+  and the tests both re-derive it from the installed binary and assert the
+  split. A hand-written variant list would make the "new variant fails the
+  build" promise a lie. The substring probe (`_codex_tool_like_name`) still runs
+  over event *names*; never widen it to reach a new item type —
+  a bare "search" token would turn the file picker's `fuzzyFileSearch/*` push
+  into a card. Each spec supplies a fallback name and a summary used by the
+  started/completed/failed branches alike, because the progress card upserts by
+  `tool_id`: a completion that falls back to "Tool completed" erases what the
+  user was reading. Item `status` outranks the method name (`item/completed` is
+  also how a *declined* patch arrives). `fileChange` cards carry paths and a
+  count, never the diff.
 - Legacy remnants are blockers for upgrade and real E2E: old LaunchAgents,
   `walkcode hook` configs, shell wrapper source lines, and `FEISHU_*` env must be
   cleaned first.
