@@ -6,7 +6,9 @@ import json
 import os
 import unittest
 import uuid
+from unittest.mock import patch
 
+import walkcode.channel_native as walkcode_channel_native
 from walkcode.channel_native import (
     EMPTY_TURN_PLACEHOLDER,
     ActorRef,
@@ -448,6 +450,90 @@ class CodexAppServerTransportTests(unittest.TestCase):
         text = client.requests[1][1]["input"][0]["text"]
         self.assertIn("CTX", text)
         self.assertIn(EMPTY_TURN_PLACEHOLDER, text)
+
+    def test_error_notification_while_retrying_becomes_a_diagnostic_note(self):
+        # app-server v2 `error` notification. willRetry=True means codex is
+        # still backing off — the note belongs on the progress card, and it
+        # must NOT count as the agent having answered.
+        transport = CodexAppServerTransport(client=_FakeCodexClient())
+
+        event = transport._convert_event(
+            {
+                "method": "error",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "willRetry": True,
+                    "error": {
+                        "message": "user message must have content",
+                        "codexErrorInfo": {"responseStreamConnectionFailed": {"httpStatusCode": 400}},
+                    },
+                },
+            },
+            thread_id="thread-1",
+        )
+
+        self.assertEqual(event.type, AgentEventType.TURN_NARRATION)
+        self.assertTrue(event.payload["diagnostic"])
+        self.assertIn("响应流连接失败", event.payload["text"])
+        self.assertIn("HTTP 400", event.payload["text"])
+        self.assertIn("user message must have content", event.payload["text"])
+
+    def test_error_notification_after_retries_becomes_a_session_error(self):
+        # willRetry=False: the turn is lost. Without this the turn just ends
+        # in silence — the 2026-08-07 outage verbatim.
+        transport = CodexAppServerTransport(client=_FakeCodexClient())
+
+        event = transport._convert_event(
+            {
+                "method": "error",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "willRetry": False,
+                    "error": {
+                        "message": "retry limit reached",
+                        "codexErrorInfo": "responseTooManyFailedAttempts",
+                    },
+                },
+            },
+            thread_id="thread-1",
+        )
+
+        self.assertEqual(event.type, AgentEventType.SESSION_ERROR)
+        self.assertEqual(event.payload["reason"], "codex_turn_error")
+        self.assertIn("重试次数耗尽", event.payload["message"])
+        self.assertEqual(event.payload["turn_id"], "turn-1")
+
+    def test_error_notification_without_codex_error_info_still_reports(self):
+        transport = CodexAppServerTransport(client=_FakeCodexClient())
+
+        event = transport._convert_event(
+            {"method": "error", "params": {"willRetry": False, "error": {"message": "boom"}}},
+            thread_id="thread-1",
+        )
+
+        self.assertEqual(event.type, AgentEventType.SESSION_ERROR)
+        self.assertIn("boom", event.payload["message"])
+
+    def test_unhandled_event_types_are_logged_once_each(self):
+        # Everything unrecognised used to vanish without a trace, which is how
+        # a whole class of "codex said it, nobody listened" stayed invisible.
+        transport = CodexAppServerTransport(client=_FakeCodexClient())
+        logged = []
+        with patch.object(walkcode_channel_native, "_log_degrade",
+                          lambda event, **kw: logged.append((event, kw))):
+            for _ in range(3):
+                transport._convert_event({"method": "thread/tokenUsage/updated"}, thread_id="t")
+            transport._convert_event(
+                {"type": "event_msg", "payload": {"type": "sub_agent_activity"}}, thread_id="t"
+            )
+
+        self.assertEqual(
+            [kw["event_type"] for _, kw in logged],
+            ["thread/tokenUsage/updated", "event_msg/sub_agent_activity"],
+        )
+        self.assertTrue(all(name == "codex_event_type_unhandled" for name, _ in logged))
 
     def test_events_convert_delta_and_completed(self):
         client = _FakeCodexClient()
