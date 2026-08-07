@@ -40,7 +40,14 @@ _BASH = "/bin/bash" if os.path.exists("/bin/bash") else shutil.which("bash")
 FAKE_GH = """#!/usr/bin/env bash
 cmd="${1:-}"; sub="${2:-}"
 case "$cmd" in
-  api)     echo "${FAKE_GH_ACCOUNT:-0x5446}" ;;
+  api)
+    case "$sub" in
+      */releases/latest)
+        # FAKE_GH_LATEST_TAG=NONE emulates an unauthenticated / erroring gh.
+        [ "${FAKE_GH_LATEST_TAG:-v9.9.9}" = "NONE" ] && exit 1
+        echo "${FAKE_GH_LATEST_TAG:-v9.9.9}" ;;
+      *) echo "${FAKE_GH_ACCOUNT:-0x5446}" ;;
+    esac ;;
   pr)      case "$sub" in create) echo "https://fake/pr/1" ;; *) : ;; esac ;;
   release) case "$sub" in
              view)
@@ -75,6 +82,16 @@ case "${1:-}" in
   native) echo "native doctor ok" ;;
   *) : ;;
 esac
+"""
+
+# upgrade.sh's last-resort tag source reads the Location header of
+# github.com/<repo>/releases/latest via `curl -w '%{redirect_url}'`.
+# FAKE_CURL_REDIRECT empty = no release (curl -f exits 22 on the 404).
+FAKE_CURL = """#!/usr/bin/env bash
+if [ -z "${FAKE_CURL_REDIRECT:-}" ]; then
+  exit 22
+fi
+printf '%s' "$FAKE_CURL_REDIRECT"
 """
 
 FAKE_LAUNCHCTL = """#!/usr/bin/env bash
@@ -150,6 +167,10 @@ class _ScriptGateBase(unittest.TestCase):
         _write_exe(self.fakebin / "uv", FAKE_UV)
         _write_exe(self.fakebin / "walkcode", FAKE_WALKCODE)
         _write_exe(self.fakebin / "launchctl", FAKE_LAUNCHCTL)
+        # Not on PATH by default: only the tag-resolution tests shadow curl.
+        self.fakecurl = self.fakebin / "curl-shim"
+        self.fakecurl.mkdir()
+        _write_exe(self.fakecurl / "curl", FAKE_CURL)
 
         self.env = _sanitized_host_env(os.environ)
         self.env["PATH"] = f"{self.fakebin}{os.pathsep}{self.env['PATH']}"
@@ -312,6 +333,68 @@ class UpgradeGateTests(_ScriptGateBase):
         self.assertIn("--with claude-agent-sdk", uv_invocation)
         self.assertIn("--reinstall", uv_invocation)
         self.assertIn("--refresh-package walkcode", uv_invocation)
+
+    def _offline_tag_env(self, **extra):
+        """No gh release lookup, no reachable releases API — so only the
+        release-page redirect can answer. The dead proxy keeps the anonymous
+        API attempt hermetic (it used to reach github.com from the suite)."""
+        env = self._upgrade_env(
+            FAKE_GH_LATEST_TAG="NONE",
+            https_proxy="http://127.0.0.1:1",
+            HTTPS_PROXY="http://127.0.0.1:1",
+            PATH=f"{self.fakecurl}{os.pathsep}{self.env['PATH']}",
+        )
+        env.update(extra)
+        return env
+
+    def test_upgrade_pins_the_release_tag_gh_resolves(self):
+        uv_log = self.tmp / "uv.log"
+        r = self._run("upgrade.sh", extra_env=self._upgrade_env(
+            FAKE_GH_LATEST_TAG="v1.2.3", FAKE_UV_LOG=str(uv_log)))
+
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("walkcode.git@v1.2.3", uv_log.read_text())
+
+    def test_upgrade_rejects_a_tag_shape_that_is_not_semver(self):
+        # The tag lands in a shell `uv tool install` command; a compromised or
+        # merely renamed release must not smuggle anything into it.
+        uv_log = self.tmp / "uv.log"
+        r = self._run("upgrade.sh", extra_env=self._offline_tag_env(
+            FAKE_GH_LATEST_TAG="v1.2.3; touch /tmp/pwned", FAKE_UV_LOG=str(uv_log)))
+
+        self.assertNotEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertFalse(uv_log.exists(), "a malformed tag must install nothing")
+
+    def test_upgrade_falls_back_to_the_release_page_redirect(self):
+        # 2026-08-07: the anonymous releases API answered 403 (rate limit) and
+        # upgrade.sh silently installed from main. The redirect is the no-API
+        # backstop, and unlike a bare tag list it can only name a tag that
+        # actually has a Release.
+        uv_log = self.tmp / "uv.log"
+        r = self._run("upgrade.sh", extra_env=self._offline_tag_env(
+            FAKE_CURL_REDIRECT="https://github.com/0x5446/walkcode/releases/tag/v0.14.19",
+            FAKE_UV_LOG=str(uv_log)))
+
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("walkcode.git@v0.14.19", uv_log.read_text())
+
+    def test_upgrade_refuses_to_install_from_main_when_no_tag_resolves(self):
+        uv_log = self.tmp / "uv.log"
+        r = self._run("upgrade.sh", extra_env=self._offline_tag_env(
+            FAKE_CURL_REDIRECT="", FAKE_UV_LOG=str(uv_log)))
+
+        self.assertNotEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertFalse(uv_log.exists(), "nothing may be installed without a tag")
+
+    def test_allow_main_override_installs_from_the_default_branch(self):
+        uv_log = self.tmp / "uv.log"
+        r = self._run("upgrade.sh", extra_env=self._offline_tag_env(
+            FAKE_CURL_REDIRECT="", FAKE_UV_LOG=str(uv_log), WALKCODE_ALLOW_MAIN="1"))
+
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        invocation = uv_log.read_text()
+        self.assertIn("walkcode.git", invocation)
+        self.assertNotIn("walkcode.git@", invocation)
 
     def test_upgrade_allows_v3_pass_through_agent_wrappers(self):
         wrappers = self.home / ".agent-control-plane"

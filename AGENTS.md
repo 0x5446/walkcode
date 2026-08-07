@@ -42,9 +42,19 @@ scripts; orchestration and gates live in the skill.
   `com.walkcode.*` services excluding `com.walkcode.tap-*` proxies), and
   verify each restarted instance with `walkcode native doctor` bound to its
   env file.
+- **Release tag resolution (ADR 0061)**: `gh api …/releases/latest` →
+  anonymous releases API → the `releases/latest` HTML redirect; every source
+  must yield `vX.Y.Z`. All three failing is a hard error — upgrade refuses to
+  install from `main` unless `WALKCODE_ALLOW_MAIN=1` is set explicitly
+  (the anonymous API is IP-rate-limited and used to make that fallback silent).
 - V3 hard rules: do not reinstall legacy hooks, do not restart old
   `walkcode serve/start` daemons, and do not share a bot token or state file
   between Claude and Codex runtimes.
+- **Runtime contract (ADR 0061)**: never submit empty text to an agent — an
+  empty message persists in the thread history and permanently 400s it — and
+  never let a turn close without the channel seeing something. Both are
+  enforced in `channel_native/__init__.py` (`_compose_turn_text` /
+  `EMPTY_TURN_NOTICE`); don't "simplify" either away.
 - Legacy remnants are blockers for upgrade and real E2E: old LaunchAgents,
   `walkcode hook` configs, shell wrapper source lines, and `FEISHU_*` env must be
   cleaned first.

@@ -10,6 +10,7 @@ import shlex
 import subprocess
 import sys
 import tomllib
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -27,15 +28,90 @@ def _run(cmd: str, **kwargs) -> None:
         raise SystemExit(1)
 
 
-def _get_latest_tag() -> str | None:
+_SEMVER_TAG = re.compile(r"^v(\d+)\.(\d+)\.(\d+)$")
+
+
+def _validated_tag(tag: str | None) -> str | None:
+    """Accept only `vX.Y.Z`.
+
+    Every source here is remote-controlled and the result is interpolated into
+    a `uv tool install "walkcode @ git+<url>@<tag>"` shell command, so the
+    shape is checked once, centrally, rather than trusted per source.
+    """
+    tag = (tag or "").strip()
+    return tag if _SEMVER_TAG.match(tag) else None
+
+
+def _latest_tag_via_gh() -> str | None:
+    """Authenticated release lookup. The only source that knows which release
+    GitHub calls "latest" (a hotfix on an older line must not win)."""
+    try:
+        result = subprocess.run(
+            ["gh", "api", f"repos/{_GITHUB_REPO}/releases/latest", "--jq", ".tag_name"],
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+    except Exception:
+        return None
+    return _validated_tag(result.stdout if result.returncode == 0 else "")
+
+
+def _latest_tag_via_api() -> str | None:
     url = f"https://api.github.com/repos/{_GITHUB_REPO}/releases/latest"
     try:
         req = urllib.request.Request(url, headers={"Accept": "application/vnd.github+json"})
         with urllib.request.urlopen(req, timeout=10) as resp:
-            data = json.loads(resp.read())
-            return data.get("tag_name")
+            return _validated_tag(json.loads(resp.read()).get("tag_name"))
     except Exception:
         return None
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def _latest_tag_via_release_redirect() -> str | None:
+    """Latest release from the HTML redirect: no API, so no rate limit.
+
+    `github.com/<repo>/releases/latest` 302s to `/releases/tag/<tag>`. Reading
+    the tag list over `git ls-remote` would be simpler but wrong: `release.sh`
+    pushes the tag BEFORE creating the Release, so a failed `gh release create`
+    leaves a tag with no Release behind — and AGENTS.md is explicit that
+    upgrade installs *Releases*. This endpoint can only ever name a real one.
+    """
+    url = f"https://github.com/{_GITHUB_REPO}/releases/latest"
+    opener = urllib.request.build_opener(_NoRedirect)
+    try:
+        opener.open(url, timeout=10)
+    except urllib.error.HTTPError as exc:
+        location = (exc.headers or {}).get("Location", "")
+    except Exception:
+        return None
+    else:
+        # 200 without a redirect means no release exists (or the page shape
+        # changed): either way there is nothing trustworthy to install.
+        return None
+    if "/releases/tag/" not in location:
+        return None
+    return _validated_tag(location.rstrip("/").rsplit("/", 1)[-1])
+
+
+def _get_latest_tag() -> str | None:
+    """Resolve the release to install, hardest source first.
+
+    The anonymous releases API is rate-limited per IP and WILL return 403
+    (observed 2026-08-07). When it did, the old single-source lookup fell
+    through to "install from the default branch" without saying anything —
+    an upgrade that silently ships unreleased code. Try gh (authenticated),
+    then the anonymous API, then the release-page redirect.
+    """
+    for resolve in (_latest_tag_via_gh, _latest_tag_via_api, _latest_tag_via_release_redirect):
+        tag = resolve()
+        if tag:
+            return tag
+    return None
 
 
 def _current_version() -> str:
@@ -269,9 +345,18 @@ def cmd_upgrade(_args) -> None:
     if tag:
         print(f"Latest release: {tag}")
         source = f"walkcode @ git+{_GITHUB_URL}@{tag}"
-    else:
-        print("Could not resolve latest release; installing from default branch.")
+    elif os.environ.get("WALKCODE_ALLOW_MAIN") == "1":
+        print("Could not resolve latest release; WALKCODE_ALLOW_MAIN=1 → installing from the default branch.")
         source = f"walkcode @ git+{_GITHUB_URL}"
+    else:
+        # Falling through to the default branch here used to be silent, which
+        # turns "upgrade to the release" into "ship whatever is on main".
+        print(
+            "Could not resolve the latest release tag (gh, the anonymous API and "
+            "the release-page redirect all failed). Refusing to install from the default "
+            "branch: authenticate gh (`gh auth login`) or set WALKCODE_ALLOW_MAIN=1 to override."
+        )
+        raise SystemExit(1)
 
     python_spec = os.environ.get("WALKCODE_PYTHON", "3.13")
     _run(

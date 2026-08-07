@@ -2,6 +2,7 @@
 
 import argparse
 import unittest
+import urllib.error
 from pathlib import Path
 from unittest.mock import patch
 
@@ -35,7 +36,7 @@ class UpgradeV3Tests(unittest.TestCase):
     def test_upgrade_restarts_only_explicit_v3_launchd_labels(self):
         calls = []
         with patch.object(m, "_run", lambda cmd, **kw: calls.append(cmd)), \
-             patch.object(m, "_get_latest_tag", lambda: None), \
+             patch.object(m, "_get_latest_tag", lambda: "v9.9.9"), \
              patch.object(m, "_current_version", lambda: "0.0.0"), \
              patch.dict("os.environ", {"WALKCODE_V3_LAUNCHD_LABELS": "com.walkcode.telegram-claude, com.walkcode.telegram-codex"}, clear=True):
             m.cmd_upgrade(argparse.Namespace())
@@ -50,7 +51,7 @@ class UpgradeV3Tests(unittest.TestCase):
         calls = []
         scheduled = []
         with patch.object(m, "_run", lambda cmd, **kw: calls.append(cmd)), \
-             patch.object(m, "_get_latest_tag", lambda: None), \
+             patch.object(m, "_get_latest_tag", lambda: "v9.9.9"), \
              patch.object(m, "_current_version", lambda: "0.0.0"), \
              patch.object(m, "_schedule_deferred_self_restart", lambda label: scheduled.append(label)), \
              patch.dict("os.environ", {
@@ -93,7 +94,7 @@ class UpgradeV3Tests(unittest.TestCase):
         # the driver before doctor and the completion message land.
         events = []
         with patch.object(m, "_run", lambda cmd, **kw: events.append(("run", cmd))), \
-             patch.object(m, "_get_latest_tag", lambda: None), \
+             patch.object(m, "_get_latest_tag", lambda: "v9.9.9"), \
              patch.object(m, "_current_version", lambda: "0.0.0"), \
              patch.object(m, "_schedule_deferred_self_restart",
                           lambda label: events.append(("schedule", label))), \
@@ -151,7 +152,7 @@ class UpgradeV3Tests(unittest.TestCase):
     def test_explicit_tap_labels_are_never_kickstarted(self):
         calls = []
         with patch.object(m, "_run", lambda cmd, **kw: calls.append(cmd)), \
-             patch.object(m, "_get_latest_tag", lambda: None), \
+             patch.object(m, "_get_latest_tag", lambda: "v9.9.9"), \
              patch.object(m, "_current_version", lambda: "0.0.0"), \
              patch.dict(
                  "os.environ",
@@ -175,7 +176,7 @@ class UpgradeV3Tests(unittest.TestCase):
             walkdir.mkdir()
             (walkdir / "a-claude.env").write_text("WALKCODE_CHANNEL=lark\n")
             with patch.object(m, "_run", lambda cmd, **kw: calls.append(cmd)), \
-                 patch.object(m, "_get_latest_tag", lambda: None), \
+                 patch.object(m, "_get_latest_tag", lambda: "v9.9.9"), \
                  patch.object(m, "_current_version", lambda: "0.0.0"), \
                  patch.object(
                      m, "_discover_v3_launchd_labels",
@@ -197,7 +198,7 @@ class UpgradeV3Tests(unittest.TestCase):
         # leaving every instance on the old version after an upgrade.
         calls = []
         with patch.object(m, "_run", lambda cmd, **kw: calls.append(cmd)), \
-             patch.object(m, "_get_latest_tag", lambda: None), \
+             patch.object(m, "_get_latest_tag", lambda: "v9.9.9"), \
              patch.object(m, "_current_version", lambda: "0.0.0"), \
              patch.object(m, "_discover_v3_launchd_labels", lambda: ["com.walkcode.a-claude"]), \
              patch.dict("os.environ", {"HOME": "/nonexistent-walkcode-test"}, clear=True):
@@ -210,6 +211,82 @@ class UpgradeV3Tests(unittest.TestCase):
         # no per-label env file exists → falls back to a bare doctor
         self.assertTrue(any("walkcode native doctor" in c for c in calls), calls)
         self.assertFalse(any("tap-" in c for c in calls), calls)
+
+
+class LatestTagResolutionTests(unittest.TestCase):
+    """The anonymous releases API is rate-limited per IP and returned 403 on
+    2026-08-07; the old single-source lookup then silently installed from the
+    default branch instead of the release."""
+
+    def test_falls_back_to_release_redirect_when_gh_and_api_fail(self):
+        with patch.object(m, "_latest_tag_via_gh", lambda: None), \
+             patch.object(m, "_latest_tag_via_api", lambda: None), \
+             patch.object(m, "_latest_tag_via_release_redirect", lambda: "v0.14.19"):
+            self.assertEqual(m._get_latest_tag(), "v0.14.19")
+
+    def test_gh_wins_over_the_other_sources(self):
+        with patch.object(m, "_latest_tag_via_gh", lambda: "v1.2.3"), \
+             patch.object(m, "_latest_tag_via_api", lambda: "v0.0.1"), \
+             patch.object(m, "_latest_tag_via_release_redirect", lambda: "v0.0.2"):
+            self.assertEqual(m._get_latest_tag(), "v1.2.3")
+
+    def _redirect_opener(self, location):
+        """Stand in for the 302 that /releases/latest answers with."""
+        class _Opener:
+            def open(self, url, timeout=None):
+                raise urllib.error.HTTPError(
+                    url, 302, "Found", {"Location": location}, None
+                )
+
+        return _Opener()
+
+    def test_release_redirect_reads_the_tag_from_the_location_header(self):
+        opener = self._redirect_opener("https://github.com/o/r/releases/tag/v0.14.19")
+        with patch.object(m.urllib.request, "build_opener", lambda *a: opener):
+            self.assertEqual(m._latest_tag_via_release_redirect(), "v0.14.19")
+
+    def test_release_redirect_rejects_a_non_semver_target(self):
+        # A moved/renamed page must not become an installable "tag".
+        opener = self._redirect_opener("https://github.com/o/r/releases")
+        with patch.object(m.urllib.request, "build_opener", lambda *a: opener):
+            self.assertIsNone(m._latest_tag_via_release_redirect())
+
+    def test_tag_sources_reject_shapes_that_are_not_semver(self):
+        # The tag is interpolated into a shell `uv tool install` command.
+        for raw in ("main", "v1.2", "v1.2.3; rm -rf /", "", None, "  v1.2.3  "):
+            with self.subTest(raw=raw):
+                got = m._validated_tag(raw)
+                self.assertEqual(got, "v1.2.3" if raw == "  v1.2.3  " else None)
+
+    def test_ls_remote_is_no_longer_a_tag_source(self):
+        # release.sh pushes the tag BEFORE creating the Release, so a bare tag
+        # list can name a version that was never released (AGENTS.md: upgrade
+        # installs Releases).
+        self.assertFalse(hasattr(m, "_latest_tag_via_ls_remote"))
+
+    def test_upgrade_refuses_to_install_from_main_when_no_tag_resolves(self):
+        calls = []
+        with patch.object(m, "_run", lambda cmd, **kw: calls.append(cmd)), \
+             patch.object(m, "_get_latest_tag", lambda: None), \
+             patch.object(m, "_current_version", lambda: "0.0.0"), \
+             patch.dict("os.environ", {}, clear=True):
+            with self.assertRaises(SystemExit):
+                m.cmd_upgrade(argparse.Namespace())
+
+        self.assertEqual(calls, [], "nothing may be installed without a resolved tag")
+
+    def test_allow_main_override_still_installs_from_the_default_branch(self):
+        calls = []
+        with patch.object(m, "_run", lambda cmd, **kw: calls.append(cmd)), \
+             patch.object(m, "_get_latest_tag", lambda: None), \
+             patch.object(m, "_current_version", lambda: "0.0.0"), \
+             patch.object(m, "_discover_v3_launchd_labels", lambda: []), \
+             patch.dict("os.environ", {"WALKCODE_ALLOW_MAIN": "1"}, clear=True):
+            m.cmd_upgrade(argparse.Namespace())
+
+        install = next(c for c in calls if "uv tool install" in c)
+        self.assertIn("walkcode @ git+", install)
+        self.assertNotIn("@v", install.split("git+")[1])
 
 
 if __name__ == "__main__":

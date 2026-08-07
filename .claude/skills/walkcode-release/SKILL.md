@@ -49,7 +49,12 @@ metadata:
    - 打 tag 前校验 `HEAD`==`origin/main`（防发未合并的本地提交）。在 `main` 打 `vX.Y.Z` tag、push、`gh release create --latest`（release notes 自动取上个 tag 到 HEAD 的 commit）。
    - **可重入**：若 tag 已在 HEAD 但 Release 没建成（如 `gh` 中途失败），重跑会跳过打 tag、续建 Release；tag 指向别处才报错。
 5. **本地升级**：`./upgrade.sh`
-   - 安装最新 Release。
+   - 安装最新 Release。tag 解析三源（ADR 0061）：`gh api …/releases/latest` →
+     匿名 releases API → `releases/latest` 的 HTML 跳转；每一路的结果都必须匹配
+     `vX.Y.Z`。三源全失败**直接报错退出**，不再静默回落到 main；
+     确实要装 main 时显式 `WALKCODE_ALLOW_MAIN=1`。
+     （不用 `git ls-remote` 列 tag：prepare/publish 先推 tag 再建 Release，
+     `gh release create` 失败会留下没有 Release 的 tag。）
    - 不写 legacy `walkcode hook`，不安装 tmux wrapper。
    - 发现旧 LaunchAgent、old hook、shell wrapper、`FEISHU_*` env 会直接失败。
    - kickstart `WALKCODE_V3_LAUNCHD_LABELS`；为空时自动发现已加载的
