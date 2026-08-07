@@ -8540,13 +8540,23 @@ class CodexAppServerTransport:
         error = payload.get("error")
         if not isinstance(error, dict):
             error = {}
-        message = str(error.get("message", "") or "").strip()
-        details = str(error.get("additionalDetails", "") or "").strip()
         kind, status = _codex_error_kind(error.get("codexErrorInfo"))
-        parts = [part for part in (kind, message, details) if part]
-        summary = " · ".join(dict.fromkeys(parts)) or "上游返回了一个未描述的错误"
-        if status:
-            summary = f"{summary}（HTTP {status}）"
+        # Kind and HTTP status lead, free text follows and is what gets cut.
+        # The other order loses the status entirely: the progress card caps
+        # its lines, so a thousand-character upstream message would push
+        # "HTTP 429" — the single most diagnostic token — off the end.
+        head = f"{kind}（HTTP {status}）" if kind and status else (kind or (f"HTTP {status}" if status else ""))
+        free_text = " · ".join(
+            dict.fromkeys(
+                part
+                for part in (
+                    _compact_tool_summary(error.get("message"), limit=200),
+                    _compact_tool_summary(error.get("additionalDetails"), limit=120),
+                )
+                if part
+            )
+        )
+        summary = " · ".join(part for part in (head, free_text) if part) or "上游返回了一个未描述的错误"
         if bool(payload.get("willRetry")):
             return AgentEvent(
                 AgentEventType.TURN_NARRATION,
@@ -12386,7 +12396,11 @@ class Orchestrator:
                 # turn's title on this long-lived stream.
                 turn_text_parts.clear()
                 turn_text_len = 0
-                turn_produced_output = False
+                # A SESSION_ERROR already told the user what went wrong — and
+                # codex still sends turn/completed right after one. Resetting
+                # here would make that completion look like a silent turn and
+                # post a second, redundant warning for the same failure.
+                turn_produced_output = event.type == AgentEventType.SESSION_ERROR
                 turn_ended = True
             else:
                 turn_ended = False

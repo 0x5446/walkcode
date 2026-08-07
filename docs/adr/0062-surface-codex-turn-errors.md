@@ -67,12 +67,39 @@ event_type=…)`，每种类型每进程一次。
 - 频道多出 💬 诊断行；`willRetry` 为真时不产生独立气泡。
 - 未知事件日志一次性，不影响热路径（一个 set 查询）。
 
+## 与 ADR 0061 的边界
+
+codex 在终止错误之后**仍会发 `turn/completed`**（真实抓包确认）。所以
+`_drain_events` 的回合结束分支对 `SESSION_ERROR` **不重置** `turn_produced_output`
+而是置真——否则紧随其后的完成事件会被判成静默轮，同一次失败告警两遍。
+
+lifecycle 最终落到 `IDLE` 而不是停在 `ERROR_RECOVERABLE`，这是**有意的**：
+回合失败不等于 worker 坏了，会话仍可直接接收下一条消息；失败本身已经以
+气泡形式留在话题里。
+
 ## 验证
 
-- `tests/test_channel_native_codex.py`：`willRetry` 真/假两条分支、
-  无 `codexErrorInfo` 的降级、未知类型按类型只记一次。
+**真实协议抓包（AGENTS.md 要求的真实环境验收）**：用真实
+`codex app-server --stdio`（codex 0.144.5，CODEX_HOME=个人 profile）起 ephemeral
+thread，模型指向 `gpt-5.6-sol` + `commandcode` provider（上游必然回
+403 MODEL_NOT_IN_PLAN），实测收到 **6 条 `error` 通知**：5 条
+`willRetry: true`（`message: "Reconnecting... N/5"`,
+`codexErrorInfo: {"responseStreamDisconnected": {"httpStatusCode": null}}`,
+`additionalDetails` 携带上游原始 JSON），1 条 `willRetry: false`
+（`codexErrorInfo: "other"`，message 为上游原文），随后 `turn/completed`。
+
+这批真实报文已逐字固化进 `tests/test_channel_native_codex.py`
+（`_LIVE_RETRY_ERROR` / `_LIVE_TERMINAL_ERROR`）——协议形状不再只靠 schema 推断。
+同时验证了两个边界：`httpStatusCode: null` 不产生 `HTTP None`，
+`codexErrorInfo: "other"` 无标签时 message 必须保留。
+
+其余：
+
+- `tests/test_channel_native_codex.py`：`willRetry` 真/假分支、
+  `codexErrorInfo` 各变体表驱动、字段全缺的降级、超长 message 下
+  HTTP 状态仍在前 60 字符内、未知类型按类型只记一次。
 - `tests/test_channel_native_silent_turn.py`：两次重试 + 空完成的完整序列
   （既看到 `正在重试` 与 `HTTP 400`，也仍然收到收尾的零输出告警）；
-  放弃重试后 `重试次数耗尽` 进频道。
+  放弃重试后只发一条 `本轮失败`，不再叠加零输出告警。
 - 协议来源：`codex app-server generate-json-schema --out <dir>` 的
   `ServerNotification.json` / `v2/ErrorNotification.json`（codex 0.144.5）。

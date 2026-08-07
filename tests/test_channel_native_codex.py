@@ -516,6 +516,134 @@ class CodexAppServerTransportTests(unittest.TestCase):
         self.assertEqual(event.type, AgentEventType.SESSION_ERROR)
         self.assertIn("boom", event.payload["message"])
 
+    # Captured verbatim off a live `codex app-server --stdio` (codex 0.144.5)
+    # whose upstream answered 403 MODEL_NOT_IN_PLAN — six `error`
+    # notifications, five retrying and one terminal. Recorded 2026-08-07 so
+    # the parser is pinned to the real wire shape, not to the schema alone
+    # (docs/review/.review-learnings.md: a fake client proves nothing about
+    # the protocol).
+    _LIVE_RETRY_ERROR = {
+        "method": "error",
+        "params": {
+            "error": {
+                "message": "Reconnecting... 5/5",
+                "codexErrorInfo": {"responseStreamDisconnected": {"httpStatusCode": None}},
+                "additionalDetails": (
+                    'stream disconnected before completion: {"error":{"message":'
+                    '"MODEL_NOT_IN_PLAN: GPT-5.6 Sol available in Pro and above plans '
+                    'or extra on demand usage","type":"permission_error","code":"FORBIDDEN"}}'
+                ),
+            },
+            "willRetry": True,
+            "threadId": "019fdbff-710c-7e72-98dd-3fea57646a9f",
+            "turnId": "019fdbff-7afb-7431-85c9-6a82a3a00521",
+        },
+    }
+    _LIVE_TERMINAL_ERROR = {
+        "method": "error",
+        "params": {
+            "error": {
+                "message": (
+                    'stream disconnected before completion: {"error":{"message":'
+                    '"MODEL_NOT_IN_PLAN: GPT-5.6 Sol available in Pro and above plans '
+                    'or extra on demand usage","type":"permission_error","code":"FORBIDDEN"}}'
+                ),
+                "codexErrorInfo": "other",
+                "additionalDetails": None,
+            },
+            "willRetry": False,
+            "threadId": "019fdbff-710c-7e72-98dd-3fea57646a9f",
+            "turnId": "019fdbff-7afb-7431-85c9-6a82a3a00521",
+        },
+    }
+
+    def test_live_captured_retry_error_is_parsed(self):
+        transport = CodexAppServerTransport(client=_FakeCodexClient())
+
+        event = transport._convert_event(dict(self._LIVE_RETRY_ERROR), thread_id="t")
+
+        self.assertEqual(event.type, AgentEventType.TURN_NARRATION)
+        self.assertTrue(event.payload["diagnostic"])
+        self.assertIn("响应流中断", event.payload["text"])
+        self.assertIn("Reconnecting... 5/5", event.payload["text"])
+        # httpStatusCode is null here — no phantom "HTTP None".
+        self.assertNotIn("HTTP", event.payload["text"])
+
+    def test_live_captured_terminal_error_is_parsed(self):
+        transport = CodexAppServerTransport(client=_FakeCodexClient())
+
+        event = transport._convert_event(dict(self._LIVE_TERMINAL_ERROR), thread_id="t")
+
+        self.assertEqual(event.type, AgentEventType.SESSION_ERROR)
+        # codexErrorInfo "other" carries no label; the message must survive.
+        self.assertIn("MODEL_NOT_IN_PLAN", event.payload["message"])
+        self.assertIn("本轮失败", event.payload["message"])
+
+    def test_error_variants_render_predictably(self):
+        transport = CodexAppServerTransport(client=_FakeCodexClient())
+        cases = [
+            ("unauthorized", None, "鉴权失败", ""),
+            ("usageLimitExceeded", None, "用量超限", ""),
+            ("contextWindowExceeded", None, "上下文超限", ""),
+            ({"httpConnectionFailed": {"httpStatusCode": 502}}, None, "连接失败", "HTTP 502"),
+            (
+                {"responseTooManyFailedAttempts": {"httpStatusCode": 429}},
+                None,
+                "重试次数耗尽",
+                "HTTP 429",
+            ),
+            ({"activeTurnNotSteerable": {"turnKind": "review"}}, None, "当前回合不可插话", ""),
+            ("someFutureVariant", None, "someFutureVariant", ""),
+            (None, "plain failure", "plain failure", ""),
+        ]
+        for info, message, expected, status in cases:
+            with self.subTest(info=info):
+                event = transport._convert_event(
+                    {
+                        "method": "error",
+                        "params": {
+                            "willRetry": False,
+                            "error": {"message": message or "", "codexErrorInfo": info},
+                        },
+                    },
+                    thread_id="t",
+                )
+                text = event.payload["message"]
+                self.assertIn(expected, text)
+                if status:
+                    self.assertIn(status, text)
+
+    def test_error_with_nothing_usable_still_says_something(self):
+        transport = CodexAppServerTransport(client=_FakeCodexClient())
+
+        event = transport._convert_event(
+            {"method": "error", "params": {"willRetry": False}}, thread_id="t"
+        )
+
+        self.assertEqual(event.type, AgentEventType.SESSION_ERROR)
+        self.assertIn("未描述的错误", event.payload["message"])
+
+    def test_long_upstream_message_keeps_the_http_status_visible(self):
+        transport = CodexAppServerTransport(client=_FakeCodexClient())
+
+        event = transport._convert_event(
+            {
+                "method": "error",
+                "params": {
+                    "willRetry": True,
+                    "error": {
+                        "message": "x" * 1500,
+                        "codexErrorInfo": {"httpConnectionFailed": {"httpStatusCode": 429}},
+                    },
+                },
+            },
+            thread_id="t",
+        )
+
+        text = event.payload["text"]
+        self.assertIn("HTTP 429", text[:60])
+        self.assertLess(len(text), 400)
+
     def test_unhandled_event_types_are_logged_once_each(self):
         # Everything unrecognised used to vanish without a trace, which is how
         # a whole class of "codex said it, nobody listened" stayed invisible.
