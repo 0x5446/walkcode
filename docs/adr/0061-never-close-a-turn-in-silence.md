@@ -18,7 +18,13 @@
    上游 Command Code 返回 `400 user message must have content`
    （`param=messages.510.content`）。**每个后续回合都 400**。
 4. relay 回 HTTP 200 + `response.failed`；codex 重试 6 次后发
-   `task_complete{last_agent_message: null}`，**不产生任何 error 事件**。
+   `task_complete{last_agent_message: null}`。
+
+   > **勘误（[ADR 0062](0062-surface-codex-turn-errors.md)，v0.14.21）**：
+   > 本条原文写的是"不产生任何 error 事件"，**错了**。当时的依据是 rollout
+   > 文件里搜不到 error 事件，但 rollout 只存会话历史，瞬时通知不落盘。
+   > codex app-server 每次失败都发了 `error` 通知（含 `willRetry`），
+   > 是 walkcode 的 `_convert_event` 没接、直接丢弃。已在 ADR 0062 修复。
 5. `Orchestrator._drain_events` 里 `if not visible_text: continue`
    把这个空完成事件丢掉 → 飞书话题里什么都没有。
 

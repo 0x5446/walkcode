@@ -8156,6 +8156,9 @@ class CodexAppServerTransport:
         # it onto the converted events; _record_session_progress then writes
         # session.model from event.payload["model"].
         self._thread_models: dict[str, str] = {}
+        # Codex event types we drop on the floor, logged once each. See
+        # _log_unhandled_event_type.
+        self._logged_unhandled_types: set[str] = set()
 
     def capabilities(self) -> TransportCapabilities:
         return TransportCapabilities(
@@ -8460,6 +8463,7 @@ class CodexAppServerTransport:
             tool_event = _codex_tool_event(codex_event_type, event_payload)
             if tool_event is not None:
                 return tool_event
+            self._log_unhandled_event_type(f"event_msg/{codex_event_type}")
             return None
         payload = event.get("params", event)
         if not isinstance(payload, dict):
@@ -8499,7 +8503,78 @@ class CodexAppServerTransport:
             if model:
                 payload_out["model"] = model
             return AgentEvent(AgentEventType.TURN_COMPLETED, payload_out)
+        if event_type == "error":
+            return self._turn_error_event(payload)
+        self._log_unhandled_event_type(event_type)
         return None
+
+    def _log_unhandled_event_type(self, event_type: str) -> None:
+        """Say — once per type — that codex told us something we ignore.
+
+        Everything unrecognised used to be dropped without a trace, so a whole
+        class of "codex said it and nobody listened" was invisible: the
+        2026-08-07 outage sat behind exactly that blind spot. Once per type per
+        process keeps a chatty stream (token_count, sub_agent_activity) from
+        flooding the log while still surfacing the vocabulary we don't cover.
+        """
+        if not event_type or event_type in self._logged_unhandled_types:
+            return
+        self._logged_unhandled_types.add(event_type)
+        _log_degrade("codex_event_type_unhandled", event_type=event_type)
+
+    @staticmethod
+    def _turn_error_event(payload: dict[str, Any]) -> AgentEvent:
+        """codex app-server `error` notification → a channel-visible event.
+
+        Shape (app-server v2 `ErrorNotification`):
+            {error: {message, additionalDetails?, codexErrorInfo?},
+             threadId, turnId, willRetry}
+
+        `willRetry` is the whole point: while it is true codex is still
+        backing off and retrying, so the note rides the tool-progress card
+        rather than the thread. When it flips to false the turn is lost, and
+        that is a bubble — otherwise the turn just ends in silence, which is
+        the 2026-08-07 outage verbatim (six upstream 400s, no user-visible
+        trace of any of them).
+        """
+        error = payload.get("error")
+        if not isinstance(error, dict):
+            error = {}
+        kind, status = _codex_error_kind(error.get("codexErrorInfo"))
+        # Kind and HTTP status lead, free text follows and is what gets cut.
+        # The other order loses the status entirely: the progress card caps
+        # its lines, so a thousand-character upstream message would push
+        # "HTTP 429" — the single most diagnostic token — off the end.
+        head = f"{kind}（HTTP {status}）" if kind and status else (kind or (f"HTTP {status}" if status else ""))
+        free_text = " · ".join(
+            dict.fromkeys(
+                part
+                for part in (
+                    _compact_tool_summary(error.get("message"), limit=200),
+                    _compact_tool_summary(error.get("additionalDetails"), limit=120),
+                )
+                if part
+            )
+        )
+        summary = " · ".join(part for part in (head, free_text) if part) or "上游返回了一个未描述的错误"
+        if bool(payload.get("willRetry")):
+            return AgentEvent(
+                AgentEventType.TURN_NARRATION,
+                {
+                    "text": f"⚠️ 上游报错，正在重试：{summary}",
+                    # Not real output: a turn whose only trace is retry notes
+                    # must still get the end-of-turn "no output" warning.
+                    "diagnostic": True,
+                },
+            )
+        return AgentEvent(
+            AgentEventType.SESSION_ERROR,
+            {
+                "reason": "codex_turn_error",
+                "message": f"⚠️ 本轮失败（代理已放弃重试）：{summary}",
+                "turn_id": str(payload.get("turnId", "") or ""),
+            },
+        )
 
     @classmethod
     def _is_hitl_server_request(cls, event: dict[str, Any]) -> bool:
@@ -8720,6 +8795,43 @@ class CodexAppServerTransport:
                     "answers": [str(item) for item in values if item is not None]
                 }
         return {"answers": native_answers}
+
+
+# codex app-server v2 `CodexErrorInfo` → 中文短标签。Unit variants are bare
+# strings; the ones that carry an upstream HTTP status are single-key objects
+# (`{"responseStreamDisconnected": {"httpStatusCode": 400}}`).
+_CODEX_ERROR_LABELS = {
+    "contextWindowExceeded": "上下文超限",
+    "sessionBudgetExceeded": "会话预算耗尽",
+    "usageLimitExceeded": "用量超限",
+    "serverOverloaded": "上游过载",
+    "cyberPolicy": "安全策略拦截",
+    "internalServerError": "上游内部错误",
+    "unauthorized": "鉴权失败",
+    "badRequest": "请求被拒（400）",
+    "threadRollbackFailed": "会话回滚失败",
+    "sandboxError": "沙箱错误",
+    "other": "",
+    "httpConnectionFailed": "连接失败",
+    "responseStreamConnectionFailed": "响应流连接失败",
+    "responseStreamDisconnected": "响应流中断",
+    "responseTooManyFailedAttempts": "重试次数耗尽",
+    "activeTurnNotSteerable": "当前回合不可插话",
+}
+
+
+def _codex_error_kind(info: Any) -> tuple[str, str]:
+    """(label, http_status) from a `codexErrorInfo`; ("", "") when absent."""
+    if isinstance(info, str):
+        return _CODEX_ERROR_LABELS.get(info, info), ""
+    if isinstance(info, dict) and info:
+        key = next(iter(info))
+        detail = info.get(key)
+        status = ""
+        if isinstance(detail, dict) and detail.get("httpStatusCode") is not None:
+            status = str(detail["httpStatusCode"])
+        return _CODEX_ERROR_LABELS.get(key, key), status
+    return "", ""
 
 
 def _codex_tool_event(event_type: str, payload: dict[str, Any]) -> AgentEvent | None:
@@ -12284,7 +12396,11 @@ class Orchestrator:
                 # turn's title on this long-lived stream.
                 turn_text_parts.clear()
                 turn_text_len = 0
-                turn_produced_output = False
+                # A SESSION_ERROR already told the user what went wrong — and
+                # codex still sends turn/completed right after one. Resetting
+                # here would make that completion look like a silent turn and
+                # post a second, redundant warning for the same failure.
+                turn_produced_output = event.type == AgentEventType.SESSION_ERROR
                 turn_ended = True
             else:
                 turn_ended = False
@@ -12294,7 +12410,11 @@ class Orchestrator:
                 # a bubble, and it must NOT seal the burst (the tools it
                 # narrates land right after it).
                 await self._upsert_tool_progress_view(session, channel, view)
-                turn_produced_output = True
+                # A diagnostic line ("upstream errored, retrying") is not the
+                # agent answering — a turn whose only trace is retry notes must
+                # still close with the no-output warning.
+                if not view.get("diagnostic"):
+                    turn_produced_output = True
                 continue
             if view.get("type") == "background_tasks":
                 # Ledger beat: status card is already refreshed above; it must
@@ -12535,7 +12655,10 @@ class Orchestrator:
         if event.type == AgentEventType.TURN_DELTA:
             return {"type": "turn_delta", "text": str(event.payload.get("text", ""))}
         if event.type == AgentEventType.TURN_NARRATION:
-            return {"type": "turn_narration", "text": str(event.payload.get("text", ""))}
+            view = {"type": "turn_narration", "text": str(event.payload.get("text", ""))}
+            if event.payload.get("diagnostic"):
+                view["diagnostic"] = True
+            return view
         if event.type == AgentEventType.TURN_COMPLETED:
             return {"type": "turn_completed", "message": str(event.payload.get("message", ""))}
         if event.type == AgentEventType.BACKGROUND_TASKS:

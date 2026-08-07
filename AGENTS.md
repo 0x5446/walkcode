@@ -55,6 +55,12 @@ scripts; orchestration and gates live in the skill.
   never let a turn close without the channel seeing something. Both are
   enforced in `channel_native/__init__.py` (`_compose_turn_text` /
   `EMPTY_TURN_NOTICE`); don't "simplify" either away.
+- **Agent diagnostics (ADR 0062)**: codex's app-server `error` notification is
+  surfaced (retrying → progress-card note, gave up → bubble), and any codex
+  event type we don't handle is logged once via
+  `_log_degrade("codex_event_type_unhandled")`. When adding transports, keep
+  that rule: an agent's error channel must never be dropped silently. The
+  protocol is discoverable — `codex app-server generate-json-schema --out <dir>`.
 - Legacy remnants are blockers for upgrade and real E2E: old LaunchAgents,
   `walkcode hook` configs, shell wrapper source lines, and `FEISHU_*` env must be
   cleaned first.

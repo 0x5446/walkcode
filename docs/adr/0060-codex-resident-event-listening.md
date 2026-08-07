@@ -175,8 +175,12 @@ result（worker 中途出问题、被判 injected turn），此时文案与用�
   - `asyncio.Queue` 绑定创建它的事件循环，client 因此是单事件循环资源。
     生产里 runtime 全程单循环，但跨 `asyncio.run` 复用同一个 client 会在
     第二次 `queue.get()` 抛 `RuntimeError`。当前靠约定保证，未加显式护栏。
-  - `_convert_event` 返回 `None` 的未知事件仍被静默跳过，且会重置静默计时。
-    协议升级新增用户可见事件时，它们会无痕丢失。
+  - ~~`_convert_event` 返回 `None` 的未知事件仍被静默跳过，且会重置静默计时。
+    协议升级新增用户可见事件时，它们会无痕丢失。~~
+    **已由 [ADR 0062](0062-surface-codex-turn-errors.md) 处理（v0.14.21）**：
+    未识别类型按类型各记一次 `_log_degrade("codex_event_type_unhandled")`，
+    `error` 通知已接入。这个盲区正是 2026-08-07 事故五小时无人察觉的原因。
+    （仍会重置静默计时——那部分未变。）
 
 ## Verification
 

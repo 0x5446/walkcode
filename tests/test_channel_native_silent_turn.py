@@ -275,6 +275,69 @@ class SilentTurnOverRealCodexEventsTests(unittest.TestCase):
 
         self.assertEqual(_notice_count(channel), 1)
 
+    def test_upstream_retries_surface_while_they_happen(self):
+        # The outage shape, now with codex's own `error` notifications: six
+        # 400s while retrying, then the turn closes empty. The user must see
+        # WHY, not just "no output" seventeen seconds later.
+        retry = {
+            "method": "error",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "willRetry": True,
+                "error": {
+                    "message": "user message must have content",
+                    "codexErrorInfo": {"responseStreamConnectionFailed": {"httpStatusCode": 400}},
+                },
+            },
+        }
+        orchestrator, channel, session = self._orchestrator_with_codex(
+            [
+                retry,
+                retry,
+                {
+                    "type": "event_msg",
+                    "payload": {"type": "task_complete", "turn_id": "turn-1", "last_agent_message": None},
+                },
+            ]
+        )
+
+        _submit(orchestrator, session)
+
+        blob = "\n".join(_sent_texts(channel))
+        self.assertIn("正在重试", blob)
+        self.assertIn("HTTP 400", blob)
+        # Retry notes are diagnostics, not an answer: the closing warning stays.
+        self.assertEqual(_notice_count(channel), 1)
+
+    def test_giving_up_after_retries_reaches_the_channel(self):
+        orchestrator, channel, session = self._orchestrator_with_codex(
+            [
+                {
+                    "method": "error",
+                    "params": {
+                        "threadId": "thread-1",
+                        "turnId": "turn-1",
+                        "willRetry": False,
+                        "error": {
+                            "message": "retry limit reached",
+                            "codexErrorInfo": "responseTooManyFailedAttempts",
+                        },
+                    },
+                },
+                {
+                    "method": "turn/completed",
+                    "params": {"threadId": "thread-1", "turn": {"id": "turn-1"}},
+                },
+            ]
+        )
+
+        _submit(orchestrator, session)
+
+        blob = "\n".join(_sent_texts(channel))
+        self.assertIn("重试次数耗尽", blob)
+        self.assertIn("本轮失败", blob)
+
     def test_codex_delta_then_bare_completion_stays_silent(self):
         # The normal shape: the answer rides `item/agentMessage/delta` and the
         # completion is bare. This must NOT warn.
