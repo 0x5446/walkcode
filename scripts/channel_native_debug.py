@@ -518,15 +518,19 @@ async def debug_agent_smoke(
             timeout=timeout,
         )
         events_value = transport.events(handle)
-        if inspect.isasyncgen(events_value):
+        drain_error = ""
+        if inspect.isawaitable(events_value):
+            # Await first, then look for the stream. ClaudeHeadlessTransport
+            # returns a *coroutine that resolves to* an async generator, so
+            # probing for the generator before awaiting misses it and falls
+            # through to `list()` — the TypeError this branch exists to avoid.
+            events_value = await asyncio.wait_for(events_value, timeout=timeout)
+        if hasattr(events_value, "__aiter__"):
             # codex/external-TUI transports stream events and keep the listener
             # open past the turn (up to the silence ceiling — an hour in
-            # production). `list()` on that raises TypeError, which is how the
-            # codex smoke used to die before it ever reached the agent. Drain
-            # until the turn closes, then stop; don't wait out the ceiling.
-            events = await _drain_agent_events(events_value, timeout=timeout)
-        elif inspect.isawaitable(events_value):
-            events = await asyncio.wait_for(events_value, timeout=timeout)
+            # production). Drain until the turn closes; don't wait out the
+            # ceiling, and don't call a half-drained turn a pass.
+            events, drain_error = await _drain_agent_events(events_value, timeout=timeout)
         else:
             events = list(events_value or [])
     except (TransportUnavailable, Exception) as exc:
@@ -537,15 +541,23 @@ async def debug_agent_smoke(
             "message": str(exc),
         }
 
-    return {
+    report = {
         **payload,
-        "ok": not _agent_smoke_error_events(events),
+        # A drain that never saw the turn close is not a pass. Without this the
+        # smoke reported ok on a stalled agent — and this smoke is the release
+        # gate's real-environment check, so a false green here is worse than
+        # a crash.
+        "ok": not _agent_smoke_error_events(events) and not drain_error,
         "handle_created": True,
         "event_count": len(list(events or [])),
         "event_types": [str(getattr(event, "type", "")) for event in list(events or [])],
         "tool_events": _agent_smoke_tool_events(events),
         **_agent_smoke_error_payload(events),
     }
+    if drain_error:
+        report.setdefault("error", "agent_drain_incomplete")
+        report["drain_error"] = drain_error
+    return report
 
 
 async def debug_lark(*, live: bool) -> dict[str, Any]:
@@ -770,23 +782,53 @@ def _agent_smoke_tool_events(events: Any) -> list[dict[str, str]]:
     return rendered
 
 
-async def _drain_agent_events(stream: Any, *, timeout: float) -> list[Any]:
-    """Collect a streaming transport's events until the turn closes."""
+async def _drain_agent_events(stream: Any, *, timeout: float) -> tuple[list[Any], str]:
+    """Collect a streaming transport's events until the turn closes.
+
+    Returns ``(events, error)``. A non-empty ``error`` means the drain never
+    saw a turn-closing event: a stalled agent, a stream that dies mid-turn and
+    a clean completion all leave a partial list behind, and only the terminal
+    event tells them apart. Swallowing that distinction is how a smoke run
+    reports success while the turn is still hanging.
+
+    ``timeout`` bounds the whole collection, not each event. Re-arming it per
+    event let a chatty turn run past the budget indefinitely while a single
+    slow tool call still cut the listener off early.
+    """
     terminal = {AgentEventType.TURN_COMPLETED, AgentEventType.SESSION_ERROR}
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
     collected: list[Any] = []
+    error = "stream ended without a turn-closing event"
     try:
         while True:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                error = f"timed out after {timeout:g}s without a turn-closing event"
+                break
             try:
-                event = await asyncio.wait_for(stream.__anext__(), timeout=timeout)
-            except (StopAsyncIteration, asyncio.TimeoutError):
+                event = await asyncio.wait_for(stream.__anext__(), timeout=remaining)
+            except StopAsyncIteration:
+                break
+            except asyncio.TimeoutError:
+                error = f"timed out after {timeout:g}s without a turn-closing event"
                 break
             collected.append(event)
             if getattr(event, "type", None) in terminal:
+                error = ""
                 break
     finally:
-        with contextlib.suppress(Exception):
-            await stream.aclose()
-    return collected
+        aclose = getattr(stream, "aclose", None)
+        if aclose is not None:
+            try:
+                await aclose()
+            except Exception as exc:  # noqa: BLE001 - reported, never fatal
+                # Closing a generator that `wait_for` just cancelled is the
+                # normal case and is safe; report anything else rather than
+                # dropping it, but don't mask a real drain failure.
+                if not error:
+                    error = f"closing the event stream failed: {exc}"
+    return collected, error
 
 
 def _agent_smoke_error_events(events: Any) -> list[Any]:

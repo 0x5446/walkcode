@@ -4,6 +4,7 @@ import contextlib
 import hashlib
 import json
 import os
+import re
 import unittest
 import uuid
 from unittest.mock import patch
@@ -861,6 +862,11 @@ class CodexAppServerTransportTests(unittest.TestCase):
         self.assertIn("InfLoRA continual learning", events[0].payload["summary"])
         self.assertEqual(events[1].type, AgentEventType.TOOL_COMPLETED)
         self.assertEqual(events[1].payload["tool_id"], "ws-1")
+        self.assertEqual(events[1].payload["tool_name"], "web_search")
+        # The completion must keep the query. The progress card upserts by
+        # tool_id, so a generic "Tool completed" here overwrites what the user
+        # was reading and the finished card says nothing about the search.
+        self.assertIn("InfLoRA continual learning", events[1].payload["summary"])
         self.assertEqual(events[2].type, AgentEventType.TURN_COMPLETED)
 
     def test_events_convert_file_change_items_with_paths_not_diffs(self):
@@ -902,14 +908,161 @@ class CodexAppServerTransportTests(unittest.TestCase):
 
         events = _drain_events(transport, handle)
 
-        self.assertEqual(events[0].type, AgentEventType.TOOL_STARTED)
-        self.assertEqual(events[0].payload["tool_name"], "apply_patch")
-        self.assertIn("src/a.py", events[0].payload["summary"])
-        self.assertIn("src/b.py", events[0].payload["summary"])
-        self.assertEqual(events[1].type, AgentEventType.TOOL_COMPLETED)
         for event in events[:2]:
+            self.assertEqual(event.payload["tool_name"], "apply_patch")
+            self.assertIn("src/a.py", event.payload["summary"])
+            self.assertIn("src/b.py", event.payload["summary"])
             self.assertNotIn("brand new", event.payload["summary"])
+            self.assertNotIn("@@", event.payload["summary"])
+        self.assertEqual(events[0].type, AgentEventType.TOOL_STARTED)
+        self.assertEqual(events[1].type, AgentEventType.TOOL_COMPLETED)
         self.assertEqual(events[2].type, AgentEventType.TURN_COMPLETED)
+
+    def test_declined_file_change_is_a_failed_card_not_a_completed_one(self):
+        """codex reports a rejected patch as `item/completed` + status declined.
+
+        Going by the method name alone turned "the user said no" into a green
+        card claiming the edit landed.
+        """
+        transport = CodexAppServerTransport(client=_FakeCodexClient(), event_silence_ceiling=0)
+
+        event = transport._convert_event(
+            {
+                "method": "item/completed",
+                "params": {
+                    "threadId": "thread-1",
+                    "item": {
+                        "type": "fileChange",
+                        "id": "patch-1",
+                        "status": "declined",
+                        "changes": [
+                            {"path": "src/a.py", "kind": {"type": "update"}, "diff": "@@"}
+                        ],
+                    },
+                },
+            },
+            thread_id="thread-1",
+        )
+
+        self.assertEqual(event.type, AgentEventType.TOOL_FAILED)
+        self.assertEqual(event.payload["tool_name"], "apply_patch")
+        # Which patch was rejected is the first thing anyone asks.
+        self.assertIn("src/a.py", event.payload["summary"])
+
+    def test_bulk_file_change_summary_counts_the_files_it_cannot_show(self):
+        """Truncating a joined path list hides how big the edit was."""
+        transport = CodexAppServerTransport(client=_FakeCodexClient(), event_silence_ceiling=0)
+
+        event = transport._convert_event(
+            {
+                "method": "item/started",
+                "params": {
+                    "threadId": "thread-1",
+                    "item": {
+                        "type": "fileChange",
+                        "id": "patch-1",
+                        "status": "inProgress",
+                        "changes": [
+                            {"path": f"src/module_{n:02d}.py", "kind": {"type": "update"}, "diff": "@@"}
+                            for n in range(50)
+                        ],
+                    },
+                },
+            },
+            thread_id="thread-1",
+        )
+
+        summary = event.payload["summary"]
+        self.assertIn("50 files", summary)
+        self.assertIn("+45 more", summary)
+        self.assertLessEqual(len(summary), 160)
+        self.assertNotIn("...", summary)
+
+    def test_mcp_tool_call_item_is_named_after_the_tool(self):
+        """`mcpToolCall` spells its name `tool`, which the generic chain missed."""
+        transport = CodexAppServerTransport(client=_FakeCodexClient(), event_silence_ceiling=0)
+
+        event = transport._convert_event(
+            {
+                "method": "item/started",
+                "params": {
+                    "threadId": "thread-1",
+                    "item": {
+                        "type": "mcpToolCall",
+                        "id": "mcp-1",
+                        "server": "exa",
+                        "tool": "web_search_exa",
+                        "status": "inProgress",
+                        "arguments": {"query": "InfLoRA"},
+                    },
+                },
+            },
+            thread_id="thread-1",
+        )
+
+        self.assertEqual(event.type, AgentEventType.TOOL_STARTED)
+        self.assertEqual(event.payload["tool_name"], "web_search_exa")
+
+    def test_codex_tool_item_specs_cover_every_schema_variant(self):
+        """Every `ThreadItem` variant is classified on purpose, not by spelling.
+
+        Snapshot of `codex app-server generate-json-schema --out <dir>` →
+        `codex_app_server_protocol.v2.schemas.json`, ThreadItem, codex-cli
+        0.144.5. When codex adds a variant this fails, which is the whole
+        point: the 2026-08-07 outage was a tool item nobody had classified.
+        """
+        schema_variants = {
+            "userMessage",
+            "hookPrompt",
+            "agentMessage",
+            "plan",
+            "reasoning",
+            "commandExecution",
+            "fileChange",
+            "mcpToolCall",
+            "dynamicToolCall",
+            "collabAgentToolCall",
+            "subAgentActivity",
+            "webSearch",
+            "imageView",
+            "sleep",
+            "imageGeneration",
+            "enteredReviewMode",
+            "exitedReviewMode",
+            "contextCompaction",
+        }
+        # Variants that are deliberately not tool cards: they are either
+        # rendered by another path (messages, reasoning, plan) or have no
+        # user-facing form yet.
+        not_tool_activity = {
+            "userMessage",
+            "hookPrompt",
+            "agentMessage",
+            "plan",
+            "reasoning",
+            "subAgentActivity",
+            "imageView",
+            "sleep",
+            "imageGeneration",
+            "enteredReviewMode",
+            "exitedReviewMode",
+            "contextCompaction",
+        }
+        compact = {
+            variant: re.sub(r"[^a-z0-9]+", "", variant.lower()) for variant in schema_variants
+        }
+        mapped = {
+            variant
+            for variant, key in compact.items()
+            if key in walkcode_channel_native._CODEX_TOOL_ITEM_SPECS
+        }
+
+        self.assertEqual(mapped, schema_variants - not_tool_activity)
+        self.assertEqual(
+            set(walkcode_channel_native._CODEX_TOOL_ITEM_SPECS),
+            {compact[variant] for variant in mapped},
+            "the spec table must not carry keys that no schema variant produces",
+        )
 
     def test_fuzzy_file_search_notification_is_not_a_tool_card(self):
         """The file picker's own notification is not agent tool activity.
