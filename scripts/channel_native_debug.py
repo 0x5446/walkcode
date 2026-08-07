@@ -782,6 +782,11 @@ def _agent_smoke_tool_events(events: Any) -> list[dict[str, str]]:
     return rendered
 
 
+# Grace period for closing a drained event stream. Short on purpose: cleanup
+# must not extend the drain deadline it runs after.
+_DRAIN_CLOSE_TIMEOUT = 5.0
+
+
 async def _drain_agent_events(stream: Any, *, timeout: float) -> tuple[list[Any], str]:
     """Collect a streaming transport's events until the turn closes.
 
@@ -821,13 +826,15 @@ async def _drain_agent_events(stream: Any, *, timeout: float) -> tuple[list[Any]
         aclose = getattr(stream, "aclose", None)
         if aclose is not None:
             try:
-                await aclose()
+                # Bounded: a generator whose cleanup blocks would otherwise let
+                # the smoke run past the deadline it just enforced.
+                await asyncio.wait_for(aclose(), timeout=_DRAIN_CLOSE_TIMEOUT)
             except Exception as exc:  # noqa: BLE001 - reported, never fatal
                 # Closing a generator that `wait_for` just cancelled is the
                 # normal case and is safe; report anything else rather than
                 # dropping it, but don't mask a real drain failure.
                 if not error:
-                    error = f"closing the event stream failed: {exc}"
+                    error = f"closing the event stream failed: {exc!r}"
     return collected, error
 
 

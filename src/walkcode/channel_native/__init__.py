@@ -4744,7 +4744,13 @@ def render_view_text(view_model: dict[str, Any]) -> str:
     return str(view_model)
 
 
-def _compact_tool_summary(value: Any, *, limit: int = 160) -> str:
+# Characters a tool card's summary may occupy. Shared so callers that
+# pre-render a summary (e.g. _codex_file_change_summary) budget against the
+# same number that finally truncates it.
+_TOOL_SUMMARY_LIMIT = 160
+
+
+def _compact_tool_summary(value: Any, *, limit: int = _TOOL_SUMMARY_LIMIT) -> str:
     if isinstance(value, dict):
         raw = ", ".join(f"{key}={value[key]!r}" for key in sorted(value)[:4])
     elif isinstance(value, list):
@@ -8919,8 +8925,10 @@ def _codex_tool_event(event_type: str, payload: dict[str, Any]) -> AgentEvent | 
             {
                 "tool_id": tool_id,
                 "tool_name": tool_name,
+                # The type's own extractor wins: a generic `summary` field
+                # would otherwise be free to carry a whole patch onto the card.
                 "summary": _compact_tool_summary(
-                    payload.get("summary") or item_summary or "Tool completed"
+                    item_summary or payload.get("summary") or "Tool completed"
                 ),
             },
         )
@@ -8931,11 +8939,11 @@ def _codex_tool_event(event_type: str, payload: dict[str, Any]) -> AgentEvent | 
                 "tool_id": tool_id,
                 "tool_name": tool_name,
                 "summary": _compact_tool_summary(
-                    payload.get("arguments")
+                    item_summary
+                    or payload.get("arguments")
                     or payload.get("args")
                     or payload.get("input")
                     or payload.get("command")
-                    or item_summary
                     or payload.get("summary")
                     or ""
                 ),
@@ -9119,13 +9127,17 @@ class _CodexToolItemSpec(NamedTuple):
     summary: Callable[[dict[str, Any]], Any]
 
 
-def _codex_file_change_summary(changes: Any) -> str:
-    """Paths only, and a count once they stop fitting.
+def _codex_file_change_summary(changes: Any, *, limit: int = _TOOL_SUMMARY_LIMIT) -> str:
+    """Paths that fit, then a count of the ones that don't.
 
     A `fileChange` item carries the full diff of every change; the patch body
-    must stay off the card for the same reason command output does. Truncating
-    the joined string mid-path would also hide *how many* files a bulk edit
-    touched, so overflow is spelled out instead of chopped.
+    must stay off the card for the same reason command output does.
+
+    The count has to be computed *inside* the same budget `_compact_tool_summary`
+    enforces, not appended and hoped for: long paths would otherwise push the
+    "+N more" tail past the limit and get chopped off, leaving a card that both
+    cuts a path mid-word and hides how big the edit was — the exact thing the
+    tail exists to prevent.
     """
     if not isinstance(changes, list):
         return ""
@@ -9136,16 +9148,19 @@ def _codex_file_change_summary(changes: Any) -> str:
     ]
     if not paths:
         return ""
-    shown = paths[:_CODEX_FILE_CHANGE_PATHS_SHOWN]
-    rendered = ", ".join(shown)
-    if len(paths) > len(shown):
-        rendered += f" (+{len(paths) - len(shown)} more, {len(paths)} files)"
-    return rendered
+    total = len(paths)
+    for shown in range(min(_CODEX_FILE_CHANGE_PATHS_SHOWN, total), 0, -1):
+        rendered = ", ".join(paths[:shown])
+        if shown < total:
+            rendered += f" (+{total - shown} more, {total} files)"
+        if len(rendered) <= limit:
+            return rendered
+    # Even one path overflows: keep the count, drop the path list.
+    return f"{total} files" if total > 1 else paths[0][:limit]
 
 
-# How many paths a fileChange card lists before switching to a count. Five
-# short paths sit inside `_compact_tool_summary`'s 160-char budget; the
-# "+N more" suffix is what survives when they don't.
+# How many paths a fileChange card lists before switching to a count; fewer are
+# shown when they do not fit the summary budget.
 _CODEX_FILE_CHANGE_PATHS_SHOWN = 5
 
 # Every `ThreadItem` variant that is agent tool activity, taken from the

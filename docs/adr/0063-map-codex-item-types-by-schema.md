@@ -56,15 +56,26 @@ _CODEX_TOOL_ITEM_SPECS: dict[str, _CodexToolItemSpec] = {
 }
 ```
 
-每个 schema 变体要么在这张表里，要么在测试的「不是工具活动」清单里，二者必居其一：
-`test_codex_tool_item_specs_cover_every_schema_variant` 拿 codex 0.144.5 的
-`ThreadItem` 变体快照做分割断言，codex 新增变体时**测试直接挂**。这条机械保障是本
-ADR 的核心——只列白名单而没有守卫，等于把同一个坑推到下一次升级。
+每个 schema 变体要么在这张表里，要么在测试的「不是工具活动」清单里，二者必居其一。
+守卫是两段的，缺一不可：
+
+- `tests/data/codex_thread_item_variants.json` 是**从二进制生成的**变体快照
+  （`codex app-server generate-json-schema` → `ThreadItem`），不是手写清单。
+- `test_codex_thread_item_snapshot_matches_installed_codex` 在本机重新生成一次并与
+  快照比对（没装 codex 的环境 skip）；
+  `test_codex_tool_item_specs_cover_every_schema_variant` 拿快照做分割断言。
+
+两段合起来才成立：只写死一份手抄清单的话，升级 codex 不会改变它，测试照样全绿——
+"新增变体会让测试挂"就成了一句假话。这条机械保障是本 ADR 的核心，只列白名单而没有
+守卫，等于把同一个坑推到下一次升级。
 
 **不往词根表里塞 `search` 或 `file`**。这两个词在 codex 的通知里另有主人：
 `fuzzyFileSearch/sessionCompleted` 是文件选择器的自动补全推送，子串会命中
-`search` + `completed`，用户每敲一个字符收一张卡。词根探测保留，但只服务于没有
-`item` 结构的旧 `event_msg` 事件名。
+`search` + `completed`，用户每敲一个字符收一张卡。
+
+词根探测 `_codex_tool_like_name` 保留且仍然作用于**所有事件名**（`event_msg/*` 的
+旧类型和 `item/*` 的方法名都过它）——它是没有 `item` 结构那条路径的唯一判据。变的是
+`item.type`：那一维已经完全由穷举表决定，不再受词根影响。
 
 ### 2. 摘要在三个分支之间共用
 
@@ -99,10 +110,14 @@ codex 把**被拒绝**的补丁也报成 `item/completed`，只是 `status: "dec
 - 联网搜索、改文件、MCP 工具调用在频道里都可见且有正确名字。
 - `fuzzyFileSearch/*` 明确不出卡（有回归测试钉住）。
 - codex 升级新增 item 变体 → 单测挂，而不是线上静默丢卡。
-- 未映射的变体（`imageGeneration`、`imageView`、`sleep`、`subAgentActivity`、
-  `plan`、`enteredReviewMode` / `exitedReviewMode`、`contextCompaction`，以及本来
-  就走别的渲染路径的 `userMessage`、`hookPrompt`、`agentMessage`、`reasoning`）
-  不是"漏了"，是显式登记在测试清单里的有意排除。
+- 未映射的变体不是"漏了"，是显式登记在测试 `not_tool_activity` 清单里的有意排除，
+  分两类：
+  - **已有别的渲染路径**：`agentMessage`（`item/agentMessage/delta` → TURN_DELTA）、
+    `userMessage`（用户自己发的）。
+  - **目前没有面向用户的形态**：`reasoning`、`plan`、`hookPrompt`、
+    `subAgentActivity`、`imageGeneration`、`imageView`、`sleep`、
+    `enteredReviewMode` / `exitedReviewMode`、`contextCompaction`。这些确实还没接，
+    要接时按本 ADR 的方式加表项 + 摘要，别动词根表。
 
 ## 验证
 

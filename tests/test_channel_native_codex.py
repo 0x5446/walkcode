@@ -5,8 +5,12 @@ import hashlib
 import json
 import os
 import re
+import shutil
+import subprocess
+import tempfile
 import unittest
 import uuid
+from pathlib import Path
 from unittest.mock import patch
 
 import walkcode.channel_native as walkcode_channel_native
@@ -978,6 +982,72 @@ class CodexAppServerTransportTests(unittest.TestCase):
         self.assertLessEqual(len(summary), 160)
         self.assertNotIn("...", summary)
 
+    def test_long_paths_keep_the_file_count_instead_of_being_chopped(self):
+        """The count must be budgeted for, not appended and hoped for.
+
+        With deep paths, a "+N more" tail computed outside the summary limit
+        gets truncated away — leaving a card that both cuts a path mid-word and
+        hides how big the edit was.
+        """
+        transport = CodexAppServerTransport(client=_FakeCodexClient(), event_silence_ceiling=0)
+
+        long_paths = [
+            f"services/backend/internal/domain/scheduling/handlers/very_long_handler_{n:02d}.py"
+            for n in range(12)
+        ]
+        event = transport._convert_event(
+            {
+                "method": "item/started",
+                "params": {
+                    "threadId": "thread-1",
+                    "item": {
+                        "type": "fileChange",
+                        "id": "patch-1",
+                        "status": "inProgress",
+                        "changes": [
+                            {"path": path, "kind": {"type": "update"}, "diff": "@@"}
+                            for path in long_paths
+                        ],
+                    },
+                },
+            },
+            thread_id="thread-1",
+        )
+
+        summary = event.payload["summary"]
+        self.assertLessEqual(len(summary), 160)
+        self.assertIn("12 files", summary)
+        self.assertNotIn("...", summary)
+        # Whatever paths made the cut must be whole.
+        listed = summary.split(" (+")[0]
+        for path in listed.split(", "):
+            self.assertIn(path, long_paths)
+
+    def test_file_change_card_prefers_paths_over_a_generic_summary_field(self):
+        """A generic `summary` must not be able to push a patch onto the card."""
+        transport = CodexAppServerTransport(client=_FakeCodexClient(), event_silence_ceiling=0)
+
+        event = transport._convert_event(
+            {
+                "method": "item/completed",
+                "params": {
+                    "threadId": "thread-1",
+                    "item": {
+                        "type": "fileChange",
+                        "id": "patch-1",
+                        "status": "completed",
+                        "summary": "@@ -1 +1 @@\n-old secret\n+new secret",
+                        "changes": [
+                            {"path": "src/a.py", "kind": {"type": "update"}, "diff": "@@"}
+                        ],
+                    },
+                },
+            },
+            thread_id="thread-1",
+        )
+
+        self.assertEqual(event.payload["summary"], "src/a.py")
+
     def test_mcp_tool_call_item_is_named_after_the_tool(self):
         """`mcpToolCall` spells its name `tool`, which the generic chain missed."""
         transport = CodexAppServerTransport(client=_FakeCodexClient(), event_silence_ceiling=0)
@@ -1003,34 +1073,71 @@ class CodexAppServerTransportTests(unittest.TestCase):
         self.assertEqual(event.type, AgentEventType.TOOL_STARTED)
         self.assertEqual(event.payload["tool_name"], "web_search_exa")
 
+    # Generated from the installed codex, not hand-written:
+    #   codex app-server generate-json-schema --out <dir>
+    #   → codex_app_server_protocol.v2.schemas.json → ThreadItem variants
+    # `test_codex_thread_item_snapshot_matches_installed_codex` re-derives it
+    # from the binary and fails when the two drift apart. A hand-maintained
+    # list here would be worthless: upgrading codex would not change it, so
+    # the "new variant fails the build" guarantee would be a lie.
+    _THREAD_ITEM_SNAPSHOT = Path(__file__).parent / "data" / "codex_thread_item_variants.json"
+
+    @classmethod
+    def _schema_thread_item_variants(cls) -> set[str]:
+        payload = json.loads(cls._THREAD_ITEM_SNAPSHOT.read_text())
+        return set(payload["thread_item_variants"])
+
+    @staticmethod
+    def _thread_item_variants_from_schema_dir(schema_dir) -> set[str]:
+        schema = json.loads(
+            (Path(schema_dir) / "codex_app_server_protocol.v2.schemas.json").read_text()
+        )
+        defs = schema.get("definitions") or schema["$defs"]
+        thread_item = defs["ThreadItem"]
+        found: set[str] = set()
+        for variant in thread_item.get("oneOf") or thread_item.get("anyOf") or []:
+            type_schema = variant.get("properties", {}).get("type", {})
+            names = type_schema.get("enum") or (
+                [type_schema["const"]] if "const" in type_schema else []
+            )
+            found.update(names)
+        return found
+
+    def test_codex_thread_item_snapshot_matches_installed_codex(self):
+        """The snapshot must track the codex actually installed here.
+
+        Skipped where codex is absent (CI), which is exactly why the snapshot
+        is committed — but on a developer box, an upgrade that adds a
+        ThreadItem variant fails here and forces the classification decision.
+        """
+        codex = shutil.which("codex")
+        if codex is None:
+            self.skipTest("codex CLI not installed")
+        with tempfile.TemporaryDirectory() as tmp:
+            result = subprocess.run(
+                [codex, "app-server", "generate-json-schema", "--out", tmp],
+                capture_output=True,
+                text=True,
+            )
+            if result.returncode != 0:
+                self.skipTest(f"codex could not emit its schema: {result.stderr.strip()[:200]}")
+            live = self._thread_item_variants_from_schema_dir(tmp)
+
+        self.assertEqual(
+            live,
+            self._schema_thread_item_variants(),
+            "codex changed its ThreadItem variants — regenerate "
+            "tests/data/codex_thread_item_variants.json and classify the new ones "
+            "in _CODEX_TOOL_ITEM_SPECS or in this test's not_tool_activity set",
+        )
+
     def test_codex_tool_item_specs_cover_every_schema_variant(self):
         """Every `ThreadItem` variant is classified on purpose, not by spelling.
 
-        Snapshot of `codex app-server generate-json-schema --out <dir>` →
-        `codex_app_server_protocol.v2.schemas.json`, ThreadItem, codex-cli
-        0.144.5. When codex adds a variant this fails, which is the whole
-        point: the 2026-08-07 outage was a tool item nobody had classified.
+        The 2026-08-07 outage was a tool item nobody had classified; this is
+        the guard that turns the next one into a red test.
         """
-        schema_variants = {
-            "userMessage",
-            "hookPrompt",
-            "agentMessage",
-            "plan",
-            "reasoning",
-            "commandExecution",
-            "fileChange",
-            "mcpToolCall",
-            "dynamicToolCall",
-            "collabAgentToolCall",
-            "subAgentActivity",
-            "webSearch",
-            "imageView",
-            "sleep",
-            "imageGeneration",
-            "enteredReviewMode",
-            "exitedReviewMode",
-            "contextCompaction",
-        }
+        schema_variants = self._schema_thread_item_variants()
         # Variants that are deliberately not tool cards: they are either
         # rendered by another path (messages, reasoning, plan) or have no
         # user-facing form yet.
