@@ -8843,13 +8843,17 @@ def _codex_tool_event(event_type: str, payload: dict[str, Any]) -> AgentEvent | 
         item_type = str(item.get("type", "") or "")
     item_type_compact = re.sub(r"[^a-z0-9]+", "", item_type.lower())
     event_is_tool_like = _codex_tool_like_name(normalized_compact)
-    item_is_tool_like = _codex_tool_like_name(item_type_compact)
+    item_is_tool_like = _codex_tool_like_item_type(item_type_compact)
     if not event_is_tool_like and not item_is_tool_like:
         return None
     if isinstance(item, dict):
         payload = {**payload, **item}
         normalized = f"{normalized}/{item_type.lower()}"
         normalized_compact = re.sub(r"[^a-z0-9]+", "", normalized)
+    if item_type_compact == "filechange":
+        # Feed both branches below one pre-built summary: a fileChange item has
+        # no arguments/command/query to fall back on, only `changes`.
+        payload = {**payload, "summary": _codex_file_change_summary(payload.get("changes"))}
     tool_name = str(
         payload.get("toolName")
         or payload.get("tool_name")
@@ -8857,6 +8861,10 @@ def _codex_tool_event(event_type: str, payload: dict[str, Any]) -> AgentEvent | 
         or payload.get("commandName")
         or payload.get("command_name")
         or ("command" if payload.get("command") else "")
+        # `webSearch` and `fileChange` items carry neither a name nor a
+        # command; name them after the tool that produces them.
+        or ("web_search" if payload.get("query") else "")
+        or ("apply_patch" if payload.get("changes") else "")
         or "tool"
     )
     tool_id = str(
@@ -8906,6 +8914,7 @@ def _codex_tool_event(event_type: str, payload: dict[str, Any]) -> AgentEvent | 
                     or payload.get("args")
                     or payload.get("input")
                     or payload.get("command")
+                    or payload.get("query")
                     or payload.get("summary")
                     or ""
                 ),
@@ -9074,6 +9083,34 @@ def _codex_tool_like_name(value: str) -> bool:
     if value in {"usermessage", "agentmessage", "reasoning"}:
         return False
     return any(token in value for token in ("tool", "function", "command", "exec", "shell", "bash"))
+
+
+# ThreadItem variants that are agent tool activity but whose names share no root
+# with the words above, so the substring probe can never reach them. Enumerated
+# from the app-server schema (`codex app-server generate-json-schema`) rather
+# than guessed; an exact match keeps `fuzzyFileSearch/sessionCompleted` — the
+# file-picker's own notification, not a tool — from being mistaken for one,
+# which a bare "search"/"file" token would do.
+_CODEX_TOOL_LIKE_ITEM_TYPES = frozenset({"websearch", "filechange"})
+
+
+def _codex_tool_like_item_type(value: str) -> bool:
+    return _codex_tool_like_name(value) or value in _CODEX_TOOL_LIKE_ITEM_TYPES
+
+
+def _codex_file_change_summary(changes: Any) -> str:
+    """Paths only — a `fileChange` item carries the full diff of every change.
+
+    Same reason command output is left off its card: a patch body blows past
+    the summary budget and dumps code into the chat.
+    """
+    if not isinstance(changes, list):
+        return ""
+    return ", ".join(
+        str(change["path"])
+        for change in changes
+        if isinstance(change, dict) and change.get("path")
+    )
 
 
 def _codex_thread_id(result: dict[str, Any]) -> str:

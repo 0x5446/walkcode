@@ -815,6 +815,120 @@ class CodexAppServerTransportTests(unittest.TestCase):
         self.assertNotIn("large output", events[1].payload["summary"])
         self.assertEqual(events[2].type, AgentEventType.TURN_COMPLETED)
 
+    def test_events_convert_web_search_items(self):
+        """`webSearch` is tool activity even though its name shares no root.
+
+        The tool-like probe looks for tool/function/command/exec/shell/bash and
+        `webSearch` hits none of them, so a server-executed search produced no
+        card at all — just a one-shot `codex_event_type_unhandled` line. Item
+        shape per `codex app-server generate-json-schema`: {id, query, action?}.
+        """
+        client = _FakeCodexClient()
+        client.event_batches["thread-1"] = [
+            {
+                "method": "item/started",
+                "params": {
+                    "threadId": "thread-1",
+                    "item": {
+                        "type": "webSearch",
+                        "id": "ws-1",
+                        "query": "InfLoRA continual learning",
+                        "action": None,
+                    },
+                },
+            },
+            {
+                "method": "item/completed",
+                "params": {
+                    "threadId": "thread-1",
+                    "item": {
+                        "type": "webSearch",
+                        "id": "ws-1",
+                        "query": "InfLoRA continual learning",
+                        "action": {"type": "search", "query": "InfLoRA continual learning"},
+                    },
+                },
+            },
+            {"method": "turn/completed", "params": {"threadId": "thread-1"}},
+        ]
+        transport = CodexAppServerTransport(client=client, event_silence_ceiling=0)
+        handle = asyncio.run(transport.launch(LaunchSpec(cwd="/tmp/project", session_id="s1")))
+
+        events = _drain_events(transport, handle)
+
+        self.assertEqual(events[0].type, AgentEventType.TOOL_STARTED)
+        self.assertEqual(events[0].payload["tool_name"], "web_search")
+        self.assertIn("InfLoRA continual learning", events[0].payload["summary"])
+        self.assertEqual(events[1].type, AgentEventType.TOOL_COMPLETED)
+        self.assertEqual(events[1].payload["tool_id"], "ws-1")
+        self.assertEqual(events[2].type, AgentEventType.TURN_COMPLETED)
+
+    def test_events_convert_file_change_items_with_paths_not_diffs(self):
+        """`fileChange` gets a card too, and the card must not carry the patch."""
+        client = _FakeCodexClient()
+        changes = [
+            {"path": "src/a.py", "kind": {"type": "update"}, "diff": "@@ -1 +1 @@\n-old\n+new"},
+            {"path": "src/b.py", "kind": {"type": "add"}, "diff": "@@ -0,0 +1 @@\n+brand new"},
+        ]
+        client.event_batches["thread-1"] = [
+            {
+                "method": "item/started",
+                "params": {
+                    "threadId": "thread-1",
+                    "item": {
+                        "type": "fileChange",
+                        "id": "patch-1",
+                        "status": "inProgress",
+                        "changes": changes,
+                    },
+                },
+            },
+            {
+                "method": "item/completed",
+                "params": {
+                    "threadId": "thread-1",
+                    "item": {
+                        "type": "fileChange",
+                        "id": "patch-1",
+                        "status": "completed",
+                        "changes": changes,
+                    },
+                },
+            },
+            {"method": "turn/completed", "params": {"threadId": "thread-1"}},
+        ]
+        transport = CodexAppServerTransport(client=client, event_silence_ceiling=0)
+        handle = asyncio.run(transport.launch(LaunchSpec(cwd="/tmp/project", session_id="s1")))
+
+        events = _drain_events(transport, handle)
+
+        self.assertEqual(events[0].type, AgentEventType.TOOL_STARTED)
+        self.assertEqual(events[0].payload["tool_name"], "apply_patch")
+        self.assertIn("src/a.py", events[0].payload["summary"])
+        self.assertIn("src/b.py", events[0].payload["summary"])
+        self.assertEqual(events[1].type, AgentEventType.TOOL_COMPLETED)
+        for event in events[:2]:
+            self.assertNotIn("brand new", event.payload["summary"])
+        self.assertEqual(events[2].type, AgentEventType.TURN_COMPLETED)
+
+    def test_fuzzy_file_search_notification_is_not_a_tool_card(self):
+        """The file picker's own notification is not agent tool activity.
+
+        `fuzzyFileSearch/sessionCompleted` is codex asking the *client* to
+        render an autocomplete list. Matching item types on a bare "search" or
+        "file" substring would turn every keystroke into a TOOL_COMPLETED card,
+        so the extra types are matched exactly instead.
+        """
+        transport = CodexAppServerTransport(client=_FakeCodexClient(), event_silence_ceiling=0)
+
+        for method in ("fuzzyFileSearch/sessionCompleted", "fuzzyFileSearch/sessionUpdated"):
+            with self.subTest(method=method):
+                event = transport._convert_event(
+                    {"method": method, "params": {"threadId": "thread-1", "query": "chan"}},
+                    thread_id="thread-1",
+                )
+                self.assertIsNone(event)
+
     def test_events_convert_command_approval_request_and_answer_original_request_id(self):
         client = _FakeCodexClient()
         client.event_batches["thread-1"] = [

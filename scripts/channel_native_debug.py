@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import inspect
 import json
 import os
@@ -517,7 +518,14 @@ async def debug_agent_smoke(
             timeout=timeout,
         )
         events_value = transport.events(handle)
-        if inspect.isawaitable(events_value):
+        if inspect.isasyncgen(events_value):
+            # codex/external-TUI transports stream events and keep the listener
+            # open past the turn (up to the silence ceiling — an hour in
+            # production). `list()` on that raises TypeError, which is how the
+            # codex smoke used to die before it ever reached the agent. Drain
+            # until the turn closes, then stop; don't wait out the ceiling.
+            events = await _drain_agent_events(events_value, timeout=timeout)
+        elif inspect.isawaitable(events_value):
             events = await asyncio.wait_for(events_value, timeout=timeout)
         else:
             events = list(events_value or [])
@@ -535,6 +543,7 @@ async def debug_agent_smoke(
         "handle_created": True,
         "event_count": len(list(events or [])),
         "event_types": [str(getattr(event, "type", "")) for event in list(events or [])],
+        "tool_events": _agent_smoke_tool_events(events),
         **_agent_smoke_error_payload(events),
     }
 
@@ -732,6 +741,52 @@ def _outbox_counts(outbox: DurableOutbox) -> dict[str, int]:
         "sent_count": outbox.sent_count(),
         "dead_count": outbox.dead_count(),
     }
+
+
+def _agent_smoke_tool_events(events: Any) -> list[dict[str, str]]:
+    """Tool cards as the channel would render them — name and summary only.
+
+    Event types alone can't tell a working card from one labelled "tool" with
+    an empty summary, which is what an unmapped item type degrades into.
+    """
+    kinds = {
+        AgentEventType.TOOL_STARTED: "started",
+        AgentEventType.TOOL_COMPLETED: "completed",
+        AgentEventType.TOOL_FAILED: "failed",
+    }
+    rendered = []
+    for event in list(events or []):
+        kind = kinds.get(getattr(event, "type", None))
+        if kind is None:
+            continue
+        payload = getattr(event, "payload", {}) or {}
+        rendered.append(
+            {
+                "kind": kind,
+                "tool_name": str(payload.get("tool_name", "")),
+                "summary": str(payload.get("summary", "")),
+            }
+        )
+    return rendered
+
+
+async def _drain_agent_events(stream: Any, *, timeout: float) -> list[Any]:
+    """Collect a streaming transport's events until the turn closes."""
+    terminal = {AgentEventType.TURN_COMPLETED, AgentEventType.SESSION_ERROR}
+    collected: list[Any] = []
+    try:
+        while True:
+            try:
+                event = await asyncio.wait_for(stream.__anext__(), timeout=timeout)
+            except (StopAsyncIteration, asyncio.TimeoutError):
+                break
+            collected.append(event)
+            if getattr(event, "type", None) in terminal:
+                break
+    finally:
+        with contextlib.suppress(Exception):
+            await stream.aclose()
+    return collected
 
 
 def _agent_smoke_error_events(events: Any) -> list[Any]:

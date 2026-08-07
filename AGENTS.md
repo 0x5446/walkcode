@@ -61,6 +61,14 @@ scripts; orchestration and gates live in the skill.
   `_log_degrade("codex_event_type_unhandled")`. When adding transports, keep
   that rule: an agent's error channel must never be dropped silently. The
   protocol is discoverable — `codex app-server generate-json-schema --out <dir>`.
+- **Item-type mapping (ADR 0063)**: which codex `ThreadItem` variants become tool
+  cards is an explicit list checked against that generated schema
+  (`_CODEX_TOOL_LIKE_ITEM_TYPES`), not a substring guess — `webSearch` and
+  `fileChange` share no root with tool/command/exec, while `fuzzyFileSearch/*` is
+  the file picker and must NOT produce cards. Never widen the substring probe to
+  cover a new item type; add it to the list and give it a name + summary, or the
+  card renders as "tool" with an empty body. `fileChange` cards carry paths only
+  — the diff stays out, like command output.
 - Legacy remnants are blockers for upgrade and real E2E: old LaunchAgents,
   `walkcode hook` configs, shell wrapper source lines, and `FEISHU_*` env must be
   cleaned first.
