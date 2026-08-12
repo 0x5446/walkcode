@@ -130,3 +130,17 @@ review 期间用真实 `codex app-server --stdio` + 一次性 `CODEX_HOME` 实�
 
 突变验证（防假绿）：把 `_with_sandbox_override` 改回恒发 `read-only`、并把白名单闸短路成 `if False`，
 4 条测试转红（omit×2、refuse×1、resume boundary×1），确认新断言真的会在代码坏掉时失败。
+
+### 修复过程中自查发现的一条（不在原报告里）
+
+第 2 条的白名单闸最初抛的是 `ChannelConfigError`。追调用链时发现 lark / telegram 的
+ingress 循环对这个异常类型是 `except ChannelConfigError: raise`——它被当作致命配置错误
+用来结束进程。而这个闸是**每条入站消息**都会触发的运行期检查，在 launchd 下等于崩溃循环，
+飞书那头还什么都看不到。
+
+改成新的 `UnsafeSandboxError(RuntimeError)`：拒绝这一个线程，实例存活，拒绝理由进日志。
+真正静态可判的那一半（显式 `WALKCODE_CODEX_SANDBOX=danger-full-access` 且无白名单）
+移到 `_build_transports` 里抛 `ChannelConfigError`——启动期致命才是对的爆炸半径。
+新增 `test_refusal_is_not_a_channel_config_error` 锁住这个区分。
+
+本机两个 codex 实例实测均 `allowlist=True`，不受这条闸影响。

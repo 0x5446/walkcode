@@ -5061,6 +5061,8 @@ class CodexSandboxConfigTests(unittest.TestCase):
                 "WALKCODE_AGENT": "codex",
                 "WALKCODE_CODEX_APP_SERVER_MODE": "stdio",
                 "WALKCODE_CODEX_SANDBOX": "danger-full-access",
+                # Required alongside full access — see the startup guard.
+                "TELEGRAM_ALLOWED_CHAT_IDS": "4242",
             }
         )
         original = runtime_module.shutil.which
@@ -5227,13 +5229,49 @@ class CodexSandboxConfigTests(unittest.TestCase):
     def test_unsandboxed_thread_without_allowlist_is_refused(self):
         # No allowlist + no sandbox + approval_policy=never is remote arbitrary
         # command execution for anyone who can message the bot.
-        from walkcode.channel_native import ChannelConfigError as _CCE
         from walkcode.channel_native import LaunchSpec as _LS
+        from walkcode.channel_native import UnsafeSandboxError as _USE
 
         client = _RecordingCodexClient(sandbox={"type": "dangerFullAccess"})
         transport = _codex_transport(client, allowlist_configured=False)
-        with self.assertRaisesRegex(_CCE, "no sender allowlist"):
+        with self.assertRaisesRegex(_USE, "no sender allowlist"):
             asyncio.run(transport.launch(_LS(cwd="/tmp/project", session_id="s1")))
+
+    def test_refusal_is_not_a_channel_config_error(self):
+        # The lark/telegram ingress loops re-raise ChannelConfigError to kill the
+        # process. Raising one per inbound message would crash-loop the instance
+        # under launchd with nothing visible in chat.
+        from walkcode.channel_native import ChannelConfigError as _CCE
+        from walkcode.channel_native import LaunchSpec as _LS
+        from walkcode.channel_native import UnsafeSandboxError as _USE
+
+        client = _RecordingCodexClient(sandbox={"type": "dangerFullAccess"})
+        transport = _codex_transport(client, allowlist_configured=False)
+        with self.assertRaises(_USE) as caught:
+            asyncio.run(transport.launch(_LS(cwd="/tmp/project", session_id="s1")))
+        self.assertNotIsInstance(caught.exception, _CCE)
+
+    def test_explicit_full_access_without_allowlist_fails_at_startup(self):
+        # This half IS statically knowable, so it belongs at startup where a
+        # fatal ChannelConfigError is the right blast radius.
+        from walkcode.channel_native import ChannelConfigError as _CCE
+
+        cfg = ChannelNativeConfig.from_env(
+            {
+                "WALKCODE_CHANNEL": "telegram",
+                "TELEGRAM_BOT_TOKEN": "fake",
+                "WALKCODE_AGENT": "codex",
+                "WALKCODE_CODEX_APP_SERVER_MODE": "stdio",
+                "WALKCODE_CODEX_SANDBOX": "danger-full-access",
+            }
+        )
+        original = runtime_module.shutil.which
+        runtime_module.shutil.which = lambda name: "/usr/bin/codex" if name == "codex" else original(name)
+        try:
+            with self.assertRaisesRegex(_CCE, "no sender allowlist"):
+                runtime_module._build_transports(cfg)
+        finally:
+            runtime_module.shutil.which = original
 
     def test_unsandboxed_thread_without_allowlist_can_be_opted_into(self):
         from walkcode.channel_native import LaunchSpec as _LS

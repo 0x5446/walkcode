@@ -66,6 +66,16 @@ _CODEX_SANDBOX_POLICY_TYPES = {
     "danger-full-access": "dangerFullAccess",
 }
 
+UNSAFE_SANDBOX_MESSAGE = (
+    "refusing to run an unsandboxed Codex thread on a channel with no sender "
+    "allowlist: anyone who can message this bot would get arbitrary command "
+    "execution on this host. Set the channel's allowlist "
+    "(LARK_ALLOWED_CHAT_IDS / LARK_ALLOWED_OPEN_IDS, TELEGRAM_ALLOWED_CHAT_IDS / "
+    "TELEGRAM_ALLOWED_ACTOR_IDS), or constrain the sandbox via "
+    "WALKCODE_CODEX_SANDBOX, or opt in explicitly with "
+    "WALKCODE_CODEX_ALLOW_UNRESTRICTED_WITHOUT_ALLOWLIST=1"
+)
+
 
 def _log_degrade(event: str, **fields: Any) -> None:
     """One-line stderr trace for silent-degradation paths.
@@ -149,6 +159,19 @@ class CapabilityUnsupported(RuntimeError):
 
 class ChannelConfigError(ValueError):
     """Raised when channel-native runtime config is invalid."""
+
+
+class UnsafeSandboxError(RuntimeError):
+    """Raised when a thread would run unsandboxed on an unrestricted channel.
+
+    Deliberately NOT a ChannelConfigError: the lark/telegram ingress loops
+    re-raise that one to kill the process, and under launchd a fatal error
+    thrown per inbound message is a crash loop with nothing visible in chat.
+    Refusing the one thread keeps the instance alive and the refusal in the
+    logs. The genuinely static half of this check — an explicit
+    WALKCODE_CODEX_SANDBOX=danger-full-access with no allowlist — is a
+    ChannelConfigError raised at startup instead, where fatal is correct.
+    """
 
 
 class TransientDeliveryError(RuntimeError):
@@ -8267,17 +8290,14 @@ class CodexAppServerTransport:
         if thread_id:
             self.effective_sandbox[thread_id] = effective
 
-        unrestricted = effective == "dangerFullAccess"
-        if unrestricted and not self.allowlist_configured and not self.unrestricted_without_allowlist_ok:
-            raise ChannelConfigError(
-                "refusing to run an unsandboxed Codex thread on a channel with no "
-                "sender allowlist: anyone who can message this bot would get "
-                "arbitrary command execution on this host. Set the channel's "
-                "allowlist (LARK_ALLOWED_CHAT_IDS / LARK_ALLOWED_OPEN_IDS, "
-                "TELEGRAM_ALLOWED_CHAT_IDS / TELEGRAM_ALLOWED_ACTOR_IDS), or "
-                "constrain the sandbox via WALKCODE_CODEX_SANDBOX, or opt in "
-                "explicitly with WALKCODE_CODEX_ALLOW_UNRESTRICTED_WITHOUT_ALLOWLIST=1"
+        if effective == "dangerFullAccess" and not self.allowlist_configured and not self.unrestricted_without_allowlist_ok:
+            _log_degrade(
+                "codex_unsandboxed_without_allowlist",
+                method=method,
+                thread_id=thread_id,
+                effective=effective,
             )
+            raise UnsafeSandboxError(UNSAFE_SANDBOX_MESSAGE)
 
         if self.sandbox_override is not None:
             expected = _CODEX_SANDBOX_POLICY_TYPES.get(self.sandbox_override)
