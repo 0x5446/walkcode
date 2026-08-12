@@ -1,4 +1,6 @@
 import asyncio
+import contextlib
+import io
 import json
 import subprocess
 import sys
@@ -5020,6 +5022,36 @@ class OrphanHeadlessSweepTests(unittest.TestCase):
             self.assertEqual(session.lifecycle_state, "STOPPED")
 
 
+class _RecordingCodexClient:
+    """Minimal app-server stand-in that records requests and echoes a sandbox.
+
+    The echoed shape mirrors the real ThreadStartResponse / ThreadResumeResponse,
+    both of which mark `sandbox` as required and return a SandboxPolicy object
+    (`{"type": "readOnly", ...}`), not the SandboxMode string that requests take.
+    """
+
+    def __init__(self, sandbox=None):
+        self.requests = []
+        self._sandbox = sandbox
+
+    async def request(self, method, params):
+        self.requests.append((method, params))
+        result = {"thread": {"id": "thread-1"}}
+        if self._sandbox is not None:
+            result["sandbox"] = self._sandbox
+        return result
+
+    async def events(self, thread_id):
+        return []
+
+
+def _codex_transport(client, **kwargs):
+    from walkcode.channel_native import CodexAppServerTransport as _T
+
+    kwargs.setdefault("event_silence_ceiling", 0)
+    return _T(client=client, **kwargs)
+
+
 class CodexSandboxConfigTests(unittest.TestCase):
     def test_walkcode_codex_sandbox_flows_into_app_server_transport(self):
         cfg = ChannelNativeConfig.from_env(
@@ -5029,6 +5061,8 @@ class CodexSandboxConfigTests(unittest.TestCase):
                 "WALKCODE_AGENT": "codex",
                 "WALKCODE_CODEX_APP_SERVER_MODE": "stdio",
                 "WALKCODE_CODEX_SANDBOX": "danger-full-access",
+                # Required alongside full access — see the startup guard.
+                "TELEGRAM_ALLOWED_CHAT_IDS": "4242",
             }
         )
         original = runtime_module.shutil.which
@@ -5040,9 +5074,11 @@ class CodexSandboxConfigTests(unittest.TestCase):
 
         transport = transports["codex_app_server"]
         self.assertIsInstance(transport, runtime_module.CodexAppServerTransport)
-        self.assertEqual(transport.sandbox, "danger-full-access")
+        self.assertEqual(transport.sandbox_override, "danger-full-access")
 
-    def test_default_codex_sandbox_stays_read_only(self):
+    def test_default_codex_sandbox_defers_to_the_profile(self):
+        # No env override => no opinion. Anything else here would override the
+        # codex profile's own sandbox_mode behind the user's back.
         cfg = ChannelNativeConfig.from_env(
             {
                 "WALKCODE_CHANNEL": "telegram",
@@ -5058,7 +5094,67 @@ class CodexSandboxConfigTests(unittest.TestCase):
         finally:
             runtime_module.shutil.which = original
 
-        self.assertEqual(transports["codex_app_server"].sandbox, "read-only")
+        self.assertIsNone(transports["codex_app_server"].sandbox_override)
+
+    def test_unrestricted_opt_in_env_reaches_the_transport(self):
+        cfg = ChannelNativeConfig.from_env(
+            {
+                "WALKCODE_CHANNEL": "telegram",
+                "TELEGRAM_BOT_TOKEN": "fake",
+                "WALKCODE_AGENT": "codex",
+                "WALKCODE_CODEX_APP_SERVER_MODE": "stdio",
+                "WALKCODE_CODEX_ALLOW_UNRESTRICTED_WITHOUT_ALLOWLIST": "1",
+            }
+        )
+        original = runtime_module.shutil.which
+        runtime_module.shutil.which = lambda name: "/usr/bin/codex" if name == "codex" else original(name)
+        try:
+            transports = runtime_module._build_transports(cfg)
+        finally:
+            runtime_module.shutil.which = original
+
+        self.assertTrue(transports["codex_app_server"].unrestricted_without_allowlist_ok)
+
+    def test_allowlisted_channel_reaches_the_transport(self):
+        # The guard must see the channel's allowlist; if this wiring breaks, a
+        # properly locked-down deployment starts refusing to launch.
+        cfg = ChannelNativeConfig.from_env(
+            {
+                "WALKCODE_CHANNEL": "telegram",
+                "TELEGRAM_BOT_TOKEN": "fake",
+                "TELEGRAM_ALLOWED_CHAT_IDS": "4242",
+                "WALKCODE_AGENT": "codex",
+                "WALKCODE_CODEX_APP_SERVER_MODE": "stdio",
+            }
+        )
+        original = runtime_module.shutil.which
+        runtime_module.shutil.which = lambda name: "/usr/bin/codex" if name == "codex" else original(name)
+        try:
+            transports = runtime_module._build_transports(cfg)
+        finally:
+            runtime_module.shutil.which = original
+
+        transport = transports["codex_app_server"]
+        self.assertTrue(transport.allowlist_configured)
+        self.assertFalse(transport.unrestricted_without_allowlist_ok)
+
+    def test_open_channel_is_marked_as_having_no_allowlist(self):
+        cfg = ChannelNativeConfig.from_env(
+            {
+                "WALKCODE_CHANNEL": "telegram",
+                "TELEGRAM_BOT_TOKEN": "fake",
+                "WALKCODE_AGENT": "codex",
+                "WALKCODE_CODEX_APP_SERVER_MODE": "stdio",
+            }
+        )
+        original = runtime_module.shutil.which
+        runtime_module.shutil.which = lambda name: "/usr/bin/codex" if name == "codex" else original(name)
+        try:
+            transports = runtime_module._build_transports(cfg)
+        finally:
+            runtime_module.shutil.which = original
+
+        self.assertFalse(transports["codex_app_server"].allowlist_configured)
 
     def test_invalid_codex_sandbox_is_rejected_at_config_time(self):
         from walkcode.channel_native import ChannelConfigError as _CCE
@@ -5074,27 +5170,141 @@ class CodexSandboxConfigTests(unittest.TestCase):
             )
 
     def test_launch_sends_configured_sandbox_to_thread_start(self):
-        # End-to-end: the transport's sandbox lands in the thread/start RPC.
-        from walkcode.channel_native import CodexAppServerTransport as _T
+        # End-to-end: the transport's sandbox override lands in the thread/start RPC.
         from walkcode.channel_native import LaunchSpec as _LS
 
-        class _Client:
-            def __init__(self):
-                self.requests = []
-
-            async def request(self, method, params):
-                self.requests.append((method, params))
-                return {"thread": {"id": "thread-1"}}
-
-            async def events(self, thread_id):
-                return []
-
-        client = _Client()
-        transport = _T(client=client, sandbox="workspace-write", event_silence_ceiling=0)
+        client = _RecordingCodexClient()
+        transport = _codex_transport(client, sandbox_override="workspace-write")
         handle = asyncio.run(transport.launch(_LS(cwd="/tmp/project", session_id="s1")))
         self.assertEqual(client.requests[0][0], "thread/start")
         self.assertEqual(client.requests[0][1]["sandbox"], "workspace-write")
         self.assertEqual(handle.ref["thread_id"], "thread-1")
+
+    def test_launch_omits_sandbox_when_unset_so_the_profile_decides(self):
+        # Sending any value — including a "safe" default — beats the profile's
+        # sandbox_mode. Absence is the only way to say "no opinion".
+        from walkcode.channel_native import LaunchSpec as _LS
+
+        client = _RecordingCodexClient()
+        transport = _codex_transport(client)
+        asyncio.run(transport.launch(_LS(cwd="/tmp/project", session_id="s1")))
+        self.assertEqual(client.requests[0][0], "thread/start")
+        self.assertNotIn("sandbox", client.requests[0][1])
+
+    def test_resume_carries_the_same_sandbox_override_as_launch(self):
+        # An explicit read-only used to lapse on cold resume: thread/resume never
+        # carried the override, so the app-server rebuilt permissions from the
+        # profile and a danger-full-access profile silently won.
+        client = _RecordingCodexClient()
+        transport = _codex_transport(client, sandbox_override="read-only")
+        asyncio.run(transport.resume_thread("thread-1", cwd="/tmp/project"))
+        self.assertEqual(client.requests[0][0], "thread/resume")
+        self.assertEqual(client.requests[0][1]["sandbox"], "read-only")
+
+    def test_resume_omits_sandbox_when_unset(self):
+        client = _RecordingCodexClient()
+        transport = _codex_transport(client)
+        asyncio.run(transport.resume_thread("thread-1", cwd="/tmp/project"))
+        self.assertNotIn("sandbox", client.requests[0][1])
+
+    def test_effective_sandbox_is_recorded_from_the_server_echo(self):
+        # The override is what we asked for; this is what we got. Only the echo
+        # can reveal a wrong CODEX_HOME or a profile edited underneath us.
+        from walkcode.channel_native import LaunchSpec as _LS
+
+        client = _RecordingCodexClient(sandbox={"type": "dangerFullAccess"})
+        transport = _codex_transport(client)
+        asyncio.run(transport.launch(_LS(cwd="/tmp/project", session_id="s1")))
+        self.assertEqual(transport.effective_sandbox["thread-1"], "dangerFullAccess")
+
+    def test_override_ignored_by_server_is_logged(self):
+        from walkcode.channel_native import LaunchSpec as _LS
+
+        client = _RecordingCodexClient(sandbox={"type": "dangerFullAccess"})
+        transport = _codex_transport(client, sandbox_override="read-only")
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            asyncio.run(transport.launch(_LS(cwd="/tmp/project", session_id="s1")))
+        self.assertIn("codex_sandbox_override_ignored", err.getvalue())
+
+    def test_unsandboxed_thread_without_allowlist_is_refused(self):
+        # No allowlist + no sandbox + approval_policy=never is remote arbitrary
+        # command execution for anyone who can message the bot.
+        from walkcode.channel_native import LaunchSpec as _LS
+        from walkcode.channel_native import UnsafeSandboxError as _USE
+
+        client = _RecordingCodexClient(sandbox={"type": "dangerFullAccess"})
+        transport = _codex_transport(client, allowlist_configured=False)
+        with self.assertRaisesRegex(_USE, "no sender allowlist"):
+            asyncio.run(transport.launch(_LS(cwd="/tmp/project", session_id="s1")))
+
+    def test_refusal_is_not_a_channel_config_error(self):
+        # The lark/telegram ingress loops re-raise ChannelConfigError to kill the
+        # process. Raising one per inbound message would crash-loop the instance
+        # under launchd with nothing visible in chat.
+        from walkcode.channel_native import ChannelConfigError as _CCE
+        from walkcode.channel_native import LaunchSpec as _LS
+        from walkcode.channel_native import UnsafeSandboxError as _USE
+
+        client = _RecordingCodexClient(sandbox={"type": "dangerFullAccess"})
+        transport = _codex_transport(client, allowlist_configured=False)
+        with self.assertRaises(_USE) as caught:
+            asyncio.run(transport.launch(_LS(cwd="/tmp/project", session_id="s1")))
+        self.assertNotIsInstance(caught.exception, _CCE)
+
+    def test_explicit_full_access_without_allowlist_fails_at_startup(self):
+        # This half IS statically knowable, so it belongs at startup where a
+        # fatal ChannelConfigError is the right blast radius.
+        from walkcode.channel_native import ChannelConfigError as _CCE
+
+        cfg = ChannelNativeConfig.from_env(
+            {
+                "WALKCODE_CHANNEL": "telegram",
+                "TELEGRAM_BOT_TOKEN": "fake",
+                "WALKCODE_AGENT": "codex",
+                "WALKCODE_CODEX_APP_SERVER_MODE": "stdio",
+                "WALKCODE_CODEX_SANDBOX": "danger-full-access",
+            }
+        )
+        original = runtime_module.shutil.which
+        runtime_module.shutil.which = lambda name: "/usr/bin/codex" if name == "codex" else original(name)
+        try:
+            with self.assertRaisesRegex(_CCE, "no sender allowlist"):
+                runtime_module._build_transports(cfg)
+        finally:
+            runtime_module.shutil.which = original
+
+    def test_unsandboxed_thread_without_allowlist_can_be_opted_into(self):
+        from walkcode.channel_native import LaunchSpec as _LS
+
+        client = _RecordingCodexClient(sandbox={"type": "dangerFullAccess"})
+        transport = _codex_transport(
+            client, allowlist_configured=False, unrestricted_without_allowlist_ok=True
+        )
+        asyncio.run(transport.launch(_LS(cwd="/tmp/project", session_id="s1")))
+        self.assertEqual(transport.effective_sandbox["thread-1"], "dangerFullAccess")
+
+    def test_sandboxed_thread_without_allowlist_is_allowed(self):
+        # The guard is about the *combination*; a read-only thread on an open
+        # channel is the bootstrap default and must keep working.
+        from walkcode.channel_native import LaunchSpec as _LS
+
+        client = _RecordingCodexClient(sandbox={"type": "readOnly", "networkAccess": False})
+        transport = _codex_transport(client, allowlist_configured=False)
+        asyncio.run(transport.launch(_LS(cwd="/tmp/project", session_id="s1")))
+        self.assertEqual(transport.effective_sandbox["thread-1"], "readOnly")
+
+    def test_allowlist_detection_counts_any_single_list(self):
+        from walkcode.channel_native import ChannelEndpointConfig as _CEC
+        from walkcode.channel_native import _channel_allowlist_configured as _detect
+
+        def endpoint(**options):
+            return _CEC(kind="lark", credentials={}, options=options)
+
+        self.assertFalse(_detect(endpoint()))
+        self.assertFalse(_detect(endpoint(allowed_chat_ids=(), allowed_open_ids=())))
+        self.assertTrue(_detect(endpoint(allowed_chat_ids=("oc_1",))))
+        self.assertTrue(_detect(endpoint(allowed_open_ids=("ou_1",))))
+        self.assertTrue(_detect(endpoint(allowed_actor_ids=("42",))))
 
 
 class TuiHookToolEventDedupKeyTests(unittest.TestCase):

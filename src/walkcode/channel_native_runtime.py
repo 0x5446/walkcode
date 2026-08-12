@@ -49,6 +49,7 @@ from .channel_native import (
     LaunchSpec,
     LocalProcessController,
     Orchestrator,
+    _channel_allowlist_configured,
     _channel_environment_context,
     _command_executable_basename,
     _command_is_claude_headless_sdk_process,
@@ -73,6 +74,7 @@ from .channel_native import (
     TransportHandle,
     TransportUnavailable,
     TurnInput,
+    UNSAFE_SANDBOX_MESSAGE,
     ViewModelFactory,
     WriterOwner,
     _agent_to_transport_kind,
@@ -5371,9 +5373,26 @@ def _build_transports(config: ChannelNativeConfig) -> dict[str, AgentTransport]:
     elif kind == "codex_app_server":
         if shutil.which("codex"):
             codex_options = config.agent_options.get("codex", {})
+            sandbox_override = codex_options.get("sandbox") or None
+            allowlist_configured = _channel_allowlist_configured(config.channel)
+            unrestricted_ok = bool(codex_options.get("unrestricted_without_allowlist_ok", False))
+            if (
+                sandbox_override == "danger-full-access"
+                and not allowlist_configured
+                and not unrestricted_ok
+            ):
+                # The statically-knowable half of the guard. Fatal at startup is
+                # the right blast radius here: nothing about this depends on a
+                # running thread, so failing per-message later would just be a
+                # worse way to deliver the same news.
+                raise ChannelConfigError(UNSAFE_SANDBOX_MESSAGE)
             transports[kind] = CodexAppServerTransport(
                 client=_build_codex_app_server_client(config),
-                sandbox=str(codex_options.get("sandbox", "") or "read-only"),
+                # None means "don't send a sandbox at all" — Codex then applies
+                # the profile's own `sandbox_mode`. See CodexAppServerTransport.
+                sandbox_override=sandbox_override,
+                allowlist_configured=allowlist_configured,
+                unrestricted_without_allowlist_ok=unrestricted_ok,
                 environment_context=_channel_environment_context(config.channel.kind),
             )
         else:

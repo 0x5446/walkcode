@@ -141,6 +141,26 @@ gate 行为（v3 真双端）：AskUserQuestion 与会原生弹权限的工具�
 白名单、`WALKCODE_CWD`、按需 `WALKCODE_WORKSPACE_ROOTS`（启用 `/repo`）。
 状态路径和 codex socket 不用写，按 profile 自动推导。
 
+codex 实例的沙箱默认**跟随 codex profile 自己的 `sandbox_mode`**，walkcode 不插手。
+只有显式设 `WALKCODE_CODEX_SANDBOX=read-only|workspace-write|danger-full-access`
+才会覆盖 profile 的设置，新建（`thread/start`）和恢复（`thread/resume`）两条路径都带上。
+0.14.22 及之前这里硬兜底 `read-only`，会静默压过 profile 里的 `danger-full-access`——
+表现是频道里起的每个线程都断网、写不了盘，而模型只能把它描述成"整台机器被锁死"，
+看不出是 walkcode 干的。
+
+最终生效的沙箱以 app-server 在 `thread/start` / `thread/resume` 响应里回显的为准，
+不要按环境变量推断：profile 指错、`CODEX_HOME` 写错、config.toml 被改都会让两者不一致。
+walkcode 会把回显值记在 `CodexAppServerTransport.effective_sandbox`；显式覆盖没被服务端
+采纳时打 `walkcode degrade=codex_sandbox_override_ignored`。profile 完全没写
+`sandbox_mode` 时 app-server 回落 `read-only`（fail-closed，不是 workspace-write）。
+
+**白名单闸**：最终生效沙箱是 `danger-full-access` 而 `LARK_ALLOWED_CHAT_IDS` /
+`LARK_ALLOWED_OPEN_IDS`（Telegram 对应 `TELEGRAM_ALLOWED_CHAT_IDS` /
+`TELEGRAM_ALLOWED_ACTOR_IDS`）全为空时，walkcode 拒绝起线程并报错。这两个白名单留空
+等于放行所有人，叠上无沙箱、`approval_policy=never` 就是任何人都能远程在这台机器上执行
+任意命令。确实要这么跑就显式设
+`WALKCODE_CODEX_ALLOW_UNRESTRICTED_WITHOUT_ALLOWLIST=1`。
+
 claude 实例默认保留 daemon 传输能力（ADR 0046，`DAEMON_MODE` 默认 auto）：
 **bg 会话**（`daemon_live`）飞书直写走 daemon `reply`，socket 路径由
 `WALKCODE_CLAUDE_CONFIG_DIR` 自动推导；普通 TUI 会话走 hooks 只读观察 +

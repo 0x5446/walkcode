@@ -56,6 +56,27 @@ def attachment_download_dir() -> Path:
     return base
 
 
+# Codex app-server speaks two vocabularies for the same thing: requests take a
+# SandboxMode string ("read-only"), responses echo a SandboxPolicy object
+# ({"type": "readOnly"}). Keep the mapping in one place so the "did the server
+# honour our override?" check can't drift from the value we send.
+_CODEX_SANDBOX_POLICY_TYPES = {
+    "read-only": "readOnly",
+    "workspace-write": "workspaceWrite",
+    "danger-full-access": "dangerFullAccess",
+}
+
+UNSAFE_SANDBOX_MESSAGE = (
+    "refusing to run an unsandboxed Codex thread on a channel with no sender "
+    "allowlist: anyone who can message this bot would get arbitrary command "
+    "execution on this host. Set the channel's allowlist "
+    "(LARK_ALLOWED_CHAT_IDS / LARK_ALLOWED_OPEN_IDS, TELEGRAM_ALLOWED_CHAT_IDS / "
+    "TELEGRAM_ALLOWED_ACTOR_IDS), or constrain the sandbox via "
+    "WALKCODE_CODEX_SANDBOX, or opt in explicitly with "
+    "WALKCODE_CODEX_ALLOW_UNRESTRICTED_WITHOUT_ALLOWLIST=1"
+)
+
+
 def _log_degrade(event: str, **fields: Any) -> None:
     """One-line stderr trace for silent-degradation paths.
 
@@ -138,6 +159,19 @@ class CapabilityUnsupported(RuntimeError):
 
 class ChannelConfigError(ValueError):
     """Raised when channel-native runtime config is invalid."""
+
+
+class UnsafeSandboxError(RuntimeError):
+    """Raised when a thread would run unsandboxed on an unrestricted channel.
+
+    Deliberately NOT a ChannelConfigError: the lark/telegram ingress loops
+    re-raise that one to kill the process, and under launchd a fatal error
+    thrown per inbound message is a crash loop with nothing visible in chat.
+    Refusing the one thread keeps the instance alive and the refusal in the
+    logs. The genuinely static half of this check — an explicit
+    WALKCODE_CODEX_SANDBOX=danger-full-access with no allowlist — is a
+    ChannelConfigError raised at startup instead, where fatal is correct.
+    """
 
 
 class TransientDeliveryError(RuntimeError):
@@ -615,17 +649,22 @@ def _configured_agent_options(source: Any) -> dict[str, dict[str, Any]]:
     codex_sandbox = str(source.get("WALKCODE_CODEX_SANDBOX") or "").strip()
     if codex_sandbox:
         # Mirrors the app-server protocol's SandboxMode enum (read-only /
-        # workspace-write / danger-full-access). The old behavior hardcoded
-        # read-only in CodexAppServerTransport, silently overriding the user's
-        # `sandbox_mode` in ~/.codex/config.toml for every channel-launched
-        # thread (curl/networking died, filesystem read-only). The default
-        # stays read-only when the env is unset.
-        if codex_sandbox not in {"read-only", "workspace-write", "danger-full-access"}:
+        # workspace-write / danger-full-access). Setting this OVERRIDES the
+        # codex profile's own `sandbox_mode`; leaving it unset means walkcode
+        # sends no sandbox at all and the profile decides. It used to fall back
+        # to read-only, which silently overrode profiles configured for
+        # danger-full-access on every channel-launched thread.
+        if codex_sandbox not in _CODEX_SANDBOX_POLICY_TYPES:
             raise ChannelConfigError(
                 f"invalid WALKCODE_CODEX_SANDBOX: {codex_sandbox}; "
                 "use one of read-only, workspace-write, danger-full-access"
             )
         codex["sandbox"] = codex_sandbox
+    # Only write the key when opted in, matching every other option here: an
+    # always-present key would make "codex has no configured options" untrue and
+    # is indistinguishable from an explicit opt-out anyway.
+    if _env_bool(source.get("WALKCODE_CODEX_ALLOW_UNRESTRICTED_WITHOUT_ALLOWLIST"), default=False):
+        codex["unrestricted_without_allowlist_ok"] = True
     return {
         "claude": claude,
         "codex": codex,
@@ -945,6 +984,23 @@ def _channel_environment_context(channel_kind: str) -> str:
         str(channel_kind or "").strip().lower(), "the remote chat"
     )
     return _CHANNEL_ENVIRONMENT_CONTEXT_TEMPLATE.format(channel=channel)
+
+
+def _channel_allowlist_configured(channel: ChannelEndpointConfig) -> bool:
+    """True when this channel restricts who may drive the agent.
+
+    Every allowlist option is "empty means allow everyone" (see
+    `_lark_chat_allowed` / the telegram equivalents), which is a reasonable
+    bootstrap default on its own but not in combination with an unsandboxed
+    agent. Any one list being non-empty counts as restricted: the channels
+    apply chat-level and sender-level lists independently, so requiring both
+    would reject setups that are already locked down by one of them.
+    """
+    options = channel.options or {}
+    return any(
+        bool(options.get(key))
+        for key in ("allowed_chat_ids", "allowed_open_ids", "allowed_actor_ids")
+    )
 
 
 def _session_is_external_tui_takeover_candidate(session: Session) -> bool:
@@ -8129,14 +8185,36 @@ class CodexAppServerTransport:
         *,
         client: Any,
         approval_policy: str = "never",
-        sandbox: str = "read-only",
+        sandbox_override: str | None = None,
+        allowlist_configured: bool = True,
+        unrestricted_without_allowlist_ok: bool = False,
         ephemeral: bool = False,
         environment_context: str = "",
         event_silence_ceiling: float = 3600.0,
     ):
         self.client = client
         self.approval_policy = approval_policy
-        self.sandbox = sandbox
+        # None means: send no `sandbox` in thread/start or thread/resume and let
+        # Codex apply the profile's own `sandbox_mode`. This used to default to
+        # "read-only", which SILENTLY overrode a profile configured for
+        # danger-full-access — every channel-launched thread lost network and
+        # write access, and the model reported it as the whole machine being
+        # locked down rather than as a walkcode setting. Deciding the sandbox is
+        # the codex profile's job; walkcode only overrides when explicitly told
+        # to via WALKCODE_CODEX_SANDBOX.
+        #
+        # This is an OVERRIDE, not the effective policy. The effective policy is
+        # whatever the app-server echoes back in the thread/start response —
+        # read it from `self.effective_sandbox`, never from this field.
+        self.sandbox_override = sandbox_override
+        # Whether the channel restricts who may talk to this bot. A thread that
+        # ends up unsandboxed while ANY sender can reach it is remote arbitrary
+        # command execution, so `_apply_effective_sandbox` refuses to run in
+        # that combination unless it was opted into explicitly.
+        self.allowlist_configured = allowlist_configured
+        self.unrestricted_without_allowlist_ok = unrestricted_without_allowlist_ok
+        # Effective policy echoed by the app-server, per thread id.
+        self.effective_sandbox: dict[str, str] = {}
         self.ephemeral = ephemeral
         # Total silence for this long ends the listen (matches the Claude
         # background-wait ceiling). This is NOT the per-batch collector
@@ -8183,17 +8261,66 @@ class CodexAppServerTransport:
             external_tui_takeover=True,
         )
 
+    def _with_sandbox_override(self, params: dict[str, Any]) -> dict[str, Any]:
+        # Omit the key entirely rather than sending a placeholder: any value we
+        # send wins over the profile's sandbox_mode, so "no opinion" has to be
+        # expressed as absence. thread/start and thread/resume both accept the
+        # key and both must carry the override — sending it only on start meant
+        # an explicit `read-only` silently lapsed the moment the app-server
+        # restarted and the thread was cold-resumed from disk.
+        if self.sandbox_override is not None:
+            params["sandbox"] = self.sandbox_override
+        return params
+
+    def _apply_effective_sandbox(self, result: Any, thread_id: str, *, method: str) -> None:
+        """Record (and vet) the sandbox the app-server says it actually applied.
+
+        thread/start and thread/resume both return the effective SandboxPolicy.
+        Without reading it back, a permission drift — wrong CODEX_HOME, a
+        profile edited underneath us, an override the server declined — is
+        completely invisible: the bot just quietly runs with more or less
+        privilege than intended.
+        """
+        policy = (result or {}).get("sandbox") if isinstance(result, dict) else None
+        effective = ""
+        if isinstance(policy, dict):
+            effective = str(policy.get("type") or "")
+        if not effective:
+            return
+        if thread_id:
+            self.effective_sandbox[thread_id] = effective
+
+        if effective == "dangerFullAccess" and not self.allowlist_configured and not self.unrestricted_without_allowlist_ok:
+            _log_degrade(
+                "codex_unsandboxed_without_allowlist",
+                method=method,
+                thread_id=thread_id,
+                effective=effective,
+            )
+            raise UnsafeSandboxError(UNSAFE_SANDBOX_MESSAGE)
+
+        if self.sandbox_override is not None:
+            expected = _CODEX_SANDBOX_POLICY_TYPES.get(self.sandbox_override)
+            if expected and effective != expected:
+                _log_degrade(
+                    "codex_sandbox_override_ignored",
+                    method=method,
+                    thread_id=thread_id,
+                    requested=self.sandbox_override,
+                    effective=effective,
+                )
+
     async def launch(self, spec: LaunchSpec) -> TransportHandle:
-        result = await self.client.request(
-            "thread/start",
+        params = self._with_sandbox_override(
             {
                 "cwd": spec.cwd,
                 "approvalPolicy": self.approval_policy,
-                "sandbox": self.sandbox,
                 "ephemeral": self.ephemeral,
-            },
+            }
         )
+        result = await self.client.request("thread/start", params)
         thread_id = _codex_thread_id(result)
+        self._apply_effective_sandbox(result, thread_id, method="thread/start")
         if self.environment_context and thread_id:
             self._env_context_pending.add(thread_id)
         return TransportHandle(
@@ -8205,8 +8332,10 @@ class CodexAppServerTransport:
     async def resume_thread(self, thread_id: str, *, cwd: str) -> TransportHandle:
         if not thread_id:
             raise ValueError("thread_id is required for Codex resume")
-        result = await self.client.request("thread/resume", {"threadId": thread_id, "cwd": cwd})
+        params = self._with_sandbox_override({"threadId": thread_id, "cwd": cwd})
+        result = await self.client.request("thread/resume", params)
         resumed = _codex_thread_id(result) or thread_id
+        self._apply_effective_sandbox(result, resumed, method="thread/resume")
         if self.environment_context and resumed not in self._env_context_delivered:
             self._env_context_pending.add(resumed)
         return TransportHandle(

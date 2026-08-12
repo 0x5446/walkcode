@@ -76,8 +76,10 @@ AGENTS.md 的"upgrade 拉的是 Release"。
 
 - 频道里会多出 ⚠️ 提示。判据是"整轮零输出"，不是"完成事件为空"——
   正常回合（正文走 delta、完成事件为空）不受影响。
-- 纯附件消息现在能送达 agent（以本地路径形式）。codex 侧沙箱是
-  `WALKCODE_CODEX_SANDBOX` 配置的值，路径可读性由它决定。
+- 纯附件消息现在能送达 agent（以本地路径形式）。codex 侧沙箱由 codex profile 的
+  `sandbox_mode` 决定，`WALKCODE_CODEX_SANDBOX` 设了才覆盖它（v0.14.23 起；此前
+  walkcode 恒发 `read-only`）。路径可读性取决于最终生效的那个值——以 `thread/start`
+  响应里回显的 sandbox 为准，不要按环境变量推断。
 - 匿名 API 被限流（403）时 upgrade 仍可用；GitHub 全挂时 upgrade 会失败而不是乱装。
 
 ## 验证
