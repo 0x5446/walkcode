@@ -49,6 +49,7 @@ from .channel_native import (
     LaunchSpec,
     LocalProcessController,
     Orchestrator,
+    _channel_allowlist_configured,
     _channel_environment_context,
     _command_executable_basename,
     _command_is_claude_headless_sdk_process,
@@ -5371,9 +5372,16 @@ def _build_transports(config: ChannelNativeConfig) -> dict[str, AgentTransport]:
     elif kind == "codex_app_server":
         if shutil.which("codex"):
             codex_options = config.agent_options.get("codex", {})
+            sandbox_override = codex_options.get("sandbox") or None
             transports[kind] = CodexAppServerTransport(
                 client=_build_codex_app_server_client(config),
-                sandbox=str(codex_options.get("sandbox", "") or "read-only"),
+                # None means "don't send a sandbox at all" — Codex then applies
+                # the profile's own `sandbox_mode`. See CodexAppServerTransport.
+                sandbox_override=sandbox_override,
+                allowlist_configured=_channel_allowlist_configured(config.channel),
+                unrestricted_without_allowlist_ok=bool(
+                    codex_options.get("unrestricted_without_allowlist_ok", False)
+                ),
                 environment_context=_channel_environment_context(config.channel.kind),
             )
         else:

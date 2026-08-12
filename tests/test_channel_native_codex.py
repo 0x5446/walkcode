@@ -2122,3 +2122,109 @@ class CodexAppServerModelBackfillTests(unittest.TestCase):
         self.assertEqual(len(events), 2)
         self.assertEqual(events[0].payload["model"], "gpt-5.6-sol")
         self.assertEqual(events[1].payload["model"], "gpt-5.6-sol")
+
+
+_CODEX_LIVE_FLAG = "WALKCODE_E2E_CODEX_APP_SERVER"
+
+
+def _codex_live_skip_reason() -> str:
+    if os.environ.get(_CODEX_LIVE_FLAG, "").strip() not in {"1", "true", "yes", "on"}:
+        return f"set {_CODEX_LIVE_FLAG}=1 to run the real codex app-server checks"
+    if not shutil.which("codex"):
+        return "codex CLI is not installed"
+    return ""
+
+
+@unittest.skipIf(_codex_live_skip_reason(), _codex_live_skip_reason() or "live gate")
+class CodexAppServerSandboxLiveTests(unittest.TestCase):
+    """Real `codex app-server` checks for the sandbox contract.
+
+    Everything else in this file talks to a fake client, which can only prove
+    what walkcode *sends*. The whole point of omitting the `sandbox` key is what
+    the server then *does* — that is unfalsifiable without a real server, and
+    AGENTS.md requires the real-environment check for behaviour changes.
+
+    Gated because it spawns a process and takes a few seconds; the assertions
+    are deterministic, not flaky, so enable it in any pre-release run.
+    """
+
+    # Not covered here: thread/resume against a real server. A thread that has
+    # never run a turn has no rollout on disk, so the app-server answers
+    # `no rollout found for thread id ...`; producing one would need a real model
+    # call. The resume path's parameter construction is covered by
+    # test_resume_carries_the_same_sandbox_override_as_launch, and both paths go
+    # through the same _with_sandbox_override helper exercised below.
+
+    def _effective_sandbox(self, config_lines, *, override=None, resume=False):
+        codex_home = tempfile.mkdtemp(prefix="walkcode-codex-live-")
+        self.addCleanup(shutil.rmtree, codex_home, ignore_errors=True)
+        Path(codex_home, "config.toml").write_text("\n".join(config_lines) + "\n")
+        cwd = tempfile.mkdtemp(prefix="walkcode-codex-live-cwd-")
+        self.addCleanup(shutil.rmtree, cwd, ignore_errors=True)
+
+        proc = subprocess.Popen(
+            ["codex", "app-server", "--stdio"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            env={**os.environ, "CODEX_HOME": codex_home},
+            text=True,
+            bufsize=1,
+        )
+        self.addCleanup(proc.kill)
+
+        def call(request_id, method, params):
+            proc.stdin.write(
+                json.dumps({"jsonrpc": "2.0", "id": request_id, "method": method, "params": params})
+                + "\n"
+            )
+            proc.stdin.flush()
+            while True:
+                line = proc.stdout.readline()
+                self.assertTrue(line, f"app-server closed stdout before answering {method}")
+                message = json.loads(line)
+                if message.get("id") == request_id:
+                    self.assertNotIn("error", message, f"{method} failed: {message.get('error')}")
+                    return message["result"]
+
+        call(1, "initialize", {"clientInfo": {"name": "walkcode-test", "version": "1"}})
+        proc.stdin.write(json.dumps({"jsonrpc": "2.0", "method": "initialized", "params": {}}) + "\n")
+        proc.stdin.flush()
+
+        # Build params exactly the way the transport does, so this test breaks if
+        # the omission logic regresses.
+        transport = CodexAppServerTransport(client=None, sandbox_override=override)
+        start = call(2, "thread/start", transport._with_sandbox_override({"cwd": cwd}))
+        if not resume:
+            return start["sandbox"]["type"]
+        thread_id = start["thread"]["id"]
+        resumed = call(
+            3, "thread/resume", transport._with_sandbox_override({"threadId": thread_id, "cwd": cwd})
+        )
+        return resumed["sandbox"]["type"]
+
+    def test_omitting_sandbox_uses_the_profile_setting(self):
+        self.assertEqual(
+            self._effective_sandbox(['sandbox_mode = "danger-full-access"']), "dangerFullAccess"
+        )
+        self.assertEqual(self._effective_sandbox(['sandbox_mode = "read-only"']), "readOnly")
+
+    def test_profile_without_sandbox_mode_fails_closed(self):
+        # If this ever starts returning workspaceWrite, omitting the key stops
+        # being safe for profiles that never declared a sandbox.
+        self.assertEqual(self._effective_sandbox(['approval_policy = "never"']), "readOnly")
+
+    def test_explicit_override_still_beats_the_profile(self):
+        self.assertEqual(
+            self._effective_sandbox(['sandbox_mode = "danger-full-access"'], override="read-only"),
+            "readOnly",
+        )
+
+    def test_resume_params_carry_the_override(self):
+        # thread/resume used to drop the override, so a cold resume silently
+        # inherited the profile's full access. Assert on the params the transport
+        # builds for resume — see the class note on why the live server cannot
+        # resume a turn-less thread.
+        transport = CodexAppServerTransport(client=None, sandbox_override="read-only")
+        params = transport._with_sandbox_override({"threadId": "t1", "cwd": "/tmp"})
+        self.assertEqual(params["sandbox"], "read-only")
