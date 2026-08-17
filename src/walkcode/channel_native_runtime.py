@@ -196,6 +196,10 @@ class CodexStdioAppServerClient:
     # chunked readuntil accumulation is NOT cancellation-safe (a wait_for
     # timeout mid-line would drop drained bytes and desync the stream).
     _STDOUT_LIMIT = 64 * 1024 * 1024
+    # Shutdown budget for the app-server subprocess. See _discard_process for
+    # why SIGTERM comes first and why both waits are bounded.
+    _TERMINATE_GRACE_SECONDS = 5.0
+    _KILL_GRACE_SECONDS = 2.0
 
     def __init__(
         self,
@@ -480,6 +484,25 @@ class CodexStdioAppServerClient:
         with contextlib.suppress(asyncio.CancelledError, Exception):
             await task
 
+    async def restart(self) -> None:
+        """Replace the app-server process so it re-reads config.toml.
+
+        This exists for /reload and nothing else. The app-server snapshots
+        ``mcp_servers`` when the PROCESS starts; ``thread/resume`` reuses that
+        snapshot and only ``thread/start`` re-reads the file, so an MCP added
+        after the process came up is unreachable for every existing thread
+        until the process is replaced.
+
+        Only tears down — ``_ensure_started`` spawns the replacement on the
+        next request, which keeps the "one place builds the wire" invariant.
+        In-flight requests are failed rather than left to time out: their
+        answers died with the process.
+        """
+        async with self._lock:
+            await self._stop_reader()
+            self._fail_stream(TransportUnavailable("codex app-server restarted for /reload"))
+            await self._discard_process()
+
     async def answer_request(self, request_id: str, result: dict[str, Any]) -> None:
         async with self._lock:
             await self._ensure_started()
@@ -546,14 +569,35 @@ class CodexStdioAppServerClient:
         process, self._process = self._process, None
         if process is None or process.returncode is not None:
             return
+        # SIGTERM, not SIGKILL. `codex app-server --stdio` is a thin node
+        # wrapper around the vendor binary: SIGTERM lets the wrapper shut the
+        # real server down, SIGKILL kills only the wrapper and leaves the
+        # server orphaned — still holding our stdout pipe, so `await
+        # process.wait()` never returns even though returncode is already set.
+        # Measured on 0.144.5: terminate returns in 0.01s with no survivors;
+        # kill hangs the caller AND leaks the app-server, which for /reload
+        # would mean the stale config snapshot outlives the "restart".
+        with contextlib.suppress(ProcessLookupError):
+            process.terminate()
         try:
-            process.kill()
-        except ProcessLookupError:
+            await asyncio.wait_for(process.wait(), timeout=self._TERMINATE_GRACE_SECONDS)
+            return
+        except (asyncio.TimeoutError, TimeoutError):
             pass
-        try:
-            await process.wait()
         except Exception:
-            pass
+            return
+        _log_degrade(
+            "codex_app_server_terminate_escalated",
+            pid=process.pid,
+            grace_seconds=self._TERMINATE_GRACE_SECONDS,
+        )
+        with contextlib.suppress(ProcessLookupError):
+            process.kill()
+        # Bounded on purpose: a SIGKILLed wrapper can leave the pipe held open
+        # by its child, and blocking here forever would wedge every caller
+        # behind self._lock.
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(process.wait(), timeout=self._KILL_GRACE_SECONDS)
 
     async def _send(self, message: dict[str, Any]) -> None:
         process = self._require_process()
@@ -697,9 +741,38 @@ class CodexManagedAppServerClient(CodexStdioAppServerClient):
         await self._send({"method": "initialized", "params": {}})
         self._start_reader()
 
+    async def restart(self) -> None:
+        """Restart the managed daemon, not just our socket to it.
+
+        Dropping the connection would accomplish nothing here: the config
+        snapshot that /reload is after lives in the DAEMON process, which
+        outlives every client. ``codex app-server daemon restart`` replaces it;
+        the torn-down socket then reconnects on the next request.
+        """
+        async with self._lock:
+            await self._stop_reader()
+            self._fail_stream(TransportUnavailable("codex app-server daemon restarted for /reload"))
+            self._close_websocket()
+            await self._run_daemon_command("restart")
+            # Force the next _ensure_started back through _start_daemon: the
+            # restart may still be settling, and the cached "checked" flag
+            # would skip the one call that waits for it.
+            self._daemon_checked = False
+
     async def _start_daemon(self) -> None:
+        await self._run_daemon_command("start")
+
+    def _daemon_command_for(self, action: str) -> tuple[str, ...]:
+        # daemon_command carries its own verb ("... daemon start"); swap the
+        # verb rather than appending, or restart becomes "daemon start restart".
+        base = tuple(self.daemon_command)
+        if base and base[-1] in {"start", "restart", "stop"}:
+            base = base[:-1]
+        return (*base, action)
+
+    async def _run_daemon_command(self, action: str) -> None:
         process = await asyncio.create_subprocess_exec(
-            *self.daemon_command,
+            *self._daemon_command_for(action),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=self._subprocess_env(),
@@ -707,7 +780,9 @@ class CodexManagedAppServerClient(CodexStdioAppServerClient):
         stdout, stderr = await process.communicate()
         if process.returncode != 0:
             detail = (stderr or stdout).decode("utf-8", errors="replace").strip()
-            raise TransportUnavailable(detail or "failed to start Codex app-server daemon")
+            raise TransportUnavailable(
+                detail or f"failed to {action} Codex app-server daemon"
+            )
 
     async def _connect_websocket(self) -> None:
         try:
@@ -1446,7 +1521,7 @@ class ChannelNativeRuntime:
                     "text": (
                         "Skills are not introspectable through the current "
                         f"{self.config.agent} structured transport yet.\n"
-                        "WalkCode-native commands: /status, /sessions, /model, /takeover."
+                        "WalkCode-native commands: /status, /sessions, /model, /takeover, /reload."
                     ),
                 },
             )
@@ -1459,6 +1534,9 @@ class ChannelNativeRuntime:
                     "text": _telegram_commands_help_text(self.config.agent),
                 },
             )
+            return SubmitResult(True, "telegram_bot_command")
+        if name == "reload":
+            await self._handle_reload_command(channel, inbound, session, actor)
             return SubmitResult(True, "telegram_bot_command")
         if name == "model":
             await self._handle_telegram_model_command(channel, inbound, session, actor, argument)
@@ -1561,6 +1639,91 @@ class ChannelNativeRuntime:
                 f"Cwd: {self.config.cwd}"
             ),
         }
+
+    async def _handle_reload_command(self, channel, inbound, session, actor: ActorRef) -> None:
+        """Restart this session's agent backend without losing the conversation.
+
+        The problem it solves: an MCP server added to the agent's config only
+        reaches a session whose backend started AFTER the edit. For codex that
+        is brutal — the app-server snapshots ``mcp_servers`` at process start,
+        ``thread/resume`` reuses that snapshot, and only ``thread/start``
+        re-reads the file. So a long-running session could never pick up a new
+        MCP; the only workaround was abandoning it and starting over, losing
+        hours of context.
+
+        /reload stops the backend and stops the session with a reason INSIDE
+        ``_CHANNEL_REVIVAL_STOP_REASONS``, so the next message revives the same
+        session (ADR 0054) onto a freshly started backend — new config, same
+        conversation.
+        """
+        zh = str(getattr(inbound, "channel_kind", "")) == "lark"
+        binding = self._telegram_command_reply_binding(inbound, session)
+
+        async def _reply(text: str) -> None:
+            await channel.send_view(binding, {"type": "text", "text": text})
+
+        if session is None:
+            await _reply(
+                "这个话题没有绑定会话，/reload 没有可重启的对象。"
+                if zh
+                else "No session is bound to this thread; /reload has nothing to restart."
+            )
+            return
+        if session.transport_kind == "external_tui":
+            # The backend is a terminal the user owns. Restarting it is the
+            # consented takeover flow's job, not a slash command's.
+            await _reply(
+                "这是终端会话的只读观测视图，/reload 不会动你的终端。请在终端里自己重启。"
+                if zh
+                else "This is a read-only view of a terminal session; /reload will not touch "
+                "your terminal. Restart it there instead."
+            )
+            return
+        result = await self.orchestrator.reload_session_backend(
+            session.session_id,
+            actor=actor,
+        )
+        if not result.accepted:
+            if str(result.reason) == "turn_in_flight":
+                await _reply(
+                    "这个会话正在跑一个回合，现在重启会把它悄悄杀掉且不会有任何回复。"
+                    "等它答完再 /reload。"
+                    if zh
+                    else "A turn is still in flight; restarting now would kill it silently "
+                    "with no reply ever arriving. Run /reload once it has answered."
+                )
+                return
+            if str(result.reason) == "missing_resume_ref":
+                # Refused on purpose: without a resumable id the reload would
+                # be a one-way kill. Say what to do instead of printing a code.
+                await _reply(
+                    "这个会话还没跑完第一个回合，没有可恢复的存档，现在重启会把它弄丢。"
+                    "等它答完一轮再 /reload。"
+                    if zh
+                    else "This session has not finished a turn yet, so there is nothing to "
+                    "revive it from — reloading now would lose it. Try again after it replies."
+                )
+                return
+            await _reply(
+                f"重启失败：{result.reason}" if zh else f"Reload failed: {result.reason}"
+            )
+            return
+        shared = result.state == "reloaded_shared_backend"
+        if zh:
+            text = "🔄 后端已重启，会话和上下文都留着。下一条消息会带着当前配置（含新加的 MCP）恢复这个会话。"
+            if shared:
+                text += "\n同一个 profile 的其他 codex 会话也断了一次，它们下条消息会自己恢复。"
+        else:
+            text = (
+                "🔄 Backend restarted; the session and its context are intact. Your next "
+                "message revives it with the current config, new MCP servers included."
+            )
+            if shared:
+                text += (
+                    "\nOther codex sessions on this profile were disconnected too; their "
+                    "next message reconnects them."
+                )
+        await _reply(text)
 
     async def _handle_telegram_model_command(
         self,
@@ -5571,6 +5734,8 @@ def _telegram_bot_command(inbound: Any) -> tuple[str, str] | None:
         "takeover": "takeover",
         "take-over": "takeover",
         "repo": "repo",
+        "reload": "reload",
+        "restart": "reload",
     }
     resolved = aliases.get(name)
     if resolved is None:
@@ -5602,6 +5767,7 @@ _WALKCODE_TELEGRAM_COMMANDS = [
     {"command": "model", "description": "Show or switch the current session model"},
     {"command": "skills", "description": "Show agent skill support status"},
     {"command": "takeover", "description": "Request takeover for a TUI-origin session"},
+    {"command": "reload", "description": "Restart this session's agent backend, keeping the conversation"},
     {"command": "commands", "description": "Show all WalkCode and agent commands"},
 ]
 

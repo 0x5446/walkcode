@@ -179,8 +179,22 @@ uv run --with claude-agent-sdk --with lark-oapi python scripts/channel_native_de
 WALKCODE_ENV_FILE=~/.walkcode/work-claude.env walkcode native serve
 ```
 
-会话内可用命令：`/status`、`/sessions`、`/model`、`/takeover`、
-`/repo <目录> <任务>`（在 `WALKCODE_WORKSPACE_ROOTS` 白名单内选择仓库启动新会话）。
+会话内可用命令：`/status`、`/sessions`、`/model`、`/takeover`、`/reload`（别名
+`/restart`）、`/repo <目录> <任务>`（在 `WALKCODE_WORKSPACE_ROOTS` 白名单内选择
+仓库启动新会话）。
+
+`/reload` 重启这个会话的 agent 后端，**会话和上下文都留着**：下一条消息按
+ADR 0054 复活同一个会话，用当前配置重新连上。给 agent 新加了 MCP 又不想丢掉
+聊了半天的会话，就用它。codex 尤其需要——app-server 在**进程启动那一刻**快照
+`mcp_servers`，`thread/resume` 只用这份快照，只有 `thread/start` 会重读
+config.toml，所以不换进程，已有会话永远看不到新 MCP。终端观测会话会被拒绝
+（那进程在你的终端里，归 takeover 管）。
+
+`/status` 的 **Session** 是 agent 自己的 session id——codex 的 `threadId`、
+claude 的 session uuid，可以直接喂给 `codex resume` / `claude --resume`；
+**WalkCode** 那一行才是 state 文件和日志用的账本 key。注意 profile 实例的
+rollout 存在 `WALKCODE_CODEX_HOME` 下，`codex resume` 要带上同一个
+`CODEX_HOME` 才找得到。
 
 ## 从旧版迁移
 

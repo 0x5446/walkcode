@@ -899,6 +899,28 @@ class TakeoverOrchestratorTests(unittest.TestCase):
         self.assertEqual(tx["phase"], TakeoverPhase.PROMPTED)
         self.assertEqual(transport.submitted_turns, [])
 
+    def test_close_session_on_an_observed_session_does_not_blow_up(self):
+        # "external_tui" is a transport_kind with no transport object behind
+        # it, so the indexed lookup close_session used to do raised KeyError
+        # and left the record stuck at running.
+        orchestrator, _channel, _transport, session = _setup(
+            resume_ref={
+                "transport_kind": "fake-transport",
+                "transport_ref": {"handle_id": "resume-h", "session_id": "native-1"},
+            }
+        )
+
+        result = asyncio.run(
+            orchestrator.close_session(
+                session.session_id, actor=_actor("owner"), reason="backend_reload"
+            )
+        )
+
+        self.assertTrue(result.accepted)
+        updated = orchestrator.sessions.get(session.session_id)
+        self.assertEqual(updated.status, "stopped")
+        self.assertEqual(updated.stop_reason, "backend_reload")
+
 
 if __name__ == "__main__":
     unittest.main()

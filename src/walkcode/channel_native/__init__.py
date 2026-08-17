@@ -1017,7 +1017,25 @@ def _session_is_external_tui_takeover_candidate(session: Session) -> bool:
 
 
 _STRUCTURED_TRANSPORT_KINDS = frozenset({"claude_headless", "codex_app_server"})
-_CHANNEL_REVIVAL_STOP_REASONS = frozenset({"runtime_restart", "revive_failed"})
+# Stops that a later channel message is allowed to undo (ADR 0054). All three
+# are INVOLUNTARY from the conversation's point of view: the runtime went away,
+# a revival attempt did not land, or /reload deliberately cycled the backend
+# under a session the user wants to keep talking to.
+_CHANNEL_REVIVAL_STOP_REASONS = frozenset(
+    {"runtime_restart", "revive_failed", "backend_reload"}
+)
+
+# Lifecycle states where a turn is still in flight, so cycling the backend
+# under it would kill work the user is waiting on. ACTIVE is running; the two
+# WAITING_* states are parked on a human and resume the moment they answer.
+#
+# Losing such a turn is silent on codex: the drain sees session.status ==
+# "stopped", takes the "stale drain must not error-mark the successor" branch
+# and drops the failure (`event_drain_failed_after_replacement`, drop=True),
+# and codex has no `pending_turn_lost` — that ADR 0058 auto-replay marker is
+# produced only by ClaudeHeadlessTransport. The user's question would simply
+# never be answered, with nothing in the channel saying so.
+_TURN_IN_FLIGHT_STATES = frozenset({"ACTIVE", "WAITING_PERMISSION", "WAITING_USER"})
 
 # ADR 0058：worker 在回答已接受的提交前退出（API 故障窗、进程崩溃）时的
 # 自动重放退避表。两档：短退避接住瞬时抖动，长退避跨过典型的过载窗口。
@@ -1106,6 +1124,43 @@ def _durable_resume_ref(session: Session) -> dict[str, Any]:
     if session.transport_kind == "codex_app_server" and not ref.get("thread_id"):
         return {}
     return ref
+
+
+def _agent_session_identity(session: Session) -> str:
+    """The AGENT's own session id — what ``codex resume`` / ``claude --resume`` take.
+
+    ``session.session_id`` is WalkCode's ledger key (``sess-<uuid4 hex>``); no
+    agent has ever heard of it. /status used to print only that, so anyone who
+    copied it into ``codex resume`` got "no such session" — the real id lives
+    in the transport ref (``thread_id`` for codex, ``agent_session_id`` for
+    claude), one level down inside ``resume_ref`` for TUI-observed sessions.
+    """
+    ref = session.transport_ref if isinstance(session.transport_ref, dict) else {}
+    kind = str(session.transport_kind or "")
+    nested = ref.get("resume_ref")
+    if isinstance(nested, dict) and nested:
+        # TUI-observed sessions (transport_kind "external_tui") keep the
+        # agent-native ref nested, tagged with its own discriminator.
+        kind = str(nested.get("transport_kind", "") or kind)
+        ref = nested
+    if kind == "claude_headless":
+        value = ref.get("agent_session_id") or ref.get("claude_session_id") or ""
+    elif kind == "codex_app_server":
+        value = (
+            ref.get("thread_id")
+            or ref.get("codex_thread_id")
+            or ref.get("conversation_id")
+            or ""
+        )
+    else:
+        value = ""
+    identity = str(value or "").strip()
+    if identity:
+        return identity
+    # Older claude records parked the agent id under the generic key. A
+    # WalkCode ledger id sitting there is NOT an agent id.
+    fallback = str(ref.get("session_id", "") or "").strip()
+    return "" if fallback.startswith("sess-") else fallback
 
 
 def _session_is_channel_revival_candidate(session: Session) -> bool:
@@ -3395,12 +3450,17 @@ class ViewModelFactory:
         context_limit: int = 0,
         direct_write: bool = False,
         background_tasks: int = 0,
+        agent_session_id: str = "",
     ) -> dict[str, Any]:
         return {
             "type": "health",
             "status": status,
             "title": title,
             "session_id": session_id,
+            # The agent's own session id (codex threadId / claude session
+            # uuid). Distinct from session_id, which is WalkCode's ledger key
+            # and means nothing to `codex resume` / `claude --resume`.
+            "agent_session_id": agent_session_id,
             "transport": transport,
             "elapsed": elapsed,
             "cwd": cwd,
@@ -4723,7 +4783,11 @@ def render_view_text(view_model: dict[str, Any]) -> str:
             f"Agent: {view_model.get('transport', '')}",
             f"Model: {view_model.get('model', '') or '-'}",
             f"Context: {context_text}",
-            f"Session: {view_model.get('session_id', '')}",
+            # Agent-native id first: it is the one `codex resume` /
+            # `claude --resume` accept. The WalkCode ledger key stays visible
+            # right under it for state/log lookups.
+            f"Session: {view_model.get('agent_session_id', '') or '-'}",
+            f"WalkCode: {view_model.get('session_id', '') or '-'}",
             f"State: {view_model.get('lifecycle_state', '') or '-'}",
             f"Writer: {view_model.get('writer_owner', '') or '-'}",
             f"Duration: {int(elapsed)}s",
@@ -8240,6 +8304,14 @@ class CodexAppServerTransport:
         # it onto the converted events; _record_session_progress then writes
         # session.model from event.payload["model"].
         self._thread_models: dict[str, str] = {}
+        # Live turn per thread, from the turn/start response. turn/interrupt
+        # needs it, and without it an explicit close could only stop WalkCode
+        # from listening while the agent kept running server-side.
+        self._active_turns: dict[str, str] = {}
+        # Threads shut down by close_session. The event loop checks this at
+        # each batch boundary so a drain parked in client.events() ends with
+        # the session instead of hanging around until the silence ceiling.
+        self._released_threads: set[str] = set()
         # Codex event types we drop on the floor, logged once each. See
         # _log_unhandled_event_type.
         self._logged_unhandled_types: set[str] = set()
@@ -8320,6 +8392,7 @@ class CodexAppServerTransport:
         )
         result = await self.client.request("thread/start", params)
         thread_id = _codex_thread_id(result)
+        self._released_threads.discard(thread_id)
         self._apply_effective_sandbox(result, thread_id, method="thread/start")
         if self.environment_context and thread_id:
             self._env_context_pending.add(thread_id)
@@ -8335,6 +8408,9 @@ class CodexAppServerTransport:
         params = self._with_sandbox_override({"threadId": thread_id, "cwd": cwd})
         result = await self.client.request("thread/resume", params)
         resumed = _codex_thread_id(result) or thread_id
+        # A resumed thread is live again; a stale release mark would make the
+        # next drain quit on its first batch boundary.
+        self._released_threads.discard(resumed)
         self._apply_effective_sandbox(result, resumed, method="thread/resume")
         if self.environment_context and resumed not in self._env_context_delivered:
             self._env_context_pending.add(resumed)
@@ -8363,7 +8439,7 @@ class CodexAppServerTransport:
             text = f"{self.environment_context}\n\n{text}"
         if not text.strip():
             text = EMPTY_TURN_PLACEHOLDER
-        await self.client.request(
+        result = await self.client.request(
             "turn/start",
             {
                 "threadId": thread_id,
@@ -8374,6 +8450,10 @@ class CodexAppServerTransport:
                 "idempotencyKey": idempotency_key,
             },
         )
+        turn = result.get("turn") if isinstance(result, dict) else None
+        turn_id = str(turn.get("id", "") or "") if isinstance(turn, dict) else ""
+        if thread_id and turn_id:
+            self._active_turns[thread_id] = turn_id
         # Only a confirmed turn/start clears the mark: a failed submit keeps
         # the context pending so the retry carries it again.
         self._env_context_pending.discard(thread_id)
@@ -8449,12 +8529,21 @@ class CodexAppServerTransport:
                 # the cache entry so a long-lived runtime cannot accumulate
                 # one ~100B mapping per finished thread forever.
                 self._thread_models.pop(thread_id, None)
+                self._active_turns.pop(thread_id, None)
             if delta_parts:
                 delta_payload: dict[str, Any] = {"text": "".join(delta_parts)}
                 if delta_model:
                     delta_payload["model"] = delta_model
                 yield AgentEvent(AgentEventType.TURN_DELTA, delta_payload)
             if turn_closed:
+                return
+            if thread_id in self._released_threads:
+                # close_session shut this thread down while the batch was in
+                # flight. Ending with a synthetic completion (not a bare
+                # return) keeps the drain from reading a closed session's
+                # stream end as a mid-turn failure.
+                self._released_threads.discard(thread_id)
+                yield AgentEvent(AgentEventType.TURN_COMPLETED, {"message": ""})
                 return
             if raw_events:
                 # Any traffic at all proves the worker is alive and working.
@@ -8529,6 +8618,104 @@ class CodexAppServerTransport:
         if responder is None:
             raise CapabilityUnsupported("Codex app-server request responses are not available")
         await responder(rid, self._question_response_for_request(rid, answers))
+
+    async def shutdown(self, handle: TransportHandle, mode: str) -> ControlResult:
+        """Stop this thread's work and stop listening to it.
+
+        There is no per-session process to reap: ONE app-server serves every
+        thread under this CODEX_HOME, so killing it would take every other
+        session down with it. "Exit" is therefore two THREAD-scoped calls, and
+        nothing process- or server-scoped:
+
+        - ``turn/interrupt`` so the agent actually stops working. Unsubscribing
+          alone would only stop us WATCHING a turn that keeps running, with
+          whatever sandbox it holds.
+        - ``thread/unsubscribe`` so the server stops pushing this thread's
+          notifications at us. Verified against codex 0.144.5: it drops THIS
+          connection's subscription to THIS thread — a second call answers
+          ``notSubscribed``, sibling threads stay loaded, subscribed and
+          readable, and the server keeps serving. The thread itself stays in
+          the daemon's loaded set (there is no non-destructive unload;
+          thread/archive and thread/delete are not that), and the rollout stays
+          on disk, so ``thread/resume`` brings it back.
+
+        Best-effort by design: the ledger close must not hinge on the server
+        answering, or a wedged daemon would pin the session at "running" with
+        no way for the user to end it.
+        """
+        thread_id = str((handle.ref or {}).get("thread_id", "") or "")
+        turn_id = self._active_turns.pop(thread_id, "")
+        self._env_context_pending.discard(thread_id)
+        self._env_context_delivered.discard(thread_id)
+        self._thread_models.pop(thread_id, None)
+        self.effective_sandbox.pop(thread_id, None)
+        if not thread_id:
+            return ControlResult(True, state="stopped")
+        # Marked before the calls, not after: a drain sitting in
+        # client.events() must find the mark whenever its batch returns, even
+        # if the requests below hang or fail.
+        self._released_threads.add(thread_id)
+        if turn_id:
+            try:
+                await self.client.request(
+                    "turn/interrupt",
+                    {"threadId": thread_id, "turnId": turn_id},
+                )
+            except Exception as exc:
+                _log_degrade(
+                    "codex_turn_interrupt_failed",
+                    thread_id=thread_id,
+                    turn_id=turn_id,
+                    mode=mode,
+                    error=exc,
+                )
+        try:
+            await self.client.request("thread/unsubscribe", {"threadId": thread_id})
+        except Exception as exc:
+            _log_degrade(
+                "codex_thread_unsubscribe_failed",
+                thread_id=thread_id,
+                mode=mode,
+                error=exc,
+            )
+        return ControlResult(True, state="stopped")
+
+    async def restart_backend(self) -> None:
+        """Replace the app-server so it re-reads config.toml (/reload).
+
+        Profile-wide by construction: one app-server serves every thread under
+        this CODEX_HOME, and the config snapshot it is holding — ``mcp_servers``
+        above all — only refreshes when the process is replaced. Sibling
+        sessions therefore lose their connection too and reconnect on their
+        next message; the caller is expected to say so out loud.
+
+        Per-thread caches are dropped with the process they described. Keeping
+        them would let a stale model or sandbox reading survive onto the new
+        server, which is the exact class of drift ``_apply_effective_sandbox``
+        exists to catch.
+        """
+        restart = getattr(self.client, "restart", None)
+        if restart is None:
+            raise CapabilityUnsupported(
+                "this Codex app-server client cannot be restarted"
+            )
+        await _maybe_await(restart())
+        self._thread_models.clear()
+        self._active_turns.clear()
+        self.effective_sandbox.clear()
+        # NOT cleared, deliberately:
+        #
+        # _released_threads — it is a signal to drains, not a cache of the old
+        #   process. A drain that returns from a batch right after the restart
+        #   and finds no mark falls through to client.events(), whose
+        #   _ensure_started SPAWNS A NEW app-server and then listens on a
+        #   thread nobody resumed there: empty batches until the silence
+        #   ceiling (an hour). Keeping the mark lets it close out cleanly at
+        #   the next batch boundary. resume_thread discards it when the thread
+        #   genuinely comes back.
+        # _env_context_delivered — the preamble is in the thread's HISTORY,
+        #   not in the server; a restart does not un-send it, and re-marking
+        #   would re-inject it on every resume after a reload.
 
     async def set_model(self, handle: TransportHandle, model: str) -> ControlResult:
         raise CapabilityUnsupported("Codex app-server model switching is not verified")
@@ -10565,8 +10752,11 @@ class Orchestrator:
             return ControlResult(False, authz_result.reason)
         if session.status == "stopped":
             return ControlResult(True, state="stopped")
-        transport = self.transports[session.transport_kind]
-        shutdown = getattr(transport, "shutdown", None)
+        # .get, not [] : "external_tui" is a transport_kind with no transport
+        # object behind it (the process lives in somebody's terminal), so an
+        # indexed lookup would KeyError instead of closing the ledger record.
+        transport = self.transports.get(session.transport_kind)
+        shutdown = getattr(transport, "shutdown", None) if transport is not None else None
         if shutdown is not None:
             result = await shutdown(self._handle_for_session(session), mode)
             if not result.accepted:
@@ -10581,6 +10771,72 @@ class Orchestrator:
         session.background_tasks = []
         await self.refresh_session_status_card(session)
         return ControlResult(True, state="stopped")
+
+    async def reload_session_backend(
+        self,
+        session_id: str,
+        *,
+        actor: ActorRef,
+    ) -> ControlResult:
+        """Cycle the agent backend under a session, keeping the conversation.
+
+        Why this cannot just be "close and let the user re-ask": the whole
+        point is that the CONVERSATION survives. Config picked up at backend
+        start — MCP servers above all — is otherwise unreachable for a
+        long-running session, because codex's app-server snapshots
+        ``mcp_servers`` at process start and ``thread/resume`` reuses that
+        snapshot (only ``thread/start`` re-reads the file). Restarting the
+        process is the only way in, and abandoning the thread to get it costs
+        the user everything they built up.
+
+        Two steps, in this order:
+
+        1. ``close_session`` with ``backend_reload`` — a reason inside
+           ``_CHANNEL_REVIVAL_STOP_REASONS``, so the next message revives THIS
+           session instead of dead-ending at 会话已结束. The transport's
+           shutdown runs here, so the worker/turn stops before anything is
+           torn down under it.
+        2. the transport's optional ``restart_backend``. Claude needs none —
+           closing reaps the per-session worker and the next resume spawns a
+           fresh one. Codex does: one app-server serves every thread on the
+           profile, and its config snapshot only refreshes on process start.
+        """
+        session = self.sessions.get(session_id)
+        transport_kind = session.transport_kind
+        if session.status != "stopped" and session.lifecycle_state in _TURN_IN_FLIGHT_STATES:
+            # Refuse rather than kill a turn the user is waiting on — see
+            # _TURN_IN_FLIGHT_STATES for why that loss is silent on codex.
+            return ControlResult(False, "turn_in_flight")
+        if session.status != "stopped" and not _durable_resume_ref(session):
+            # No resumable identity yet (codex before its first turn, claude
+            # before the first result carried agent_session_id). Cycling the
+            # backend here would stop the session with nothing to revive it
+            # from — /reload would silently become a permanent kill.
+            return ControlResult(False, "missing_resume_ref")
+        result = await self.close_session(session_id, actor=actor, reason="backend_reload")
+        if not result.accepted:
+            return result
+        transport = self.transports.get(transport_kind)
+        restart = getattr(transport, "restart_backend", None) if transport is not None else None
+        if restart is None:
+            return ControlResult(True, state="reloaded")
+        try:
+            await restart()
+        except Exception as exc:
+            # The session is already stopped-but-revivable, so the next
+            # message still works — it just reconnects to the OLD backend and
+            # silently misses the new config. Say so rather than reporting a
+            # reload that did not happen.
+            _log_degrade(
+                "backend_restart_failed",
+                session_id=session_id,
+                transport_kind=transport_kind,
+                error=exc,
+            )
+            return ControlResult(False, "backend_restart_failed")
+        # Shared backend: siblings on this profile lost their connection too,
+        # and the caller has to say so instead of letting them look broken.
+        return ControlResult(True, state="reloaded_shared_backend")
 
     async def set_session_model(
         self,
@@ -10721,6 +10977,7 @@ class Orchestrator:
             status=status,
             title=session.cached_title or session.session_id,
             session_id=session.session_id,
+            agent_session_id=_agent_session_identity(session),
             transport=session.transport_kind,
             elapsed=elapsed,
             cwd=session.cwd,

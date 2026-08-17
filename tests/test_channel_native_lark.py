@@ -847,6 +847,101 @@ class LarkRuntimeTests(_LarkRuntimeHarness):
         sent_view = api.calls[-1][1]["view"]
         self.assertIn("Active sessions", sent_view.get("text", ""))
 
+    def _settle_session(self, runtime, value="agent-1"):
+        # Bring the session to the state a real finished turn leaves behind:
+        # FakeAgentTransport emits no terminal event, so it stays ACTIVE with
+        # no agent_session_id. /reload refuses both (in-flight turn, and
+        # nothing to revive from).
+        for item in runtime.state.sessions.list_sessions(channel_kind="lark"):
+            session = runtime.state.sessions.get(item.session_id)
+            session.lifecycle_state = "IDLE"
+            session.transport_ref["agent_session_id"] = value
+
+    def test_reload_command_cycles_the_backend_and_answers_in_chinese(self):
+        runtime, api, transport = self._runtime()
+
+        asyncio.run(runtime.process_lark_event(self._message_payload()))
+        self._settle_session(runtime)
+        result = asyncio.run(
+            runtime.process_lark_event(
+                self._message_payload(
+                    event_id="evt-reload",
+                    text="/reload",
+                    root_id="lark-msg-1",
+                    message_id="om_reload",
+                )
+            )
+        )
+        sessions = runtime.state.sessions.list_sessions(channel_kind="lark")
+        reloaded = runtime.state.sessions.get(sessions[0].session_id)
+
+        self.assertTrue(result.accepted)
+        self.assertEqual(transport.shutdown_calls, ["graceful"])
+        self.assertEqual(reloaded.stop_reason, "backend_reload")
+        # /reload is a WalkCode command, never prompt text for the agent.
+        self.assertEqual([turn.text for turn in transport.submitted_turns], ["run tests"])
+        texts = [
+            call[1]["view"].get("text", "")
+            for call in api.calls
+            if isinstance(call[1].get("view"), dict)
+        ]
+        self.assertTrue(any("后端已重启" in text for text in texts), texts)
+
+    def test_restart_is_an_alias_for_reload(self):
+        runtime, api, transport = self._runtime()
+
+        asyncio.run(runtime.process_lark_event(self._message_payload()))
+        self._settle_session(runtime)
+        asyncio.run(
+            runtime.process_lark_event(
+                self._message_payload(
+                    event_id="evt-restart",
+                    text="/restart",
+                    root_id="lark-msg-1",
+                    message_id="om_restart",
+                )
+            )
+        )
+        sessions = runtime.state.sessions.list_sessions(channel_kind="lark")
+
+        self.assertEqual(
+            runtime.state.sessions.get(sessions[0].session_id).stop_reason, "backend_reload"
+        )
+        self.assertEqual([turn.text for turn in transport.submitted_turns], ["run tests"])
+
+    def test_message_after_reload_revives_the_same_lark_session(self):
+        runtime, api, transport = self._runtime()
+
+        asyncio.run(runtime.process_lark_event(self._message_payload()))
+        self._settle_session(runtime)
+        before = runtime.state.sessions.list_sessions(channel_kind="lark")[0].session_id
+        asyncio.run(
+            runtime.process_lark_event(
+                self._message_payload(
+                    event_id="evt-reload2",
+                    text="/reload",
+                    root_id="lark-msg-1",
+                    message_id="om_reload2",
+                )
+            )
+        )
+        after = asyncio.run(
+            runtime.process_lark_event(
+                self._message_payload(
+                    event_id="evt-after",
+                    text="继续",
+                    root_id="lark-msg-1",
+                    message_id="om_after",
+                )
+            )
+        )
+        sessions = runtime.state.sessions.list_sessions(channel_kind="lark")
+
+        self.assertTrue(after.accepted)
+        self.assertEqual([item.session_id for item in sessions], [before])
+        self.assertEqual(runtime.state.sessions.get(before).status, "running")
+        self.assertEqual([turn.text for turn in transport.submitted_turns], ["run tests", "继续"])
+
     def test_redelivered_command_event_is_not_rerun(self):
         # Local command branches never reach the orchestrator's ledger, so
         # they record the event themselves — a Feishu redelivery of the same

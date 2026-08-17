@@ -194,6 +194,60 @@ class HealthCardTests(unittest.TestCase):
         self.assertIn("sess-1234", rendered)
         self.assertIn("2分05秒", rendered)
 
+    def test_health_card_shows_agent_session_id_next_to_walkcode_id(self):
+        # The card used to print only the WalkCode ledger key, so anyone who
+        # copied it into `codex resume` got "no such session".
+        message = render_lark_message(
+            {
+                "type": "health",
+                "status": "idle",
+                "title": "t",
+                "session_id": "sess-51cb47e7",
+                "agent_session_id": "01a00de8-62bc-73e3-bd3c-1fda27f272ac",
+                "transport": "codex_app_server",
+                "elapsed": 5.0,
+                "cwd": "/tmp",
+            }
+        )
+
+        rendered = json.dumps(message["content"], ensure_ascii=False)
+        self.assertIn("**Session**: `01a00de8-62bc-73e3-bd3c-1fda27f272ac`", rendered)
+        self.assertIn("**WalkCode**: `sess-51cb47e7`", rendered)
+
+    def test_health_card_without_agent_session_id_keeps_walkcode_id(self):
+        message = render_lark_message(
+            {
+                "type": "health",
+                "status": "running",
+                "title": "t",
+                "session_id": "sess-1234",
+                "transport": "codex_app_server",
+                "elapsed": 5.0,
+                "cwd": "/tmp",
+            }
+        )
+
+        rendered = json.dumps(message["content"], ensure_ascii=False)
+        self.assertIn("**WalkCode**: `sess-1234`", rendered)
+        self.assertNotIn("**Session**: `", rendered)
+
+    def test_health_card_strips_backticks_from_agent_session_id(self):
+        message = render_lark_message(
+            {
+                "type": "health",
+                "status": "running",
+                "title": "t",
+                "session_id": "sess-1",
+                "agent_session_id": "abc`**bold**`",
+                "transport": "codex_app_server",
+                "elapsed": 1.0,
+                "cwd": "/tmp",
+            }
+        )
+
+        rendered = json.dumps(message["content"], ensure_ascii=False)
+        self.assertNotIn("abc`", rendered)
+
     def test_health_card_shows_model_and_context_usage(self):
         message = render_lark_message(
             {

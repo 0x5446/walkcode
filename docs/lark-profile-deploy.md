@@ -268,7 +268,10 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.walkcode.work-claude
 - 权限卡三按钮（允许/拒绝/始终允许）回环；
 - AskUserQuestion 三模式（单选 / 多选 toggle+提交 / 其他自由文本）；
 - 发图片/文件 → agent 收到本地附件；
-- `/status`、`/sessions`、`/model`；
+- `/status`（**Session** 显示 agent 自己的 id，**WalkCode** 才是账本 key）、
+  `/sessions`、`/model`；
+- `/reload`（或 `/restart`）→ 后端重启、会话保留，下一条消息在同一个话题里
+  复活并带上当前配置（新加的 MCP 这时才生效）；
 - TUI 起会话 → 话题只读观察 → 接管提示 → 接管后可写。
 
 daemon-native 会话另验（ADR 0046 v3，真双端）——**ADR 0050 后这是显式
