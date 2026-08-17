@@ -297,8 +297,55 @@ Telegram bot commands are installed on polling service startup:
 /model     show local model inventory or switch model when the transport supports it
 /skills    current skill-introspection support
 /takeover  takeover fallback for TUI-origin sessions
+/reload    restart this session's agent backend, keeping the conversation (alias /restart)
 /commands  installed WalkCode and agent command catalog
 ```
+
+### `/reload`
+
+Restarts the agent backend under a session **without losing the conversation**.
+The session stops with reason `backend_reload`, which is inside
+`_CHANNEL_REVIVAL_STOP_REASONS`, so the next message revives that same session
+(ADR 0054) on a freshly started backend.
+
+Why it has to exist: config that is only read when the backend starts — MCP
+servers above all — is otherwise unreachable for a long-running session.
+Measured against codex 0.144.5:
+
+| action | newly added MCP loaded? |
+| --- | --- |
+| app-server started while the config already listed it, then `thread/resume` | yes |
+| config edited while the app-server runs, then `thread/resume` | **no** |
+| same, then `thread/start` | yes |
+
+The app-server snapshots `mcp_servers` at PROCESS start; `thread/resume` reuses
+that snapshot and only `thread/start` re-reads the file. Before `/reload` the
+only way in was abandoning the thread for a new one, losing all its context.
+
+Per transport:
+
+- `claude_headless` — closing reaps the per-session worker; the next resume
+  spawns a fresh one. No extra restart step.
+- `codex_app_server` — the session is stopped with `turn/interrupt` +
+  `thread/unsubscribe` (both thread-scoped: verified that unsubscribing one
+  thread leaves siblings loaded, subscribed and readable), then the app-server
+  process itself is replaced, because that is where the config snapshot lives.
+  This is profile-wide: sibling sessions on the same `CODEX_HOME` lose their
+  connection and reconnect on their next message, and the reply says so.
+
+Refusals:
+
+- TUI-observed sessions — that backend is a terminal the user owns; restarting
+  it belongs to the consented takeover flow.
+- sessions with no durable resume ref yet (no `agent_session_id` / `thread_id`,
+  i.e. the first turn has not landed) — reloading would stop a session nothing
+  can revive, turning `/reload` into a silent permanent kill.
+
+Implementation note: the app-server subprocess is stopped with SIGTERM, not
+SIGKILL. `codex app-server --stdio` is a node wrapper around the vendor binary;
+SIGKILL reaps only the wrapper and leaves the real server orphaned, still
+holding the stdout pipe, so `await process.wait()` never returns and the
+"restarted" server is still the old one.
 
 The command menu is agent-specific. A Claude bot registers WalkCode controls plus
 known Claude Code slash commands; a Codex bot registers WalkCode controls plus

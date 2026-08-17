@@ -12,10 +12,13 @@ from walkcode.channel_native import (
     FakeChannelAdapter,
     InteractionStore,
     Orchestrator,
+    Session,
     SessionRegistry,
     TransportCapabilities,
     TurnInput,
+    render_view_text,
 )
+from walkcode.channel_native import _agent_session_identity
 
 
 class _Clock:
@@ -309,6 +312,86 @@ class HealthWatchdogTests(unittest.TestCase):
         ).view_model
         self.assertEqual(view["context_used"], 405_000)
         self.assertEqual(view["context_limit"], 1_000_000)
+
+
+class AgentSessionIdentityTests(unittest.TestCase):
+    """/status must show the id the AGENT answers to, not WalkCode's key.
+
+    ``sess-<uuid4 hex>`` is a ledger key; pasting it into ``codex resume``
+    returns "no such session", which is exactly how this surfaced.
+    """
+
+    @staticmethod
+    def _session(transport_kind: str, transport_ref: dict) -> Session:
+        return Session(
+            schema_version=1,
+            session_id="sess-abc",
+            transport_kind=transport_kind,
+            transport_ref=transport_ref,
+            cwd="/tmp/project",
+        )
+
+    def test_codex_identity_is_the_thread_id(self):
+        session = self._session(
+            "codex_app_server",
+            {"handle_id": "codex-1", "thread_id": "01a00de8-62bc-73e3"},
+        )
+
+        self.assertEqual(_agent_session_identity(session), "01a00de8-62bc-73e3")
+
+    def test_claude_identity_is_the_agent_session_id(self):
+        session = self._session(
+            "claude_headless",
+            {
+                "handle_id": "claude-1",
+                "agent_session_id": "c5b03e87-9ca0-48af",
+                "session_id": "sess-abc",
+            },
+        )
+
+        self.assertEqual(_agent_session_identity(session), "c5b03e87-9ca0-48af")
+
+    def test_walkcode_key_parked_in_the_generic_slot_is_not_an_agent_id(self):
+        session = self._session("claude_headless", {"session_id": "sess-abc"})
+
+        self.assertEqual(_agent_session_identity(session), "")
+
+    def test_legacy_claude_record_falls_back_to_the_generic_slot(self):
+        session = self._session("claude_headless", {"session_id": "7a440930-364f"})
+
+        self.assertEqual(_agent_session_identity(session), "7a440930-364f")
+
+    def test_tui_observed_session_reads_the_nested_resume_ref(self):
+        session = self._session(
+            "external_tui",
+            {
+                "agent": "codex",
+                "resume_ref": {
+                    "thread_id": "019ff42d-b4be",
+                    "transport_kind": "codex_app_server",
+                },
+            },
+        )
+
+        self.assertEqual(_agent_session_identity(session), "019ff42d-b4be")
+
+    def test_health_view_carries_both_ids(self):
+        clock = _Clock()
+        transport = FakeAgentTransport("fake-transport", _transport_caps())
+        orchestrator, _channel, session = _orchestrator(clock, transport)
+        session.transport_kind = "codex_app_server"
+        session.transport_ref = {"thread_id": "01a00de8"}
+        orchestrator.transports["codex_app_server"] = transport
+
+        view = orchestrator.check_session_health(
+            session.session_id, progress_timeout=0
+        ).view_model
+
+        self.assertEqual(view["agent_session_id"], "01a00de8")
+        self.assertEqual(view["session_id"], session.session_id)
+        text = render_view_text(view)
+        self.assertIn("Session: 01a00de8", text)
+        self.assertIn(f"WalkCode: {session.session_id}", text)
 
 
 if __name__ == "__main__":

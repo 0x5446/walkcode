@@ -269,6 +269,22 @@ def _ask_user_form_card(questions: list[Any], submit: dict[str, Any]) -> dict[st
     return _card_message("请选择", "blue", elements)
 
 
+def _session_ids_line(agent_session_id: str, session_id: str) -> str:
+    """One row carrying both ids, agent-native first.
+
+    Two ids, two jobs: ``Session`` is what you paste into ``codex resume`` /
+    ``claude --resume``, ``WalkCode`` is what state.json and the logs are keyed
+    by. Showing only the latter (the old layout) is what made /status look like
+    it was reporting a session the CLI could not find.
+    """
+    bits = []
+    if agent_session_id:
+        bits.append(f"**Session**: `{agent_session_id}`")
+    if session_id:
+        bits.append(f"**WalkCode**: `{session_id}`")
+    return "　".join(bits) if bits else "**Session**: —"
+
+
 def _health_card(view: dict[str, Any]) -> dict[str, Any]:
     status = str(view.get("status", "") or "running")
     template = _HEALTH_TEMPLATE.get(status, "blue")
@@ -277,6 +293,10 @@ def _health_card(view: dict[str, Any]) -> dict[str, Any]:
     minutes, seconds = divmod(elapsed, 60)
     duration = f"{minutes}分{seconds:02d}秒" if minutes else f"{seconds}秒"
     session_id = str(view.get("session_id", "") or "")
+    # The agent's own session id: codex threadId / claude session uuid. This is
+    # the id `codex resume` and `claude --resume` accept — session_id is the
+    # WalkCode ledger key and resolves to nothing in either CLI.
+    agent_session_id = _inline(str(view.get("agent_session_id", "") or "")).replace("`", "")
     # Model ids come from SDK events / config; strip backticks so a hostile
     # value cannot break out of the code span (V2 escape rationale applies).
     model = _inline(str(view.get("model", "") or "")).replace("`", "")
@@ -292,7 +312,7 @@ def _health_card(view: dict[str, Any]) -> dict[str, Any]:
     elements: list[dict[str, Any]] = [
         {"tag": "markdown", "content": f"**状态**: {status_label}　**Agent**: {view.get('transport', '') or '—'}"},
         {"tag": "markdown", "content": f"**模型**: {f'`{model}`' if model else '—'}　**上下文**: {context_label}"},
-        {"tag": "markdown", "content": f"**Session**: `{session_id}`" if session_id else "**Session**: —"},
+        {"tag": "markdown", "content": _session_ids_line(agent_session_id, session_id)},
         {"tag": "markdown", "content": f"**时长**: {duration}　**目录**: {escape_lark_md(str(view.get('cwd', '') or '—'))}"},
     ]
     detail_bits = []

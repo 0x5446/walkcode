@@ -264,6 +264,20 @@ def _telegram_update(
     }
 
 
+def _settle_session(runtime, *, resume_ref=True, value="agent-1"):
+    """Bring the session to the state a real finished turn leaves behind.
+
+    FakeAgentTransport emits no terminal event, so a session stays ACTIVE with
+    no ``agent_session_id``. Both matter to /reload: it refuses an in-flight
+    turn, and it refuses a session with nothing to revive from.
+    """
+    for item in runtime.state.sessions.list_sessions(channel_kind="telegram"):
+        session = runtime.state.sessions.get(item.session_id)
+        session.lifecycle_state = "IDLE"
+        if resume_ref:
+            session.transport_ref["agent_session_id"] = value
+
+
 def _telegram_service_update(update_id=10, *, chat_id=123, message_thread_id="", service_field="forum_topic_closed"):
     message = {
         "message_id": update_id + 100,
@@ -520,6 +534,256 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
             self.assertEqual([turn.text for turn in transport.submitted_turns], ["ship it"])
             sent = [payload for method, payload in api.calls if method == "sendMessage"]
             self.assertTrue(any("WalkCode session:" in payload["text"] for payload in sent))
+
+    def test_reload_refuses_while_a_turn_is_in_flight(self):
+        # Cycling the backend under a running turn kills it, and on codex that
+        # loss is silent: the drain sees status == "stopped", takes the stale
+        # branch and drops the failure, and codex has no pending_turn_lost
+        # replay marker. The user's question would go unanswered forever.
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = ChannelNativeConfig.from_env(
+                {
+                    "WALKCODE_CHANNEL": "telegram",
+                    "TELEGRAM_BOT_TOKEN": "fake",
+                    "WALKCODE_AGENT": "claude",
+                    "WALKCODE_STATE_PATH": str(Path(tmp) / "state.json"),
+                    "WALKCODE_CWD": tmp,
+                }
+            )
+            api = _FakeTelegramApi()
+            transport = FakeAgentTransport("claude_headless", _transport_caps())
+            runtime = ChannelNativeRuntime.from_config(
+                cfg,
+                telegram_api=api,
+                transports={"claude_headless": transport},
+            )
+
+            asyncio.run(runtime.process_telegram_update(_telegram_update(10, text="ship it")))
+            _settle_session(runtime)
+            session_id = runtime.state.sessions.list_sessions(channel_kind="telegram")[0].session_id
+            for state in ("ACTIVE", "WAITING_PERMISSION", "WAITING_USER"):
+                with self.subTest(state=state):
+                    runtime.state.sessions.get(session_id).lifecycle_state = state
+                    asyncio.run(
+                        runtime.process_telegram_update(
+                            _telegram_update(11, text="/reload", reply_to_message_id="110")
+                        )
+                    )
+                    session = runtime.state.sessions.get(session_id)
+                    self.assertNotEqual(session.status, "stopped")
+                    self.assertEqual(transport.shutdown_calls, [])
+            sent = [payload for method, payload in api.calls if method == "sendMessage"]
+            self.assertTrue(any("still in flight" in p["text"] for p in sent), sent)
+
+    def test_reload_refuses_a_session_with_nothing_to_revive_from(self):
+        # A session that has not produced agent_session_id yet has no durable
+        # resume ref. Cycling the backend would stop it with no way back —
+        # /reload would silently be a permanent kill.
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = ChannelNativeConfig.from_env(
+                {
+                    "WALKCODE_CHANNEL": "telegram",
+                    "TELEGRAM_BOT_TOKEN": "fake",
+                    "WALKCODE_AGENT": "claude",
+                    "WALKCODE_STATE_PATH": str(Path(tmp) / "state.json"),
+                    "WALKCODE_CWD": tmp,
+                }
+            )
+            api = _FakeTelegramApi()
+            transport = FakeAgentTransport("claude_headless", _transport_caps())
+            runtime = ChannelNativeRuntime.from_config(
+                cfg,
+                telegram_api=api,
+                transports={"claude_headless": transport},
+            )
+
+            asyncio.run(runtime.process_telegram_update(_telegram_update(10, text="ship it")))
+            _settle_session(runtime, resume_ref=False)
+            asyncio.run(
+                runtime.process_telegram_update(
+                    _telegram_update(11, text="/reload", reply_to_message_id="110")
+                )
+            )
+            session = runtime.state.sessions.get(
+                runtime.state.sessions.list_sessions(channel_kind="telegram")[0].session_id
+            )
+
+            self.assertNotEqual(session.status, "stopped")
+            self.assertEqual(transport.shutdown_calls, [])
+            sent = [payload for method, payload in api.calls if method == "sendMessage"]
+            self.assertTrue(any("nothing to revive it from" in p["text"] for p in sent), sent)
+
+    def test_reload_command_cycles_the_backend_and_keeps_the_session_revivable(self):
+        # /reload exists so a long-running session can pick up config that is
+        # only read at backend start (MCP servers). Closing the session for
+        # real would defeat the point — the conversation has to survive.
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = str(Path(tmp) / "state.json")
+            cfg = ChannelNativeConfig.from_env(
+                {
+                    "WALKCODE_CHANNEL": "telegram",
+                    "TELEGRAM_BOT_TOKEN": "fake",
+                    "WALKCODE_AGENT": "claude",
+                    "WALKCODE_STATE_PATH": state_path,
+                    "WALKCODE_CWD": tmp,
+                }
+            )
+            api = _FakeTelegramApi()
+            transport = FakeAgentTransport("claude_headless", _transport_caps())
+            runtime = ChannelNativeRuntime.from_config(
+                cfg,
+                telegram_api=api,
+                transports={"claude_headless": transport},
+            )
+
+            asyncio.run(runtime.process_telegram_update(_telegram_update(10, text="ship it")))
+            _settle_session(runtime)
+            result = asyncio.run(
+                runtime.process_telegram_update(
+                    _telegram_update(11, text="/reload", reply_to_message_id="110")
+                )
+            )
+            sessions = runtime.state.sessions.list_sessions(channel_kind="telegram")
+            reloaded = runtime.state.sessions.get(sessions[0].session_id)
+
+            self.assertTrue(result.accepted)
+            self.assertEqual(result.reason, "telegram_bot_command")
+            self.assertEqual(transport.shutdown_calls, ["graceful"])
+            self.assertEqual(reloaded.stop_reason, "backend_reload")
+            # Not forwarded to the agent as prompt text.
+            self.assertEqual([turn.text for turn in transport.submitted_turns], ["ship it"])
+            sent = [payload for method, payload in api.calls if method == "sendMessage"]
+            self.assertTrue(any("Backend restarted" in p["text"] for p in sent), sent)
+
+    def test_next_message_after_reload_revives_the_same_session(self):
+        # The whole contract: same session id, same conversation, fresh backend.
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = str(Path(tmp) / "state.json")
+            cfg = ChannelNativeConfig.from_env(
+                {
+                    "WALKCODE_CHANNEL": "telegram",
+                    "TELEGRAM_BOT_TOKEN": "fake",
+                    "WALKCODE_AGENT": "claude",
+                    "WALKCODE_STATE_PATH": state_path,
+                    "WALKCODE_CWD": tmp,
+                }
+            )
+            transport = FakeAgentTransport("claude_headless", _transport_caps())
+            runtime = ChannelNativeRuntime.from_config(
+                cfg,
+                telegram_api=_FakeTelegramApi(),
+                transports={"claude_headless": transport},
+            )
+
+            asyncio.run(runtime.process_telegram_update(_telegram_update(10, text="ship it")))
+            _settle_session(runtime)
+            before = runtime.state.sessions.list_sessions(channel_kind="telegram")[0].session_id
+            asyncio.run(
+                runtime.process_telegram_update(
+                    _telegram_update(11, text="/reload", reply_to_message_id="110")
+                )
+            )
+            after_reload = asyncio.run(
+                runtime.process_telegram_update(
+                    _telegram_update(12, text="carry on", reply_to_message_id="110")
+                )
+            )
+            sessions = runtime.state.sessions.list_sessions(channel_kind="telegram")
+            revived = runtime.state.sessions.get(before)
+
+            self.assertTrue(after_reload.accepted)
+            self.assertEqual([s.session_id for s in sessions], [before])
+            self.assertEqual(revived.status, "running")
+            self.assertEqual(
+                [turn.text for turn in transport.submitted_turns], ["ship it", "carry on"]
+            )
+
+    def test_reload_refuses_a_terminal_observed_session(self):
+        # The backend is a terminal the user owns; restarting it belongs to the
+        # consented takeover flow, not a slash command.
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = ChannelNativeConfig.from_env(
+                {
+                    "WALKCODE_CHANNEL": "telegram",
+                    "TELEGRAM_BOT_TOKEN": "fake",
+                    "WALKCODE_AGENT": "claude",
+                    "WALKCODE_STATE_PATH": str(Path(tmp) / "state.json"),
+                    "WALKCODE_CWD": tmp,
+                }
+            )
+            api = _FakeTelegramApi()
+            runtime = ChannelNativeRuntime.from_config(
+                cfg,
+                telegram_api=api,
+                transports={
+                    "claude_headless": FakeAgentTransport("claude_headless", _transport_caps())
+                },
+            )
+            session = runtime.state.sessions.create_observed_session(
+                session_id="tui-claude-live",
+                binding=ChannelBinding(
+                    "telegram",
+                    "bot",
+                    "123",
+                    "77",
+                    "",
+                    capabilities={"status_card": True, "native_topic": True},
+                ),
+                cwd=tmp,
+                external_ref={
+                    "source": "native_tui_hook",
+                    "resume_ref": {
+                        "transport_kind": "claude_headless",
+                        "agent_session_id": "claude-live",
+                    },
+                },
+                owner=ActorRef("telegram", "local_tui", "Claude TUI"),
+            )
+
+            result = asyncio.run(
+                runtime.process_telegram_update(
+                    _telegram_update(
+                        10,
+                        text="/reload",
+                        chat_id=123,
+                        chat_type="supergroup",
+                        message_thread_id="77",
+                    )
+                )
+            )
+
+            self.assertTrue(result.accepted)
+            self.assertEqual(runtime.state.sessions.get(session.session_id).status, "running")
+            sent = [payload for method, payload in api.calls if method == "sendMessage"]
+            self.assertTrue(any("will not touch" in p["text"] for p in sent), sent)
+
+    def test_reload_without_a_session_says_so(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = ChannelNativeConfig.from_env(
+                {
+                    "WALKCODE_CHANNEL": "telegram",
+                    "TELEGRAM_BOT_TOKEN": "fake",
+                    "WALKCODE_AGENT": "claude",
+                    "WALKCODE_STATE_PATH": str(Path(tmp) / "state.json"),
+                    "WALKCODE_CWD": tmp,
+                }
+            )
+            api = _FakeTelegramApi()
+            transport = FakeAgentTransport("claude_headless", _transport_caps())
+            runtime = ChannelNativeRuntime.from_config(
+                cfg,
+                telegram_api=api,
+                transports={"claude_headless": transport},
+            )
+
+            result = asyncio.run(
+                runtime.process_telegram_update(_telegram_update(10, text="/reload"))
+            )
+
+            self.assertTrue(result.accepted)
+            self.assertEqual(transport.submitted_turns, [])
+            sent = [payload for method, payload in api.calls if method == "sendMessage"]
+            self.assertTrue(any("nothing to restart" in p["text"] for p in sent), sent)
 
     def test_process_telegram_model_command_does_not_leak_to_agent_when_unsupported(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2092,19 +2356,27 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
                 raise ValueError("Separator is not found, and chunk exceed the limit")
 
         class _FakeProcess:
+            pid = 4242
+
             def __init__(self):
                 self.returncode = None
-                self.killed = False
+                self.signals = []
                 self.stdout = _FakeStdout()
                 self.stderr = None
                 self.stdin = None
 
+            def terminate(self):
+                # SIGTERM is the discard path's first move: SIGKILL orphans the
+                # real app-server behind the node wrapper.
+                self.signals.append("terminate")
+                self.returncode = 0
+
             def kill(self):
-                self.killed = True
+                self.signals.append("kill")
                 self.returncode = -9
 
             async def wait(self):
-                return -9
+                return self.returncode
 
         client = runtime_module.CodexStdioAppServerClient()
         fake = _FakeProcess()
@@ -2116,7 +2388,7 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
 
         self.assertIn(str(runtime_module.CodexStdioAppServerClient._STDOUT_LIMIT), str(ctx.exception))
         self.assertIsNone(client._process)
-        self.assertTrue(fake.killed)
+        self.assertEqual(fake.signals, ["terminate"])
         # Already-parsed notifications are real events that happened; the
         # transport dying must not silently drop them (deep-review round 2).
         self.assertEqual(client._buffered_notifications, [{"method": "stale"}])

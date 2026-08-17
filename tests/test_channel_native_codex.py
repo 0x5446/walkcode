@@ -8,6 +8,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 import unittest
 import uuid
 from pathlib import Path
@@ -20,6 +21,7 @@ from walkcode.channel_native import (
     AgentEventType,
     AttachmentRef,
     AuthorizationStore,
+    CapabilityUnsupported,
     ChannelBinding,
     ChannelCapabilities,
     CodexAppServerTransport,
@@ -400,6 +402,161 @@ class CodexAppServerTransportTests(unittest.TestCase):
             [{"type": "text", "text": "hello", "text_elements": []}],
         )
         self.assertEqual(client.requests[1][1]["idempotencyKey"], "idem-1")
+
+    def test_shutdown_interrupts_the_live_turn_then_unsubscribes(self):
+        # Closing has to stop the WORK, not just the watching: one app-server
+        # serves every thread under this CODEX_HOME, so there is no process to
+        # kill — unsubscribing alone would leave the agent running with
+        # whatever sandbox it holds.
+        client = _FakeCodexClient()
+        transport = CodexAppServerTransport(client=client, event_silence_ceiling=0)
+
+        handle = asyncio.run(transport.launch(LaunchSpec(cwd="/tmp/project", session_id="s1")))
+        asyncio.run(transport.submit_turn(handle, TurnInput(text="hello"), "idem-1"))
+        result = asyncio.run(transport.shutdown(handle, "graceful"))
+
+        self.assertTrue(result.accepted)
+        methods = [method for method, _params in client.requests]
+        self.assertEqual(methods[-2:], ["turn/interrupt", "thread/unsubscribe"])
+        self.assertEqual(
+            client.requests[-2][1],
+            {"threadId": "thread-1", "turnId": "turn-1"},
+        )
+        self.assertEqual(client.requests[-1][1], {"threadId": "thread-1"})
+
+    def test_shutdown_between_turns_skips_the_interrupt(self):
+        client = _FakeCodexClient()
+        transport = CodexAppServerTransport(client=client, event_silence_ceiling=0)
+
+        handle = asyncio.run(transport.launch(LaunchSpec(cwd="/tmp/project", session_id="s1")))
+        result = asyncio.run(transport.shutdown(handle, "graceful"))
+
+        self.assertTrue(result.accepted)
+        self.assertEqual(
+            [method for method, _params in client.requests],
+            ["thread/start", "thread/unsubscribe"],
+        )
+
+    def test_shutdown_still_closes_when_the_server_refuses(self):
+        # A wedged daemon must not pin the session at "running" with no way
+        # for the user to end it.
+        class _AngryClient(_FakeCodexClient):
+            async def request(self, method, params):
+                await super().request(method, params)
+                if method in {"turn/interrupt", "thread/unsubscribe"}:
+                    raise TransportUnavailable("app-server is gone")
+                if method == "thread/start":
+                    return {"thread": {"id": "thread-1"}}
+                return {}
+
+        client = _AngryClient()
+        transport = CodexAppServerTransport(client=client, event_silence_ceiling=0)
+
+        handle = asyncio.run(transport.launch(LaunchSpec(cwd="/tmp/project", session_id="s1")))
+        result = asyncio.run(transport.shutdown(handle, "graceful"))
+
+        self.assertTrue(result.accepted)
+        self.assertEqual(result.state, "stopped")
+
+    def test_released_thread_ends_a_parked_listener_with_a_closed_turn(self):
+        # A drain sitting in client.events() when the close lands must not wait
+        # out the silence ceiling, and must not end bare — a bare stream end
+        # reads as a mid-turn failure.
+        client = _FakeCodexClient()
+        transport = CodexAppServerTransport(client=client, event_silence_ceiling=3600)
+
+        handle = asyncio.run(transport.launch(LaunchSpec(cwd="/tmp/project", session_id="s1")))
+        asyncio.run(transport.submit_turn(handle, TurnInput(text="hello"), "idem-1"))
+        asyncio.run(transport.shutdown(handle, "graceful"))
+        events = _drain_events(transport, handle)
+
+        self.assertEqual([event.type for event in events], [AgentEventType.TURN_COMPLETED])
+
+    def test_restart_backend_replaces_the_process_and_drops_stale_caches(self):
+        # /reload's reason for existing: the app-server snapshots mcp_servers
+        # at process start, so a config edit only reaches existing threads
+        # after the process is replaced. Per-thread caches describe the OLD
+        # process and must not survive it.
+        class _RestartableClient(_FakeCodexClient):
+            def __init__(self):
+                super().__init__()
+                self.restarts = 0
+
+            async def restart(self):
+                self.restarts += 1
+
+        client = _RestartableClient()
+        transport = CodexAppServerTransport(client=client, event_silence_ceiling=0)
+        handle = asyncio.run(transport.launch(LaunchSpec(cwd="/tmp/project", session_id="s1")))
+        asyncio.run(transport.submit_turn(handle, TurnInput(text="hello"), "idem-1"))
+        transport._thread_models["thread-1"] = "gpt-5.6-sol"
+        transport.effective_sandbox["thread-1"] = "readOnly"
+
+        asyncio.run(transport.restart_backend())
+
+        self.assertEqual(client.restarts, 1)
+        self.assertEqual(transport._thread_models, {})
+        self.assertEqual(transport._active_turns, {})
+        self.assertEqual(transport.effective_sandbox, {})
+
+    def test_restart_backend_keeps_the_release_mark_for_parked_drains(self):
+        # _released_threads is a signal to drains, not a cache of the old
+        # process. Clearing it lets a drain that returns from a batch just
+        # after the restart fall through to client.events(), which respawns an
+        # app-server and then listens on a thread nobody resumed there —
+        # empty batches until the hour-long silence ceiling.
+        class _RestartableClient(_FakeCodexClient):
+            async def restart(self):
+                return None
+
+        transport = CodexAppServerTransport(
+            client=_RestartableClient(), event_silence_ceiling=0
+        )
+        handle = asyncio.run(transport.launch(LaunchSpec(cwd="/tmp/project", session_id="s1")))
+        asyncio.run(transport.shutdown(handle, "graceful"))
+        self.assertIn("thread-1", transport._released_threads)
+
+        asyncio.run(transport.restart_backend())
+
+        self.assertIn("thread-1", transport._released_threads)
+        # And a genuine comeback still clears it.
+        asyncio.run(transport.resume_thread("thread-1", cwd="/tmp/project"))
+        self.assertNotIn("thread-1", transport._released_threads)
+
+    def test_restart_backend_keeps_the_env_context_mark(self):
+        # The channel preamble lives in the thread's HISTORY, not in the
+        # server. Re-marking it would re-inject the same block on every resume
+        # after a reload.
+        class _RestartableClient(_FakeCodexClient):
+            async def restart(self):
+                return None
+
+        transport = CodexAppServerTransport(
+            client=_RestartableClient(), event_silence_ceiling=0, environment_context="CTX"
+        )
+        handle = asyncio.run(transport.launch(LaunchSpec(cwd="/tmp/project", session_id="s1")))
+        asyncio.run(transport.submit_turn(handle, TurnInput(text="hello"), "idem-1"))
+        self.assertIn("thread-1", transport._env_context_delivered)
+
+        asyncio.run(transport.restart_backend())
+
+        self.assertIn("thread-1", transport._env_context_delivered)
+
+    def test_restart_backend_refuses_a_client_that_cannot_restart(self):
+        transport = CodexAppServerTransport(client=_FakeCodexClient(), event_silence_ceiling=0)
+
+        with self.assertRaises(CapabilityUnsupported):
+            asyncio.run(transport.restart_backend())
+
+    def test_resume_clears_a_stale_release_mark(self):
+        client = _FakeCodexClient()
+        transport = CodexAppServerTransport(client=client, event_silence_ceiling=0)
+
+        handle = asyncio.run(transport.launch(LaunchSpec(cwd="/tmp/project", session_id="s1")))
+        asyncio.run(transport.shutdown(handle, "graceful"))
+        asyncio.run(transport.resume_thread("thread-1", cwd="/tmp/project"))
+
+        self.assertNotIn("thread-1", transport._released_threads)
 
     def test_submit_turn_carries_attachment_paths(self):
         # An attachment-only message used to reach codex as text "" — the
@@ -2228,3 +2385,209 @@ class CodexAppServerSandboxLiveTests(unittest.TestCase):
         transport = CodexAppServerTransport(client=None, sandbox_override="read-only")
         params = transport._with_sandbox_override({"threadId": "t1", "cwd": "/tmp"})
         self.assertEqual(params["sandbox"], "read-only")
+
+
+@unittest.skipIf(_codex_live_skip_reason(), _codex_live_skip_reason() or "live gate")
+class CodexAppServerShutdownLiveTests(unittest.TestCase):
+    """Real `codex app-server` checks for the shutdown protocol calls.
+
+    ``shutdown()`` sends two methods no other code path uses. A fake client
+    can only prove we *send* them; whether the server knows them at all is
+    exactly the thing that would silently turn the close into a no-op, so it gets
+    the real-server check AGENTS.md requires.
+    """
+
+    def _server(self):
+        codex_home = tempfile.mkdtemp(prefix="walkcode-codex-exit-")
+        self.addCleanup(shutil.rmtree, codex_home, ignore_errors=True)
+        Path(codex_home, "config.toml").write_text('sandbox_mode = "read-only"\n')
+        cwd = tempfile.mkdtemp(prefix="walkcode-codex-exit-cwd-")
+        self.addCleanup(shutil.rmtree, cwd, ignore_errors=True)
+
+        proc = subprocess.Popen(
+            ["codex", "app-server", "--stdio"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            env={**os.environ, "CODEX_HOME": codex_home},
+            text=True,
+            bufsize=1,
+        )
+        self.addCleanup(proc.kill)
+
+        state = {"id": 0}
+
+        def call(method, params, *, expect_error=False):
+            state["id"] += 1
+            request_id = state["id"]
+            proc.stdin.write(
+                json.dumps({"jsonrpc": "2.0", "id": request_id, "method": method, "params": params})
+                + "\n"
+            )
+            proc.stdin.flush()
+            while True:
+                line = proc.stdout.readline()
+                self.assertTrue(line, f"app-server closed stdout before answering {method}")
+                message = json.loads(line)
+                if message.get("id") != request_id:
+                    continue
+                if expect_error:
+                    return message
+                self.assertNotIn("error", message, f"{method} failed: {message.get('error')}")
+                return message["result"]
+
+        call("initialize", {"clientInfo": {"name": "walkcode-test", "version": "1"}})
+        proc.stdin.write(json.dumps({"jsonrpc": "2.0", "method": "initialized", "params": {}}) + "\n")
+        proc.stdin.flush()
+        return call, cwd
+
+    def test_unsubscribe_drops_this_connections_subscription(self):
+        call, cwd = self._server()
+        thread_id = call("thread/start", {"cwd": cwd})["thread"]["id"]
+
+        first = call("thread/unsubscribe", {"threadId": thread_id})
+        second = call("thread/unsubscribe", {"threadId": thread_id})
+
+        self.assertEqual(first["status"], "unsubscribed")
+        # notSubscribed, not notLoaded: the call takes away the SUBSCRIPTION,
+        # it does not unload the thread. Also proves the repeat is harmless,
+        # which is what makes shutdown's best-effort retry safe.
+        self.assertEqual(second["status"], "notSubscribed")
+
+    def test_turn_interrupt_is_a_known_method(self):
+        # No live turn to stop here (that needs a model call), so this only
+        # rules out the failure that would matter: the server not knowing the
+        # method at all, which shutdown() would swallow as a degrade log.
+        call, cwd = self._server()
+        thread_id = call("thread/start", {"cwd": cwd})["thread"]["id"]
+
+        message = call(
+            "turn/interrupt",
+            {"threadId": thread_id, "turnId": "no-such-turn"},
+            expect_error=True,
+        )
+
+        code = (message.get("error") or {}).get("code")
+        self.assertNotEqual(code, -32601, f"turn/interrupt unknown to the server: {message}")
+
+    def test_unsubscribing_one_thread_leaves_the_others_alone(self):
+        # The whole worry about closing a codex session: one app-server serves every
+        # thread under a CODEX_HOME, so if the close reached the SERVER rather
+        # than the THREAD, ending one Feishu session would silently kill every
+        # other session on the same profile. Prove it is thread-scoped.
+        call, cwd = self._server()
+        keep = call("thread/start", {"cwd": cwd})["thread"]["id"]
+        drop = call("thread/start", {"cwd": cwd})["thread"]["id"]
+
+        self.assertEqual(call("thread/unsubscribe", {"threadId": drop})["status"], "unsubscribed")
+
+        # Same connection, same server process, still answering — and the
+        # sibling is untouched: still loaded, still readable, still holding its
+        # own subscription (only a subscribed thread answers "unsubscribed").
+        loaded = set(call("thread/loaded/list", {}).get("data") or [])
+        self.assertIn(keep, loaded, loaded)
+        call("thread/read", {"threadId": keep})  # `call` fails the test on error
+        self.assertEqual(call("thread/unsubscribe", {"threadId": keep})["status"], "unsubscribed")
+
+    def test_restart_backend_replaces_the_server_and_picks_up_a_new_mcp(self):
+        """The end-to-end claim behind /reload, against a real app-server.
+
+        A config edit is invisible to `thread/resume` because the app-server
+        snapshots `mcp_servers` at process start. Nothing short of replacing
+        the process fixes that, and a fake client can prove neither that the
+        replacement happened nor that it read the edited file.
+        """
+        codex_home = tempfile.mkdtemp(prefix="walkcode-codex-reload-")
+        self.addCleanup(shutil.rmtree, codex_home, ignore_errors=True)
+        cwd = tempfile.mkdtemp(prefix="walkcode-codex-reload-cwd-")
+        self.addCleanup(shutil.rmtree, cwd, ignore_errors=True)
+        probe = shutil.which("cat") or "/bin/cat"
+        base = 'sandbox_mode = "read-only"\n'
+        Path(codex_home, "config.toml").write_text(base)
+
+        def mcp_children(pid):
+            found = []
+            for kid in subprocess.run(
+                ["pgrep", "-P", str(pid)], capture_output=True, text=True
+            ).stdout.split():
+                cmd = subprocess.run(
+                    ["ps", "-o", "command=", "-p", kid],
+                    capture_output=True,
+                    text=True,
+                    env={**os.environ, "LC_ALL": "C"},
+                ).stdout.strip()
+                if cmd.startswith(probe):
+                    found.append(kid)
+                found.extend(mcp_children(kid))
+            return found
+
+        async def scenario():
+            client = CodexStdioAppServerClient(request_timeout=30, codex_home=codex_home)
+            transport = CodexAppServerTransport(client=client, event_silence_ceiling=0)
+            try:
+                await transport.launch(LaunchSpec(cwd=cwd, session_id="s1"))
+                first_pid = client._process.pid
+                await asyncio.sleep(1.5)
+                before = len(mcp_children(first_pid))
+
+                # Exactly what "I added an MCP to config.toml" looks like.
+                Path(codex_home, "config.toml").write_text(
+                    f'{base}\n[mcp_servers.probe]\ncommand = "{probe}"\n'
+                )
+                await transport.restart_backend()
+                await transport.launch(LaunchSpec(cwd=cwd, session_id="s2"))
+                second_pid = client._process.pid
+                await asyncio.sleep(2.0)
+                after = len(mcp_children(second_pid))
+                return first_pid, second_pid, before, after
+            finally:
+                # Teardown inside the same loop: restart()/_stop_reader await
+                # objects bound to it, and a fresh asyncio.run() would hang.
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(client.restart(), timeout=15)
+
+        first_pid, second_pid, before, after = asyncio.run(
+            asyncio.wait_for(scenario(), timeout=90)
+        )
+
+        self.assertNotEqual(first_pid, second_pid, "restart_backend did not replace the process")
+        self.assertEqual(before, 0)
+        self.assertGreaterEqual(after, 1, "the replacement server did not read the edited config")
+
+    def test_discarding_the_process_leaves_no_orphaned_app_server(self):
+        """SIGKILL orphans the real server; the discard path must not use it.
+
+        `codex app-server --stdio` is a node wrapper around the vendor binary.
+        SIGKILL reaps only the wrapper, leaving the actual server alive holding
+        our stdout pipe — `await process.wait()` then never returns, and for
+        /reload the "restarted" server would still be the old one.
+        """
+        codex_home = tempfile.mkdtemp(prefix="walkcode-codex-discard-")
+        self.addCleanup(shutil.rmtree, codex_home, ignore_errors=True)
+        Path(codex_home, "config.toml").write_text('sandbox_mode = "read-only"\n')
+
+        async def scenario():
+            client = CodexStdioAppServerClient(request_timeout=30, codex_home=codex_home)
+            await client._ensure_started()
+            pid = client._process.pid
+            descendants = subprocess.run(
+                ["pgrep", "-P", str(pid)], capture_output=True, text=True
+            ).stdout.split()
+            # Bounded: an unbounded wait is the bug this guards against.
+            await asyncio.wait_for(client.restart(), timeout=20)
+            return pid, descendants
+
+        pid, descendants = asyncio.run(asyncio.wait_for(scenario(), timeout=60))
+
+        self.assertTrue(descendants, "expected the wrapper to have spawned the vendor binary")
+        time.sleep(0.5)
+        survivors = [
+            kid
+            for kid in descendants
+            if subprocess.run(
+                ["ps", "-o", "pid=", "-p", kid], capture_output=True, text=True
+            ).stdout.strip()
+        ]
+        for kid in survivors:
+            subprocess.run(["kill", "-9", kid], check=False)
+        self.assertEqual(survivors, [], "app-server survived the discard")

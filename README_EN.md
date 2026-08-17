@@ -208,9 +208,24 @@ Start the resident service (use launchd for long-running deploys):
 WALKCODE_ENV_FILE=~/.walkcode/work-claude.env walkcode native serve
 ```
 
-In-session commands: `/status`, `/sessions`, `/model`, `/takeover`, and
-`/repo <dir> <task>` (start a new session inside the
+In-session commands: `/status`, `/sessions`, `/model`, `/takeover`, `/reload`
+(alias `/restart`), and `/repo <dir> <task>` (start a new session inside the
 `WALKCODE_WORKSPACE_ROOTS` allowlist).
+
+`/reload` restarts this session's agent backend and **keeps the session and its
+context**: the next message revives the same session (ADR 0054) on the fresh
+backend. Use it after adding an MCP server you want a long-running session to
+pick up. Codex needs it most — the app-server snapshots `mcp_servers` when the
+PROCESS starts, `thread/resume` reuses that snapshot, and only `thread/start`
+re-reads `config.toml`, so without replacing the process an existing session can
+never see a newly added MCP. TUI-observed sessions are refused; that process
+lives in a terminal and belongs to the takeover flow.
+
+`/status` reports **Session** as the agent's own id — codex's `threadId`,
+claude's session uuid — which is what `codex resume` / `claude --resume`
+accept; the **WalkCode** line is the ledger key used by the state file and the
+logs. Profile instances keep their rollouts under `WALKCODE_CODEX_HOME`, so
+`codex resume` needs the same `CODEX_HOME` to find them.
 
 ## Migrating From Legacy
 
