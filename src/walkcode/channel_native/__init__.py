@@ -9503,6 +9503,15 @@ _CODEX_TOOL_ITEM_SPECS: dict[str, _CodexToolItemSpec] = {
     "filechange": _CodexToolItemSpec(
         "apply_patch", lambda p: _codex_file_change_summary(p.get("changes"))
     ),
+    # codex 0.153.4. Unreachable today: this item is the echo of tool output
+    # the *client* submits in `turn/start.toolOutput`, and walkcode never sets
+    # that field (guarded by test_no_code_path_submits_tool_output). Carded
+    # anyway because the alternative is the 2026-08-07 failure mode — an
+    # unclassified tool item drops into the unhandled-event log and the user
+    # sees nothing. No status field on this one, so the card state falls back
+    # to the method name via `_codex_tool_state_from_event_name`; the payload's
+    # own `name` (the function) outranks the label below.
+    "functioncalloutput": _CodexToolItemSpec("tool_output", lambda p: p.get("output")),
 }
 
 # `PatchApplyStatus` / `McpToolCallStatus` values → card state. Checked before
