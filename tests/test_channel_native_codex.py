@@ -1,3 +1,4 @@
+import ast
 import asyncio
 import base64
 import contextlib
@@ -977,6 +978,45 @@ class CodexAppServerTransportTests(unittest.TestCase):
         self.assertNotIn("large output", events[1].payload["summary"])
         self.assertEqual(events[2].type, AgentEventType.TURN_COMPLETED)
 
+    def test_events_convert_function_call_output_items(self):
+        """`functionCallOutput` renders instead of vanishing into a log line.
+
+        codex 0.153.4 added this variant. walkcode can't produce it today (it
+        is the echo of a client-submitted `turn/start.toolOutput`, which we
+        never send — see test_no_code_path_submits_tool_output), but leaving it
+        unclassified is the 2026-08-07 shape: an unmapped tool item returns
+        None from `_codex_tool_event` and the work is only visible in the
+        unhandled-event log. Item shape per `generate-json-schema`:
+        {id, name, namespace?, output} — no status field, so the card state
+        comes from the method name.
+        """
+        client = _FakeCodexClient()
+        client.event_batches["thread-1"] = [
+            {
+                "method": "item/completed",
+                "params": {
+                    "threadId": "thread-1",
+                    "item": {
+                        "type": "functionCallOutput",
+                        "id": "fco-1",
+                        "name": "lookup_invoice",
+                        "output": "invoice 4471 is paid",
+                    },
+                },
+            },
+            {"method": "turn/completed", "params": {"threadId": "thread-1"}},
+        ]
+        transport = CodexAppServerTransport(client=client, event_silence_ceiling=0)
+        handle = asyncio.run(transport.launch(LaunchSpec(cwd="/tmp/project", session_id="s1")))
+
+        events = _drain_events(transport, handle)
+
+        self.assertEqual(events[0].type, AgentEventType.TOOL_COMPLETED)
+        self.assertEqual(events[0].payload["tool_id"], "fco-1")
+        # The item's own `name` outranks the spec's fallback label.
+        self.assertEqual(events[0].payload["tool_name"], "lookup_invoice")
+        self.assertIn("invoice 4471 is paid", events[0].payload["summary"])
+
     def test_events_convert_web_search_items(self):
         """`webSearch` is tool activity even though its name shares no root.
 
@@ -1327,6 +1367,45 @@ class CodexAppServerTransportTests(unittest.TestCase):
             {compact[variant] for variant in mapped},
             "the spec table must not carry keys that no schema variant produces",
         )
+
+    def test_no_code_path_submits_tool_output(self):
+        """walkcode never hands codex tool output of its own.
+
+        `turn/start.toolOutput` is what makes codex emit a
+        `functionCallOutput` ThreadItem. We card that variant anyway, so this
+        is not load-bearing for coverage — it documents why the variant is
+        unreachable in practice, and going red means a real behaviour change
+        worth noticing: walkcode would be feeding codex tool results instead
+        of only relaying the agent's own.
+        """
+        # Parsed, not grepped: a comment naming the field (there is one, in
+        # _CODEX_TOOL_ITEM_SPECS) is not a submit, and an AST walk also catches
+        # the dynamic `params["toolOutput"] = ...` shape a literal-dict scan
+        # would miss.
+        package_root = Path(walkcode_channel_native.__file__).resolve().parent.parent
+        offenders = []
+        for path in sorted(package_root.rglob("*.py")):
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Constant) and node.value == "toolOutput":
+                    offenders.append(f"{path.relative_to(package_root)}:{node.lineno}")
+                elif isinstance(node, ast.keyword) and node.arg == "toolOutput":
+                    offenders.append(f"{path.relative_to(package_root)}:{node.lineno}")
+
+        self.assertEqual(offenders, [], "a code path now submits codex tool output")
+
+        # Same invariant at the wire boundary, so a payload assembled
+        # dynamically (not a literal `toolOutput` key) is caught too.
+        client = _FakeCodexClient()
+        transport = CodexAppServerTransport(client=client, event_silence_ceiling=0)
+
+        handle = asyncio.run(transport.launch(LaunchSpec(cwd="/tmp/project", session_id="s1")))
+        asyncio.run(transport.submit_turn(handle, TurnInput(text="hello"), "idem-1"))
+
+        turn_starts = [params for method, params in client.requests if method == "turn/start"]
+        self.assertTrue(turn_starts)
+        for params in turn_starts:
+            self.assertNotIn("toolOutput", params)
 
     def test_fuzzy_file_search_notification_is_not_a_tool_card(self):
         """The file picker's own notification is not agent tool activity.

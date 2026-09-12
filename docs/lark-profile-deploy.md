@@ -43,9 +43,23 @@ app 配置与第 1 节清单完全一致（Bot 能力 + 4 scope + 长连接事�
 3. `launchctl kickstart -k` 两实例，向新 bot 各发一条消息，从
    `{profile}-state.json` 抓真实 `open_id`/`chat_id` 回填白名单，再 kickstart。
 
-**切回 Lark**（次月额度恢复后）：`cp personal-{claude,codex}.env.lark-backup`
-覆盖回 env，`launchctl kickstart -k` 两实例即可——Lark state 里的旧话题绑定
-未清除，切回后原话题继续可用。
+**切回 Lark**（2026-09-12 已执行，personal 两实例当前在 Lark）：把 6 个租户键
+（`LARK_APP_ID`/`LARK_APP_SECRET`/`LARK_OPENAPI_DOMAIN`/`LARK_ALLOWED_CHAT_IDS`/
+`LARK_ALLOWED_OPEN_IDS`/`WALKCODE_E2E_LARK_CHAT_ID`）从 `.env.lark-backup` 抄回
+active env，其余键保留（飞书期新增的 `WALKCODE_CODEX_SANDBOX` 等不能被整文件
+覆盖冲掉），再 `launchctl bootout`→`bootstrap` 两实例。
+
+**只换 env 不够**：飞书期建立的 TUI 观察会话，`channel_binding` 里存的是飞书
+chat/message id，切回后这些话题用 Lark bot 发消息会一路 230002（bot 不在那个
+群）。停实例 → 对每个 pid 仍存活的会话在 Lark 群发一张新根卡 → 改
+`channel_binding` 的 chat/thread/root/health + 挪 `binding_to_session` 索引 key +
+补一条 Lark open_id 的 owner grant → 再起实例。已停会话不用管。迁移脚本存档在
+`~/.walkcode/backup-lark-switch-*/migrate_live_tui_to_lark.py`。
+
+**代价**：open.larksuite.com 从本机的 API 往返约 288ms，open.feishu.cn 约
+105ms（2026-09-12 各 5 次采样中位数）。每次渠道调用贵 2.7 倍，重工具量会话更容易
+把 hook 排水队列压出积压——实测确实压出来了，但这不是必然，取决于产出速率和
+hook 构成（见 §7 已知边界）。
 
 已知噪音：切换 bot 后，state 里绑定旧 bot 话题的存活会话（尤其还开着的
 TUI daemon 会话）发进度消息会报 `230002 Bot/User can NOT be out of the chat`
@@ -87,9 +101,32 @@ codex-work login # codex-personal login 同理
 
 **日常规则：终端起 TUI 一律用 wrapper，不用裸 `claude`/`codex`。** hook 配置
 住在各 profile 的配置目录里，用哪个 wrapper 启动，TUI 观察就锚定到哪个
-runtime 实例；裸命令读 `~/.claude`/`~/.codex`，不属于任何 profile。
+runtime 实例。
+
+裸命令读 `~/.claude`/`~/.codex`。2026-09-12 起这两份裸配置也装了 walkcode
+hook，锚到 **personal** 两实例（`~/.claude/settings.json` 的 hooks 段、
+`~/.codex/hooks.json` + `~/.codex/config.toml` 的 `[hooks.state]` 信任哈希），
+所以忘了用 wrapper 也不会彻底断掉镜像。但它只是兜底：裸 claude 的
+`CLAUDE_CONFIG_DIR` 是 `~/.claude` 而实例配的是
+`~/.claude-profiles/personal`，接管/resume 会用后者，MCP 与权限设置对不上。
+换 codex hooks.json 后必须同步换 `config.toml` 里 `[hooks.state."<绝对路径>:<事件>:0:0"]`
+的 `trusted_hash`（key 含 hooks.json 绝对路径，哈希不对 codex 会静默不跑 hook）。
+哈希算法没有公开、也不是整份文件的普通 sha256，**别手算**。两条可行路径：
+① 若新 hooks.json 与某个 profile 的那份逐字节相同，直接把该 profile
+`config.toml` 里的 `[hooks.state]` 整段搬过来，只改 key 里的绝对路径——哈希跟
+内容走，不跟路径走（2026-09-12 裸 codex 就是这么接上的）；② 内容不同就用对应
+`CODEX_HOME` 起一次 codex，在 `/hooks` 里逐项 review 并信任，由它自己写回。
+改完必须真发一次事件验收：跑一条会触发 hook 的命令，确认队列目录多出文件或
+频道收到卡片。**`walkcode native doctor` 不校验信任状态**，它只看 hooks.json
+里的事件和命令，哈希错了它照样报正常。
 Codex 的 managed app-server daemon 也按 CODEX_HOME 分家（每 profile 一个
 daemon + socket）。
+
+**裸配置锚死在 personal，等于放弃了工作/个人的租户隔离。** hook 不校验
+`cwd`：在公司仓库里忘用 wrapper、直接敲 `claude`/`codex`，这次会话的 prompt、
+回复、工具参数就镜像进个人 Lark 群，群里的白名单账号还能接管它。所以裸配置
+只当兜底，公司仓库一律用 `claude-work` / `codex-work`。真要堵死，得在
+`process_tui_hook` 里按工作区根校验 `cwd` 并拒绝跨租户，那是另一件事。
 
 TUI hook 归属锚定：把 walkcode hook 命令写进各 profile 的
 `{CLAUDE_CONFIG_DIR}/settings.json` / `{CODEX_HOME}/hooks.json`，**命令必须显式
@@ -335,3 +372,26 @@ ADR 0044）。
   v0.10.56 起状态卡刷新带指纹去重：仅实质状态变化（阶段/按钮/gate 等待等）
   才调 API，工具事件抖动、时长走字、事件序号不再触发 patch——忙会话的
   状态卡调用量从数千/天降到数十/天。
+- **Lark 租户下，重工具量会话的 hook 镜像会滞后。** 排水每批上限 25 条、
+  单批 30s 超时，**整批跑完或超时后再 sleep 1s** 才起下一批
+  （`_drain_deferred_tui_hooks_forever`，`TUI_HOOK_DRAIN_*` 硬编码无 env 开关）——
+  不是每秒定时发一批，所以最慢的批间隔接近 31s。
+  每条 hook 的渠道开销也不是定值：工具类 hook 一条就可能刷状态卡 + 补叙述消息 +
+  upsert 工具进度（`_send_tui_hook_output`），有的 hook 则一次调用都不发。
+  open.larksuite.com 一次 API 往返约 288ms（feishu.cn 约 105ms，口径同 §1.1），
+  同样的会话在 Lark 下排水慢一截。产出长期高于实际排水能力时队列就持续增长——
+  2026-09-12 实测重工具量会话 2 分钟 +94 条，滞后涨到 8 分钟。
+  **别把某次实测的吞吐当成代码保证的阈值**，它随 hook 构成和卡片去重命中率变。
+  积压本身落在磁盘上，`_deferred_tui_hook_paths` 把 300s 内的新 hook 排在更旧的
+  积压之前。**但这只是优先级，不是实时保证**：recent 桶内部仍是先进先出，
+  持续过载时新 hook 同样要排在本桶已有积压之后，延迟可逼近 300s；被挤出窗口的
+  旧 hook 要等产出降到排水能力以下才补齐。hook 没有过期丢弃机制。
+  **也别把磁盘队列理解成"一条都不会丢"**：工具进度卡按设计不走 outbox 重试，
+  发送失败只记一条 `tool_progress_send_failed`（只有 `PermanentDeliveryError`
+  才会顺带把绑定标成投递异常，网络抖动这类瞬时错误连标记都没有），hook 仍算
+  accepted、队列文件照删（`channel_native/__init__.py` 的 `send_view` 失败分支
+  + `channel_native_runtime.py` 排水里的 `result.accepted → path.unlink()`）。
+  队列保的是积压不丢，不是渠道故障不丢。
+  盯两个数就够：队列目录 `<state 文件名>.tui-hooks.d`（含 `.json`，例如
+  `personal-claude-state.json.tui-hooks.d`）的文件数，和最老文件名前缀
+  （纳秒时间戳）换算出的滞后。
