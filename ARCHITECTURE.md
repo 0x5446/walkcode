@@ -218,7 +218,9 @@ input. It never injects IM text into a live TUI.
 V3 keeps the mature product capabilities but re-implements them inside the new
 boundaries:
 
-- atomic JSON state persistence;
+- atomic JSON state persistence (private temporary file, flush/fsync, replace,
+  cleanup on failure); persistence errors are logged and propagated, and the
+  outbox cannot send a batch whose claim was not saved;
 - pending sessions and durable bindings;
 - inbound dedupe;
 - durable outbox and retry/dead-letter state;
@@ -226,6 +228,29 @@ boundaries:
 - hook dedupe for observed TUI sessions;
 - session health/watchdog views;
 - takeover confirmation with single-writer protection.
+
+Lark callbacks persist each normalized event in `<state>.lark-inbox.d` before
+returning to the SDK. A `.json` file is pending; the runtime renames it to
+`.processing` before any side effects and deletes it after processing and state
+save succeed. Pending files resume at startup. Exceptions and interrupted
+`.processing` files produce a durable channel notice and remain as `.failed`
+files for operator inspection. They are never automatically resubmitted to an
+agent: a failed response does not prove the agent rejected the request. If the
+notice cannot be saved, the `.processing` file remains for startup recovery.
+Failed inbox payloads are retained until explicitly inspected and removed.
+This is not an exactly-once delivery guarantee; the outbox may redeliver when
+the process dies after a channel send but before saving its result.
+
+Ephemeral tool/narration cards count as visible turn output only after a
+successful send or edit. A turn whose progress cards all fail still emits the
+existing empty-turn notice through the durable outbox.
+
+At startup and every five minutes the runtime invokes the existing outbox,
+interaction, and HITL retention policies and saves the compacted snapshot.
+Pending deliveries and unexpired prompts survive. Sessions are not pruned.
+`native hook --defer` loads configuration and writes a private queue file
+directly; it does not load state or construct agent transports. Hook ordering,
+capture stamps, and `<state>.tui-hooks.d` filenames keep their existing contract.
 
 Legacy implementation details no longer define the architecture:
 

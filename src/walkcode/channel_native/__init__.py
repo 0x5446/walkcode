@@ -3960,8 +3960,9 @@ class OutboxDispatcher:
             return
         try:
             self.on_state_changed()
-        except Exception:
-            return
+        except Exception as exc:
+            _log_degrade("outbox_state_save_failed", error=exc)
+            raise
 
 
 class FakeChannelAdapter:
@@ -9854,6 +9855,26 @@ class StateSnapshot:
     hitls: HitlStore = field(default_factory=HitlStore)
 
 
+def _atomic_write_json(path: Path, payload: Any) -> None:
+    """Replace a private JSON file only after its complete contents reach disk."""
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    tmp_name = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w", encoding="utf-8", dir=str(path.parent),
+            prefix=f".{path.name}.", suffix=".tmp", delete=False,
+        ) as tmp:
+            tmp_name = tmp.name
+            json.dump(payload, tmp, sort_keys=True)
+            tmp.write("\n")
+            tmp.flush()
+            os.fsync(tmp.fileno())
+        os.replace(tmp_name, path)
+    finally:
+        if tmp_name is not None:
+            Path(tmp_name).unlink(missing_ok=True)
+
+
 class JsonFileStateStore:
     def __init__(self, path: str | Path, *, now: Callable[[], float] = time.time):
         self.path = Path(path).expanduser()
@@ -9896,17 +9917,7 @@ class JsonFileStateStore:
             "inbound_ledger": inbound_ledger.to_dict(),
             "hitls": hitls.to_dict(),
         }
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        with tempfile.NamedTemporaryFile(
-            "w",
-            encoding="utf-8",
-            dir=str(self.path.parent),
-            delete=False,
-        ) as tmp:
-            json.dump(payload, tmp, sort_keys=True)
-            tmp.write("\n")
-            tmp_name = tmp.name
-        os.replace(tmp_name, self.path)
+        _atomic_write_json(self.path, payload)
 
     def load(self) -> StateSnapshot:
         with self.path.open("r", encoding="utf-8") as f:
@@ -10388,8 +10399,9 @@ class Orchestrator:
             return
         try:
             self.on_state_changed()
-        except Exception:
-            return
+        except Exception as exc:
+            _log_degrade("orchestrator_state_save_failed", error=exc)
+            raise
 
     async def _flush_outbox(self) -> None:
         await self.outbox_dispatcher.flush_once()
@@ -12955,11 +12967,11 @@ class Orchestrator:
                 # Narration joins the rolling burst card as a 💬 line — never
                 # a bubble, and it must NOT seal the burst (the tools it
                 # narrates land right after it).
-                await self._upsert_tool_progress_view(session, channel, view)
+                delivered = await self._upsert_tool_progress_view(session, channel, view)
                 # A diagnostic line ("upstream errored, retrying") is not the
                 # agent answering — a turn whose only trace is retry notes must
                 # still close with the no-output warning.
-                if not view.get("diagnostic"):
+                if delivered and not view.get("diagnostic"):
                     turn_produced_output = True
                 continue
             if view.get("type") == "background_tasks":
@@ -13023,10 +13035,10 @@ class Orchestrator:
         session: Session,
         channel: ChannelAdapter,
         view: dict[str, Any],
-    ) -> None:
+    ) -> bool:
         binding = session.channel_binding
         if binding is None or self._delivery_is_dead(binding):
-            return
+            return False
         # Accumulate a burst of consecutive tool events into one card that is
         # patched in place. A tool_result (completed/failed) updates its own
         # started line (matched by tool_id) instead of appending a new one.
@@ -13037,11 +13049,10 @@ class Orchestrator:
         if view.get("type") == "turn_narration":
             text = str(view.get("text", "") or "").strip()
             if not text:
-                return
+                return False
             lines.append({"kind": "narration", "text": text[:600]})
             binding.capabilities["tool_progress_lines"] = lines
-            await self._patch_tool_progress_card(session, channel, lines)
-            return
+            return await self._patch_tool_progress_card(session, channel, lines)
         entry = {
             "tool_name": str(view.get("tool_name", "") or "tool"),
             "status": str(view.get("status", "") or "running"),
@@ -13064,7 +13075,7 @@ class Orchestrator:
         if not merged:
             lines.append(entry)
         binding.capabilities["tool_progress_lines"] = lines
-        await self._patch_tool_progress_card(
+        return await self._patch_tool_progress_card(
             session, channel, lines, tool=entry["tool_name"], status=entry["status"]
         )
 
@@ -13076,10 +13087,10 @@ class Orchestrator:
         *,
         tool: str = "narration",
         status: str = "",
-    ) -> None:
+    ) -> bool:
         binding = session.channel_binding
         if binding is None:
-            return
+            return False
         aggregate = {"type": "tool_progress", "lines": [dict(line) for line in lines if isinstance(line, dict)]}
         message_id = str(binding.capabilities.get("tool_progress_message_id", "") or "")
         if message_id and channel.capabilities().editable_message:
@@ -13096,7 +13107,7 @@ class Orchestrator:
                     fallback="send_new_card",
                 )
             if edited:
-                return
+                return True
             binding.capabilities.pop("tool_progress_message_id", None)
         try:
             new_message_id = await channel.send_view(binding, aggregate)
@@ -13113,9 +13124,10 @@ class Orchestrator:
                 drop=True,
                 delivery_dead=bool(self._delivery_is_dead(binding)),
             )
-            return
+            return False
         if new_message_id:
             binding.capabilities["tool_progress_message_id"] = str(new_message_id)
+        return bool(new_message_id)
 
     @staticmethod
     def _seal_tool_progress_burst(session: Session) -> None:

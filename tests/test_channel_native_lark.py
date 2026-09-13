@@ -608,6 +608,68 @@ class _LarkRuntimeHarness(unittest.TestCase):
         }
 
 
+class LarkInboxReliabilityTests(_LarkRuntimeHarness):
+    def test_inbox_failure_is_retained_and_not_resubmitted_on_restart(self):
+        runtime, api, transport = self._runtime()
+        payload = self._message_payload()
+        path = runtime._persist_lark_event(payload)
+        self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+        with mock.patch.object(runtime, "process_lark_event", side_effect=OSError("agent result unknown")) as process:
+            asyncio.run(runtime._process_lark_inbox_item(path))
+        self.assertEqual(process.call_count, 1)
+        self.assertEqual(json.loads(path.with_suffix(".failed").read_text()), payload)
+        self.assertIn("结果未能确认", runtime.channels["lark"].rendered_text())
+        self.assertIn("agent result unknown", runtime.last_lark_event_error)
+        self.assertTrue(runtime.state.inbound_ledger.seen("lark:" + payload["event_id"]))
+        self.assertEqual(transport.submitted_turns, [])
+
+    def test_interrupted_inbox_is_reported_without_agent_replay(self):
+        runtime, _, transport = self._runtime()
+        path = runtime._persist_lark_event(self._message_payload())
+        claimed = path.with_suffix(".processing")
+        path.rename(claimed)
+        with mock.patch.object(runtime, "process_lark_event") as process:
+            asyncio.run(runtime._process_lark_inbox_item(claimed))
+        process.assert_not_called()
+        self.assertTrue(path.with_suffix(".failed").exists())
+        self.assertEqual(transport.submitted_turns, [])
+
+    def test_inbox_keeps_claimed_payload_when_notice_cannot_be_saved(self):
+        runtime, _, _ = self._runtime()
+        path = runtime._persist_lark_event(self._message_payload())
+        with mock.patch.object(runtime, "process_lark_event", side_effect=OSError("submit")), \
+             mock.patch.object(runtime, "save_state", side_effect=OSError("disk")):
+            with self.assertRaises(OSError):
+                asyncio.run(runtime._process_lark_inbox_item(path))
+        self.assertTrue(path.with_suffix(".processing").exists())
+        self.assertFalse(path.with_suffix(".failed").exists())
+
+    def test_pending_inbox_replays_after_restart_and_is_removed_after_save(self):
+        runtime, _, transport = self._runtime()
+        path = runtime._persist_lark_event(self._message_payload())
+        class Bridge:
+            def start(self):
+                pass
+        asyncio.run(runtime.serve_lark_ws(max_events=1, bridge_factory=lambda **_: Bridge()))
+        self.assertEqual([turn.text for turn in transport.submitted_turns], ["run tests"])
+        self.assertEqual(list(path.parent.iterdir()), [])
+
+    def test_runtime_compaction_persists_retention_and_keeps_pending_delivery(self):
+        runtime, _, _ = self._runtime()
+        outbox = runtime.state.outbox
+        from walkcode.channel_native import DeliveryStatus
+        binding = ("lark", "app-id", "oc_chat", "", "")
+        sent = outbox.enqueue(channel_binding_key=binding, view_model={"type": "text", "text": "old"}, idempotency_key="old")
+        outbox.record_result(sent.delivery_id, DeliveryStatus.SENT)
+        outbox.enqueue(channel_binding_key=binding, view_model={"type": "text", "text": "pending"}, idempotency_key="pending")
+        outbox._now = lambda: 10**12
+        removed = runtime.compact_state()
+        self.assertEqual(removed["outbox"]["sent"], 1)
+        loaded = runtime.state_store.load().outbox.to_dict()
+        self.assertEqual(len(loaded["pending"]), 1)
+        self.assertEqual(loaded["sent"], {})
+
+
 class LarkRuntimeTests(_LarkRuntimeHarness):
     def test_plain_message_creates_session_rooted_at_status_card(self):
         runtime, api, transport = self._runtime()

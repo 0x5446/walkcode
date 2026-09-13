@@ -2,6 +2,8 @@ import io
 import json
 import sys
 import unittest
+import tempfile
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -199,24 +201,30 @@ class ChannelNativeCliTests(unittest.TestCase):
         self.assertEqual(runtime.hooks[0]["hook_type"], "stop")
 
     def test_native_hook_defer_queues_locally_and_stays_stdout_silent(self):
-        runtime = _FakeRuntime()
-        stdin = io.StringIO(json.dumps({"session_id": "claude-session-1", "message": "done"}))
-        with patch.object(channel_native_runtime.ChannelNativeRuntime, "from_env", return_value=runtime), \
-             patch.object(sys, "argv", ["walkcode", "native", "hook", "Stop", "--agent", "claude", "--defer"]), \
-             patch("sys.stdin", stdin), \
-             patch("sys.stdout", new_callable=io.StringIO) as stdout, \
-             patch("sys.stderr", new_callable=io.StringIO) as stderr:
-            with self.assertRaises(SystemExit) as raised:
-                main.main()
-
-        self.assertEqual(raised.exception.code, 0)
-        self.assertEqual(stdout.getvalue(), "")
-        self.assertEqual(stderr.getvalue(), "")
-        self.assertEqual(runtime.hooks, [])
-        self.assertEqual(runtime.deferred_hooks[0]["hook_type"], "Stop")
-        self.assertTrue(runtime.deferred_hooks[0]["payload"]["_walkcode_infer_tui_pid"])
-        self.assertIn("_walkcode_hook_parent_pid", runtime.deferred_hooks[0]["payload"])
-        self.assertIn("_walkcode_hook_process_tree", runtime.deferred_hooks[0]["payload"])
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = Path(directory) / "state.json"
+            state_path.write_text("invalid state must never be loaded by defer")
+            stdin = io.StringIO(json.dumps({"session_id": "claude-session-1", "message": "done"}))
+            with patch.object(channel_native_runtime.ChannelNativeRuntime, "from_env", side_effect=AssertionError("runtime initialized")), \
+                 patch.object(channel_native_runtime.ChannelNativeConfig, "from_env", return_value=SimpleNamespace(state_path=str(state_path))), \
+                 patch.object(channel_native_runtime, "_load_native_env", return_value={}), \
+                 patch.object(sys, "argv", ["walkcode", "native", "hook", "Stop", "--agent", "claude", "--defer"]), \
+                 patch("sys.stdin", stdin), \
+                 patch("sys.stdout", new_callable=io.StringIO) as stdout, \
+                 patch("sys.stderr", new_callable=io.StringIO) as stderr:
+                with self.assertRaises(SystemExit) as raised:
+                    main.main()
+            self.assertEqual(raised.exception.code, 0)
+            self.assertEqual(stdout.getvalue(), "")
+            self.assertEqual(stderr.getvalue(), "")
+            files = list((Path(directory) / "state.json.tui-hooks.d").glob("*.json"))
+            self.assertEqual(len(files), 1)
+            queued = json.loads(files[0].read_text())
+            self.assertEqual(queued["hook_type"], "Stop")
+            self.assertTrue(queued["payload"]["_walkcode_infer_tui_pid"])
+            self.assertIn("_walkcode_hook_parent_pid", queued["payload"])
+            self.assertIn("_walkcode_hook_process_tree", queued["payload"])
+            self.assertEqual(files[0].stat().st_mode & 0o777, 0o600)
 
     def test_native_hook_reject_without_json_uses_stderr_only(self):
         runtime = _FakeRuntime(hook_result=SubmitResult(False, "duplicate_inbound"))

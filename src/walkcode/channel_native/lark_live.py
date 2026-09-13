@@ -32,6 +32,7 @@ import sys
 import threading
 import time
 from typing import Any, Callable
+from pathlib import Path
 
 from . import PermanentDeliveryError, TransientDeliveryError
 from .lark_cards import render_lark_message
@@ -484,7 +485,7 @@ class LarkIngressBridge:
     """Runs the lark-oapi WebSocket client in a daemon thread and forwards
     events into an asyncio queue owned by the serve loop.
 
-    Both SDK callbacks return promptly: message events are fire-and-forget;
+    Both SDK callbacks return promptly after an optional local inbox write;
     card actions wait on an AckRegistry future for at most ``ack_timeout``
     seconds so the inline response (toast) still fits Feishu's callback
     window, then fall back to a neutral toast.
@@ -501,6 +502,7 @@ class LarkIngressBridge:
         ack_timeout: float = DEFAULT_ACK_TIMEOUT,
         ws_client_factory: Callable[..., Any] | None = None,
         reconnect_delay: float = 5.0,
+        persist_event: Callable[[dict[str, Any]], Path] | None = None,
     ):
         self.credentials = credentials
         self.options = options
@@ -512,9 +514,13 @@ class LarkIngressBridge:
         self._ws_client_factory = ws_client_factory
         self._thread: threading.Thread | None = None
         self._stopped = threading.Event()
+        self._persist_event = persist_event
 
     def _enqueue(self, payload: dict[str, Any]) -> None:
-        self.loop.call_soon_threadsafe(self.queue.put_nowait, payload)
+        # Persist before the SDK acknowledges receipt. No agent/network work
+        # belongs here; a failed disk write must reach the SDK as a failure.
+        item = self._persist_event(payload) if self._persist_event else payload
+        self.loop.call_soon_threadsafe(self.queue.put_nowait, item)
 
     def on_message(self, data: Any) -> None:
         # Must not block: heavy work in this callback stalls the SDK event
