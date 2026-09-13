@@ -2173,7 +2173,6 @@ class ChannelNativeRuntime:
     async def serve_lark_ws(
         self,
         *,
-        retry_delay: float = 2.0,
         max_events: int | None = None,
         bridge_factory=None,
     ) -> None:
@@ -2218,15 +2217,12 @@ class ChannelNativeRuntime:
                         # Custom bridges retain the dict seam used by tests.
                         path = item if isinstance(item, Path) else self._persist_lark_event(item)
                         await self._process_lark_inbox_item(path)
-                except (ChannelConfigError, OSError):
-                    # A disk failure must restart the consumer so retained
-                    # inbox files are recovered, rather than silently parked.
-                    raise
                 except Exception as exc:
                     self.last_lark_event_error = f"{type(exc).__name__}: {exc}"
                     _log_degrade("lark_inbox_processing_failed", error=exc)
-                    if retry_delay > 0:
-                        await asyncio.sleep(retry_delay)
+                    # Recovery itself failed. Restart the consumer so retained
+                    # inbox files are recovered, rather than silently parked.
+                    raise
         finally:
             if hasattr(bridge, "stop"):
                 bridge.stop()
@@ -2278,7 +2274,7 @@ class ChannelNativeRuntime:
             return
         if not self._lark_chat_allowed(inbound.chat_id, is_callback=inbound.callback is not None):
             return
-        if not self._lark_sender_allowed(inbound.sender_id):
+        if inbound.callback is None and not self._lark_sender_allowed(inbound.sender_id):
             return
         self.state.inbound_ledger.complete(inbound.event_id)
         binding = ChannelBinding(
@@ -2294,7 +2290,7 @@ class ChannelNativeRuntime:
             idempotency_key=f"lark-inbound-failed:{inbound.event_id}",
         )
         self.save_state()
-        await self.outbox_dispatcher.flush_once()
+        await self._best_effort_flush_outbox()
 
     async def _place_telegram_new_session(
         self,

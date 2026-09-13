@@ -237,8 +237,10 @@ save succeed. Pending files resume at startup. Exceptions and interrupted
 files for operator inspection. They are never automatically resubmitted to an
 agent: a failed response does not prove the agent rejected the request. If the
 notice cannot be saved, the `.processing` file remains for startup recovery.
-Disk errors stop the consumer so its service supervisor can restart it and
-recover retained files. Malformed payloads that cannot identify a recipient
+Recovery failures stop the consumer so its service supervisor can restart it
+and recover retained files. Notice delivery uses the existing five-second
+outbox flush; saved notices can retry later without holding ingress indefinitely.
+Malformed payloads that cannot identify a recipient
 are logged and archived as `.failed` without a channel notice.
 Failed inbox payloads are retained until explicitly inspected and removed.
 This is not an exactly-once delivery guarantee; the outbox may redeliver when
