@@ -9865,7 +9865,7 @@ def _atomic_write_json(path: Path, payload: Any) -> None:
             prefix=f".{path.name}.", suffix=".tmp", delete=False,
         ) as tmp:
             tmp_name = tmp.name
-            json.dump(payload, tmp, sort_keys=True)
+            json.dump(payload, tmp, sort_keys=True, ensure_ascii=False)
             tmp.write("\n")
             tmp.flush()
             os.fsync(tmp.fileno())

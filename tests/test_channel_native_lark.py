@@ -609,6 +609,36 @@ class _LarkRuntimeHarness(unittest.TestCase):
 
 
 class LarkInboxReliabilityTests(_LarkRuntimeHarness):
+    def test_malformed_payload_is_archived_without_repeated_parse_failure(self):
+        for payload in ({"event": {"message": None}}, [], {"event": None}):
+            with self.subTest(payload=payload):
+                runtime, api, transport = self._runtime()
+                path = runtime._persist_lark_event(payload)
+                asyncio.run(runtime._process_lark_inbox_item(path))
+                self.assertEqual(json.loads(path.with_suffix(".failed").read_text()), payload)
+                self.assertFalse(path.with_suffix(".processing").exists())
+                self.assertEqual(transport.submitted_turns, [])
+                self.assertEqual(api.calls, [])
+
+    def test_corrupt_inbox_file_is_archived_without_agent_submission(self):
+        runtime, _, transport = self._runtime()
+        path = runtime._persist_lark_event(self._message_payload())
+        path.write_bytes(b'{"event":\xff')
+        asyncio.run(runtime._process_lark_inbox_item(path))
+        self.assertEqual(path.with_suffix(".failed").read_bytes(), b'{"event":\xff')
+        self.assertEqual(transport.submitted_turns, [])
+
+    def test_disk_read_failure_stops_consumer_and_retains_pending_inbox(self):
+        runtime, _, transport = self._runtime()
+        path = runtime._persist_lark_event(self._message_payload())
+        bridge = mock.Mock()
+        with mock.patch.object(Path, "read_text", side_effect=OSError("disk unavailable")):
+            with self.assertRaisesRegex(OSError, "disk unavailable"):
+                asyncio.run(runtime.serve_lark_ws(max_events=1, bridge_factory=lambda **_: bridge))
+        bridge.stop.assert_called_once()
+        self.assertTrue(path.exists())
+        self.assertEqual(transport.submitted_turns, [])
+
     def test_inbox_failure_is_retained_and_not_resubmitted_on_restart(self):
         runtime, api, transport = self._runtime()
         payload = self._message_payload()

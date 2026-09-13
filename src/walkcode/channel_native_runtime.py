@@ -2218,7 +2218,9 @@ class ChannelNativeRuntime:
                         # Custom bridges retain the dict seam used by tests.
                         path = item if isinstance(item, Path) else self._persist_lark_event(item)
                         await self._process_lark_inbox_item(path)
-                except ChannelConfigError:
+                except (ChannelConfigError, OSError):
+                    # A disk failure must restart the consumer so retained
+                    # inbox files are recovered, rather than silently parked.
                     raise
                 except Exception as exc:
                     self.last_lark_event_error = f"{type(exc).__name__}: {exc}"
@@ -2237,7 +2239,13 @@ class ChannelNativeRuntime:
         return path
 
     async def _process_lark_inbox_item(self, path: Path) -> None:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (ValueError, UnicodeError) as exc:
+            self.last_lark_event_error = f"{type(exc).__name__}: {exc}"
+            _log_degrade("lark_inbox_invalid_json", path=str(path), error=exc)
+            path.rename(path.with_suffix(".failed"))
+            return
         interrupted = path.suffix == ".processing"
         claimed = path.with_suffix(".processing")
         if not interrupted:
@@ -2261,7 +2269,13 @@ class ChannelNativeRuntime:
 
     async def _report_lark_inbound_failure(self, payload: dict[str, Any]) -> None:
         channel = self.channels["lark"]
-        inbound = channel.parse_event(payload)
+        try:
+            inbound = channel.parse_event(payload)
+        except (AttributeError, TypeError, ValueError) as exc:
+            # Invalid input has no trustworthy recipient. Retain it as failed;
+            # retrying the same parser cannot make a channel notice possible.
+            _log_degrade("lark_inbound_failure_unaddressable", error=exc)
+            return
         if not self._lark_chat_allowed(inbound.chat_id, is_callback=inbound.callback is not None):
             return
         if not self._lark_sender_allowed(inbound.sender_id):
@@ -2684,7 +2698,7 @@ class ChannelNativeRuntime:
         }
         self.save_state()
         if any(value for counts in removed.values() for value in counts.values()):
-            _log_degrade("state_compacted", removed=removed)
+            print(f"walkcode maintenance=state_compacted removed={removed}", file=sys.stderr)
         return removed
 
     async def _compact_state_forever(self) -> None:

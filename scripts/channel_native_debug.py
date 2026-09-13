@@ -51,7 +51,7 @@ from walkcode.channel_native import (  # noqa: E402
     TurnInput,
     WriterOwner,
 )
-from walkcode.channel_native_runtime import ChannelNativeRuntime, _load_native_env  # noqa: E402
+from walkcode.channel_native_runtime import ChannelNativeRuntime, _launchd_service_label, _load_native_env  # noqa: E402
 
 
 TEST_GROUPS = {
@@ -1047,7 +1047,7 @@ def _expected_channel_native_service_label() -> str:
     agent = str(config.agent or "").strip().lower()
     if agent not in {"claude", "codex"}:
         return ""
-    return f"com.walkcode.{config.profile or config.channel.kind}-{agent}"
+    return _launchd_service_label(config.channel.kind, agent, config.profile)
 
 
 def _is_hard_runtime_consumer(item: dict[str, Any], *, allow_channel_native: bool) -> bool:
