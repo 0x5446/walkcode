@@ -11,6 +11,7 @@ anywhere the user could see.
 
 import asyncio
 import unittest
+from unittest.mock import patch
 
 from walkcode.channel_native import (
     EMPTY_TURN_NOTICE,
@@ -29,6 +30,7 @@ from walkcode.channel_native import (
     SessionRegistry,
     TransportCapabilities,
     TurnInput,
+    TransientDeliveryError,
     render_view_text,
 )
 
@@ -123,6 +125,22 @@ def _notice_count(channel) -> int:
 
 
 class SilentTurnNoticeTests(unittest.TestCase):
+    def test_failed_progress_card_does_not_suppress_empty_turn_notice(self):
+        orchestrator, _, channel, session = _orchestrator([
+            AgentEvent(AgentEventType.TOOL_STARTED, {"tool_name": "Bash", "tool_id": "t1"}),
+            _completed(""),
+        ])
+        send = channel.send_view
+
+        async def fail_progress(binding, view):
+            if view.get("type") == "tool_progress":
+                raise TransientDeliveryError("temporary outage")
+            return await send(binding, view)
+
+        with patch.object(channel, "send_view", side_effect=fail_progress):
+            _submit(orchestrator, session)
+        self.assertEqual(_notice_count(channel), 1)
+
     def test_turn_completing_with_no_output_at_all_warns(self):
         orchestrator, _transport, channel, session = _orchestrator([_completed("")])
 

@@ -1,8 +1,8 @@
-# Feishu/Lark 4-Instance Profile Deploy
+# Feishu/Lark Profile Deploy
 
-WalkCode V3 的标准本地部署：{work, personal} × {claude, codex} 共 4 个运行实例。
-work 两个 bot 在公司飞书租户（open.feishu.cn），personal 两个 bot 在 Lark 租户
-（open.larksuite.com）。设计决策见 ADR 0043（profile 拆分）、ADR 0044（Lark live
+WalkCode V3 的本地部署：{work, personal} × {claude, codex}，另有 work2-claude，共 5 个实例。
+work/work2 使用各自公司飞书应用，personal 两个 bot 使用个人飞书应用；
+2026-09-13 起全部使用 open.feishu.cn。设计决策见 ADR 0043（profile 拆分）、ADR 0044（Lark live
 ingress）、ADR 0045（/repo 工作目录）。
 
 每个实例 = 1 个 profile + 1 个渠道 + 1 个 bot 身份 + 1 个 agent + 1 份 env +
@@ -18,14 +18,13 @@ ingress）、ADR 0045（/repo 工作目录）。
 - 卡片回调 `card.action.trigger`（长连接同通道）；
 - 发布版本。
 
-work 可复用 V2 时代已配好的两个公司飞书 bot；personal 在 Lark 开发者后台新建
-两个。
+work 可复用已配好的公司飞书 bot；personal 使用下面列出的两个个人飞书 bot。
 
-### 1.1 personal 的个人飞书 fallback bot（Lark 配额耗尽时）
+### 1.1 personal 的个人飞书应用与迁移记录
 
 Lark 免费租户 API 额度为每月 10000 次调用，耗尽后（错误码 99991403）personal
-两实例的出站消息全部失败，且额度到次月 1 日才恢复。fallback 方案：在**个人
-飞书租户**（open.feishu.cn 个人版）再建一对同名 bot，随时可切：
+两实例的出站消息全部失败。2026-09-13 用户决定彻底转回**个人飞书租户**，
+下列应用现在是 personal 的正式配置，不再自动切回 Lark：
 
 | 飞书个人版 app | App ID | 服务实例 |
 |---|---|---|
@@ -43,11 +42,29 @@ app 配置与第 1 节清单完全一致（Bot 能力 + 4 scope + 长连接事�
 3. `launchctl kickstart -k` 两实例，向新 bot 各发一条消息，从
    `{profile}-state.json` 抓真实 `open_id`/`chat_id` 回填白名单，再 kickstart。
 
-**切回 Lark**（2026-09-12 已执行，personal 两实例当前在 Lark）：把 6 个租户键
+**历史：切回 Lark**（2026-09-12 执行，2026-09-13 已撤回）：把 6 个租户键
 （`LARK_APP_ID`/`LARK_APP_SECRET`/`LARK_OPENAPI_DOMAIN`/`LARK_ALLOWED_CHAT_IDS`/
 `LARK_ALLOWED_OPEN_IDS`/`WALKCODE_E2E_LARK_CHAT_ID`）从 `.env.lark-backup` 抄回
 active env，其余键保留（飞书期新增的 `WALKCODE_CODEX_SANDBOX` 等不能被整文件
 覆盖冲掉），再 `launchctl bootout`→`bootstrap` 两实例。
+
+**2026-09-13 实机排障记录**：Lark 的 `Claude Code` 应用经 bot info API 确认为
+`cli_aa8ff6ae7e781e18`，对应 `~/.walkcode/personal-claude.env`、
+`com.walkcode.personal-claude`。其中 `WALKCODE_CLAUDE_CONFIG_DIR` 指向
+`~/.claude-profiles/personal`，即 `claude-personal` 的配置。
+11:39（UTC+8）的“你是什么模型”已进入该 profile 的 Claude transcript 并完成回复，
+但根卡 create 和回复 reply 均返回 `99991403`，回复保留在 state 的 outbox.dead。
+贴表情只表示收到；根卡失败后会退回以用户消息为根，若回复也失败，界面就没有话题。
+重启、升级或重发消息不能恢复租户配额。完整计费流水不在本地 state/log 中，
+不能据镜像消息数量推定精确消耗；恢复发送需要租户额度恢复，或另行决定渠道迁移。
+
+**2026-09-13 转回个人飞书**：仅替换上述 6 个租户键；Claude config dir、Codex home、
+provider、sandbox 等保持原值。两实例停机后完整备份 env/state/旧队列，再建立干净的
+飞书渠道状态；2 个存活 Claude TUI、1 个 Codex TUI 及本次未送达回复所在会话迁入
+新话题并重新授权各自应用的 owner。活跃会话的待处理 hook 随迁，旧 Lark 收件箱和
+其他历史队列不向飞书重放。604 个历史会话留在完整备份中，agent transcript 未改动。
+备份与迁移脚本：`~/.walkcode/backup-feishu-return-20260913-v0.14.26/`。
+两套个人飞书应用的真实 agent、工具卡、话题回复、失败通知读回均已验证通过。
 
 **只换 env 不够**：飞书期建立的 TUI 观察会话，`channel_binding` 里存的是飞书
 chat/message id，切回后这些话题用 Lark bot 发消息会一路 230002（bot 不在那个
@@ -61,14 +78,12 @@ chat/message id，切回后这些话题用 Lark bot 发消息会一路 230002（
 把 hook 排水队列压出积压——实测确实压出来了，但这不是必然，取决于产出速率和
 hook 构成（见 §7 已知边界）。
 
-已知噪音：切换 bot 后，state 里绑定旧 bot 话题的存活会话（尤其还开着的
-TUI daemon 会话）发进度消息会报 `230002 Bot/User can NOT be out of the chat`
-并丢弃——属预期，旧会话结束后自然消失，不影响新会话。注意这些失败调用同样
-消耗当前 bot 的 API 额度，切换后尽快结束旧终端会话。
+切换时若留下旧 bot 的 chat/message id，会产生 `230002 Bot/User can NOT be out
+of the chat` 并丢失输出。不要靠等待旧会话结束消除错误；迁移活跃话题并隔离旧队列。
 
 ## 2. Agent Profile 配置目录（每 profile 一次）
 
-`~/.local/bin` 下有四个 profile wrapper（独立可执行脚本，任何 shell 上下文都生效）：
+`~/.local/bin` 下有五个 profile wrapper（独立可执行脚本，任何 shell 上下文都生效）：
 
 5 wrapper ↔ 5 实例 ↔ 5 bot 对应（2026-07-04 定型）：
 
@@ -76,9 +91,9 @@ TUI daemon 会话）发进度消息会报 `230002 Bot/User can NOT be out of the
 |---|---|---|---|
 | `claude-work` | enterprise 订阅 OAuth | work-claude | 飞书 Claude Code |
 | `claude-work2` | 公司 Claude llm-proxy（Vela key，`~/.claude-profiles/work2` 独立 profile） | work2-claude | 飞书 ccp |
-| `claude-personal` | Vertex 直连 | personal-claude | Lark Claude Code |
+| `claude-personal` | Vertex 直连 | personal-claude | 个人飞书 Claude Code |
 | `codex-work` | 公司 Codex llm-proxy（Vela key） | work-codex | 飞书 Codex |
-| `codex-personal` | Azure（本地 proxy） | personal-codex | Lark Codex |
+| `codex-personal` | Azure（本地 proxy） | personal-codex | 个人飞书 Codex |
 
 应急 Vertex 路由片段保留在 `~/.claude-profiles/work/routes/vertex.json`
 （`claude --settings` 按次注入，或写 `WALKCODE_CLAUDE_SETTINGS` 给实例用）。
@@ -124,7 +139,7 @@ daemon + socket）。
 
 **裸配置锚死在 personal，等于放弃了工作/个人的租户隔离。** hook 不校验
 `cwd`：在公司仓库里忘用 wrapper、直接敲 `claude`/`codex`，这次会话的 prompt、
-回复、工具参数就镜像进个人 Lark 群，群里的白名单账号还能接管它。所以裸配置
+回复、工具参数就镜像进个人飞书群，群里的白名单账号还能接管它。所以裸配置
 只当兜底，公司仓库一律用 `claude-work` / `codex-work`。真要堵死，得在
 `process_tui_hook` 里按工作区根校验 `cwd` 并拒绝跨租户，那是另一件事。
 
@@ -165,13 +180,12 @@ gate 行为（v3 真双端）：AskUserQuestion 与会原生弹权限的工具�
 |---|---|---|---|---|
 | WALKCODE_PROFILE | work | work | personal | personal |
 | WALKCODE_AGENT | claude | codex | claude | codex |
-| LARK_APP_ID/SECRET | 公司 bot A | 公司 bot B | Lark bot C¹ | Lark bot D¹ |
-| LARK_OPENAPI_DOMAIN | open.feishu.cn | open.feishu.cn | open.larksuite.com¹ | open.larksuite.com¹ |
+| LARK_APP_ID/SECRET | 公司 bot A | 公司 bot B | 个人飞书 Claude Code¹ | 个人飞书 Codex¹ |
+| LARK_OPENAPI_DOMAIN | open.feishu.cn | open.feishu.cn | open.feishu.cn¹ | open.feishu.cn¹ |
 | WALKCODE_CLAUDE_CONFIG_DIR | ~/.claude-profiles/work | — | ~/.claude-profiles/personal | — |
 | WALKCODE_CODEX_HOME | — | ~/.codex-profiles/work | — | ~/.codex-profiles/personal |
 
-¹ Lark 额度耗尽期间 personal 两列切到个人飞书 fallback bot
-（open.feishu.cn，见 1.1 节）；Lark 原值备份在
+¹ personal 两列已于 2026-09-13 正式切回个人飞书（见 1.1 节）；Lark 原值备份在
 `personal-{claude,codex}.env.lark-backup`。
 
 共同项：`WALKCODE_CHANNEL=lark`、`LARK_ALLOWED_CHAT_IDS`/`LARK_ALLOWED_OPEN_IDS`
@@ -338,7 +352,7 @@ opt-in 路径**，验收前先去掉 wrapper 的 `WALKCODE_NO_BG=1` 并在实例
   `claude stop <short>` 后状态卡才转已结束。
 
 部署顺序：work-claude → work-codex（验证 CODEX_HOME 双 daemon 隔离）→
-personal-claude / personal-codex（验证 larksuite 域名差异）。
+personal-claude / personal-codex（验证个人飞书身份隔离）。
 
 ## 6. Telegram 实例退役
 

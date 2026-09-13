@@ -842,6 +842,51 @@ class ChannelNativeDebugScriptTests(unittest.TestCase):
         self.assertEqual(payload["native_consumer_count"], 2)
         self.assertEqual(payload["managed_native_consumer_count"], 2)
 
+    def test_runtime_debug_allows_profile_lark_services_but_excludes_tap(self):
+        ps_result = subprocess.CompletedProcess(
+            args=["ps"],
+            returncode=0,
+            stdout=(
+                "  101     1 /opt/python /Users/alpha/.local/bin/walkcode native serve --poll-timeout 5\n"
+                "  102     1 /opt/python /Users/alpha/.local/bin/walkcode native serve --poll-timeout 5\n"
+            ),
+            stderr="",
+        )
+        launchctl_result = subprocess.CompletedProcess(
+            args=["launchctl", "list"],
+            returncode=0,
+            stdout=(
+                "101\t0\tcom.walkcode.personal-claude\n"
+                "102\t0\tcom.walkcode.work2-claude\n"
+                "103\t0\tcom.walkcode.tap-work2\n"
+            ),
+            stderr="",
+        )
+
+        with (
+            patch.object(channel_native_debug.subprocess, "run", side_effect=[ps_result, launchctl_result]),
+            patch.object(channel_native_debug, "_detect_legacy_runtime_remnants", return_value=[]),
+            patch.dict(
+                channel_native_debug.os.environ,
+                {
+                    "WALKCODE_CHANNEL": "lark",
+                    "WALKCODE_PROFILE": "personal",
+                    "LARK_APP_ID": "a",
+                    "LARK_APP_SECRET": "s",
+                    "TELEGRAM_BOT_TOKEN": "fake-token",
+                    "WALKCODE_AGENT": "claude",
+                },
+                clear=True,
+            ),
+        ):
+            payload = channel_native_debug.debug_runtime_processes()
+
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["expected_service_label"], "com.walkcode.personal-claude")
+        self.assertEqual(payload["competing_consumer_count"], 0)
+        self.assertEqual(payload["native_consumer_count"], 2)
+        self.assertEqual(payload["managed_native_consumer_count"], 2)
+
     def test_runtime_debug_fails_for_unmanaged_native_consumer(self):
         ps_result = subprocess.CompletedProcess(
             args=["ps"],

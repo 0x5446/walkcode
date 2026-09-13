@@ -247,6 +247,18 @@ class NormalizeEventTests(unittest.TestCase):
 
 
 class LarkIngressBridgeTests(unittest.TestCase):
+    def test_failed_inbox_write_is_not_acknowledged_or_queued(self):
+        async def scenario():
+            queue = asyncio.Queue()
+            bridge = self._bridge(asyncio.get_running_loop(), queue, AckRegistry())
+            def fail(payload):
+                raise OSError("disk full")
+            bridge._persist_event = fail
+            with self.assertRaises(OSError):
+                await asyncio.to_thread(bridge.on_message, {"header": {"event_id": "e"}, "event": {}})
+            self.assertTrue(queue.empty())
+        asyncio.run(scenario())
+
     def _bridge(self, loop, queue, registry, ack_timeout=0.2):
         return LarkIngressBridge(
             {"app_id": "a", "app_secret": "s"},

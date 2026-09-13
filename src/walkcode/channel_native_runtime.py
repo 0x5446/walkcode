@@ -49,6 +49,7 @@ from .channel_native import (
     LaunchSpec,
     LocalProcessController,
     Orchestrator,
+    _atomic_write_json,
     _channel_allowlist_configured,
     _channel_environment_context,
     _command_executable_basename,
@@ -131,6 +132,7 @@ TUI_HOOK_DRAIN_BATCH_SIZE = 25
 TUI_HOOK_RECENT_PRIORITY_WINDOW_SECONDS = 300.0
 TUI_HOOK_DRAIN_INTERVAL_SECONDS = 1.0
 OUTBOX_FLUSH_INTERVAL_SECONDS = 1.0
+STATE_COMPACT_INTERVAL_SECONDS = 300.0
 TUI_BINDING_REFRESH_INTERVAL_SECONDS = 5.0
 # 被 @ 进别人的飞书话题时，最多读回多少条既有讨论作为首轮上下文。够覆盖一场
 # 有来有回的讨论，又不至于让一个长话题把整个回合的输入撑爆。
@@ -1120,6 +1122,7 @@ class ChannelNativeRuntime:
         self.last_lark_event_error = ""
         self._telegram_commands_installed = False
         self._tui_hook_queue_dir = _tui_hook_queue_dir(self.state_store.path)
+        self._lark_inbox_dir = self.state_store.path.with_name(f"{self.state_store.path.name}.lark-inbox.d")
         self._ingress_lock = asyncio.Lock()
         self._drain_lock = asyncio.Lock()
         # ADR 0055: per-session transcript read cursor (path, byte offset,
@@ -2170,7 +2173,6 @@ class ChannelNativeRuntime:
     async def serve_lark_ws(
         self,
         *,
-        retry_delay: float = 2.0,
         max_events: int | None = None,
         bridge_factory=None,
     ) -> None:
@@ -2187,6 +2189,7 @@ class ChannelNativeRuntime:
                 loop=loop,
                 queue=queue,
                 ack_registry=ack_registry,
+                persist_event=self._persist_lark_event,
             )
         else:
             bridge = bridge_factory(loop=loop, queue=queue, ack_registry=ack_registry)
@@ -2194,6 +2197,12 @@ class ChannelNativeRuntime:
         # first inbound message must not race the sweep into a dead worker
         # handle, and the sweep must never see sessions this process created.
         await self._settle_orphan_headless_sessions_once()
+        # Unclaimed messages may be replayed. A claimed message may already
+        # have reached an agent: report uncertainty instead of resubmitting it.
+        if self._lark_inbox_dir.exists():
+            for path in sorted(self._lark_inbox_dir.iterdir()):
+                if path.suffix in {".json", ".processing"}:
+                    queue.put_nowait(path)
         bridge.start()
         previous_defer_event_drain = self.orchestrator.defer_event_drain
         self.orchestrator.defer_event_drain = True
@@ -2201,26 +2210,87 @@ class ChannelNativeRuntime:
         processed = 0
         try:
             while max_events is None or processed < max_events:
-                payload = await queue.get()
+                item = await queue.get()
                 processed += 1
                 try:
                     async with self._ingress_lock:
-                        await self.process_lark_event(payload)
-                except ChannelConfigError:
-                    raise
+                        # Custom bridges retain the dict seam used by tests.
+                        path = item if isinstance(item, Path) else self._persist_lark_event(item)
+                        await self._process_lark_inbox_item(path)
                 except Exception as exc:
                     self.last_lark_event_error = f"{type(exc).__name__}: {exc}"
-                    print(
-                        f"lark event transient error: {self.last_lark_event_error}",
-                        file=sys.stderr,
-                    )
-                    if retry_delay > 0:
-                        await asyncio.sleep(retry_delay)
-                else:
-                    self.last_lark_event_error = ""
+                    _log_degrade("lark_inbox_processing_failed", error=exc)
+                    # Recovery itself failed. Restart the consumer so retained
+                    # inbox files are recovered, rather than silently parked.
+                    raise
         finally:
+            if hasattr(bridge, "stop"):
+                bridge.stop()
             await self._stop_telegram_maintenance_tasks(maintenance_tasks)
             self.orchestrator.defer_event_drain = previous_defer_event_drain
+
+    def _persist_lark_event(self, payload: dict[str, Any]) -> Path:
+        path = self._lark_inbox_dir / f"{time.time_ns():019d}-{uuid.uuid4().hex}.json"
+        _atomic_write_json(path, payload)
+        return path
+
+    async def _process_lark_inbox_item(self, path: Path) -> None:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (ValueError, UnicodeError) as exc:
+            self.last_lark_event_error = f"{type(exc).__name__}: {exc}"
+            _log_degrade("lark_inbox_invalid_json", path=str(path), error=exc)
+            path.rename(path.with_suffix(".failed"))
+            return
+        interrupted = path.suffix == ".processing"
+        claimed = path.with_suffix(".processing")
+        if not interrupted:
+            path.rename(claimed)
+        try:
+            if interrupted:
+                raise RuntimeError("runtime stopped while handling this event; outcome unknown")
+            await self.process_lark_event(payload)
+            self.save_state()
+        except Exception as exc:
+            self.last_lark_event_error = f"{type(exc).__name__}: {exc}"
+            _log_degrade("lark_inbound_failed", path=str(claimed), error=exc)
+            # Keep the claimed payload if even persisting the notice fails.
+            # On restart it gets another notice attempt, never an agent replay.
+            await self._report_lark_inbound_failure(payload)
+            claimed.rename(claimed.with_suffix(".failed"))
+            if isinstance(exc, ChannelConfigError):
+                raise
+        else:
+            claimed.unlink()
+
+    async def _report_lark_inbound_failure(self, payload: dict[str, Any]) -> None:
+        channel = self.channels["lark"]
+        try:
+            inbound = channel.parse_event(payload)
+        except (AttributeError, TypeError, ValueError) as exc:
+            # Invalid input has no trustworthy recipient. Retain it as failed;
+            # retrying the same parser cannot make a channel notice possible.
+            _log_degrade("lark_inbound_failure_unaddressable", error=exc)
+            return
+        if not self._lark_chat_allowed(inbound.chat_id, is_callback=inbound.callback is not None):
+            return
+        if inbound.callback is None and not self._lark_sender_allowed(inbound.sender_id):
+            return
+        self.state.inbound_ledger.complete(inbound.event_id)
+        binding = ChannelBinding(
+            inbound.channel_kind, inbound.account_id, inbound.chat_id,
+            inbound.thread_id, inbound.root_message_id or inbound.message_id,
+        )
+        self.state.outbox.enqueue(
+            channel_binding_key=binding.key(),
+            view_model={"type": "text", "text": (
+                "这条消息的处理结果未能确认，原始消息已保留。"
+                "请先查看话题中的执行结果，再决定是否重发。"
+            )},
+            idempotency_key=f"lark-inbound-failed:{inbound.event_id}",
+        )
+        self.save_state()
+        await self._best_effort_flush_outbox()
 
     async def _place_telegram_new_session(
         self,
@@ -2470,6 +2540,7 @@ class ChannelNativeRuntime:
 
     def _start_telegram_maintenance_tasks(self) -> list[asyncio.Task[None]]:
         return [
+            asyncio.create_task(self._compact_state_forever(), name="walkcode-state-compact"),
             asyncio.create_task(
                 self._flush_outbox_forever(interval=OUTBOX_FLUSH_INTERVAL_SECONDS),
                 name="walkcode-outbox-flush",
@@ -2612,6 +2683,28 @@ class ChannelNativeRuntime:
         while True:
             await self._best_effort_flush_outbox()
             await asyncio.sleep(interval)
+
+    def compact_state(self) -> dict[str, dict[str, int]]:
+        # Synchronous: no task can observe a half-compacted snapshot. Existing
+        # store retention policies preserve pending deliveries/live prompts.
+        removed = {
+            "outbox": self.state.outbox.compact(),
+            "interactions": self.state.interactions.compact(),
+            "hitls": self.state.hitls.compact(),
+        }
+        self.save_state()
+        if any(value for counts in removed.values() for value in counts.values()):
+            print(f"walkcode maintenance=state_compacted removed={removed}", file=sys.stderr)
+        return removed
+
+    async def _compact_state_forever(self) -> None:
+        while True:
+            try:
+                async with self._ingress_lock:
+                    self.compact_state()
+            except Exception as exc:
+                _log_degrade("state_compaction_failed", error=exc)
+            await asyncio.sleep(STATE_COMPACT_INTERVAL_SECONDS)
 
     async def _refresh_loaded_tui_observed_bindings_forever(
         self,
@@ -2782,33 +2875,9 @@ class ChannelNativeRuntime:
         payload: dict[str, Any],
         agent: str = "",
     ) -> dict[str, Any]:
-        hook_id = uuid.uuid4().hex
-        created_at_ns = time.time_ns()
-        queued_payload = dict(payload)
-        queued_payload.setdefault("_walkcode_deferred_id", hook_id)
-        # Enqueue time IS capture time for direct defer callers; a drain
-        # minutes later must not treat the then-current transcript size as
-        # this hook's boundary (ADR 0055).
-        queued_payload.setdefault("_walkcode_hook_captured_at", created_at_ns / 1_000_000_000)
-        _stamp_transcript_size(queued_payload)
-        queued = {
-            "id": hook_id,
-            "created_at": created_at_ns / 1_000_000_000,
-            "created_at_ns": created_at_ns,
-            "hook_type": str(hook_type or ""),
-            "agent": str(agent or ""),
-            "payload": queued_payload,
-        }
-        self._tui_hook_queue_dir.mkdir(parents=True, exist_ok=True)
-        filename = (
-            f"{created_at_ns:019d}-"
-            f"{os.getpid()}-{queued['id']}.json"
+        return _defer_tui_hook(
+            self.state_store.path, hook_type=hook_type, payload=payload, agent=agent,
         )
-        final_path = self._tui_hook_queue_dir / filename
-        tmp_path = self._tui_hook_queue_dir / f".{filename}.tmp"
-        tmp_path.write_text(json.dumps(queued, ensure_ascii=False, sort_keys=True), encoding="utf-8")
-        os.replace(tmp_path, final_path)
-        return {"queued": True, "id": queued["id"], "path": str(final_path)}
 
     async def drain_deferred_tui_hooks(self, *, limit: int = 100) -> int:
         async with self._drain_lock:
@@ -5346,8 +5415,15 @@ class ChannelNativeRuntime:
 
 
 def run_native_cli(args) -> None:
+    deferred_hook = (
+        args.native_command == "hook" and getattr(args, "defer", False)
+        and not getattr(args, "gate", False)
+    )
     try:
-        runtime = ChannelNativeRuntime.from_env()
+        if deferred_hook:
+            config = ChannelNativeConfig.from_env(_load_native_env(None))
+        else:
+            runtime = ChannelNativeRuntime.from_env()
     except ChannelConfigError as exc:
         print(f"channel-native config error: {exc}", file=sys.stderr)
         raise SystemExit(1) from None
@@ -5406,8 +5482,9 @@ def run_native_cli(args) -> None:
             if output is not None:
                 print(json.dumps(output, ensure_ascii=False))
             raise SystemExit(0)
-        if getattr(args, "defer", False):
-            queued = runtime.defer_tui_hook(
+        if deferred_hook:
+            queued = _defer_tui_hook(
+                config.state_path,
                 hook_type=args.hook_type,
                 payload=payload,
                 agent=getattr(args, "agent", "") or "",
@@ -7340,6 +7417,36 @@ def _safe_error_message(exc: Exception, *secrets: str) -> str:
         if secret:
             message = message.replace(str(secret), "<redacted>")
     return message
+
+
+def _defer_tui_hook(
+    state_path: str | Path, *, hook_type: str, payload: dict[str, Any], agent: str = "",
+) -> dict[str, Any]:
+    queue_dir = _tui_hook_queue_dir(Path(state_path).expanduser())
+    hook_id = uuid.uuid4().hex
+    created_at_ns = time.time_ns()
+    queued_payload = dict(payload)
+    queued_payload.setdefault("_walkcode_deferred_id", hook_id)
+    # Enqueue time IS capture time for direct defer callers; a drain
+    # minutes later must not treat the then-current transcript size as
+    # this hook's boundary (ADR 0055).
+    queued_payload.setdefault("_walkcode_hook_captured_at", created_at_ns / 1_000_000_000)
+    _stamp_transcript_size(queued_payload)
+    queued = {
+        "id": hook_id,
+        "created_at": created_at_ns / 1_000_000_000,
+        "created_at_ns": created_at_ns,
+        "hook_type": str(hook_type or ""),
+        "agent": str(agent or ""),
+        "payload": queued_payload,
+    }
+    filename = (
+        f"{created_at_ns:019d}-"
+        f"{os.getpid()}-{queued['id']}.json"
+    )
+    final_path = queue_dir / filename
+    _atomic_write_json(final_path, queued)
+    return {"queued": True, "id": queued["id"], "path": str(final_path)}
 
 
 def _tui_hook_queue_dir(state_path: Path) -> Path:

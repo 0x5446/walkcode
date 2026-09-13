@@ -22,6 +22,8 @@ from walkcode.channel_native import (
     JsonFileStateStore,
     LaunchSpec,
     Orchestrator,
+    OutboxDispatcher,
+    StateSnapshot,
     PermanentDeliveryError,
     SessionRegistry,
     SessionRole,
@@ -71,6 +73,23 @@ def _channel_caps() -> ChannelCapabilities:
 
 
 class PersistenceTests(unittest.TestCase):
+    def test_failed_atomic_write_keeps_previous_snapshot_and_removes_temp(self):
+        snapshot = StateSnapshot(SessionRegistry(), InteractionStore(), DurableOutbox(),
+                                 AuthorizationStore(), InboundLedger())
+        with tempfile.TemporaryDirectory() as directory:
+            store = JsonFileStateStore(Path(directory) / "state.json")
+            store.save(snapshot)
+            original = store.path.read_bytes()
+            for target in ("json.dump", "os.fsync", "os.replace"):
+                with self.subTest(target=target), patch(
+                    f"walkcode.channel_native.{target}", side_effect=OSError("disk failure")
+                ):
+                    with self.assertRaises(OSError):
+                        store.save(snapshot)
+                self.assertEqual(store.path.read_bytes(), original)
+                self.assertEqual(list(Path(directory).iterdir()), [store.path])
+            self.assertEqual(store.path.stat().st_mode & 0o777, 0o600)
+
     def test_state_snapshot_round_trips_core_durable_state(self):
         clock = _Clock()
         sessions = SessionRegistry(now=clock)
@@ -219,6 +238,40 @@ class PersistenceTests(unittest.TestCase):
 
 
 class OutboxReliabilityTests(unittest.TestCase):
+    def test_failed_claim_persistence_stops_delivery_and_can_recover(self):
+        clock = _Clock()
+        outbox = DurableOutbox(now=clock)
+        outbox.enqueue(channel_binding_key=_binding().key(),
+                       view_model={"type": "text", "text": "durable"}, idempotency_key="k")
+        channel = FakeChannelAdapter("telegram", _channel_caps())
+
+        def fail_save():
+            raise OSError("disk full")
+
+        dispatcher = OutboxDispatcher(outbox, {"telegram": channel}, on_state_changed=fail_save)
+        with self.assertRaises(OSError):
+            asyncio.run(dispatcher.flush_once())
+        self.assertEqual(channel.sent_views, [])
+        self.assertEqual(len(outbox.to_dict()["pending"]), 1)
+        clock.now += 61
+        dispatcher.on_state_changed = lambda: None
+        asyncio.run(dispatcher.flush_once())
+        self.assertEqual(len(channel.sent_views), 1)
+
+    def test_failed_sent_persistence_surfaces_without_resending_in_process(self):
+        outbox = DurableOutbox()
+        outbox.enqueue(channel_binding_key=_binding().key(),
+                       view_model={"type": "text", "text": "durable"}, idempotency_key="k")
+        channel = FakeChannelAdapter("telegram", _channel_caps())
+        from unittest.mock import Mock
+        save = Mock(side_effect=[None, OSError("disk full")])
+        dispatcher = OutboxDispatcher(outbox, {"telegram": channel}, on_state_changed=save)
+        with self.assertRaises(OSError):
+            asyncio.run(dispatcher.flush_once())
+        dispatcher.on_state_changed = lambda: None
+        asyncio.run(dispatcher.flush_once())
+        self.assertEqual(len(channel.sent_views), 1)
+
     def test_transient_delivery_uses_backoff_and_eventually_dead_letters(self):
         from walkcode.channel_native import OutboxDispatcher
 

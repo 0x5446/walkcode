@@ -61,6 +61,12 @@ scripts; orchestration and gates live in the skill.
   `_log_degrade("codex_event_type_unhandled")`. When adding transports, keep
   that rule: an agent's error channel must never be dropped silently. The
   protocol is discoverable — `codex app-server generate-json-schema --out <dir>`.
+- **Durable delivery (ARCHITECTURE.md)**: persist Lark events before SDK
+  acknowledgement. Replay pending `.json` files, but never resubmit a claimed
+  `.processing` event to the agent: its outcome is uncertain. Persist its
+  failure notice before archiving it; if recovery fails, exit the consumer so
+  launchd can recover retained files. Never send an outbox claim that could
+  not be persisted. These guarantees do not provide exactly-once delivery.
 - **Item-type mapping (ADR 0063)**: `item.type` is classified by an exhaustive
   table, `_CODEX_TOOL_ITEM_SPECS` — every `ThreadItem` variant is either in it or
   in the test's not-tool-activity list. The guard has two halves and needs both:

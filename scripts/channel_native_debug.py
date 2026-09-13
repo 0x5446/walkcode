@@ -51,7 +51,7 @@ from walkcode.channel_native import (  # noqa: E402
     TurnInput,
     WriterOwner,
 )
-from walkcode.channel_native_runtime import ChannelNativeRuntime, _load_native_env  # noqa: E402
+from walkcode.channel_native_runtime import ChannelNativeRuntime, _launchd_service_label, _load_native_env  # noqa: E402
 
 
 TEST_GROUPS = {
@@ -1028,7 +1028,7 @@ def _launchctl_walkcode_service_labels() -> dict[int, str]:
         if len(parts) < 3:
             continue
         label = parts[2].strip()
-        if not label.startswith("com.walkcode.telegram-"):
+        if not label.startswith("com.walkcode.") or label.startswith("com.walkcode.tap-"):
             continue
         try:
             pid = int(parts[0])
@@ -1044,12 +1044,10 @@ def _expected_channel_native_service_label() -> str:
         config = ChannelNativeConfig.from_env(_load_native_env(None))
     except Exception:
         return ""
-    if config.channel.kind != "telegram":
-        return ""
     agent = str(config.agent or "").strip().lower()
     if agent not in {"claude", "codex"}:
         return ""
-    return f"com.walkcode.telegram-{agent}"
+    return _launchd_service_label(config.channel.kind, agent, config.profile)
 
 
 def _is_hard_runtime_consumer(item: dict[str, Any], *, allow_channel_native: bool) -> bool:
@@ -1064,7 +1062,11 @@ def _is_hard_runtime_consumer(item: dict[str, Any], *, allow_channel_native: boo
 
 def _is_managed_channel_native_consumer(item: dict[str, Any]) -> bool:
     label = str(item.get("service_label") or "")
-    return item.get("kind") == "channel_native_serve" and label.startswith("com.walkcode.telegram-")
+    return (
+        item.get("kind") == "channel_native_serve"
+        and label.startswith("com.walkcode.")
+        and not label.startswith("com.walkcode.tap-")
+    )
 
 
 def _classify_consumer_command(command: str) -> str:
