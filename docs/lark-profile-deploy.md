@@ -1,7 +1,8 @@
 # Feishu/Lark Profile Deploy
 
-WalkCode V3 的本地部署：{work, personal} × {claude, codex}，另有 work2-claude，共 5 个实例。
-work/work2 使用各自公司飞书应用，personal 两个 bot 使用个人飞书应用；
+WalkCode V3 的本地部署：{work, personal} × {claude, codex}，另有 work2-claude 和
+bfjdfhnf-codex（裸 `~/.codex`，2026-09-27 起），共 6 个实例。
+work/work2 使用各自公司飞书应用，personal 与 bfjdfhnf 的 bot 使用个人飞书应用；
 2026-09-13 起全部使用 open.feishu.cn。设计决策见 ADR 0043（profile 拆分）、ADR 0044（Lark live
 ingress）、ADR 0045（/repo 工作目录）。
 
@@ -20,6 +21,19 @@ ingress）、ADR 0045（/repo 工作目录）。
 
 work 可复用已配好的公司飞书 bot；personal 使用下面列出的两个个人飞书 bot。
 
+**应用命名规则**（2026-09-27 起）：飞书应用名 = `<Agent> (<路由或账号>)`，让应用名、
+walkcode 实例、agent profile 一眼对上；walkcode 实例名仍是 `<profile>-<agent>`。
+改名要发新版本才生效（两个租户当前都免审）。
+
+| 飞书应用 | App ID | 租户 | walkcode 实例 |
+|---|---|---|---|
+| Claude (vertex_plaud-agent) | `cli_aac0e4cd5238dcc2` | 个人飞书 | personal-claude |
+| Codex (commandcode) | `cli_aac0da7b7df8dcdc` | 个人飞书 | personal-codex |
+| Codex (bfjdfhnf) | `cli_aa327cd13a789be2` | 个人飞书 | bfjdfhnf-codex |
+| Claude (claude.ai_plaud) | `cli_a923ce0377f8dcc5` | Plaud | work-claude |
+| Claude (llm-proxy) | `cli_aac2d3ddac7a5ce3` | Plaud | work2-claude（原名 ccp） |
+| Codex (llm-proxy) | `cli_a9574b9bf279dcb0` | Plaud | work-codex |
+
 ### 1.1 personal 的个人飞书应用与迁移记录
 
 Lark 免费租户 API 额度为每月 10000 次调用，耗尽后（错误码 99991403）personal
@@ -28,8 +42,8 @@ Lark 免费租户 API 额度为每月 10000 次调用，耗尽后（错误码 99
 
 | 飞书个人版 app | App ID | 服务实例 |
 |---|---|---|
-| Claude Code | `cli_aac0e4cd5238dcc2` | personal-claude |
-| Codex | `cli_aac0da7b7df8dcdc` | personal-codex |
+| Claude (vertex_plaud-agent)（原名 Claude Code） | `cli_aac0e4cd5238dcc2` | personal-claude |
+| Codex (commandcode)（原名 Codex） | `cli_aac0da7b7df8dcdc` | personal-codex |
 
 app 配置与第 1 节清单完全一致（Bot 能力 + 4 scope + 长连接事件/回调 +
 发布版本；个人版租户发版免审核、即时生效）。
@@ -83,17 +97,18 @@ of the chat` 并丢失输出。不要靠等待旧会话结束消除错误；迁�
 
 ## 2. Agent Profile 配置目录（每 profile 一次）
 
-`~/.local/bin` 下有五个 profile wrapper（独立可执行脚本，任何 shell 上下文都生效）：
-
-5 wrapper ↔ 5 实例 ↔ 5 bot 对应（2026-07-04 定型）：
+`~/.local/bin` 下有五个 profile wrapper（独立可执行脚本，任何 shell 上下文都生效），
+外加裸 `codex`（`CODEX_HOME` 未设 = `~/.codex`），共 6 个入口 ↔ 6 实例 ↔ 6 bot
+（2026-07-04 定型，2026-09-27 加裸 codex 并按新规则改名）：
 
 | wrapper | 路由 | walkcode 实例 | bot |
 |---|---|---|---|
-| `claude-work` | enterprise 订阅 OAuth | work-claude | 飞书 Claude Code |
-| `claude-work2` | 公司 Claude llm-proxy（Vela key，`~/.claude-profiles/work2` 独立 profile） | work2-claude | 飞书 ccp |
-| `claude-personal` | Vertex 直连 | personal-claude | 个人飞书 Claude Code |
-| `codex-work` | 公司 Codex llm-proxy（Vela key） | work-codex | 飞书 Codex |
-| `codex-personal` | Azure（本地 proxy） | personal-codex | 个人飞书 Codex |
+| `claude-work` | enterprise 订阅 OAuth（claude.ai，Plaud 组织） | work-claude | Claude (claude.ai_plaud) |
+| `claude-work2` | 公司 Claude llm-proxy（Vela key，`~/.claude-profiles/work2` 独立 profile） | work2-claude | Claude (llm-proxy) |
+| `claude-personal` | Vertex 直连（plaud-agent 项目） | personal-claude | Claude (vertex_plaud-agent) |
+| `codex-work` | 公司 Codex llm-proxy（Vela key） | work-codex | Codex (llm-proxy) |
+| `codex-personal` | Command Code 订阅（经本地 codex-relay 127.0.0.1:4446） | personal-codex | Codex (commandcode) |
+| 裸 `codex` | ChatGPT Plus 订阅（`~/.codex`） | bfjdfhnf-codex | Codex (bfjdfhnf) |
 
 应急 Vertex 路由片段保留在 `~/.claude-profiles/work/routes/vertex.json`
 （`claude --settings` 按次注入，或写 `WALKCODE_CLAUDE_SETTINGS` 给实例用）。
@@ -101,7 +116,10 @@ of the chat` 并丢失输出。不要靠等待旧会话结束消除错误；迁�
 ⚠️ 建新 bot 的两个坑（ccp 实测）：p2p 消息事件投递必须加**专用 scope**
 `im:message.p2p_msg:readonly`（大 scope `im:message` 不够），且 scope 要随
 版本发布才对事件路由生效；`open_id` 按应用隔离，白名单不能复用其他 bot 的
-open_id——先放空白名单收首条事件抓真实值再回填。
+open_id——先放空白名单收首条事件抓真实值再回填。codex 实例若配了
+`WALKCODE_CODEX_SANDBOX=danger-full-access`，白名单全空会被 0.14.23 起的白名单闸拒绝
+启动（见 §3）；bootstrap 期间临时设 `WALKCODE_CODEX_SANDBOX=read-only`，抓到
+open_id/chat_id 回填白名单后再改回（2026-09-27 建 bfjdfhnf-codex 实测）。
 
 历史 wrapper `cc`/`ccv`/`ccp` shell 函数（`~/.agent-control-plane/agent-wrappers.sh`）
 已于 2026-07-03 移除；`ccs`/`codex-api` 归档在 `~/.walkcode-attic/20260703-wrappers/`。
@@ -118,12 +136,12 @@ codex-work login # codex-personal login 同理
 住在各 profile 的配置目录里，用哪个 wrapper 启动，TUI 观察就锚定到哪个
 runtime 实例。
 
-裸命令读 `~/.claude`/`~/.codex`。2026-09-12 起这两份裸配置也装了 walkcode
-hook，锚到 **personal** 两实例（`~/.claude/settings.json` 的 hooks 段、
-`~/.codex/hooks.json` + `~/.codex/config.toml` 的 `[hooks.state]` 信任哈希），
-所以忘了用 wrapper 也不会彻底断掉镜像。但它只是兜底：裸 claude 的
-`CLAUDE_CONFIG_DIR` 是 `~/.claude` 而实例配的是
-`~/.claude-profiles/personal`，接管/resume 会用后者，MCP 与权限设置对不上。
+裸命令：裸 `claude` 靠 `~/.zshenv` 默认 `CLAUDE_CONFIG_DIR=~/.claude-profiles/personal`，
+等同 `claude-personal`，锚到 personal-claude。裸 `codex` 读 `~/.codex`，2026-09-27 起是
+独立的第 6 个实例 **bfjdfhnf-codex**（ChatGPT Plus 订阅，`~/.codex/hooks.json` +
+`~/.codex/config.toml` 的 `[hooks.state]` 信任哈希），不再锚到 personal-codex。
+`codex exec`（deep-review、脚本）也加载同一份 hooks.json，walkcode 按 rollout 首行
+`session_meta.source == "exec"` 忽略这类 hook，不开话题（0.14.27 起）。
 换 codex hooks.json 后必须同步换 `config.toml` 里 `[hooks.state."<绝对路径>:<事件>:0:0"]`
 的 `trusted_hash`（key 含 hooks.json 绝对路径，哈希不对 codex 会静默不跑 hook）。
 哈希算法没有公开、也不是整份文件的普通 sha256，**别手算**。两条可行路径：
@@ -131,16 +149,20 @@ hook，锚到 **personal** 两实例（`~/.claude/settings.json` 的 hooks 段�
 `config.toml` 里的 `[hooks.state]` 整段搬过来，只改 key 里的绝对路径——哈希跟
 内容走，不跟路径走（2026-09-12 裸 codex 就是这么接上的）；② 内容不同就用对应
 `CODEX_HOME` 起一次 codex，在 `/hooks` 里逐项 review 并信任，由它自己写回。
+**整份对调两个 `CODEX_HOME` 的 config.toml 会把 `[hooks.state]` 一起带走**：key 里是
+hooks.json 的绝对路径，对调后两边的信任条目都指向对方目录，各自的 hook 静默失效
+（2026-09-27 对调 `~/.codex` 与 personal 后 codex-personal 的 TUI 镜像就这样断了）。
+对调后要按 key 里的路径把信任条目搬回各自的 config.toml，哈希不用动。
 改完必须真发一次事件验收：跑一条会触发 hook 的命令，确认队列目录多出文件或
 频道收到卡片。**`walkcode native doctor` 不校验信任状态**，它只看 hooks.json
 里的事件和命令，哈希错了它照样报正常。
 Codex 的 managed app-server daemon 也按 CODEX_HOME 分家（每 profile 一个
 daemon + socket）。
 
-**裸配置锚死在 personal，等于放弃了工作/个人的租户隔离。** hook 不校验
+**裸命令都锚在个人飞书租户，等于放弃了工作/个人的租户隔离。** hook 不校验
 `cwd`：在公司仓库里忘用 wrapper、直接敲 `claude`/`codex`，这次会话的 prompt、
-回复、工具参数就镜像进个人飞书群，群里的白名单账号还能接管它。所以裸配置
-只当兜底，公司仓库一律用 `claude-work` / `codex-work`。真要堵死，得在
+回复、工具参数就镜像进个人飞书群，群里的白名单账号还能接管它。所以公司仓库
+一律用 `claude-work` / `codex-work`。真要堵死，得在
 `process_tui_hook` 里按工作区根校验 `cwd` 并拒绝跨租户，那是另一件事。
 
 TUI hook 归属锚定：把 walkcode hook 命令写进各 profile 的
@@ -172,7 +194,7 @@ gate 行为（v3 真双端）：AskUserQuestion 与会原生弹权限的工具�
 `WALKCODE_CLAUDE_GATE_MODE=auto|off|ask_only`、`WALKCODE_CLAUDE_GATE_TIMEOUT`
 （仅 block 路径）、`WALKCODE_CLAUDE_GATE_TOOLS`。
 
-## 3. Env 文件（×4）
+## 3. Env 文件（×6）
 
 `~/.walkcode/{profile}-{agent}.env`，模板见 `.env.example`。关键差异项：
 
@@ -180,7 +202,7 @@ gate 行为（v3 真双端）：AskUserQuestion 与会原生弹权限的工具�
 |---|---|---|---|---|
 | WALKCODE_PROFILE | work | work | personal | personal |
 | WALKCODE_AGENT | claude | codex | claude | codex |
-| LARK_APP_ID/SECRET | 公司 bot A | 公司 bot B | 个人飞书 Claude Code¹ | 个人飞书 Codex¹ |
+| LARK_APP_ID/SECRET | Claude (claude.ai_plaud) | Codex (llm-proxy) | Claude (vertex_plaud-agent)¹ | Codex (commandcode)¹ |
 | LARK_OPENAPI_DOMAIN | open.feishu.cn | open.feishu.cn | open.feishu.cn¹ | open.feishu.cn¹ |
 | WALKCODE_CLAUDE_CONFIG_DIR | ~/.claude-profiles/work | — | ~/.claude-profiles/personal | — |
 | WALKCODE_CODEX_HOME | — | ~/.codex-profiles/work | — | ~/.codex-profiles/personal |
@@ -191,6 +213,12 @@ gate 行为（v3 真双端）：AskUserQuestion 与会原生弹权限的工具�
 共同项：`WALKCODE_CHANNEL=lark`、`LARK_ALLOWED_CHAT_IDS`/`LARK_ALLOWED_OPEN_IDS`
 白名单、`WALKCODE_CWD`、按需 `WALKCODE_WORKSPACE_ROOTS`（启用 `/repo`）。
 状态路径和 codex socket 不用写，按 profile 自动推导。
+
+另两个实例：work2-claude（`WALKCODE_PROFILE=work2`，Claude (llm-proxy)，
+`WALKCODE_CLAUDE_CONFIG_DIR=~/.claude-profiles/work2`）；bfjdfhnf-codex
+（`WALKCODE_PROFILE=bfjdfhnf`，Codex (bfjdfhnf) `cli_aa327cd13a789be2`，
+`WALKCODE_CODEX_HOME=~/.codex`，env `~/.walkcode/bfjdfhnf-codex.env`，launchd
+`com.walkcode.bfjdfhnf-codex`）。
 
 codex 实例的沙箱默认**跟随 codex profile 自己的 `sandbox_mode`**，walkcode 不插手。
 只有显式设 `WALKCODE_CODEX_SANDBOX=read-only|workspace-write|danger-full-access`
@@ -254,7 +282,7 @@ env 的 `WALKCODE_CLAUDE_SPAWN_MODE` 显式设回 `daemon`；attach 模式下
 `/exit` = detach（会话保活），结束用 `claude stop <short>`，DWIM 调试用
 `WALKCODE_RESUME_DWIM_DRYRUN=1`。
 
-## 4. launchd（×4）
+## 4. launchd（×6）
 
 `~/Library/LaunchAgents/com.walkcode.{profile}-{agent}.plist`：
 
@@ -285,14 +313,17 @@ env 的 `WALKCODE_CLAUDE_SPAWN_MODE` 显式设回 `daemon`；attach 模式下
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.walkcode.work-claude.plist
 ```
 
-升级用的重启列表（写进 shell 环境或升级前 export）：
+升级一律走 `./upgrade.sh`。**默认不要设 `WALKCODE_V3_LAUNCHD_LABELS`**：变量为空时
+脚本自动发现已加载的 `com.walkcode.*`（排除 `tap-*`）并逐个 kickstart，新增实例
+不用改任何列表。只在要限定重启范围时才设它，设了就**只**重启所列 label，漏写的
+实例会继续跑旧版本。当前 6 个实例的完整列表：
 
 ```bash
-export WALKCODE_V3_LAUNCHD_LABELS="com.walkcode.work-claude,com.walkcode.work-codex,com.walkcode.personal-claude,com.walkcode.personal-codex"
+export WALKCODE_V3_LAUNCHD_LABELS="com.walkcode.work-claude,com.walkcode.work-codex,com.walkcode.work2-claude,com.walkcode.personal-claude,com.walkcode.personal-codex,com.walkcode.bfjdfhnf-codex"
 ```
 
-`walkcode upgrade` 会安装 `--with claude-agent-sdk --with lark-oapi` 并逐个
-kickstart 上述 label。
+升级会安装 `--with claude-agent-sdk --with lark-oapi`，重启后按各实例 env 跑
+`walkcode native doctor`。
 
 ## 5. 逐实例验收（按顺序，过一个再开下一个）
 
