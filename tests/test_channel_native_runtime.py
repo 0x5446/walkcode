@@ -2779,13 +2779,25 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
                 )
             )
 
-            self.assertNotEqual(cli.reason, "codex_exec_hook_ignored")
-            self.assertNotEqual(missing.reason, "codex_exec_hook_ignored")
+            # Deep nesting under the byte cap raises RecursionError (not a
+            # ValueError); it must fall back to observing, not escape.
+            nested = Path(tmp) / "nested.jsonl"
+            nested.write_text("[" * 200_000 + "]" * 200_000 + "\n", encoding="utf-8")
+            deep = asyncio.run(
+                runtime.process_tui_hook(
+                    hook_type="sync",
+                    agent="codex",
+                    payload={"session_id": "thread-nested", "cwd": tmp, "transcript_path": str(nested)},
+                )
+            )
+
+            for result in (cli, missing, deep):
+                self.assertNotEqual(result.reason, "codex_exec_hook_ignored")
             refs = sorted(
                 str(s.transport_ref.get("agent_session_id") or s.transport_ref.get("thread_id") or "")
                 for s in runtime.state.sessions.iter_sessions()
             )
-            self.assertEqual(len(refs), 2, refs)
+            self.assertEqual(len(refs), 3, refs)
 
     def test_codex_tui_stop_hook_drains_narration_through_real_entrypoint(self):
         # Entry-level pin for the codex stop-drain wiring: the agent name

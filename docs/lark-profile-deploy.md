@@ -313,14 +313,17 @@ env 的 `WALKCODE_CLAUDE_SPAWN_MODE` 显式设回 `daemon`；attach 模式下
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.walkcode.work-claude.plist
 ```
 
-升级用的重启列表（写进 shell 环境或升级前 export）：
+升级一律走 `./upgrade.sh`。**默认不要设 `WALKCODE_V3_LAUNCHD_LABELS`**：变量为空时
+脚本自动发现已加载的 `com.walkcode.*`（排除 `tap-*`）并逐个 kickstart，新增实例
+不用改任何列表。只在要限定重启范围时才设它，设了就**只**重启所列 label，漏写的
+实例会继续跑旧版本。当前 6 个实例的完整列表：
 
 ```bash
-export WALKCODE_V3_LAUNCHD_LABELS="com.walkcode.work-claude,com.walkcode.work-codex,com.walkcode.personal-claude,com.walkcode.personal-codex"
+export WALKCODE_V3_LAUNCHD_LABELS="com.walkcode.work-claude,com.walkcode.work-codex,com.walkcode.work2-claude,com.walkcode.personal-claude,com.walkcode.personal-codex,com.walkcode.bfjdfhnf-codex"
 ```
 
-`walkcode upgrade` 会安装 `--with claude-agent-sdk --with lark-oapi` 并逐个
-kickstart 上述 label。
+升级会安装 `--with claude-agent-sdk --with lark-oapi`，重启后按各实例 env 跑
+`walkcode native doctor`。
 
 ## 5. 逐实例验收（按顺序，过一个再开下一个）
 

@@ -6569,7 +6569,9 @@ def _codex_transcript_is_exec(payload: dict[str, Any]) -> bool:
     try:
         with open(path, "rb") as fh:
             record = json.loads(fh.readline(_CODEX_SESSION_META_MAX_BYTES))
-    except (OSError, ValueError):
+    except (OSError, ValueError, RecursionError):
+        # RecursionError: deeply nested JSON under the byte cap. It is not a
+        # ValueError and would otherwise escape and wedge the hook drain.
         return False
     if not isinstance(record, dict) or record.get("type") != "session_meta":
         return False
