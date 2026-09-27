@@ -2704,6 +2704,89 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
             self.assertEqual(ledger["in_progress"], {})
             self.assertEqual(len(ledger["completed"]), 2)
 
+    def _codex_hook_runtime(self, tmp: str):
+        cfg = ChannelNativeConfig.from_env(
+            {
+                "WALKCODE_CHANNEL": "telegram",
+                "TELEGRAM_BOT_TOKEN": "fake",
+                "WALKCODE_AGENT": "codex",
+                "TELEGRAM_ALLOWED_CHAT_IDS": "123",
+                "WALKCODE_STATE_PATH": str(Path(tmp) / "state.json"),
+                "WALKCODE_CWD": tmp,
+            }
+        )
+        api = _FakeTelegramApi()
+        runtime = ChannelNativeRuntime.from_config(
+            cfg,
+            telegram_api=api,
+            transports={"codex_app_server": FakeAgentTransport("codex_app_server", _transport_caps())},
+        )
+        return runtime, api
+
+    def _codex_rollout(self, tmp: str, source: str) -> str:
+        rollout = Path(tmp) / f"rollout-{source}.jsonl"
+        meta = {
+            "type": "session_meta",
+            "payload": {"id": f"thread-{source}", "originator": "x", "source": source},
+        }
+        rollout.write_text(json.dumps(meta) + "\n", encoding="utf-8")
+        return str(rollout)
+
+    def test_codex_exec_hooks_are_not_mirrored(self):
+        # `codex exec` (deep-review, scripts) loads the same hooks.json as the
+        # TUI; its rollout says source=exec and must never open a topic.
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime, api = self._codex_hook_runtime(tmp)
+            payload = {
+                "session_id": "thread-exec",
+                "cwd": tmp,
+                "transcript_path": self._codex_rollout(tmp, "exec"),
+            }
+            results = [
+                asyncio.run(runtime.process_tui_hook(hook_type=hook, agent="codex", payload=dict(payload)))
+                for hook in ("SessionStart", "UserPromptSubmit", "PreToolUse", "Stop")
+            ]
+
+            for result in results:
+                self.assertTrue(result.accepted)
+                self.assertEqual(result.reason, "codex_exec_hook_ignored")
+            self.assertEqual(list(runtime.state.sessions.iter_sessions()), [])
+            self.assertEqual(api.calls, [])
+
+    def test_codex_cli_and_unreadable_rollouts_stay_observed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime, _api = self._codex_hook_runtime(tmp)
+            cli = asyncio.run(
+                runtime.process_tui_hook(
+                    hook_type="sync",
+                    agent="codex",
+                    payload={
+                        "session_id": "thread-cli",
+                        "cwd": tmp,
+                        "transcript_path": self._codex_rollout(tmp, "cli"),
+                    },
+                )
+            )
+            missing = asyncio.run(
+                runtime.process_tui_hook(
+                    hook_type="sync",
+                    agent="codex",
+                    payload={
+                        "session_id": "thread-missing",
+                        "cwd": tmp,
+                        "transcript_path": str(Path(tmp) / "absent.jsonl"),
+                    },
+                )
+            )
+
+            self.assertNotEqual(cli.reason, "codex_exec_hook_ignored")
+            self.assertNotEqual(missing.reason, "codex_exec_hook_ignored")
+            refs = sorted(
+                str(s.transport_ref.get("agent_session_id") or s.transport_ref.get("thread_id") or "")
+                for s in runtime.state.sessions.iter_sessions()
+            )
+            self.assertEqual(len(refs), 2, refs)
+
     def test_codex_tui_stop_hook_drains_narration_through_real_entrypoint(self):
         # Entry-level pin for the codex stop-drain wiring: the agent name
         # must flow process_tui_hook -> _send_tui_hook_output, or the codex

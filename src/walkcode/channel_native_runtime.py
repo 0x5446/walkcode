@@ -131,6 +131,9 @@ TUI_HOOK_DRAIN_TIMEOUT_SECONDS = 30.0
 TUI_HOOK_DRAIN_BATCH_SIZE = 25
 TUI_HOOK_RECENT_PRIORITY_WINDOW_SECONDS = 300.0
 TUI_HOOK_DRAIN_INTERVAL_SECONDS = 1.0
+# Codex session_meta embeds the base instructions (~20KB today); cap the
+# first-line read so a malformed rollout cannot pull a huge line into memory.
+_CODEX_SESSION_META_MAX_BYTES = 1024 * 1024
 OUTBOX_FLUSH_INTERVAL_SECONDS = 1.0
 STATE_COMPACT_INTERVAL_SECONDS = 300.0
 TUI_BINDING_REFRESH_INTERVAL_SECONDS = 5.0
@@ -2769,6 +2772,9 @@ class ChannelNativeRuntime:
         if _tui_hook_is_walkcode_headless_transport(transport_kind, payload):
             self.save_state()
             return SubmitResult(True, "internal_headless_hook_ignored")
+        if transport_kind == "codex_app_server" and _codex_transcript_is_exec(payload):
+            self.save_state()
+            return SubmitResult(True, "codex_exec_hook_ignored")
         if (
             _tui_hook_can_claim_existing_session(hook_type)
             and self._tui_hook_is_unverified_walkcode_owned_session_hook(transport_kind, resume_ref, payload)
@@ -6543,6 +6549,32 @@ def _tui_hook_is_walkcode_headless_transport(transport_kind: str, payload: dict[
     if transport_kind == "codex_app_server":
         return any(_command_is_codex_app_server_process(command) for command in commands)
     return False
+
+
+def _codex_transcript_is_exec(payload: dict[str, Any]) -> bool:
+    """True when the hook comes from a `codex exec` run, not a TUI.
+
+    `codex exec` loads the same user hooks.json as the TUI, so scripted runs
+    (deep-review, smoke tests) would each open a mirrored channel topic. The
+    process tree cannot tell them apart (both are a `codex` executable), but
+    the rollout's first record is authoritative: session_meta.source is
+    "exec" for `codex exec` ("cli" for a standalone TUI, "vscode" for a TUI
+    served by the shared app-server daemon since codex 0.157). The rollout
+    already exists when SessionStart fires. Only "exec" is skipped;
+    unreadable or unknown shapes stay observed.
+    """
+    path = str(payload.get("transcript_path", "") or "")
+    if not path:
+        return False
+    try:
+        with open(path, "rb") as fh:
+            record = json.loads(fh.readline(_CODEX_SESSION_META_MAX_BYTES))
+    except (OSError, ValueError):
+        return False
+    if not isinstance(record, dict) or record.get("type") != "session_meta":
+        return False
+    meta = record.get("payload")
+    return isinstance(meta, dict) and meta.get("source") == "exec"
 
 
 def _tui_hook_has_external_tui_process_identity(transport_kind: str, payload: dict[str, Any]) -> bool:
