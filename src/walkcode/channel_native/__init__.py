@@ -8234,6 +8234,20 @@ class ClaudeHeadlessTransport:
         return claude_agent_sdk
 
 
+def _codex_message_turn_id(message: Any) -> str:
+    """Turn id of an app-server message (notification or server request).
+
+    Turn-scoped v2 messages carry ``params.turnId`` (``params.turn.id`` on
+    turn/started and turn/completed); thread- and account-level ones carry
+    none and belong to no turn.
+    """
+    params = message.get("params") if isinstance(message, dict) else None
+    if not isinstance(params, dict):
+        return ""
+    turn = params.get("turn")
+    return str(params.get("turnId") or (turn.get("id") if isinstance(turn, dict) else "") or "")
+
+
 # How many started turn ids CodexAppServerTransport remembers for hook
 # ownership. Only turns whose hooks are still queued matter, so a few hundred
 # is generous; the cap keeps a long-lived runtime from growing without bound.
@@ -8514,10 +8528,23 @@ class CodexAppServerTransport:
         while True:
             batch_started = time.monotonic()
             raw_events = await self.client.events(thread_id)
+            # Under the shared app-server daemon another client (the TUI) can
+            # run turns on this same thread; their events queue up here too.
+            # Only our own turn is this drain's output, and only its
+            # turn/completed ends it — otherwise a TUI turn's reply is posted
+            # as ours and our real answer waits in the queue for the next
+            # message. Unknown own turn (e.g. listening without a submit):
+            # keep the old, unfiltered behavior.
+            own_turn = self._active_turns.get(thread_id, "")
             turn_closed = False
             delta_parts: list[str] = []
             delta_model = ""
             for raw_event in raw_events:
+                event_turn = _codex_message_turn_id(raw_event)
+                if own_turn and event_turn and event_turn != own_turn:
+                    if raw_event.get("method") == "turn/completed":
+                        _log_degrade("codex_foreign_turn_skipped", thread_id=thread_id, turn_id=event_turn)
+                    continue
                 event = self._convert_event(raw_event, thread_id=thread_id)
                 if event is None:
                     continue

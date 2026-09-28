@@ -887,6 +887,51 @@ class CodexAppServerTransportTests(unittest.TestCase):
         self.assertEqual(events[1].type, AgentEventType.TURN_COMPLETED)
         self.assertEqual(events[1].payload["status"], "completed")
 
+    def test_events_skip_another_clients_turn_on_the_same_thread(self):
+        # Shared daemon (codex 0.157): after a takeover the TUI can still run
+        # turns on this thread and their events queue up on our connection.
+        # Real 2026-09-28 repro: the drain posted the TUI's reply "k" as ours,
+        # stopped on the TUI's turn/completed, and left our answer "4" queued.
+        tui = "tui-turn"
+
+        class _BatchedClient(_FakeCodexClient):
+            def __init__(self, batches):
+                super().__init__()
+                self.batches = list(batches)
+
+            async def events(self, thread_id):
+                return self.batches.pop(0) if self.batches else []
+
+        def msg(method, turn, **params):
+            return {"method": method, "params": {"threadId": "thread-1", "turnId": turn, **params}}
+
+        client = _BatchedClient(
+            [
+                [
+                    {"method": "turn/started", "params": {"threadId": "thread-1", "turn": {"id": tui}}},
+                    msg("item/agentMessage/delta", tui, itemId="t1", delta="k"),
+                    {
+                        "id": "tui-approval",
+                        "method": "item/commandExecution/requestApproval",
+                        "params": {"threadId": "thread-1", "turnId": tui, "itemId": "c1", "command": "rm -rf x"},
+                    },
+                    {"method": "turn/completed", "params": {"threadId": "thread-1", "turn": {"id": tui}}},
+                ],
+                [
+                    msg("item/agentMessage/delta", "turn-1", itemId="w1", delta="4"),
+                    {"method": "turn/completed", "params": {"threadId": "thread-1", "turn": {"id": "turn-1"}}},
+                ],
+            ]
+        )
+        transport = CodexAppServerTransport(client=client, event_silence_ceiling=0)
+        handle = asyncio.run(transport.launch(LaunchSpec(cwd="/tmp/project", session_id="s1")))
+        asyncio.run(transport.submit_turn(handle, TurnInput(text="kiwi 有几个字母"), "idem-1"))
+
+        events = _drain_events(transport, handle)
+
+        self.assertEqual([e.type for e in events], [AgentEventType.TURN_DELTA, AgentEventType.TURN_COMPLETED])
+        self.assertEqual(events[0].payload["text"], "4")
+
     def test_events_convert_codex_event_msg_agent_message_and_task_complete(self):
         client = _FakeCodexClient()
         client.event_batches["thread-1"] = [
