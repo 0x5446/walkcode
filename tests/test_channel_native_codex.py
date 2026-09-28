@@ -960,6 +960,57 @@ class CodexAppServerTransportTests(unittest.TestCase):
         self.assertEqual(events[-1].type, AgentEventType.TURN_COMPLETED)
         self.assertNotIn("x", "".join(str(e.payload.get("text", "")) for e in events))
 
+    def test_turnless_thread_events_do_not_keep_a_stalled_own_turn_alive(self):
+        # deep-review v0.14.28 r2: thread/status/changed carries no turnId and
+        # fires on every TUI turn start/end, so it must not count as our turn
+        # being alive once our turn id is known.
+        class _StatusChurnClient(_FakeCodexClient):
+            calls = 0
+
+            async def events(self, thread_id):
+                self.calls += 1
+                if self.calls > 50:
+                    raise AssertionError("drain never hit the silence ceiling")
+                return [{"method": "thread/status/changed",
+                         "params": {"threadId": "thread-1", "status": {"type": "active"}}}]
+
+        transport = CodexAppServerTransport(client=_StatusChurnClient(), event_silence_ceiling=0.05)
+        transport._EMPTY_BATCH_MIN_INTERVAL = 0.01
+        handle = asyncio.run(transport.launch(LaunchSpec(cwd="/tmp/project", session_id="s1")))
+        asyncio.run(transport.submit_turn(handle, TurnInput(text="hi"), "idem-1"))
+
+        events = _drain_events(transport, handle)
+
+        self.assertEqual(events[-1].type, AgentEventType.TURN_COMPLETED)
+
+    def test_next_turn_submitted_during_completion_keeps_its_turn_id(self):
+        # The consumer may submit the next turn while TURN_COMPLETED is being
+        # yielded; the closing drain must not erase the new turn's id.
+        class _TwoTurnClient(_FakeCodexClient):
+            turns = 0
+
+            async def request(self, method, params):
+                if method == "turn/start":
+                    self.turns += 1
+                    return {"turn": {"id": f"turn-{self.turns}"}}
+                return await super().request(method, params)
+
+            async def events(self, thread_id):
+                return [{"method": "turn/completed", "params": {"threadId": "thread-1", "turn": {"id": "turn-1"}}}]
+
+        transport = CodexAppServerTransport(client=_TwoTurnClient(), event_silence_ceiling=0)
+        handle = asyncio.run(transport.launch(LaunchSpec(cwd="/tmp/project", session_id="s1")))
+
+        async def scenario():
+            await transport.submit_turn(handle, TurnInput(text="first"), "idem-1")
+            async for event in transport.events(handle):
+                if event.type == AgentEventType.TURN_COMPLETED:
+                    await transport.submit_turn(handle, TurnInput(text="second"), "idem-2")
+
+        asyncio.run(scenario())
+
+        self.assertEqual(transport._active_turns.get("thread-1"), "turn-2")
+
     def test_events_convert_codex_event_msg_agent_message_and_task_complete(self):
         client = _FakeCodexClient()
         client.event_batches["thread-1"] = [
