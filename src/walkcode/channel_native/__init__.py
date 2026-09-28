@@ -4083,9 +4083,11 @@ SHARED_APP_SERVER_CONTROLLER = "shared_app_server"
 
 
 def _command_is_codex_app_server_process(command: str) -> bool:
-    # Any `codex app-server ...` form is a walkcode-managed internal process,
-    # not a user TUI: the stdio client uses `--stdio`, the managed daemon uses
-    # `app-server daemon [start]`. Match on the PARSED subcommand, not a bare
+    # Any `codex app-server ...` form is an app-server, never a user TUI: the
+    # stdio client uses `--stdio`, the managed daemon uses `app-server daemon
+    # [start]`. Since codex 0.157 the managed daemon also serves the user's TUI,
+    # so this is NOT "WalkCode's own session" (hooks are attributed by turn id,
+    # ADR 0064); it only guarantees an app-server is never killed as a TUI. Match on the PARSED subcommand, not a bare
     # substring — `codex "explain app-server"` is a real user TUI and a bare
     # substring test misclassified it as internal (round-2 review), hiding its
     # hooks. Matching only `--stdio` (the original) missed the daemon form and

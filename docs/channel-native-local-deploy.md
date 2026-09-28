@@ -477,7 +477,10 @@ therefore has no codex hook carrier: mid-turn narration is mirrored
 incrementally from the rollout transcript (ADR 0055), and the turn-final text
 rides the `Stop` hook's `last_assistant_message`.
 
-The target Codex architecture is different: use a shared Codex app-server
+Since codex-cli 0.157 this is no longer only a target: a TUI started with the
+default `~/.codex` attaches to the managed app-server daemon WalkCode also uses,
+and the daemon runs every thread's hooks (ADR 0064). The architecture the rest
+of this paragraph describes: a shared Codex app-server
 endpoint so the Codex TUI and WalkCode's Telegram runtime attach to the same
 `threadId`. In that model, Telegram reads user input, assistant output, tool
 events, approvals, and request-user-input events from the app-server protocol
@@ -531,7 +534,11 @@ Automatic takeover requires a hook-provided `terminate_ref` such as:
 ```
 
 Without `allow_terminate=true`, WalkCode will not kill a still-running TUI
-process and takeover reports that it cannot start automatically. Claude Code
+process and takeover reports that it cannot start automatically. This applies
+to a TUI that holds the thread in its own process. A hook run inside a codex
+app-server (the shared daemon) records `{"controller_kind": "shared_app_server"}`
+instead: the daemon owns the thread, so takeover resumes it alongside the TUI
+and stops nothing (ADR 0064). Claude Code
 `Stop` hooks are turn-completion events, not proof that the TUI process exited,
 so they do not remove the termination requirement by themselves.
 
