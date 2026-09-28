@@ -477,14 +477,18 @@ therefore has no codex hook carrier: mid-turn narration is mirrored
 incrementally from the rollout transcript (ADR 0055), and the turn-final text
 rides the `Stop` hook's `last_assistant_message`.
 
-Since codex-cli 0.157 this is no longer only a target: a TUI started with the
-default `~/.codex` attaches to the managed app-server daemon WalkCode also uses,
-and the daemon runs every thread's hooks (ADR 0064). The architecture the rest
-of this paragraph describes: a shared Codex app-server
-endpoint so the Codex TUI and WalkCode's Telegram runtime attach to the same
-`threadId`. In that model, Telegram reads user input, assistant output, tool
-events, approvals, and request-user-input events from the app-server protocol
-instead of reconstructing them from hooks. See
+Since codex-cli 0.157 the process model has moved toward that: a TUI started
+with the default `~/.codex` attaches to the managed app-server daemon WalkCode
+also uses, and the daemon runs every thread's hooks (ADR 0064). **Observation
+is still hook-based today**: WalkCode attributes codex hooks by turn id, and its
+app-server drain consumes only the turns WalkCode itself started. TUI turns
+after a takeover are not mirrored yet (ADR 0064 known gaps).
+
+The target Codex architecture: a shared Codex app-server endpoint so the Codex
+TUI and WalkCode's Telegram runtime attach to the same `threadId`, and Telegram
+reads user input, assistant output, tool events, approvals, and
+request-user-input events from the app-server protocol instead of
+reconstructing them from hooks. See
 `docs/adr/0041-codex-unified-app-server-client-architecture.md`.
 
 Required durable resume ids:

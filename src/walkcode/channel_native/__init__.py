@@ -8239,13 +8239,22 @@ def _codex_message_turn_id(message: Any) -> str:
 
     Turn-scoped v2 messages carry ``params.turnId`` (``params.turn.id`` on
     turn/started and turn/completed); thread- and account-level ones carry
-    none and belong to no turn.
+    none and belong to no turn. The legacy ``event_msg`` shape, which this
+    transport also converts, keeps it in ``payload.turn_id`` — read there too,
+    the same place _notification_thread_id finds its thread id.
     """
-    params = message.get("params") if isinstance(message, dict) else None
-    if not isinstance(params, dict):
+    if not isinstance(message, dict):
         return ""
-    turn = params.get("turn")
-    return str(params.get("turnId") or (turn.get("id") if isinstance(turn, dict) else "") or "")
+    params = message.get("params")
+    if isinstance(params, dict):
+        turn = params.get("turn")
+        turn_id = params.get("turnId") or (turn.get("id") if isinstance(turn, dict) else "")
+        if turn_id:
+            return str(turn_id)
+    payload = message.get("payload")
+    if isinstance(payload, dict):
+        return str(payload.get("turn_id") or payload.get("turnId") or "")
+    return ""
 
 
 # How many started turn ids CodexAppServerTransport remembers for hook
@@ -8548,7 +8557,12 @@ class CodexAppServerTransport:
                     if raw_event.get("method") == "turn/completed":
                         _log_degrade("codex_foreign_turn_skipped", thread_id=thread_id, turn_id=event_turn)
                     continue
-                own_traffic = True
+                # With our turn known, only events of that turn prove it alive:
+                # thread-level ones (thread/status/changed, hook/*) also fire
+                # for the TUI's turns and would keep a stalled turn of ours
+                # from ever hitting the ceiling. They are still consumed.
+                if not own_turn or event_turn == own_turn:
+                    own_traffic = True
                 event = self._convert_event(raw_event, thread_id=thread_id)
                 if event is None:
                     continue
@@ -8589,7 +8603,11 @@ class CodexAppServerTransport:
                 # the cache entry so a long-lived runtime cannot accumulate
                 # one ~100B mapping per finished thread forever.
                 self._thread_models.pop(thread_id, None)
-                self._active_turns.pop(thread_id, None)
+                # Only if it is still the turn that just closed: the consumer
+                # may have submitted the next turn while the completion was
+                # yielded, and that turn's id must survive for its drain.
+                if self._active_turns.get(thread_id) == own_turn:
+                    self._active_turns.pop(thread_id, None)
             if delta_parts:
                 delta_payload: dict[str, Any] = {"text": "".join(delta_parts)}
                 if delta_model:
