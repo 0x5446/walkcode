@@ -7,6 +7,7 @@ import base64
 import collections
 import contextlib
 import hashlib
+import itertools
 import json
 import os
 import stat
@@ -1193,7 +1194,7 @@ def _clip(text: str, limit: int, marker: str = "…（已截断）") -> str:
 
 
 def _bounded_copy(value: Any, depth: int = 0) -> Any:
-    """A copy with every string, list and nesting level capped (mirror queue memory)."""
+    """A copy with every string, list, dict and nesting level capped (mirror queue memory)."""
     if isinstance(value, str):
         return _clip(value, CODEX_MIRROR_FIELD_CHARS) if len(value) > CODEX_MIRROR_FIELD_CHARS else value
     if depth >= CODEX_MIRROR_NESTING_LIMIT:
@@ -1201,7 +1202,10 @@ def _bounded_copy(value: Any, depth: int = 0) -> Any:
     if isinstance(value, list):
         return [_bounded_copy(v, depth + 1) for v in value[:CODEX_MIRROR_LIST_ITEMS]]
     if isinstance(value, dict):
-        return {k: _bounded_copy(v, depth + 1) for k, v in value.items()}
+        return {
+            str(k)[:CODEX_MIRROR_FIELD_CHARS]: _bounded_copy(v, depth + 1)
+            for k, v in itertools.islice(value.items(), CODEX_MIRROR_LIST_ITEMS)
+        }
     return value
 
 

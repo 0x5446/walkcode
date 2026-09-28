@@ -3220,6 +3220,8 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
                 self.assertEqual(len(changes["params"]["item"]["changes"]), runtime_module.CODEX_MIRROR_LIST_ITEMS)
                 self.assertLess(len(approval["params"]["command"]), limit + 20)
                 self.assertEqual(approval["id"], "r1")
+                put("wc-thread", self._foreign("item/completed", "t1", item={"type": "mcpToolCall", "arguments": {f"k{n}": n for n in range(10_000)}}))
+                self.assertEqual(len(channel.queue[-1]["params"]["item"]["arguments"]), runtime_module.CODEX_MIRROR_LIST_ITEMS)
 
             asyncio.run(run())
 
