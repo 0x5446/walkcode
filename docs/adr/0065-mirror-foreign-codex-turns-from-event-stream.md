@@ -60,8 +60,9 @@ id 消息只在单活跃监听时认领、共享缓冲、故障哨兵与连接�
 
 ### 2. 镜像器：有界、按回合聚合、只发卡
 
-runtime 为每个接管后的会话（`writer_owner.kind == "orchestrator"` 且
-`transport_kind == "codex_app_server"`）维护一个**有上限**的镜像队列（每会话
+runtime 为每个接管后的会话（会话 id 以 `tui-` 开头即由 TUI 同步会话接管而来、
+`writer_owner.kind == "orchestrator"`、`transport_kind == "codex_app_server"`、
+未停止、24 小时内有活动）维护一个**有上限**的镜像队列（每会话
 最多 N 条原始消息，满了丢最旧的并记一次 degrade 日志），由一个镜像任务串行消费；
 `on_foreign` 只做非阻塞入队，不能阻塞读者。
 
@@ -98,9 +99,10 @@ hook 直接忽略（事件流是这类会话唯一的镜像来源），不再落
 
 ### 5. 订阅的恢复：随现有维护循环对账
 
-runtime 的维护循环（与 TUI 绑定刷新同节奏）对账：`status == running`、WalkCode
-持有的 codex 会话，若当前连接未订阅其 thread，则 `thread/resume` 订阅并注册
-分流。失败只记日志、下一轮重试——覆盖启动、daemon 重启、连接重建，不需要单独的
+runtime 的维护循环（与 TUI 绑定刷新同节奏）对账第 2 节定义的镜像对象，若当前
+连接未订阅其 thread，则 `thread/resume` 订阅并注册分流；不再符合条件的会话注销
+并收尾。只看接管会话、只看 24 小时内有活动的，是为了不把大量闲置会话全部加载进
+daemon。失败只记日志、下一轮重试——覆盖启动、daemon 重启、连接重建，不需要单独的
 "启动时一次性恢复"。
 
 ### 6. 实现规则（第二轮审查补齐）

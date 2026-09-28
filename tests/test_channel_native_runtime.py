@@ -2969,6 +2969,233 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
             # orchestrator session to ACTIVE with nothing ever setting it back.
             self.assertEqual(updated.lifecycle_state, lifecycle_before)
 
+    # -- ADR 0065: client routing hook, mirror, reconciler --------------------
+
+    def test_client_router_failure_falls_back_to_the_thread_queue(self):
+        client = runtime_module.CodexStdioAppServerClient()
+
+        def broken(thread_id, message):
+            raise RuntimeError("router bug")
+
+        client.foreign_router = broken
+        message = {"method": "item/completed", "params": {"threadId": "t1", "turnId": "x"}}
+        client._dispatch(message)  # must not raise: the reader has to survive
+        self.assertEqual(client._queue_for("t1").get_nowait(), message)
+
+        client.foreign_router = lambda thread_id, m: True
+        client._dispatch(message)
+        self.assertTrue(client._queue_for("t1").empty())
+
+    def test_client_take_queued_keeps_order_and_respects_a_live_listener(self):
+        client = runtime_module.CodexStdioAppServerClient()
+        messages = [{"method": "m", "params": {"threadId": "t1", "turnId": turn}} for turn in "abab"]
+        for message in messages:
+            client._dispatch(message)
+        client._active_listeners["t1"] = 1
+        self.assertEqual(client.take_queued("t1", lambda m: True), [])
+        client._active_listeners.pop("t1")
+        taken = client.take_queued("t1", lambda m: m["params"]["turnId"] == "a")
+        self.assertEqual(taken, [messages[0], messages[2]])
+        queue = client._queue_for("t1")
+        self.assertEqual([queue.get_nowait(), queue.get_nowait()], [messages[1], messages[3]])
+
+    def _mirror_setup(self, tmp: str):
+        runtime, _api = self._codex_hook_runtime(tmp)
+        session = self._codex_orchestrator_session(runtime, tmp, "wc-thread")
+        sent = []
+
+        async def capture(sess, view, *, idempotency_key):
+            sent.append((idempotency_key, view))
+
+        runtime.orchestrator._send_session_view = capture
+        return runtime, session, sent
+
+    @staticmethod
+    def _foreign(method, turn, **params):
+        return {"method": method, "params": {"threadId": "wc-thread", "turnId": turn, **params}}
+
+    @staticmethod
+    def _session_state(session):
+        return (session.lifecycle_state, session.writer_owner.kind, session.generation, session.last_event_seq, session.writer_lease)
+
+    def test_mirror_renders_a_tui_turn_without_touching_session_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime, session, sent = self._mirror_setup(tmp)
+            before = self._session_state(session)
+            mirror = runtime_module.CodexForeignTurnMirror(runtime)
+            channel = runtime_module._MirrorChannel()
+            item = lambda **kw: self._foreign("item/completed", "tui-1", item=kw)
+            messages = [
+                item(type="userMessage", id="u1", content=[{"type": "text", "text": "列出文件"}]),
+                item(type="agentMessage", id="a1", text="先看一下目录。"),
+                item(type="commandExecution", id="c1", command="ls", status="completed", exitCode=0),
+                item(type="agentMessage", id="a2", text="一共 3 个文件。"),
+                {"method": "turn/completed", "params": {"threadId": "wc-thread", "turn": {"id": "tui-1"}}},
+            ]
+
+            async def run():
+                for message in messages:
+                    await mirror._handle(session.session_id, channel, message)
+
+            asyncio.run(run())
+
+            self.assertEqual(sent[0], ("mirror:tui-1:input:u1", {"type": "tui_user_input", "input": "列出文件"}))
+            key, summary = sent[1]
+            self.assertEqual(key, "mirror:tui-1:summary")
+            self.assertEqual(summary["type"], "turn_completed")
+            sections = summary["message"].split("\n\n")
+            self.assertEqual(sections[0], "⌨️ 终端回合")
+            self.assertTrue(sections[1].startswith("执行了：\n• "), sections[1])
+            self.assertEqual(sections[2:], ["先看一下目录。", "一共 3 个文件。"])
+            self.assertEqual(len(sent), 2)
+            self.assertEqual(channel.turns, {})
+            self.assertEqual(self._session_state(runtime.state.sessions.get(session.session_id)), before)
+
+    def test_mirror_approvals_are_notices_one_per_request(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime, session, sent = self._mirror_setup(tmp)
+            mirror = runtime_module.CodexForeignTurnMirror(runtime)
+            channel = runtime_module._MirrorChannel()
+
+            def approval(rid, command):
+                return {
+                    "id": rid,
+                    "method": "item/commandExecution/requestApproval",
+                    "params": {"threadId": "wc-thread", "turnId": "tui-1", "itemId": rid, "command": command},
+                }
+
+            async def run():
+                await mirror._handle(session.session_id, channel, approval("r1", "rm a"))
+                await mirror._handle(session.session_id, channel, approval("r2", "rm b"))
+
+            asyncio.run(run())
+            self.assertEqual([k for k, _ in sent], ["mirror:tui-1:approval:r1", "mirror:tui-1:approval:r2"])
+            self.assertEqual({v["type"] for _, v in sent}, {"tui_permission_notice"})
+            self.assertEqual(runtime.orchestrator.hitls.list_open(session.session_id) if hasattr(runtime.orchestrator.hitls, "list_open") else [], [])
+
+    def test_mirror_overflow_is_reported_in_the_summary(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime, session, sent = self._mirror_setup(tmp)
+            mirror = runtime_module.CodexForeignTurnMirror(runtime)
+
+            async def run():
+                put = mirror.sink(session.session_id)
+                channel = mirror._channels[session.session_id]
+                channel.task.cancel()
+                with patch.object(runtime_module, "CODEX_MIRROR_QUEUE_LIMIT", 2):
+                    for n in range(3):
+                        put("wc-thread", self._foreign("item/completed", "tui-1", item={"type": "agentMessage", "text": f"m{n}"}))
+                put_done = {"method": "turn/completed", "params": {"threadId": "wc-thread", "turn": {"id": "tui-1"}}}
+                channel.queue.append(put_done)
+                await mirror._drain_queue(session.session_id, channel)
+
+            asyncio.run(run())
+            summary = sent[-1][1]["message"]
+            self.assertIn("⚠️ 本回合有 1 条终端事件因过多未同步", summary)
+            self.assertNotIn("m0", summary)
+
+    def test_mirror_bounds_open_turns_and_closes_them_on_interrupt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime, session, sent = self._mirror_setup(tmp)
+            mirror = runtime_module.CodexForeignTurnMirror(runtime)
+
+            async def run():
+                mirror.sink(session.session_id)
+                channel = mirror._channels[session.session_id]
+                channel.task.cancel()
+                with patch.object(runtime_module, "CODEX_MIRROR_OPEN_TURNS_LIMIT", 2):
+                    for turn in ("t1", "t2", "t3"):
+                        await mirror._handle(session.session_id, channel, self._foreign("item/completed", turn, item={"type": "agentMessage", "text": turn}))
+                self.assertEqual(sorted(channel.turns), ["t2", "t3"])
+                await mirror.interrupt(session.session_id)
+                self.assertEqual(channel.turns, {})
+
+            asyncio.run(run())
+            titles = [v["message"].split("\n\n")[0] for _, v in sent]
+            self.assertEqual(titles, ["⌨️ 终端回合（未结束）", "⌨️ 终端回合（连接中断，后续未同步）", "⌨️ 终端回合（连接中断，后续未同步）"])
+
+    def test_mirror_clips_long_replies(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime, session, sent = self._mirror_setup(tmp)
+            mirror = runtime_module.CodexForeignTurnMirror(runtime)
+            channel = runtime_module._MirrorChannel()
+
+            async def run():
+                await mirror._handle(session.session_id, channel, self._foreign("item/completed", "t1", item={"type": "agentMessage", "text": "x" * 5000}))
+                await mirror._handle(session.session_id, channel, {"method": "turn/completed", "params": {"threadId": "wc-thread", "turn": {"id": "t1"}}})
+
+            asyncio.run(run())
+            reply = sent[-1][1]["message"].split("\n\n")[-1]
+            self.assertTrue(reply.endswith("…（已截断）"))
+            self.assertLess(len(reply), 3600)
+
+    class _MirrorTransport:
+        def __init__(self):
+            self.generation = 1
+            self.subscribed = {}
+            self.fail = False
+
+        def foreign_sink_current(self, thread_id):
+            return self.subscribed.get(thread_id) == self.generation
+
+        async def subscribe_foreign_mirror(self, thread_id, *, cwd, sink):
+            if self.fail:
+                raise RuntimeError("daemon not ready")
+            self.subscribed[thread_id] = self.generation
+
+        def unsubscribe_foreign_mirror(self, thread_id):
+            self.subscribed.pop(thread_id, None)
+
+    def _reconcile_setup(self, tmp):
+        runtime, _api = self._codex_hook_runtime(tmp)
+        fake = self._MirrorTransport()
+        runtime.transports["codex_app_server"] = fake
+        taken_over = self._codex_orchestrator_session(runtime, tmp, "tui-thread")
+        # A TUI-observed session that was taken over keeps its tui- id.
+        runtime.state.sessions._sessions.pop(taken_over.session_id)
+        taken_over.session_id = "tui-codex-abc"
+        runtime.state.sessions._sessions[taken_over.session_id] = taken_over
+        taken_over.last_progress_at = runtime._now()
+        channel_session = self._codex_orchestrator_session(runtime, tmp, "channel-thread")
+        channel_session.last_progress_at = runtime._now()
+        return runtime, fake, taken_over
+
+    def test_reconcile_subscribes_only_recent_taken_over_sessions(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime, fake, taken_over = self._reconcile_setup(tmp)
+
+            async def run():
+                self.assertEqual(await runtime.reconcile_codex_mirrors(), 1)
+                self.assertEqual(set(fake.subscribed), {"tui-thread"})
+                self.assertEqual(await runtime.reconcile_codex_mirrors(), 0)  # idempotent
+                fake.generation = 2  # reconnect: re-subscribe
+                self.assertEqual(await runtime.reconcile_codex_mirrors(), 1)
+                taken_over.last_progress_at = (
+                    runtime._now() - runtime_module.CODEX_MIRROR_CANDIDATE_MAX_IDLE_SECONDS - 1
+                )
+                await runtime.reconcile_codex_mirrors()
+                self.assertEqual(fake.subscribed, {})
+                self.assertFalse(runtime._codex_mirror.is_active(taken_over.session_id))
+
+            asyncio.run(run())
+
+    def test_reconcile_retries_failures_and_honours_the_off_switch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime, fake, taken_over = self._reconcile_setup(tmp)
+
+            async def run():
+                fake.fail = True
+                self.assertEqual(await runtime.reconcile_codex_mirrors(), 0)
+                fake.fail = False
+                self.assertEqual(await runtime.reconcile_codex_mirrors(), 1)
+                await runtime._codex_mirror.close(taken_over.session_id)
+
+            asyncio.run(run())
+            fresh, fake2, _ = self._reconcile_setup(tmp)
+            fresh.config.agent_options.setdefault("codex", {})["mirror"] = "off"
+            self.assertEqual(asyncio.run(fresh.reconcile_codex_mirrors()), 0)
+            self.assertEqual(fake2.subscribed, {})
+
     def test_codex_tui_stop_hook_drains_narration_through_real_entrypoint(self):
         # Entry-level pin for the codex stop-drain wiring: the agent name
         # must flow process_tui_hook -> _send_tui_hook_output, or the codex

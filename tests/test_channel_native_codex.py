@@ -1044,6 +1044,125 @@ class CodexAppServerTransportTests(unittest.TestCase):
         self.assertEqual([e.type for e in events], [AgentEventType.TURN_DELTA, AgentEventType.TURN_COMPLETED])
         self.assertEqual(events[0].payload["text"], "4")
 
+    # -- ADR 0065: routing another client's turns to the mirror ---------------
+
+    class _MirrorClient(_FakeCodexClient):
+        def __init__(self, batches=None, fail_turn_start=False):
+            super().__init__()
+            self.foreign_router = None
+            self.connection_generation = 1
+            self.batches = list(batches or [])
+            self.fail_turn_start = fail_turn_start
+            self.parked = []
+
+        async def request(self, method, params):
+            if method == "turn/start" and self.fail_turn_start:
+                raise TransportUnavailable("turn/start failed")
+            return await super().request(method, params)
+
+        async def events(self, thread_id):
+            return self.batches.pop(0) if self.batches else []
+
+        def take_queued(self, thread_id, predicate):
+            taken = [m for m in self.parked if predicate(m)]
+            self.parked = [m for m in self.parked if not predicate(m)]
+            return taken
+
+    @staticmethod
+    def _turn_msg(method, turn, **params):
+        return {"method": method, "params": {"threadId": "thread-1", "turnId": turn, **params}}
+
+    def _mirrored_transport(self, client):
+        transport = CodexAppServerTransport(client=client, event_silence_ceiling=0)
+        seen = []
+        asyncio.run(
+            transport.subscribe_foreign_mirror("thread-1", cwd="/tmp", sink=lambda t, m: seen.append(m))
+        )
+        return transport, seen
+
+    def test_router_takes_only_another_clients_turn(self):
+        client = self._MirrorClient()
+        transport, seen = self._mirrored_transport(client)
+        handle = asyncio.run(transport.launch(LaunchSpec(cwd="/tmp", session_id="s1")))
+        asyncio.run(transport.submit_turn(handle, TurnInput(text="hi"), "idem-1"))  # own turn-1
+        route = client.foreign_router
+
+        tui = self._turn_msg("item/completed", "tui-turn", item={"type": "agentMessage", "text": "k"})
+        self.assertTrue(route("thread-1", tui))
+        self.assertEqual(seen, [tui])
+        self.assertFalse(route("thread-1", self._turn_msg("item/completed", "turn-1")))  # ours
+        self.assertFalse(route("thread-1", {"method": "thread/status/changed", "params": {"threadId": "thread-1"}}))
+        self.assertFalse(route("thread-2", self._turn_msg("item/completed", "tui-turn")))  # not mirrored
+        self.assertEqual(seen, [tui])
+
+    def test_turn_start_window_keeps_a_new_turn_on_the_queue_path_for_good(self):
+        client = self._MirrorClient()
+        transport, seen = self._mirrored_transport(client)
+        route = client.foreign_router
+        transport._pending_starts.add("thread-1")
+        self.assertFalse(route("thread-1", self._turn_msg("turn/started", "maybe-ours")))
+        transport._pending_starts.discard("thread-1")
+        # Sticky: the rest of that turn follows the same path, so one turn never
+        # arrives half direct, half via the drain (reordering its summary).
+        self.assertFalse(route("thread-1", self._turn_msg("turn/completed", "maybe-ours")))
+        self.assertEqual(seen, [])
+
+    def test_drain_hands_queued_foreign_messages_to_the_mirror_in_order(self):
+        tui = "tui-turn"
+        first = self._turn_msg("item/completed", tui, item={"type": "userMessage", "text": "hi"})
+        done = {"method": "turn/completed", "params": {"threadId": "thread-1", "turn": {"id": tui}}}
+        client = self._MirrorClient(
+            batches=[
+                [first, done],
+                [
+                    self._turn_msg("item/agentMessage/delta", "turn-1", itemId="w", delta="4"),
+                    {"method": "turn/completed", "params": {"threadId": "thread-1", "turn": {"id": "turn-1"}}},
+                ],
+            ]
+        )
+        transport, seen = self._mirrored_transport(client)
+        transport._queued_foreign_turns.add(tui)
+        handle = asyncio.run(transport.launch(LaunchSpec(cwd="/tmp", session_id="s1")))
+        asyncio.run(transport.submit_turn(handle, TurnInput(text="q"), "idem-1"))
+
+        events = _drain_events(transport, handle)
+
+        self.assertEqual(seen, [first, done])
+        self.assertEqual([e.type for e in events], [AgentEventType.TURN_DELTA, AgentEventType.TURN_COMPLETED])
+        self.assertNotIn(tui, transport._queued_foreign_turns)
+
+    def test_failed_turn_start_hands_parked_foreign_messages_to_the_mirror(self):
+        client = self._MirrorClient(fail_turn_start=True)
+        transport, seen = self._mirrored_transport(client)
+        handle = asyncio.run(transport.launch(LaunchSpec(cwd="/tmp", session_id="s1")))
+        parked = self._turn_msg("item/completed", "tui-turn", item={"type": "agentMessage", "text": "k"})
+        other = self._turn_msg("item/completed", "someone", item={"type": "agentMessage", "text": "x"})
+        client.parked = [parked, other]
+        transport._queued_foreign_turns.add("tui-turn")
+
+        with self.assertRaises(TransportUnavailable):
+            asyncio.run(transport.submit_turn(handle, TurnInput(text="q"), "idem-1"))
+
+        self.assertEqual(seen, [parked])
+        self.assertEqual(client.parked, [other])
+        self.assertNotIn("thread-1", transport._pending_starts)
+
+    def test_mirror_registration_follows_connection_generation_and_restart(self):
+        class _Restartable(self._MirrorClient):
+            async def restart(self):
+                return None
+
+        client = _Restartable()
+        transport, _seen = self._mirrored_transport(client)
+        self.assertTrue(transport.foreign_sink_current("thread-1"))
+        client.connection_generation = 2  # reconnect
+        self.assertFalse(transport.foreign_sink_current("thread-1"))
+        asyncio.run(transport.subscribe_foreign_mirror("thread-1", cwd="/tmp", sink=lambda t, m: None))
+        self.assertTrue(transport.foreign_sink_current("thread-1"))
+        asyncio.run(transport.restart_backend())
+        self.assertFalse(transport.foreign_sink_current("thread-1"))
+        self.assertFalse(client.foreign_router("thread-1", self._turn_msg("x", "tui")))
+
     def test_events_convert_codex_event_msg_agent_message_and_task_complete(self):
         client = _FakeCodexClient()
         client.event_batches["thread-1"] = [

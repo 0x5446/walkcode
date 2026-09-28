@@ -646,6 +646,9 @@ def _configured_agent_options(source: Any) -> dict[str, dict[str, Any]]:
     codex_app_server_socket = str(source.get("WALKCODE_CODEX_APP_SERVER_SOCKET") or "").strip()
     if codex_app_server_socket:
         codex["app_server_socket"] = str(Path(codex_app_server_socket).expanduser())
+    codex_mirror = str(source.get("WALKCODE_CODEX_MIRROR") or "").strip().lower()
+    if codex_mirror:
+        codex["mirror"] = codex_mirror
     codex_sandbox = str(source.get("WALKCODE_CODEX_SANDBOX") or "").strip()
     if codex_sandbox:
         # Mirrors the app-server protocol's SandboxMode enum (read-only /
@@ -8359,10 +8362,73 @@ class CodexAppServerTransport:
         # Codex event types we drop on the floor, logged once each. See
         # _log_unhandled_event_type.
         self._logged_unhandled_types: set[str] = set()
+        # ADR 0065: another client (the TUI) can run turns on a thread we share
+        # through the codex daemon. Per thread: where its turns go, and the
+        # client connection generation the registration belongs to.
+        self._foreign_sinks: dict[str, tuple[Callable[[str, dict[str, Any]], None], int]] = {}
+        # Threads with a turn/start in flight: a new turn id seen meanwhile
+        # may be ours, so it stays on the queue path and sticks there.
+        self._pending_starts: set[str] = set()
+        self._queued_foreign_turns: set[str] = set()
+        if hasattr(client, "foreign_router"):
+            client.foreign_router = self._route_foreign_message
 
     def started_turn(self, turn_id: str) -> bool:
         """Did this transport start ``turn_id`` (recently enough to remember)?"""
         return bool(turn_id) and turn_id in self._started_turns
+
+    def _client_generation(self) -> int:
+        return int(getattr(self.client, "connection_generation", 0) or 0)
+
+    def foreign_sink_current(self, thread_id: str) -> bool:
+        """Is a mirror registered for this thread on the current connection?"""
+        entry = self._foreign_sinks.get(thread_id)
+        return entry is not None and entry[1] == self._client_generation()
+
+    async def subscribe_foreign_mirror(
+        self, thread_id: str, *, cwd: str, sink: Callable[[str, dict[str, Any]], None]
+    ) -> None:
+        """Subscribe this connection to ``thread_id`` and route others' turns to ``sink``.
+
+        Only ``thread/resume`` — none of ``resume_thread``'s turn bookkeeping
+        (environment context, release marks): this is a watcher, not a submit.
+        Idempotent per thread; a new connection generation re-subscribes.
+        """
+        params = self._with_sandbox_override({"threadId": thread_id, "cwd": cwd})
+        await self.client.request("thread/resume", params)
+        self._foreign_sinks[thread_id] = (sink, self._client_generation())
+
+    def unsubscribe_foreign_mirror(self, thread_id: str) -> None:
+        self._foreign_sinks.pop(thread_id, None)
+
+    def _route_foreign_message(self, thread_id: str, message: dict[str, Any]) -> bool:
+        """Client dispatch hook: take another client's turn off the queue path."""
+        entry = self._foreign_sinks.get(thread_id)
+        if entry is None:
+            return False
+        turn_id = _codex_message_turn_id(message)
+        if not turn_id or self.started_turn(turn_id) or turn_id in self._queued_foreign_turns:
+            return False
+        if thread_id in self._pending_starts:
+            # Could be the turn we are starting; the drain sorts it out by
+            # turn id. Sticky, so one turn never takes two paths.
+            self._queued_foreign_turns.add(turn_id)
+            return False
+        entry[0](thread_id, message)
+        return True
+
+    def _hand_off_foreign(self, thread_id: str, message: dict[str, Any], turn_id: str) -> bool:
+        """Give a queued foreign-turn message to the mirror; False = no mirror."""
+        entry = self._foreign_sinks.get(thread_id)
+        if entry is None:
+            return False
+        try:
+            entry[0](thread_id, message)
+        except Exception as exc:  # noqa: BLE001 - mirroring must never break a drain
+            _log_degrade("codex_foreign_handoff_failed", thread_id=thread_id, error=exc)
+        if message.get("method") == "turn/completed":
+            self._queued_foreign_turns.discard(turn_id)
+        return True
 
     def capabilities(self) -> TransportCapabilities:
         return TransportCapabilities(
@@ -8487,17 +8553,33 @@ class CodexAppServerTransport:
             text = f"{self.environment_context}\n\n{text}"
         if not text.strip():
             text = EMPTY_TURN_PLACEHOLDER
-        result = await self.client.request(
-            "turn/start",
-            {
-                "threadId": thread_id,
-                "input": [
-                    {"type": "text", "text": text, "text_elements": []},
-                ],
-                "approvalPolicy": self.approval_policy,
-                "idempotencyKey": idempotency_key,
-            },
-        )
+        self._pending_starts.add(thread_id)
+        try:
+            result = await self.client.request(
+                "turn/start",
+                {
+                    "threadId": thread_id,
+                    "input": [
+                        {"type": "text", "text": text, "text_elements": []},
+                    ],
+                    "approvalPolicy": self.approval_policy,
+                    "idempotencyKey": idempotency_key,
+                },
+            )
+        except BaseException:
+            # No drain will run for a failed submit: hand the foreign-turn
+            # messages that the in-flight window parked on the queue to the
+            # mirror now instead of leaving them for the next turn.
+            self._pending_starts.discard(thread_id)
+            take_queued = getattr(self.client, "take_queued", None)
+            if take_queued is not None and thread_id in self._foreign_sinks:
+                for message in take_queued(
+                    thread_id,
+                    lambda m: _codex_message_turn_id(m) in self._queued_foreign_turns,
+                ):
+                    self._hand_off_foreign(thread_id, message, _codex_message_turn_id(message))
+            raise
+        self._pending_starts.discard(thread_id)
         turn = result.get("turn") if isinstance(result, dict) else None
         turn_id = str(turn.get("id", "") or "") if isinstance(turn, dict) else ""
         if thread_id and turn_id:
@@ -8554,7 +8636,8 @@ class CodexAppServerTransport:
             for raw_event in raw_events:
                 event_turn = _codex_message_turn_id(raw_event)
                 if own_turn and event_turn and event_turn != own_turn:
-                    if raw_event.get("method") == "turn/completed":
+                    handed_off = self._hand_off_foreign(thread_id, raw_event, event_turn)
+                    if not handed_off and raw_event.get("method") == "turn/completed":
                         _log_degrade("codex_foreign_turn_skipped", thread_id=thread_id, turn_id=event_turn)
                     continue
                 # With our turn known, only events of that turn prove it alive:
@@ -8727,6 +8810,7 @@ class CodexAppServerTransport:
         self._env_context_delivered.discard(thread_id)
         self._thread_models.pop(thread_id, None)
         self.effective_sandbox.pop(thread_id, None)
+        self._foreign_sinks.pop(thread_id, None)
         if not thread_id:
             return ControlResult(True, state="stopped")
         # Marked before the calls, not after: a drain sitting in
@@ -8779,6 +8863,9 @@ class CodexAppServerTransport:
             )
         await _maybe_await(restart())
         self._thread_models.clear()
+        self._foreign_sinks.clear()
+        self._pending_starts.clear()
+        self._queued_foreign_turns.clear()
         self._active_turns.clear()
         self.effective_sandbox.clear()
         # NOT cleared, deliberately:
