@@ -49,6 +49,15 @@ walkcode 经 app-server 提交的 turn 由 app-server 进程执行，不是 TUI 
 所以 walkcode 自己装的 hooks 一个都不会响。对 `codex_app_server` 会话，
 事件流是**唯一**通路。
 
+> **2026-09-28 更正（codex-cli 0.157.1，见 [ADR 0064](0064-codex-hook-attribution-by-turn-id.md)）**：
+> 上表只对 0.144.5 成立。0.157.1 的 managed app-server daemon **会执行已信任的
+> user 级 hooks**：真机探针经 daemon 发起的线程依次触发了 SessionStart、
+> UserPromptSubmit、Stop，进程树里只有 `codex app-server --managed-daemon`。
+> 临时 CODEX_HOME 里复现不出来，是因为那里的 hooks.json 没有信任记录
+> （`--dangerously-bypass-hook-trust` 对 app-server 不生效）。所以 walkcode
+> 自己的回合也会触发它装的 hooks，必须按 turn id 认出来并忽略；"事件流是
+> 唯一通路"仍然成立——hook 只用于观察 TUI，不用于兜底 walkcode 自己的回合。
+
 对照 Claude 侧：`_bridged_event_stream` 早已是常驻 async generator，退出
 条件是 settle / ceiling / EOF，而且触顶退出前会主动补一个 TURN_COMPLETED，
 注释写明就是为了"不让排水把流结束读成中途失败进而打 ERROR_RECOVERABLE"。
