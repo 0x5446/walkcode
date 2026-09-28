@@ -2999,6 +2999,15 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
         queue = client._queue_for("t1")
         self.assertEqual([queue.get_nowait(), queue.get_nowait()], [messages[1], messages[3]])
 
+    def test_client_take_queued_takes_an_aborted_calls_pushback_first(self):
+        client = runtime_module.CodexStdioAppServerClient()
+        msg = lambda turn, n: {"method": f"m{n}", "params": {"threadId": "t1", "turnId": turn}}
+        client._thread_pushback["t1"] = [msg("a", 1), msg("b", 2)]
+        client._dispatch(msg("a", 3))
+        taken = client.take_queued("t1", lambda m: m["params"]["turnId"] == "a")
+        self.assertEqual([m["method"] for m in taken], ["m1", "m3"])
+        self.assertEqual(client._thread_pushback["t1"], [msg("b", 2)])
+
     def _mirror_setup(self, tmp: str):
         runtime, _api = self._codex_hook_runtime(tmp)
         session = self._codex_orchestrator_session(runtime, tmp, "wc-thread")
@@ -3190,6 +3199,27 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
                 self.assertLess(len(kept["aggregatedOutput"]), runtime_module.CODEX_MIRROR_FIELD_CHARS + 20)
                 self.assertEqual(kept["command"], "cat")
                 self.assertEqual(len(big["params"]["item"]["aggregatedOutput"]), 100_000)  # the drain's copy untouched
+
+            asyncio.run(run())
+
+    def test_mirror_queue_bounds_nested_text_and_approvals(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime, session, _sent = self._mirror_setup(tmp)
+            mirror = runtime_module.CodexForeignTurnMirror(runtime)
+            limit = runtime_module.CODEX_MIRROR_FIELD_CHARS
+
+            async def run():
+                put = mirror.sink(session.session_id)
+                channel = mirror._channels[session.session_id]
+                channel.task.cancel()
+                put("wc-thread", self._foreign("item/completed", "t1", item={"type": "agentMessage", "content": [{"type": "text", "text": "x" * 100_000}]}))
+                put("wc-thread", self._foreign("item/completed", "t1", item={"type": "fileChange", "changes": [{"path": "p", "diff": "d"}] * 5000}))
+                put("wc-thread", {"id": "r1", "method": "item/commandExecution/requestApproval", "params": {"threadId": "wc-thread", "turnId": "t1", "command": "y" * 100_000}})
+                text, changes, approval = channel.queue
+                self.assertLess(len(text["params"]["item"]["content"][0]["text"]), limit + 20)
+                self.assertEqual(len(changes["params"]["item"]["changes"]), runtime_module.CODEX_MIRROR_LIST_ITEMS)
+                self.assertLess(len(approval["params"]["command"]), limit + 20)
+                self.assertEqual(approval["id"], "r1")
 
             asyncio.run(run())
 

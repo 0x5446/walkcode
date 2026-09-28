@@ -1134,9 +1134,10 @@ class CodexAppServerTransportTests(unittest.TestCase):
             ]
         )
         transport, seen = self._mirrored_transport(client)
-        transport._parked_turns["thread-1"] = {tui}
         handle = asyncio.run(transport.launch(LaunchSpec(cwd="/tmp", session_id="s1")))
         asyncio.run(transport.submit_turn(handle, TurnInput(text="q"), "idem-1"))
+        # Parked, with the handover held back (e.g. subscribed mid-drain).
+        transport._parked_turns["thread-1"] = {tui}
 
         events = _drain_events(transport, handle)
 
@@ -1164,6 +1165,44 @@ class CodexAppServerTransportTests(unittest.TestCase):
         _drain_events(transport, handle)
 
         self.assertEqual(seen, [])
+
+    def test_successful_turn_start_hands_the_foreign_part_of_the_window_over(self):
+        client = self._MirrorClient()
+        transport, seen = self._mirrored_transport(client)
+        handle = asyncio.run(transport.launch(LaunchSpec(cwd="/tmp", session_id="s1")))
+        ours = self._turn_msg("turn/started", "turn-1")
+        theirs = self._turn_msg("turn/started", "tui-turn")
+        client.parked = [ours, theirs]
+        transport._parked_turns["thread-1"] = {"turn-1", "tui-turn"}
+
+        asyncio.run(transport.submit_turn(handle, TurnInput(text="q"), "idem-1"))  # -> turn-1
+
+        self.assertEqual(seen, [theirs])
+        self.assertEqual(client.parked, [ours])  # left for our drain
+        self.assertTrue(client.foreign_router("thread-1", self._turn_msg("turn/completed", "tui-turn")))
+
+    def test_no_handover_while_a_drain_still_holds_a_batch(self):
+        client = self._MirrorClient()
+        transport, seen = self._mirrored_transport(client)
+        handle = asyncio.run(transport.launch(LaunchSpec(cwd="/tmp", session_id="s1")))
+        asyncio.run(transport.submit_turn(handle, TurnInput(text="q"), "idem-1"))
+        transport._foreign_direct.discard("thread-1")  # subscribed mid-drain
+        client.parked = [self._turn_msg("item/completed", "tui-turn")]
+        direct_mid_drain = []
+
+        async def events(thread_id):
+            # Between two bounded reads the client sees no listener; a
+            # subscribe landing here must still leave the queue to the drain.
+            transport._hand_over_queued_foreign("thread-1")
+            direct_mid_drain.append("thread-1" in transport._foreign_direct)
+            return [{"method": "turn/completed", "params": {"threadId": "thread-1", "turn": {"id": "turn-1"}}}]
+
+        client.events = events
+        _drain_events(transport, handle)
+
+        self.assertEqual(direct_mid_drain, [False])
+        self.assertEqual(len(seen), 1)  # handed over when the drain ended
+        self.assertIn("thread-1", transport._foreign_direct)
 
     def test_failed_turn_start_hands_parked_foreign_messages_to_the_mirror(self):
         client = self._MirrorClient(fail_turn_start=True)

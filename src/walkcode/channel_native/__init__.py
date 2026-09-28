@@ -8377,6 +8377,10 @@ class CodexAppServerTransport:
         # submit resolves and the parked messages are handed over in order.
         self._pending_starts: set[str] = set()
         self._parked_turns: dict[str, set[str]] = {}
+        # Threads with a drain (events()) running: between two bounded client
+        # reads the client sees no listener, but the drain may still be
+        # handing over a batch it holds — the queue is still the drain's.
+        self._draining: dict[str, int] = {}
         if hasattr(client, "foreign_router"):
             client.foreign_router = self._route_foreign_message
 
@@ -8467,15 +8471,16 @@ class CodexAppServerTransport:
         """Pass the idle queue's foreign-turn messages to the mirror, in order; then route direct.
 
         Runs when nothing consumes the thread's queue any more: after a
-        subscribe, after our drain ends, after a failed submit. Synchronous on
+        subscribe, after our drain ends, after a submit resolves. Synchronous on
         purpose: with no await between taking the queue and switching direct
         routing on (and unparking), the reader cannot route a later message
         of a turn ahead of its earlier, still-queued ones. While a drain is
         listening the queue is the drain's; it hands foreign turns over itself
         and calls this again when it ends. Messages still undecidable (a
-        turn/start of ours in flight) stay queued and parked.
+        turn/start of ours in flight) stay queued and parked until the submit
+        resolves, which calls this again.
         """
-        if not self.foreign_sink_current(thread_id):
+        if not self.foreign_sink_current(thread_id) or self._draining.get(thread_id):
             return
         take_queued = getattr(self.client, "take_queued", None)
         if take_queued is None:
@@ -8652,6 +8657,9 @@ class CodexAppServerTransport:
             self._started_turns[turn_id] = None
             if len(self._started_turns) > CODEX_STARTED_TURNS_LIMIT:
                 del self._started_turns[next(iter(self._started_turns))]
+        # Our turn id is known now: what the in-flight window parked can be
+        # told apart — hand the foreign part over (a later drain gets ours).
+        self._hand_over_queued_foreign(thread_id)
         # Only a confirmed turn/start clears the mark: a failed submit keeps
         # the context pending so the retry carries it again.
         self._env_context_pending.discard(thread_id)
@@ -8665,11 +8673,18 @@ class CodexAppServerTransport:
         Once nobody consumes the queue, hand what is left to the mirror and
         let the rest of those turns route directly.
         """
+        thread_id = str(handle.ref.get("thread_id", "") or "")
+        self._draining[thread_id] = self._draining.get(thread_id, 0) + 1
         try:
             async for event in self._listen_own_turn(handle):
                 yield event
         finally:
-            self._hand_over_queued_foreign(str(handle.ref.get("thread_id", "") or ""))
+            remaining = self._draining.get(thread_id, 1) - 1
+            if remaining > 0:
+                self._draining[thread_id] = remaining
+            else:
+                self._draining.pop(thread_id, None)
+            self._hand_over_queued_foreign(thread_id)
 
     async def _listen_own_turn(self, handle: TransportHandle):
         """Listen until the turn really ends — not until one batch returns.

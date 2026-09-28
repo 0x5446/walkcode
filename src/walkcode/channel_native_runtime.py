@@ -271,18 +271,26 @@ class CodexStdioAppServerClient:
     def take_queued(
         self, thread_id: str, predicate: Callable[[dict[str, Any]], bool]
     ) -> list[dict[str, Any]] | None:
-        """Remove and return queued messages of an idle thread matching ``predicate``.
+        """Remove and return buffered messages of an idle thread matching ``predicate``.
 
-        Order is preserved for both the taken and the kept messages. Only for a
+        Covers the pushback of an aborted ``events()`` call and the queue, in
+        that (arrival) order; order is preserved for taken and kept messages. Only for a
         thread nobody is listening to: a live ``events()`` call owns its queue
         (a second consumer would split the stream), so this returns None then.
         """
         if self._active_listeners.get(thread_id, 0) > 0:
             return None
+        taken: list[dict[str, Any]] = []
+        # What an aborted events() call had already taken is older than the
+        # queue: look at it first and keep the rest of it in place.
+        pushback = self._thread_pushback.pop(thread_id, [])
+        kept_back = [m for m in pushback if not predicate(m)]
+        taken.extend(m for m in pushback if predicate(m))
+        if kept_back:
+            self._thread_pushback[thread_id] = kept_back
         queue = self._thread_queues.get(thread_id)
         if queue is None:
-            return []
-        taken: list[dict[str, Any]] = []
+            return taken
         kept: list[Any] = []
         while not queue.empty():
             item = queue.get_nowait()
@@ -1163,6 +1171,8 @@ CODEX_MIRROR_REPLY_CHARS = 3500
 CODEX_MIRROR_TURN_IDLE_SECONDS = 3600.0
 CODEX_MIRROR_IDLE_CHECK_SECONDS = 60.0
 CODEX_MIRROR_FIELD_CHARS = 4000
+CODEX_MIRROR_LIST_ITEMS = 100
+CODEX_MIRROR_NESTING_LIMIT = 12
 CODEX_MIRROR_CLOSE_SECONDS = 10.0
 
 
@@ -1182,29 +1192,31 @@ def _clip(text: str, limit: int, marker: str = "…（已截断）") -> str:
     return text if len(text) <= limit else text[:limit].rstrip() + marker
 
 
+def _bounded_copy(value: Any, depth: int = 0) -> Any:
+    """A copy with every string, list and nesting level capped (mirror queue memory)."""
+    if isinstance(value, str):
+        return _clip(value, CODEX_MIRROR_FIELD_CHARS) if len(value) > CODEX_MIRROR_FIELD_CHARS else value
+    if depth >= CODEX_MIRROR_NESTING_LIMIT:
+        return None
+    if isinstance(value, list):
+        return [_bounded_copy(v, depth + 1) for v in value[:CODEX_MIRROR_LIST_ITEMS]]
+    if isinstance(value, dict):
+        return {k: _bounded_copy(v, depth + 1) for k, v in value.items()}
+    return value
+
+
 def _slim_mirror_message(message: dict[str, Any]) -> dict[str, Any] | None:
     """What the mirror keeps of a routed message; None = nothing it renders.
 
     Only completed items, turn completions and approval requests are ever
-    rendered, so deltas never take queue slots; and an item's big string
-    fields (a command's whole output) are clipped before they sit in memory.
+    rendered, so deltas never take queue slots; what is kept is a bounded
+    copy (a command's whole output, a long diff list), so the queue's
+    message cap is also a memory cap.
     """
     method = message.get("method")
-    if method == "turn/completed" or _is_codex_hitl_server_request_message(message):
-        return message
-    if method != "item/completed":
-        return None
-    params = message.get("params")
-    item = params.get("item") if isinstance(params, dict) else None
-    if not isinstance(item, dict) or not any(
-        isinstance(v, str) and len(v) > CODEX_MIRROR_FIELD_CHARS for v in item.values()
-    ):
-        return message
-    slim_item = {
-        k: _clip(v, CODEX_MIRROR_FIELD_CHARS) if isinstance(v, str) and len(v) > CODEX_MIRROR_FIELD_CHARS else v
-        for k, v in item.items()
-    }
-    return {**message, "params": {**params, "item": slim_item}}
+    if method in {"turn/completed", "item/completed"} or _is_codex_hitl_server_request_message(message):
+        return _bounded_copy(message)
+    return None
 
 
 class _MirroredTurn:
