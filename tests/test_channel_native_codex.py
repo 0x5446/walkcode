@@ -923,7 +923,10 @@ class CodexAppServerTransportTests(unittest.TestCase):
                 ],
             ]
         )
-        transport = CodexAppServerTransport(client=client, event_silence_ceiling=0)
+        # A batch of only foreign events is not activity of ours: with a zero
+        # ceiling it would (correctly) end the drain before our batch arrives.
+        transport = CodexAppServerTransport(client=client, event_silence_ceiling=3600)
+        transport._EMPTY_BATCH_MIN_INTERVAL = 0
         handle = asyncio.run(transport.launch(LaunchSpec(cwd="/tmp/project", session_id="s1")))
         asyncio.run(transport.submit_turn(handle, TurnInput(text="kiwi 有几个字母"), "idem-1"))
 
@@ -931,6 +934,31 @@ class CodexAppServerTransportTests(unittest.TestCase):
 
         self.assertEqual([e.type for e in events], [AgentEventType.TURN_DELTA, AgentEventType.TURN_COMPLETED])
         self.assertEqual(events[0].payload["text"], "4")
+
+    def test_foreign_turn_traffic_does_not_keep_a_stalled_own_turn_alive(self):
+        # deep-review round 2: skipped TUI events still reset the silence
+        # clock, so a stalled turn of ours never hit the ceiling while the TUI
+        # kept working on the same thread — the drain would hang forever.
+        class _BusyTuiClient(_FakeCodexClient):
+            calls = 0
+
+            async def events(self, thread_id):
+                self.calls += 1
+                if self.calls > 50:
+                    raise AssertionError("drain never hit the silence ceiling")
+                return [{"method": "item/agentMessage/delta",
+                         "params": {"threadId": "thread-1", "turnId": "tui-turn", "itemId": "t", "delta": "x"}}]
+
+        client = _BusyTuiClient()
+        transport = CodexAppServerTransport(client=client, event_silence_ceiling=0.05)
+        transport._EMPTY_BATCH_MIN_INTERVAL = 0.01
+        handle = asyncio.run(transport.launch(LaunchSpec(cwd="/tmp/project", session_id="s1")))
+        asyncio.run(transport.submit_turn(handle, TurnInput(text="hi"), "idem-1"))
+
+        events = _drain_events(transport, handle)
+
+        self.assertEqual(events[-1].type, AgentEventType.TURN_COMPLETED)
+        self.assertNotIn("x", "".join(str(e.payload.get("text", "")) for e in events))
 
     def test_events_convert_codex_event_msg_agent_message_and_task_complete(self):
         client = _FakeCodexClient()

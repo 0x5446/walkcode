@@ -75,7 +75,9 @@ hook 当成"自己人"丢掉。
    一条消息才出来。修复：`CodexAppServerTransport.events()` 用 `_active_turns` 里
    自己的 turn id 过滤，带其他 turn id（`params.turnId` / `params.turn.id`，真机
    确认所有回合级 v2 消息都带）的事件一律跳过，只以自己那一轮的 `turn/completed`
-   结束；跳过的外部回合按回合记一次 `codex_foreign_turn_skipped`。不知道自己的
+   结束；跳过的外部回合按回合记一次 `codex_foreign_turn_skipped`。被跳过的事件
+   也不算本回合的活动：静默计时只由自己那一轮的事件刷新，否则 TUI 持续忙碌时，
+   一个卡住的 walkcode 回合永远到不了静默上限（deep-review 第 2 轮三维度共识）。不知道自己的
    turn（未提交就监听）时保持原来不过滤的行为。修复后真机：先排队的 TUI 回合被
    跳过并留痕，walkcode 拿到自己的回答 "w"，排水在自己的完成事件处结束。
 

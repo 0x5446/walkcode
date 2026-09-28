@@ -8537,6 +8537,9 @@ class CodexAppServerTransport:
             # keep the old, unfiltered behavior.
             own_turn = self._active_turns.get(thread_id, "")
             turn_closed = False
+            # Liveness counts only what this drain consumes: a stalled turn of
+            # ours must still hit the silence ceiling while the TUI keeps busy.
+            own_traffic = False
             delta_parts: list[str] = []
             delta_model = ""
             for raw_event in raw_events:
@@ -8545,6 +8548,7 @@ class CodexAppServerTransport:
                     if raw_event.get("method") == "turn/completed":
                         _log_degrade("codex_foreign_turn_skipped", thread_id=thread_id, turn_id=event_turn)
                     continue
+                own_traffic = True
                 event = self._convert_event(raw_event, thread_id=thread_id)
                 if event is None:
                     continue
@@ -8601,8 +8605,8 @@ class CodexAppServerTransport:
                 self._released_threads.discard(thread_id)
                 yield AgentEvent(AgentEventType.TURN_COMPLETED, {"message": ""})
                 return
-            if raw_events:
-                # Any traffic at all proves the worker is alive and working.
+            if own_traffic:
+                # Traffic for our turn proves the worker is alive and working.
                 silent_since = time.monotonic()
                 continue
             if time.monotonic() - silent_since < self.event_silence_ceiling:
