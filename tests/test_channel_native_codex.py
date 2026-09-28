@@ -500,6 +500,45 @@ class CodexAppServerTransportTests(unittest.TestCase):
         self.assertEqual(transport._active_turns, {})
         self.assertEqual(transport.effective_sandbox, {})
 
+    def test_started_turn_outlives_turn_completion_and_backend_restart(self):
+        # The Stop hook of a turn is drained after the turn has closed, and
+        # hooks queued before a daemon restart are drained after it: both must
+        # still be recognized as WalkCode's own.
+        class _RestartableClient(_FakeCodexClient):
+            async def restart(self):
+                return None
+
+        transport = CodexAppServerTransport(client=_RestartableClient(), event_silence_ceiling=0)
+        handle = asyncio.run(transport.launch(LaunchSpec(cwd="/tmp/project", session_id="s1")))
+        self.assertFalse(transport.started_turn("turn-1"))
+
+        asyncio.run(transport.submit_turn(handle, TurnInput(text="hello"), "idem-1"))
+        transport._active_turns.clear()
+        asyncio.run(transport.restart_backend())
+
+        self.assertTrue(transport.started_turn("turn-1"))
+        self.assertFalse(transport.started_turn("turn-other"))
+        self.assertFalse(transport.started_turn(""))
+
+    def test_started_turns_are_bounded_oldest_first(self):
+        class _CountingClient(_FakeCodexClient):
+            turns = 0
+
+            async def request(self, method, params):
+                if method == "turn/start":
+                    self.turns += 1
+                    return {"turn": {"id": f"turn-{self.turns}"}}
+                return await super().request(method, params)
+
+        transport = CodexAppServerTransport(client=_CountingClient(), event_silence_ceiling=0)
+        handle = asyncio.run(transport.launch(LaunchSpec(cwd="/tmp/project", session_id="s1")))
+        with patch.object(walkcode_channel_native, "CODEX_STARTED_TURNS_LIMIT", 3):
+            for n in range(4):
+                asyncio.run(transport.submit_turn(handle, TurnInput(text="hi"), f"idem-{n}"))
+
+        self.assertFalse(transport.started_turn("turn-1"))
+        self.assertTrue(all(transport.started_turn(f"turn-{n}") for n in (2, 3, 4)))
+
     def test_restart_backend_keeps_the_release_mark_for_parked_drains(self):
         # _released_threads is a signal to drains, not a cache of the old
         # process. Clearing it lets a drain that returns from a batch just
@@ -847,6 +886,79 @@ class CodexAppServerTransportTests(unittest.TestCase):
         self.assertEqual(events[0].payload["text"], "hi")
         self.assertEqual(events[1].type, AgentEventType.TURN_COMPLETED)
         self.assertEqual(events[1].payload["status"], "completed")
+
+    def test_events_skip_another_clients_turn_on_the_same_thread(self):
+        # Shared daemon (codex 0.157): after a takeover the TUI can still run
+        # turns on this thread and their events queue up on our connection.
+        # Real 2026-09-28 repro: the drain posted the TUI's reply "k" as ours,
+        # stopped on the TUI's turn/completed, and left our answer "4" queued.
+        tui = "tui-turn"
+
+        class _BatchedClient(_FakeCodexClient):
+            def __init__(self, batches):
+                super().__init__()
+                self.batches = list(batches)
+
+            async def events(self, thread_id):
+                return self.batches.pop(0) if self.batches else []
+
+        def msg(method, turn, **params):
+            return {"method": method, "params": {"threadId": "thread-1", "turnId": turn, **params}}
+
+        client = _BatchedClient(
+            [
+                [
+                    {"method": "turn/started", "params": {"threadId": "thread-1", "turn": {"id": tui}}},
+                    msg("item/agentMessage/delta", tui, itemId="t1", delta="k"),
+                    {
+                        "id": "tui-approval",
+                        "method": "item/commandExecution/requestApproval",
+                        "params": {"threadId": "thread-1", "turnId": tui, "itemId": "c1", "command": "rm -rf x"},
+                    },
+                    {"method": "turn/completed", "params": {"threadId": "thread-1", "turn": {"id": tui}}},
+                ],
+                [
+                    msg("item/agentMessage/delta", "turn-1", itemId="w1", delta="4"),
+                    {"method": "turn/completed", "params": {"threadId": "thread-1", "turn": {"id": "turn-1"}}},
+                ],
+            ]
+        )
+        # A batch of only foreign events is not activity of ours: with a zero
+        # ceiling it would (correctly) end the drain before our batch arrives.
+        transport = CodexAppServerTransport(client=client, event_silence_ceiling=3600)
+        transport._EMPTY_BATCH_MIN_INTERVAL = 0
+        handle = asyncio.run(transport.launch(LaunchSpec(cwd="/tmp/project", session_id="s1")))
+        asyncio.run(transport.submit_turn(handle, TurnInput(text="kiwi 有几个字母"), "idem-1"))
+
+        events = _drain_events(transport, handle)
+
+        self.assertEqual([e.type for e in events], [AgentEventType.TURN_DELTA, AgentEventType.TURN_COMPLETED])
+        self.assertEqual(events[0].payload["text"], "4")
+
+    def test_foreign_turn_traffic_does_not_keep_a_stalled_own_turn_alive(self):
+        # deep-review round 2: skipped TUI events still reset the silence
+        # clock, so a stalled turn of ours never hit the ceiling while the TUI
+        # kept working on the same thread — the drain would hang forever.
+        class _BusyTuiClient(_FakeCodexClient):
+            calls = 0
+
+            async def events(self, thread_id):
+                self.calls += 1
+                if self.calls > 50:
+                    raise AssertionError("drain never hit the silence ceiling")
+                return [{"method": "item/agentMessage/delta",
+                         "params": {"threadId": "thread-1", "turnId": "tui-turn", "itemId": "t", "delta": "x"}}]
+
+        client = _BusyTuiClient()
+        transport = CodexAppServerTransport(client=client, event_silence_ceiling=0.05)
+        transport._EMPTY_BATCH_MIN_INTERVAL = 0.01
+        handle = asyncio.run(transport.launch(LaunchSpec(cwd="/tmp/project", session_id="s1")))
+        asyncio.run(transport.submit_turn(handle, TurnInput(text="hi"), "idem-1"))
+
+        events = _drain_events(transport, handle)
+
+        self.assertEqual(events[-1].type, AgentEventType.TURN_COMPLETED)
+        self.assertNotIn("x", "".join(str(e.payload.get("text", "")) for e in events))
 
     def test_events_convert_codex_event_msg_agent_message_and_task_complete(self):
         client = _FakeCodexClient()

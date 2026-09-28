@@ -29,7 +29,12 @@ deferred hook is queued:
   `claude_agent_sdk/_bundled/claude` command or a Claude process running with
   both `--input-format stream-json` and `--output-format stream-json`.
 - Codex hooks are ignored when the process tree contains `codex app-server
-  --stdio`.
+  --stdio`. **Superseded by [ADR 0064](0064-codex-hook-attribution-by-turn-id.md)
+  (2026-09-28):** since codex 0.157 the TUI runs on the same shared app-server
+  daemon, so an app-server in the process tree no longer identifies WalkCode's
+  own session. Codex hooks are now attributed by `turn_id`; the process-tree
+  rule survives only as a guard that never treats an app-server as a TUI to
+  kill.
 - Real TUI processes, such as `claude --settings ...` or interactive Codex
   commands, still use the existing observed-read-only and takeover flow.
 

@@ -141,7 +141,10 @@ runtime 实例。
 独立的第 6 个实例 **bfjdfhnf-codex**（ChatGPT Plus 订阅，`~/.codex/hooks.json` +
 `~/.codex/config.toml` 的 `[hooks.state]` 信任哈希），不再锚到 personal-codex。
 `codex exec`（deep-review、脚本）也加载同一份 hooks.json，walkcode 按 rollout 首行
-`session_meta.source == "exec"` 忽略这类 hook，不开话题（0.14.27 起）。
+`session_meta.source == "exec"` 忽略这类 hook，不开话题（0.14.27 起）；`codex exec --ephemeral`
+（deep-review 用的就是它）不写 rollout，hook 的 `transcript_path` 为 null，0.14.28 起同样忽略。
+codex 0.157 起裸 codex 的 TUI 连共享 app-server daemon，hook 由 daemon 执行，walkcode 按 turn id
+认出自己发起的回合（ADR 0064）。
 换 codex hooks.json 后必须同步换 `config.toml` 里 `[hooks.state."<绝对路径>:<事件>:0:0"]`
 的 `trusted_hash`（key 含 hooks.json 绝对路径，哈希不对 codex 会静默不跑 hook）。
 哈希算法没有公开、也不是整份文件的普通 sha256，**别手算**。两条可行路径：

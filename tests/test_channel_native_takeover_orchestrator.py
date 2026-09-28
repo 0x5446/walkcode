@@ -16,6 +16,7 @@ from walkcode.channel_native import (
     InteractionStore,
     Orchestrator,
     SessionRegistry,
+    SHARED_APP_SERVER_CONTROLLER,
     SessionRole,
     TakeoverPhase,
     TransportCapabilities,
@@ -75,7 +76,7 @@ def _transport_caps(**overrides) -> TransportCapabilities:
     return TransportCapabilities(**data)
 
 
-def _setup(*, resume_ref=None, caps=None, transport=None, handoff_continue="off"):
+def _setup(*, resume_ref=None, caps=None, transport=None, handoff_continue="off", terminate_ref=None):
     clock = _Clock()
     sessions = SessionRegistry(now=clock)
     interactions = InteractionStore(now=clock)
@@ -97,7 +98,7 @@ def _setup(*, resume_ref=None, caps=None, transport=None, handoff_continue="off"
     external_ref = {}
     if resume_ref is not None:
         external_ref["resume_ref"] = resume_ref
-        external_ref["terminate_ref"] = {
+        external_ref["terminate_ref"] = terminate_ref or {
             "controller_kind": "fake-process",
             "process_ref": {"pid": 123},
         }
@@ -618,6 +619,44 @@ class TakeoverOrchestratorTests(unittest.TestCase):
             if item["view"].get("type") == "takeover_progress"
         ]
         self.assertEqual(progress_views[-1]["phase"], "submitted_blocked_input")
+
+    def test_shared_daemon_tui_takeover_attaches_without_terminating_anything(self):
+        # codex 0.157: the TUI is a client of the shared app-server daemon that
+        # owns the thread. Takeover resumes the thread alongside it; there is no
+        # TUI process to stop (the hook's parent is the daemon, never a TUI).
+        orchestrator, channel, transport, session = _setup(
+            resume_ref={
+                "transport_kind": "fake-transport",
+                "transport_ref": {"handle_id": "resume-h", "thread_id": "tui-thread"},
+            },
+            terminate_ref={"controller_kind": SHARED_APP_SERVER_CONTROLLER},
+        )
+        asyncio.run(
+            orchestrator.submit_user_input(
+                session.session_id,
+                TurnInput(text="ping"),
+                actor=_actor("owner"),
+                generation=session.generation,
+            )
+        )
+
+        result = asyncio.run(
+            orchestrator.handle_inbound_event(
+                _callback(_takeover_token(channel), event_id="cb-confirm"),
+                agent_transport_kind="fake-transport",
+                cwd="/tmp/project",
+            )
+        )
+
+        updated = orchestrator.sessions.get(session.session_id)
+        self.assertTrue(result.accepted)
+        self.assertEqual(updated.writer_owner.kind, "orchestrator")
+        self.assertEqual([turn.text for turn in transport.submitted_turns], ["ping"])
+        self.assertEqual(orchestrator.external_tui_controllers["fake-process"].terminate_calls, [])
+        self.assertNotIn(
+            "manual_only",
+            [item["view"].get("type") for item in channel.sent_views],
+        )
 
     def test_successful_takeover_marks_old_generation_hitl_stale(self):
         orchestrator, channel, transport, session = _setup(
