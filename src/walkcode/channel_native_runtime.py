@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import collections
 import contextlib
 import hashlib
+import itertools
 import json
 import os
 import stat
@@ -20,6 +22,7 @@ import sys
 import time
 import tomllib
 import uuid
+from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -53,6 +56,8 @@ from .channel_native import (
     _atomic_write_json,
     _channel_allowlist_configured,
     _channel_environment_context,
+    _codex_message_turn_id,
+    _codex_tool_event,
     _command_executable_basename,
     _command_is_claude_headless_sdk_process,
     _command_is_claude_tui_process,
@@ -254,6 +259,62 @@ class CodexStdioAppServerClient:
         # Set when the reader dies; replayed to every later caller so a dead
         # transport fails loudly instead of hanging on an empty queue.
         self._stream_error: BaseException | None = None
+        # ADR 0065: set by the transport. Called from _dispatch for every
+        # thread-addressed message; returns True when it took the message
+        # (another client's turn on a thread we share) so it must not enter
+        # the thread queue. None = every message is ours, as before.
+        self.foreign_router: Callable[[str, dict[str, Any]], bool] | None = None
+
+    @property
+    def connection_generation(self) -> int:
+        return self._connection_generation
+
+    def take_queued(
+        self, thread_id: str, predicate: Callable[[dict[str, Any]], bool]
+    ) -> list[dict[str, Any]] | None:
+        """Remove and return buffered messages of an idle thread matching ``predicate``.
+
+        Covers the pushback of an aborted ``events()`` call and the queue, in
+        that (arrival) order; order is preserved for taken and kept messages. Only for a
+        thread nobody is listening to: a live ``events()`` call owns its queue
+        (a second consumer would split the stream), so this returns None then.
+        """
+        if self._active_listeners.get(thread_id, 0) > 0:
+            return None
+        taken: list[dict[str, Any]] = []
+        # What an aborted events() call had already taken is older than the
+        # queue: look at it first and keep the rest of it in place.
+        pushback = self._thread_pushback.pop(thread_id, [])
+        kept_back = [m for m in pushback if not predicate(m)]
+        taken.extend(m for m in pushback if predicate(m))
+        if kept_back:
+            self._thread_pushback[thread_id] = kept_back
+        queue = self._thread_queues.get(thread_id)
+        if queue is None:
+            return taken
+        kept: list[Any] = []
+        while not queue.empty():
+            item = queue.get_nowait()
+            if isinstance(item, dict) and predicate(item):
+                taken.append(item)
+            else:
+                kept.append(item)
+        for item in kept:
+            queue.put_nowait(item)
+        return taken
+
+    def _route_foreign(self, thread_id: str, message: dict[str, Any]) -> bool:
+        router = self.foreign_router
+        if router is None:
+            return False
+        try:
+            return bool(router(thread_id, message))
+        except Exception as exc:  # noqa: BLE001 - the reader must survive any router bug
+            # The reader is the only consumer of the wire; an exception here
+            # would fail the whole stream. Fall back to the thread queue (the
+            # pre-ADR-0065 path) and say so.
+            _log_degrade("codex_foreign_router_failed", thread_id=thread_id, error=exc)
+            return False
 
     def _subprocess_env(self) -> dict[str, str] | None:
         # CODEX_HOME pins the profile's auth/config/daemon state; None keeps
@@ -435,6 +496,8 @@ class CodexStdioAppServerClient:
             return
         thread_id = _notification_thread_id(message)
         if thread_id:
+            if self._route_foreign(thread_id, message):
+                return
             self._queue_for(thread_id).put_nowait(message)
             return
         # No threadId on the message. With exactly one thread listening right
@@ -1097,6 +1160,335 @@ def _contains_codex_hitl_server_request(messages: list[dict[str, Any]], thread_i
     )
 
 
+# ADR 0065: mirroring another client's (the TUI's) turns on a thread WalkCode
+# took over. Bounds from the ADR's implementation rules.
+CODEX_MIRROR_QUEUE_LIMIT = 500
+CODEX_MIRROR_OPEN_TURNS_LIMIT = 4
+CODEX_MIRROR_TOOL_LINES_KEPT = 50
+CODEX_MIRROR_TOOL_LINES_SHOWN = 20
+CODEX_MIRROR_NARRATION_SHOWN = 3
+CODEX_MIRROR_NARRATION_CHARS = 300
+CODEX_MIRROR_REPLY_CHARS = 3500
+CODEX_MIRROR_TURN_IDLE_SECONDS = 3600.0
+CODEX_MIRROR_IDLE_CHECK_SECONDS = 60.0
+CODEX_MIRROR_FIELD_CHARS = 4000
+CODEX_MIRROR_LIST_ITEMS = 100
+CODEX_MIRROR_NESTING_LIMIT = 12
+CODEX_MIRROR_CLOSE_SECONDS = 10.0
+
+
+def _codex_item_text(item: dict[str, Any]) -> str:
+    """Text of a codex userMessage/agentMessage item (``text`` or content parts)."""
+    text = item.get("text")
+    if isinstance(text, str):
+        return text
+    content = item.get("content")
+    if isinstance(content, list):
+        return "".join(str(part.get("text", "")) for part in content if isinstance(part, dict))
+    return ""
+
+
+def _clip(text: str, limit: int, marker: str = "…（已截断）") -> str:
+    text = text.strip()
+    return text if len(text) <= limit else text[:limit].rstrip() + marker
+
+
+def _bounded_copy(value: Any, depth: int = 0) -> Any:
+    """A copy with every string, list, dict and nesting level capped (mirror queue memory)."""
+    if isinstance(value, str):
+        return _clip(value, CODEX_MIRROR_FIELD_CHARS) if len(value) > CODEX_MIRROR_FIELD_CHARS else value
+    if depth >= CODEX_MIRROR_NESTING_LIMIT:
+        return None
+    if isinstance(value, list):
+        return [_bounded_copy(v, depth + 1) for v in value[:CODEX_MIRROR_LIST_ITEMS]]
+    if isinstance(value, dict):
+        return {
+            str(k)[:CODEX_MIRROR_FIELD_CHARS]: _bounded_copy(v, depth + 1)
+            for k, v in itertools.islice(value.items(), CODEX_MIRROR_LIST_ITEMS)
+        }
+    return value
+
+
+def _slim_mirror_message(message: dict[str, Any]) -> dict[str, Any] | None:
+    """What the mirror keeps of a routed message; None = nothing it renders.
+
+    Only completed items, turn completions and approval requests are ever
+    rendered, so deltas never take queue slots; what is kept is a bounded
+    copy (a command's whole output, a long diff list), so the queue's
+    message cap is also a memory cap.
+    """
+    method = message.get("method")
+    if method in {"turn/completed", "item/completed"} or _is_codex_hitl_server_request_message(message):
+        return _bounded_copy(message)
+    return None
+
+
+class _MirroredTurn:
+    def __init__(self, turn_id: str, now: float) -> None:
+        self.turn_id = turn_id
+        self.dropped = 0
+        self.tool_lines: collections.deque[str] = collections.deque(maxlen=CODEX_MIRROR_TOOL_LINES_KEPT)
+        self.tool_total = 0
+        self.agent_messages: collections.deque[str] = collections.deque(maxlen=CODEX_MIRROR_NARRATION_SHOWN + 1)
+        self.last_seen = now
+
+
+class _MirrorChannel:
+    """One session's bounded mirror queue plus the turns being aggregated."""
+
+    def __init__(self) -> None:
+        self.queue: collections.deque[dict[str, Any]] = collections.deque()
+        self.wakeup = asyncio.Event()
+        self.turns: dict[str, _MirroredTurn] = {}
+        self.task: asyncio.Task[None] | None = None
+        # Drops whose turn could not be tracked (open-turn limit reached);
+        # reported by the next summary so the count stays bounded.
+        self.unattributed_drops = 0
+        self.close_reason = ""
+        self.closed = False
+
+
+# Queued in a _MirrorChannel to close out open turns in stream order (the
+# consumer is the only one that ever renders): after a connection change,
+# and on close (then the consumer stops).
+_MIRROR_INTERRUPT = {"method": "walkcode/mirrorInterrupt"}
+_MIRROR_CLOSE = {"method": "walkcode/mirrorClose"}
+_MIRROR_MARKERS = (_MIRROR_INTERRUPT, _MIRROR_CLOSE)
+
+
+class CodexForeignTurnMirror:
+    """Mirror the TUI's turns on a WalkCode-owned codex thread to its topic (ADR 0065).
+
+    Fed from the codex client's single reader via the transport's foreign-turn
+    routing; renders only through ``Orchestrator._send_session_view`` and never
+    touches session state (lifecycle, writer lease/owner, generation,
+    last_event_seq) — mirroring through the TUI-hook render path is what once
+    pinned a WalkCode session at ACTIVE.
+    """
+
+    def __init__(self, runtime: ChannelNativeRuntime) -> None:
+        self._runtime = runtime
+        self._channels: dict[str, _MirrorChannel] = {}
+
+    def sink(self, session_id: str) -> Callable[[str, dict[str, Any]], None]:
+        channel = self._channels.get(session_id)
+        if channel is None:
+            channel = self._channels[session_id] = _MirrorChannel()
+        if channel.task is None or channel.task.done():
+            channel.task = asyncio.create_task(
+                self._consume(session_id, channel), name=f"walkcode-codex-mirror-{session_id}"
+            )
+
+        def _put(_thread_id: str, message: dict[str, Any]) -> None:
+            # Runs inside the client reader: non-blocking, never raises.
+            slim = _slim_mirror_message(message)
+            if slim is None:
+                return
+            if len(channel.queue) >= CODEX_MIRROR_QUEUE_LIMIT:
+                # Drop the oldest real message; markers must survive.
+                oldest = next((m for m in channel.queue if not any(m is k for k in _MIRROR_MARKERS)), None)
+                if oldest is not None:
+                    channel.queue.remove(oldest)
+                turn_id = _codex_message_turn_id(oldest) if oldest is not None else ""
+                turn = channel.turns.get(turn_id)
+                if turn is None and turn_id and len(channel.turns) < CODEX_MIRROR_OPEN_TURNS_LIMIT:
+                    # The drop took all the turn had: track it, so its summary
+                    # — or its idle-timeout close — reports the loss.
+                    turn = channel.turns[turn_id] = _MirroredTurn(turn_id, time.time())
+                if turn is not None:
+                    turn.dropped += 1
+                else:
+                    channel.unattributed_drops += 1
+                _log_degrade("codex_mirror_queue_overflow", session_id=session_id, turn_id=turn_id)
+            channel.queue.append(slim)
+            channel.wakeup.set()
+
+        return _put
+
+    def is_active(self, session_id: str) -> bool:
+        return session_id in self._channels
+
+    async def close(self, session_id: str, *, reason: str = "") -> None:
+        """Flush open turns (with ``reason`` in their title) and stop mirroring.
+
+        The consumer does it, after what is already queued, so a summary it is
+        sending right now is finished, not cut off. Cancelled only if it takes
+        longer than CODEX_MIRROR_CLOSE_SECONDS.
+        """
+        channel = self._channels.pop(session_id, None)
+        if channel is None:
+            return
+        channel.close_reason = reason or "（未结束）"
+        task = channel.task
+        if task is None or task.done():
+            await self._drain_queue(session_id, channel)
+            await self.flush_open_turns(session_id, channel, reason=channel.close_reason)
+            return
+        channel.queue.append(_MIRROR_CLOSE)
+        channel.wakeup.set()
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=CODEX_MIRROR_CLOSE_SECONDS)
+        except TimeoutError:
+            _log_degrade("codex_mirror_close_timeout", session_id=session_id)
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
+
+    def interrupt(self, session_id: str) -> None:
+        """The connection changed under us: close out open turns, keep mirroring.
+
+        Queued, not done here: the consumer task is the only renderer, so the
+        close-out lands after everything the old wire delivered and before
+        anything the new one does.
+        """
+        channel = self._channels.get(session_id)
+        if channel is None:
+            return
+        channel.queue.append(_MIRROR_INTERRUPT)
+        channel.wakeup.set()
+
+    async def _consume(self, session_id: str, channel: _MirrorChannel) -> None:
+        while not channel.closed:
+            try:
+                await asyncio.wait_for(channel.wakeup.wait(), timeout=CODEX_MIRROR_IDLE_CHECK_SECONDS)
+            except TimeoutError:
+                pass
+            channel.wakeup.clear()
+            try:
+                await self._drain_queue(session_id, channel)
+                await self._flush_idle_turns(session_id, channel)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - one bad message must not end mirroring
+                _log_degrade("codex_mirror_consume_failed", session_id=session_id, error=exc)
+
+    async def _flush_idle_turns(self, session_id: str, channel: _MirrorChannel) -> None:
+        now = time.time()
+        for turn in [t for t in channel.turns.values() if now - t.last_seen > CODEX_MIRROR_TURN_IDLE_SECONDS]:
+            await self._flush(session_id, channel, turn, reason="（未结束）")
+
+    async def _drain_queue(self, session_id: str, channel: _MirrorChannel) -> None:
+        while channel.queue and not channel.closed:
+            await self._handle(session_id, channel, channel.queue.popleft())
+
+    def _session(self, session_id: str):
+        try:
+            session = self._runtime.state.sessions.get(session_id)
+        except KeyError:
+            return None
+        if session is None or session.status == "stopped" or session.channel_binding is None:
+            return None
+        return session
+
+    async def _send(self, session_id: str, view: dict[str, Any], key: str) -> None:
+        session = self._session(session_id)
+        if session is None:
+            return
+        await self._runtime.orchestrator._send_session_view(session, view, idempotency_key=f"mirror:{key}")
+
+    def _turn(self, channel: _MirrorChannel, turn_id: str) -> _MirroredTurn:
+        turn = channel.turns.get(turn_id)
+        if turn is None:
+            turn = channel.turns[turn_id] = _MirroredTurn(turn_id, time.time())
+        turn.last_seen = time.time()
+        return turn
+
+    async def _handle(self, session_id: str, channel: _MirrorChannel, message: dict[str, Any]) -> None:
+        if message is _MIRROR_INTERRUPT:
+            await self.flush_open_turns(session_id, channel, reason="（连接中断，后续未同步）")
+            return
+        if message is _MIRROR_CLOSE:
+            try:
+                await self.flush_open_turns(session_id, channel, reason=channel.close_reason)
+            finally:
+                channel.closed = True
+            return
+        turn_id = _codex_message_turn_id(message)
+        if not turn_id:
+            return
+        while len(channel.turns) >= CODEX_MIRROR_OPEN_TURNS_LIMIT and turn_id not in channel.turns:
+            oldest = min(channel.turns.values(), key=lambda t: t.last_seen)
+            await self._flush(session_id, channel, oldest, reason="（未结束）")
+        turn = self._turn(channel, turn_id)
+        method = str(message.get("method", "") or "")
+        params = message.get("params") if isinstance(message.get("params"), dict) else {}
+        if _is_codex_hitl_server_request_message(message):
+            item = params.get("item") if isinstance(params.get("item"), dict) else {}
+            await self._send(
+                session_id,
+                {
+                    "type": "tui_permission_notice",
+                    "tool_name": method.split("/")[1] if method.count("/") >= 2 else method,
+                    "summary": str(params.get("command") or params.get("reason") or item.get("command") or ""),
+                },
+                f"{turn_id}:approval:{message.get('id')}",
+            )
+            return
+        if method == "turn/completed":
+            await self._flush(session_id, channel, turn, reason="")
+            return
+        if method != "item/completed":
+            return
+        item = params.get("item") if isinstance(params.get("item"), dict) else {}
+        item_type = str(item.get("type", "") or "")
+        if item_type == "userMessage":
+            text = _codex_item_text(item).strip()
+            if text:
+                await self._send(
+                    session_id,
+                    {"type": "tui_user_input", "input": text},
+                    f"{turn_id}:input:{item.get('id', '')}",
+                )
+            return
+        if item_type == "agentMessage":
+            text = _codex_item_text(item).strip()
+            if text:
+                turn.agent_messages.append(_clip(text, CODEX_MIRROR_REPLY_CHARS))
+            return
+        if item_type == "reasoning":
+            return
+        event = _codex_tool_event(method, params)
+        if event is None:
+            log_unhandled = getattr(self._runtime.transports.get("codex_app_server"), "_log_unhandled_event_type", None)
+            if log_unhandled is not None:
+                log_unhandled(method, item_type=item_type)
+            return
+        if event.type in {AgentEventType.TOOL_COMPLETED, AgentEventType.TOOL_FAILED}:
+            summary = str(event.payload.get("summary") or event.payload.get("tool_name") or item_type)
+            turn.tool_lines.append(summary)
+            turn.tool_total += 1
+
+    async def flush_open_turns(self, session_id: str, channel: _MirrorChannel, *, reason: str) -> None:
+        for turn in list(channel.turns.values()):
+            await self._flush(session_id, channel, turn, reason=reason)
+
+    async def _flush(self, session_id: str, channel: _MirrorChannel, turn: _MirroredTurn, *, reason: str) -> None:
+        channel.turns.pop(turn.turn_id, None)
+        dropped = turn.dropped + channel.unattributed_drops
+        channel.unattributed_drops = 0
+        sections = [f"⌨️ 终端回合{reason}"]
+        if turn.tool_lines:
+            shown = list(turn.tool_lines)[-CODEX_MIRROR_TOOL_LINES_SHOWN:]
+            lines = ["执行了："] + [f"• {line}" for line in shown]
+            hidden = turn.tool_total - len(shown)
+            if hidden > 0:
+                lines.append(f"…另有 {hidden} 项")
+            sections.append("\n".join(lines))
+        messages = list(turn.agent_messages)
+        narration, reply = messages[:-1], (messages[-1] if messages else "")
+        if narration:
+            sections.append("\n".join(_clip(text, CODEX_MIRROR_NARRATION_CHARS) for text in narration))
+        if reply:
+            sections.append(_clip(reply, CODEX_MIRROR_REPLY_CHARS))
+        if dropped:
+            sections.append(f"⚠️ 本回合有 {dropped} 条终端事件因过多未同步")
+        await self._send(
+            session_id,
+            {"type": "turn_completed", "message": "\n\n".join(sections)},
+            f"{turn.turn_id}:summary",
+        )
+
+
 class ChannelNativeRuntime:
     def __init__(
         self,
@@ -1140,6 +1532,10 @@ class ChannelNativeRuntime:
         # the user chose "always allow" for (in-memory: hooks cannot persist
         # permission rules, so the scope is this runtime process).
         self._gate_dispatched: dict[str, float] = {}
+        # ADR 0065: foreign-turn mirror (created on first reconcile) and the
+        # thread each mirrored session is subscribed to.
+        self._codex_mirror: CodexForeignTurnMirror | None = None
+        self._codex_mirror_threads: dict[str, str] = {}
         self._gate_always_allow: set[tuple[str, str]] = set()
         daemon_transport = self._claude_daemon_transport()
         if daemon_transport is not None:
@@ -2559,6 +2955,10 @@ class ChannelNativeRuntime:
                 ),
                 name="walkcode-tui-binding-refresh",
             ),
+            asyncio.create_task(
+                self._reconcile_codex_mirrors_forever(interval=TUI_BINDING_REFRESH_INTERVAL_SECONDS),
+                name="walkcode-codex-mirror-reconcile",
+            ),
             *(
                 [
                     asyncio.create_task(
@@ -2709,6 +3109,80 @@ class ChannelNativeRuntime:
             except Exception as exc:
                 _log_degrade("state_compaction_failed", error=exc)
             await asyncio.sleep(STATE_COMPACT_INTERVAL_SECONDS)
+
+    # -- ADR 0065: mirror the TUI's turns on taken-over codex threads ---------
+
+    def _codex_mirror_enabled(self) -> bool:
+        options = self.config.agent_options.get("codex", {})
+        return str(options.get("mirror", "") or "on").strip().lower() not in {"off", "0", "false", "no"}
+
+    def _codex_mirror_candidates(self) -> dict[str, tuple[str, str]]:
+        """session_id -> (thread_id, cwd) for taken-over codex sessions worth watching.
+
+        Taken over from a TUI (``tui-`` session ids are TUI-observed sessions),
+        now WalkCode-owned on the codex transport and not stopped. Takeovers
+        are explicit user actions, so this stays a handful of threads; no
+        recency cutoff, which would silently stop mirroring a thread the user
+        comes back to the next day.
+        """
+        candidates: dict[str, tuple[str, str]] = {}
+        for session in self.state.sessions.iter_sessions():
+            if not session.session_id.startswith("tui-") or session.status == "stopped":
+                continue
+            if session.transport_kind != "codex_app_server":
+                continue
+            if session.writer_owner is None or session.writer_owner.kind != "orchestrator":
+                continue
+            thread_id = str((session.transport_ref or {}).get("thread_id", "") or "")
+            if thread_id:
+                candidates[session.session_id] = (thread_id, str(session.cwd or ""))
+        return candidates
+
+    async def reconcile_codex_mirrors(self) -> int:
+        """Subscribe/unsubscribe foreign-turn mirrors to match the candidates.
+
+        Re-subscribes when the client's connection generation moved (reconnect,
+        daemon restart), closing out turns that were open on the old wire.
+        Failures are logged and retried on the next pass.
+        """
+        transport = self.transports.get("codex_app_server")
+        if transport is None or not hasattr(transport, "subscribe_foreign_mirror"):
+            return 0
+        if not self._codex_mirror_enabled():
+            return 0
+        if self._codex_mirror is None:
+            self._codex_mirror = CodexForeignTurnMirror(self)
+        mirror = self._codex_mirror
+        candidates = self._codex_mirror_candidates()
+        for session_id, thread_id in list(self._codex_mirror_threads.items()):
+            if candidates.get(session_id, ("",))[0] != thread_id:
+                transport.unsubscribe_foreign_mirror(thread_id)
+                self._codex_mirror_threads.pop(session_id, None)
+                await mirror.close(session_id)
+        subscribed = 0
+        for session_id, (thread_id, cwd) in candidates.items():
+            if self._codex_mirror_threads.get(session_id) == thread_id and transport.foreign_sink_current(thread_id):
+                continue
+            if mirror.is_active(session_id):
+                mirror.interrupt(session_id)
+            try:
+                await transport.subscribe_foreign_mirror(thread_id, cwd=cwd, sink=mirror.sink(session_id))
+            except Exception as exc:  # noqa: BLE001 - retried on the next pass
+                _log_degrade("codex_mirror_subscribe_failed", session_id=session_id, error=exc)
+                self._codex_mirror_threads.pop(session_id, None)
+                await mirror.close(session_id)
+                continue
+            self._codex_mirror_threads[session_id] = thread_id
+            subscribed += 1
+        return subscribed
+
+    async def _reconcile_codex_mirrors_forever(self, *, interval: float) -> None:
+        while True:
+            try:
+                await self.reconcile_codex_mirrors()
+            except Exception as exc:  # noqa: BLE001 - maintenance must keep running
+                print(f"codex mirror reconcile deferred: {type(exc).__name__}: {exc}", file=sys.stderr)
+            await asyncio.sleep(interval)
 
     async def _refresh_loaded_tui_observed_bindings_forever(
         self,
@@ -4087,6 +4561,14 @@ class ChannelNativeRuntime:
                 await self.orchestrator.refresh_session_status_card(session)
                 return session
             if not session.writer_owner or session.writer_owner.kind != "external_tui":
+                if (
+                    not _tui_hook_can_claim_existing_session(hook_type)
+                    and (terminate_ref or {}).get("controller_kind") == SHARED_APP_SERVER_CONTROLLER
+                ):
+                    # ADR 0065 §4: a TUI turn on a thread WalkCode drives through
+                    # the shared daemon is mirrored from the event stream; there
+                    # is no remnant process to hunt (the hook ran in the daemon).
+                    return None
                 if not _tui_hook_can_claim_existing_session(hook_type):
                     # ADR 0053 sentinel: activity hooks (not session-start /
                     # sync) from an external TUI while the orchestrator owns

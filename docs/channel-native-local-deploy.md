@@ -482,7 +482,8 @@ with the default `~/.codex` attaches to the managed app-server daemon WalkCode
 also uses, and the daemon runs every thread's hooks (ADR 0064). **Observation
 is still hook-based today**: WalkCode attributes codex hooks by turn id, and its
 app-server drain consumes only the turns WalkCode itself started. TUI turns
-after a takeover are not mirrored yet (ADR 0064 known gaps).
+after a takeover are mirrored from the event stream instead of hooks (ADR 0065;
+see the shared-daemon notes below).
 
 The target Codex architecture: a shared Codex app-server endpoint so the Codex
 TUI and WalkCode's Telegram runtime attach to the same `threadId`, and Telegram
@@ -598,6 +599,16 @@ standalone install at `~/.codex/packages/standalone/current/codex`, and the
 control socket at `~/.codex/app-server-control/app-server-control.sock`.
 If that install is missing on another machine, keep `auto` or force `stdio`;
 do not force `daemon` until the standalone install exists.
+
+Since codex 0.157 the TUI under the same `CODEX_HOME` is served by that shared
+daemon too. After a channel takes over such a TUI session (ADR 0064), turns the
+user keeps typing in the TUI are mirrored to the topic from the event stream
+(ADR 0065): one "⌨️ 终端输入" message and, when the turn ends, one summary
+(commands run, narration, final reply). Mirroring never changes the session's
+state. `WALKCODE_CODEX_MIRROR=off` turns it off and restores ADR 0064 behavior.
+A TUI turn whose events arrive while the mirror is unsubscribed (between a
+reconnect and the next reconcile pass, every few seconds) is not mirrored; the
+conversation itself is unaffected.
 
 `agent-smoke` is dry-run by default. It reports the configured agent adapter
 capability without launching Claude/Codex. Use `agent-smoke --live` only when
