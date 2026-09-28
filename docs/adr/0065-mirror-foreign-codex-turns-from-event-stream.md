@@ -1,8 +1,8 @@
-# ADR 0065: 接管后把 TUI 在同一 codex 会话上的回合镜像到频道（事件流分流）
+# ADR 0065: 接管后把 TUI 在同一 codex 会话上的回合镜像到频道（在唯一读者处按 turn id 分流）
 
 Date: 2026-09-28
 
-Status: Proposed
+Status: Proposed（第 2 版：按 2026-09-28 方案审查改写，见文末"审查记录"）
 
 ## Context
 
@@ -13,70 +13,95 @@ ADR 0064 之后，codex 0.157 的 TUI 与 WalkCode 同是共享 app-server daemo
 已核实的事实（2026-09-28 真机）：
 
 - WalkCode `thread/resume` 过的 thread，TUI 发起回合的**完整事件流**会推到
-  WalkCode 的连接上：`turn/started`、`item/*`（userMessage、agentMessage 及
-  delta、commandExecution、fileChange…）、`turn/completed`。与 WalkCode 自己
-  回合的事件同构。4/4 次对照实验稳定投递。
-- 所有回合级事件都带 turn id（`params.turnId`，`turn/*` 为 `params.turn.id`）；
-  会话级、账号级事件不带。
-- WalkCode 只在自己的回合进行时读事件（`_drain_events` 每轮结束就退出）。两轮
-  之间到达的事件留在客户端的 per-thread 队列里（无上限），下一次排水开始时按
-  0064 的 turn id 过滤丢弃。
-- 同一个 thread 队列不能有第二个消费者：`queue.get()` 是破坏性的，两个读者会
-  瓜分事件，谁都拿不全，也可能吃掉对方的 `turn/completed` 或审批请求。
-- 渲染里只有 `_send_session_view` / `_upsert_tool_progress_view` /
-  `_seal_tool_progress_burst` 不碰生命周期；`_record_session_progress` 会把
-  WalkCode 会话改成 ACTIVE / WAITING_*（hook 路径镜像的尝试就是这样把会话卡在
-  ACTIVE 的）；`_convert_event` 会登记待答审批、缓存模型，也不能给别人的回合用。
+  WalkCode 的连接上（4/4 对照实验）：`turn/started`、`item/*`、
+  `turn/completed`。与 WalkCode 自己回合的事件同构。
+- 回合级事件都带 turn id（`params.turnId`；`turn/*` 为 `params.turn.id`；
+  `thread/tokenUsage/updated` 也带）。`thread/status/changed`、`hook/*`、账号级
+  事件不带。
+- `turn/start` 的响应先于该回合任何事件到达（5/5 轮实测）；二者走同一条连接，
+  daemon 内部并发，**不作为保证**。
+- `turn/completed` 不带回复正文；回复文本在 `item/completed`（agentMessage）与
+  `item/agentMessage/delta` 里。
+- WalkCode 客户端已有**始终运行的唯一读者**（ADR 0060 `_reader_loop` →
+  `_dispatch`），两轮之间到达的事件也经过它，按 thread 进队列。
+- 同一 thread 队列不能有第二个消费者（`queue.get()` 破坏性，会瓜分事件）。
+- 渲染里只有 `_send_session_view` 不碰会话状态；`_upsert_tool_progress_view` /
+  `_seal_tool_progress_burst` 共用 `channel_binding` 上唯一一张进度卡；
+  `_record_session_progress` 会改 lifecycle / writer_lease；`_convert_event` 会
+  登记待答审批、缓存模型。
 
 ## Decision
 
-**一个读者，按 turn id 分流。** 不新增消费者，把 transport 变成每个已订阅
-thread 的唯一读者，由它把事件分给两个去处。
+**不新增读者，也不新增常驻读取任务。** 在已有的唯一读者（客户端 `_dispatch`）处
+按 turn id 分流，外来回合交给一个只发卡、不改会话状态的镜像器。
 
-### 1. transport：常驻分流（`CodexAppServerTransport`）
+### 1. 分流点：客户端 `_dispatch`
 
-- WalkCode 订阅一个 thread 后（`thread/start` / `thread/resume` 成功），为它起
-  一个常驻 pump task，独占 `client.events(thread_id)`，跨批次一直读，直到
-  `close_session`（已有 `thread/unsubscribe`）或 `restart_backend`。
-- pump 按 turn id 路由每条原始消息：
-  - 属于 WalkCode 发起的回合（`started_turn()`，含已结束但晚到的）或不带 turn id
-    → 放进该 thread 的本地队列；`events()` 改为从这个本地队列读，其余逻辑
-    （续听、ceiling、HITL 不结束监听、`_convert_event`）不变。
-  - 属于别的回合 → 交给注册的 `on_foreign_message(thread_id, raw)` 回调；没有
-    回调时丢弃并记日志（即 0064 的现状）。
-- 结果：0064 在排水里做的过滤上移到 pump，排水只会看到自己回合的消息；两轮之间
-  到达的外来回合也有人读、能被镜像。
+transport 为自己订阅的 thread 在客户端注册一个外来回合判定与去处：
 
-### 2. runtime：镜像渲染（只发卡，不改会话状态）
+- `is_foreign(thread_id, turn_id)`：turn id 非空、不是 WalkCode 发起的
+  （`started_turn()` 为假），且该 thread **当前没有在途的 `turn/start`**；
+- `on_foreign(thread_id, raw)`：外来回合消息的去处（见第 2 节）。
 
-新增一个外来回合镜像器，按 `(thread_id, turn_id)` 聚合原始消息，直接构造视图
-经 `_send_session_view` / `_upsert_tool_progress_view` 发出：
+`_dispatch` 收到带 thread id 的消息时，先问 `is_foreign`：是 → 交给
+`on_foreign`，不进 thread 队列；否 → 照旧进 thread 队列。其余路由（无 thread
+id 消息只在单活跃监听时认领、共享缓冲、故障哨兵与连接代次、`_active_listeners`
+计数）**一行不改**。
 
-| 原始消息 | 频道里 |
+- **不带 turn id 的消息**照旧进 thread 队列，由 WalkCode 的排水处理（它本来就
+  处理这些）；ADR 0064 §7 已让它们不刷新静默计时器。镜像不需要它们。
+- **在途 `turn/start` 窗口**（发出请求到响应返回之间）：新出现的 turn id 无法
+  立即归属，照旧进 thread 队列，由排水按 turn id 分辨（ADR 0064 的过滤）。排水
+  跳过的外来消息**改为转交 `on_foreign`**，不再丢弃——同一个去处，不会丢镜像，
+  也不会误把自己的事件交出去。
+- 注册按 **thread** 幂等（重复 resume、新 handle 只覆盖同一登记），随
+  `close_session`（`thread/unsubscribe`）与 `restart_backend` 注销。没有常驻
+  task，所以没有"多个读取任务"的问题。
+
+### 2. 镜像器：有界、按回合聚合、只发卡
+
+runtime 为每个接管后的会话（`writer_owner.kind == "orchestrator"` 且
+`transport_kind == "codex_app_server"`）维护一个**有上限**的镜像队列（每会话
+最多 N 条原始消息，满了丢最旧的并记一次 degrade 日志），由一个镜像任务串行消费；
+`on_foreign` 只做非阻塞入队，不能阻塞读者。
+
+按 `(thread_id, turn_id)` 聚合，只在两个时点发卡，全部经 `_send_session_view`：
+
+| 时点 | 频道里 |
 |---|---|
 | userMessage item 完成 | `tui_user_input`（"⌨️ 终端输入"，与 hook 镜像同款） |
-| agentMessage 完成（非最终） | 叙述气泡 `turn_delta` |
-| commandExecution / fileChange 等工具 item | 工具进度卡（复用 0063 的 item 映射，只取渲染部分） |
-| 审批请求 | `tui_permission_notice`：提示"在终端处理"，**不**发可答卡片、**不**登记 HITL |
-| `turn/completed` | `turn_completed`（最终回复） |
+| `turn/completed` | 一条汇总：终端执行的工具清单（按回合聚合，每行由第 3 节的 `_codex_tool_event` 生成）＋ 最终回复 |
 
-硬约束：不调用 `_record_session_progress`、`_convert_event`，不改
-`lifecycle_state` / `writer_lease` / `writer_owner` / `generation`，不动
-`last_event_seq`；幂等键用独立命名空间 `mirror:{turn_id}:{item_id|kind}`。
-只对 WalkCode 持有（`writer_owner.kind == "orchestrator"`）且
-`transport_kind == "codex_app_server"` 的会话生效。
+- **最终回复** = 该回合最后一条完整的 agentMessage（`item/completed`）；更早的
+  agentMessage 作为中间叙述随汇总一起发出。不使用 delta，不存在增量去重问题。
+- **审批请求**：发 `tui_permission_notice`（"请到终端处理"），不发可答卡片、
+  不登记 HITL、不进 `_convert_event`。
+- 不使用 `_upsert_tool_progress_view` / `_seal_tool_progress_burst`：外来回合
+  不碰 WalkCode 自己那张进度卡，两边不交错。
+- 硬约束：不调用 `_record_session_progress`、`_convert_event`；不改
+  `lifecycle_state` / `writer_lease` / `writer_owner` / `generation` /
+  `last_event_seq`；幂等键命名空间 `mirror:{turn_id}:{kind}`。
 
-### 3. hook 路径让位
+### 3. 复用现有映射，不另写一套
 
-共享 daemon 标记（`shared_app_server`）+ WalkCode 持有的会话上，TUI 的活动类
-hook 直接忽略（事件流是这类会话唯一的镜像来源），不再落到残留哨兵分支，避免
-重复与噪音。未接管的 TUI 会话（`external_tui`）仍走 hook 镜像，不变。
+codex item → 工具事件/摘要的映射已是无副作用的模块级函数
+`_codex_tool_event(event_type, payload)`（ADR 0063 的按 schema 穷举映射，
+不读写 transport 状态；`_convert_event` 的副作用在它之外）。镜像器直接调用它
+生成工具清单的每一行，新增 item 类型、拒绝状态、文件摘要、未知类型日志只维护
+一处。
 
-### 4. 重启后重新订阅
+### 4. hook 路径让位
 
-runtime 启动时，对 `status == running`、WalkCode 持有的 codex 会话执行一次
-`thread/resume` 重新订阅（失败只记日志）。否则重启到下一条频道消息之间，TUI 的
-回合不会被镜像。
+共享 daemon 标记（`shared_app_server`）＋ WalkCode 持有的会话上，TUI 的活动类
+hook 直接忽略（事件流是这类会话唯一的镜像来源），不再落到残留哨兵分支。未接管
+的 TUI 会话（`external_tui`）仍走 hook 镜像，不变。
+
+### 5. 订阅的恢复：随现有维护循环对账
+
+runtime 的维护循环（与 TUI 绑定刷新同节奏）对账：`status == running`、WalkCode
+持有的 codex 会话，若当前连接未订阅其 thread，则 `thread/resume` 订阅并注册
+分流。失败只记日志、下一轮重试——覆盖启动、daemon 重启、连接重建，不需要单独的
+"启动时一次性恢复"。
 
 ## 不在本次范围
 
@@ -86,21 +111,32 @@ runtime 启动时，对 `status == running`、WalkCode 持有的 codex 会话执
   等 codex 提供客户端断开信号。
 - **未接管的 daemon TUI 会话改用事件流**：WalkCode 没有订阅这些 thread，继续
   走 hook 镜像。
+- **外来回合的实时进度卡**：只在回合结束时发汇总，不做逐条实时更新。
 
 ## 被否决的方案
 
-- **hook 路径镜像**（复用 `_send_tui_hook_output`）：会经过
-  `_record_session_progress`，实测把 WalkCode 会话卡在 ACTIVE，频道下一条消息
-  可能被当成"还在忙"。
-- **第二个事件读者**（空闲时另起一个 `events()` 调用）：与排水瓜分同一队列。
-- **把外来回合当作 WalkCode 的回合走 `_drain_events`**：会改生命周期、登记可答
+- **transport 常驻读取任务 + 本地队列**（本 ADR 第 1 版）：引入第二层队列、
+  读取任务生命周期（重复 resume 会多起、故障要跨层传递、监听计数长期 >1 导致无
+  thread id 消息无人认领）、无上限积压——审查 6 条确认问题里 4 条出自这一层。
+- **hook 路径镜像**（复用 `_send_tui_hook_output`）：经过
+  `_record_session_progress`，实测把 WalkCode 会话卡在 ACTIVE。
+- **第二个事件读者**：与排水瓜分同一队列。
+- **把外来回合当作 WalkCode 的回合走 `_drain_events`**：改生命周期、登记可答
   审批，WalkCode 可能替 TUI 回答授权。
 
 ## Consequences
 
-- 接管后 TUI 的回合完整出现在话题里，标注为终端输入；WalkCode 的回合状态不受
-  影响。
-- 每个已订阅 thread 多一个常驻 task；随 `close_session` / `restart_backend`
-  回收。
-- 排水不再直接读客户端，而是读 transport 的本地队列；0060 的续听、ceiling、
-  故障哨兵语义需要在 pump 层保持（故障要能传到排水）。
+- 接管后 TUI 的回合出现在话题里：终端输入一条、回合结束时一条汇总（工具清单＋
+  最终回复）；WalkCode 回合的排水、状态与进度卡完全不受影响。
+- 读者只多一次判定和一次非阻塞入队；每个接管会话多一个有界队列与一个镜像任务，
+  随会话结束回收。
+- 镜像队列溢出时丢最旧消息并记日志，汇总可能不完整，但不会拖垮读者或内存。
+
+## 审查记录
+
+2026-09-28 第 1 版方案审查（codex personal / gpt-5.6-sol，goalfit + consistency
++ feasibility，Phase 2 回证）：16 条 Warning 去重为 9 组，核实成立 6 组（队列
+无上限、重启只恢复一次、故障传递未设计、重复 resume 多起读取任务、进度卡互相
+串、最终回复来源未定义），1 组以实验核实未复现但仍加防护（`turn/start` 在途
+窗口），2 组因额度未回证、由作者读码确认并处理（无 turn id 消息滞留、映射分叉——后者核实时发现 `_codex_tool_event` 已是纯函数，直接复用即可）。
+第 2 版即本文。
