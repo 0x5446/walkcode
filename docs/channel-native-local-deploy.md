@@ -482,7 +482,8 @@ with the default `~/.codex` attaches to the managed app-server daemon WalkCode
 also uses, and the daemon runs every thread's hooks (ADR 0064). **Observation
 is still hook-based today**: WalkCode attributes codex hooks by turn id, and its
 app-server drain consumes only the turns WalkCode itself started. TUI turns
-after a takeover are not mirrored yet (ADR 0064 known gaps).
+after a takeover are mirrored from the event stream instead of hooks (ADR 0065;
+see the shared-daemon notes below).
 
 The target Codex architecture: a shared Codex app-server endpoint so the Codex
 TUI and WalkCode's Telegram runtime attach to the same `threadId`, and Telegram

@@ -2992,7 +2992,7 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
         for message in messages:
             client._dispatch(message)
         client._active_listeners["t1"] = 1
-        self.assertEqual(client.take_queued("t1", lambda m: True), [])
+        self.assertIsNone(client.take_queued("t1", lambda m: True))
         client._active_listeners.pop("t1")
         taken = client.take_queued("t1", lambda m: m["params"]["turnId"] == "a")
         self.assertEqual(taken, [messages[0], messages[2]])
@@ -3167,6 +3167,111 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
                 with patch.object(runtime_module, "CODEX_MIRROR_QUEUE_LIMIT", 1):
                     put("wc-thread", self._foreign("item/completed", "a", item={"type": "agentMessage", "text": "1"}))
                 self.assertIn(runtime_module._MIRROR_INTERRUPT, channel.queue)
+
+            asyncio.run(run())
+
+    def test_mirror_queue_skips_deltas_and_clips_big_item_fields(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime, session, _sent = self._mirror_setup(tmp)
+            mirror = runtime_module.CodexForeignTurnMirror(runtime)
+
+            async def run():
+                put = mirror.sink(session.session_id)
+                channel = mirror._channels[session.session_id]
+                channel.task.cancel()
+                put("wc-thread", self._foreign("item/agentMessage/delta", "t1", itemId="a", delta="x"))
+                put("wc-thread", self._foreign("item/commandExecution/outputDelta", "t1", itemId="c", delta="x"))
+                big = self._foreign(
+                    "item/completed", "t1", item={"type": "commandExecution", "id": "c", "command": "cat", "aggregatedOutput": "y" * 100_000}
+                )
+                put("wc-thread", big)
+                self.assertEqual(len(channel.queue), 1)
+                kept = channel.queue[0]["params"]["item"]
+                self.assertLess(len(kept["aggregatedOutput"]), runtime_module.CODEX_MIRROR_FIELD_CHARS + 20)
+                self.assertEqual(kept["command"], "cat")
+                self.assertEqual(len(big["params"]["item"]["aggregatedOutput"]), 100_000)  # the drain's copy untouched
+
+            asyncio.run(run())
+
+    def test_mirror_overflow_never_opens_turns_past_the_limit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime, session, sent = self._mirror_setup(tmp)
+            mirror = runtime_module.CodexForeignTurnMirror(runtime)
+
+            async def run():
+                put = mirror.sink(session.session_id)
+                channel = mirror._channels[session.session_id]
+                channel.task.cancel()
+                with (
+                    patch.object(runtime_module, "CODEX_MIRROR_QUEUE_LIMIT", 1),
+                    patch.object(runtime_module, "CODEX_MIRROR_OPEN_TURNS_LIMIT", 1),
+                ):
+                    for turn in ("a", "b", "c"):
+                        put("wc-thread", self._foreign("item/completed", turn, item={"type": "agentMessage", "text": turn}))
+                    self.assertEqual(sorted(channel.turns), ["a"])
+                    self.assertEqual(channel.unattributed_drops, 1)
+                    await mirror._drain_queue(session.session_id, channel)
+
+            asyncio.run(run())
+            reported = [v["message"] for _, v in sent if "⚠️" in v["message"]]
+            self.assertEqual(len(reported), 1)
+            self.assertIn("有 2 条终端事件", reported[0])
+
+    def test_mirror_clips_agent_text_when_it_arrives(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime, session, _sent = self._mirror_setup(tmp)
+            mirror = runtime_module.CodexForeignTurnMirror(runtime)
+            channel = runtime_module._MirrorChannel()
+            message = self._foreign("item/completed", "t1", item={"type": "agentMessage", "text": "x" * 50_000})
+            asyncio.run(mirror._handle(session.session_id, channel, message))
+            self.assertLess(len(channel.turns["t1"].agent_messages[0]), runtime_module.CODEX_MIRROR_REPLY_CHARS + 20)
+
+    def test_mirror_close_lets_a_summary_in_flight_finish(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime, session, sent = self._mirror_setup(tmp)
+            mirror = runtime_module.CodexForeignTurnMirror(runtime)
+
+            async def slow(sess, view, *, idempotency_key):
+                await asyncio.sleep(0.05)
+                sent.append((idempotency_key, view))
+
+            runtime.orchestrator._send_session_view = slow
+
+            async def run():
+                put = mirror.sink(session.session_id)
+                put("wc-thread", self._foreign("item/completed", "t1", item={"type": "agentMessage", "text": "done"}))
+                put("wc-thread", {"method": "turn/completed", "params": {"threadId": "wc-thread", "turn": {"id": "t1"}}})
+                put("wc-thread", self._foreign("item/completed", "t2", item={"type": "agentMessage", "text": "half"}))
+                task = mirror._channels[session.session_id].task
+                await asyncio.sleep(0.01)  # the consumer is now inside t1's send
+                with patch.object(runtime_module, "CODEX_MIRROR_CLOSE_SECONDS", 1.0):
+                    await mirror.close(session.session_id, reason="（会话已关闭）")
+                self.assertTrue(task.done())
+                self.assertFalse(task.cancelled())  # it finished, it was not cut off
+
+            asyncio.run(run())
+            self.assertEqual([k for k, _ in sent], ["mirror:t1:summary", "mirror:t2:summary"])
+            self.assertTrue(sent[1][1]["message"].startswith("⌨️ 终端回合（会话已关闭）"))
+            self.assertFalse(mirror.is_active(session.session_id))
+
+    def test_mirror_close_gives_up_on_a_hung_send(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime, session, _sent = self._mirror_setup(tmp)
+            mirror = runtime_module.CodexForeignTurnMirror(runtime)
+
+            async def hang(sess, view, *, idempotency_key):
+                await asyncio.Event().wait()
+
+            runtime.orchestrator._send_session_view = hang
+
+            async def run():
+                put = mirror.sink(session.session_id)
+                task = mirror._channels[session.session_id].task
+                put("wc-thread", {"method": "turn/completed", "params": {"threadId": "wc-thread", "turn": {"id": "t1"}}})
+                await asyncio.sleep(0.01)
+                with patch.object(runtime_module, "CODEX_MIRROR_CLOSE_SECONDS", 0.05):
+                    await mirror.close(session.session_id)
+                self.assertTrue(task.done())
 
             asyncio.run(run())
 

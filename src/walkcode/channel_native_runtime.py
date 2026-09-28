@@ -268,15 +268,17 @@ class CodexStdioAppServerClient:
     def connection_generation(self) -> int:
         return self._connection_generation
 
-    def take_queued(self, thread_id: str, predicate: Callable[[dict[str, Any]], bool]) -> list[dict[str, Any]]:
+    def take_queued(
+        self, thread_id: str, predicate: Callable[[dict[str, Any]], bool]
+    ) -> list[dict[str, Any]] | None:
         """Remove and return queued messages of an idle thread matching ``predicate``.
 
         Order is preserved for both the taken and the kept messages. Only for a
         thread nobody is listening to: a live ``events()`` call owns its queue
-        (a second consumer would split the stream), so this returns nothing then.
+        (a second consumer would split the stream), so this returns None then.
         """
         if self._active_listeners.get(thread_id, 0) > 0:
-            return []
+            return None
         queue = self._thread_queues.get(thread_id)
         if queue is None:
             return []
@@ -1160,6 +1162,8 @@ CODEX_MIRROR_NARRATION_CHARS = 300
 CODEX_MIRROR_REPLY_CHARS = 3500
 CODEX_MIRROR_TURN_IDLE_SECONDS = 3600.0
 CODEX_MIRROR_IDLE_CHECK_SECONDS = 60.0
+CODEX_MIRROR_FIELD_CHARS = 4000
+CODEX_MIRROR_CLOSE_SECONDS = 10.0
 
 
 def _codex_item_text(item: dict[str, Any]) -> str:
@@ -1176,6 +1180,31 @@ def _codex_item_text(item: dict[str, Any]) -> str:
 def _clip(text: str, limit: int, marker: str = "…（已截断）") -> str:
     text = text.strip()
     return text if len(text) <= limit else text[:limit].rstrip() + marker
+
+
+def _slim_mirror_message(message: dict[str, Any]) -> dict[str, Any] | None:
+    """What the mirror keeps of a routed message; None = nothing it renders.
+
+    Only completed items, turn completions and approval requests are ever
+    rendered, so deltas never take queue slots; and an item's big string
+    fields (a command's whole output) are clipped before they sit in memory.
+    """
+    method = message.get("method")
+    if method == "turn/completed" or _is_codex_hitl_server_request_message(message):
+        return message
+    if method != "item/completed":
+        return None
+    params = message.get("params")
+    item = params.get("item") if isinstance(params, dict) else None
+    if not isinstance(item, dict) or not any(
+        isinstance(v, str) and len(v) > CODEX_MIRROR_FIELD_CHARS for v in item.values()
+    ):
+        return message
+    slim_item = {
+        k: _clip(v, CODEX_MIRROR_FIELD_CHARS) if isinstance(v, str) and len(v) > CODEX_MIRROR_FIELD_CHARS else v
+        for k, v in item.items()
+    }
+    return {**message, "params": {**params, "item": slim_item}}
 
 
 class _MirroredTurn:
@@ -1196,11 +1225,19 @@ class _MirrorChannel:
         self.wakeup = asyncio.Event()
         self.turns: dict[str, _MirroredTurn] = {}
         self.task: asyncio.Task[None] | None = None
+        # Drops whose turn could not be tracked (open-turn limit reached);
+        # reported by the next summary so the count stays bounded.
+        self.unattributed_drops = 0
+        self.close_reason = ""
+        self.closed = False
 
 
 # Queued in a _MirrorChannel to close out open turns in stream order (the
-# consumer is the only one that ever renders).
+# consumer is the only one that ever renders): after a connection change,
+# and on close (then the consumer stops).
 _MIRROR_INTERRUPT = {"method": "walkcode/mirrorInterrupt"}
+_MIRROR_CLOSE = {"method": "walkcode/mirrorClose"}
+_MIRROR_MARKERS = (_MIRROR_INTERRUPT, _MIRROR_CLOSE)
 
 
 class CodexForeignTurnMirror:
@@ -1228,22 +1265,26 @@ class CodexForeignTurnMirror:
 
         def _put(_thread_id: str, message: dict[str, Any]) -> None:
             # Runs inside the client reader: non-blocking, never raises.
+            slim = _slim_mirror_message(message)
+            if slim is None:
+                return
             if len(channel.queue) >= CODEX_MIRROR_QUEUE_LIMIT:
-                # Drop the oldest real message; an interrupt marker must survive.
-                oldest = next((m for m in channel.queue if m is not _MIRROR_INTERRUPT), None)
+                # Drop the oldest real message; markers must survive.
+                oldest = next((m for m in channel.queue if not any(m is k for k in _MIRROR_MARKERS)), None)
                 if oldest is not None:
                     channel.queue.remove(oldest)
                 turn_id = _codex_message_turn_id(oldest) if oldest is not None else ""
-                if turn_id:
-                    # Count against the turn itself (created if the drop took
-                    # all it had), so its summary — or its idle-timeout close —
-                    # reports the loss and nothing outlives the turn.
-                    turn = channel.turns.get(turn_id)
-                    if turn is None:
-                        turn = channel.turns[turn_id] = _MirroredTurn(turn_id, time.time())
+                turn = channel.turns.get(turn_id)
+                if turn is None and turn_id and len(channel.turns) < CODEX_MIRROR_OPEN_TURNS_LIMIT:
+                    # The drop took all the turn had: track it, so its summary
+                    # — or its idle-timeout close — reports the loss.
+                    turn = channel.turns[turn_id] = _MirroredTurn(turn_id, time.time())
+                if turn is not None:
                     turn.dropped += 1
+                else:
+                    channel.unattributed_drops += 1
                 _log_degrade("codex_mirror_queue_overflow", session_id=session_id, turn_id=turn_id)
-            channel.queue.append(message)
+            channel.queue.append(slim)
             channel.wakeup.set()
 
         return _put
@@ -1252,16 +1293,30 @@ class CodexForeignTurnMirror:
         return session_id in self._channels
 
     async def close(self, session_id: str, *, reason: str = "") -> None:
-        """Flush open turns (with ``reason`` in their title) and stop mirroring."""
+        """Flush open turns (with ``reason`` in their title) and stop mirroring.
+
+        The consumer does it, after what is already queued, so a summary it is
+        sending right now is finished, not cut off. Cancelled only if it takes
+        longer than CODEX_MIRROR_CLOSE_SECONDS.
+        """
         channel = self._channels.pop(session_id, None)
         if channel is None:
             return
-        if channel.task is not None:
-            channel.task.cancel()
+        channel.close_reason = reason or "（未结束）"
+        task = channel.task
+        if task is None or task.done():
+            await self._drain_queue(session_id, channel)
+            await self.flush_open_turns(session_id, channel, reason=channel.close_reason)
+            return
+        channel.queue.append(_MIRROR_CLOSE)
+        channel.wakeup.set()
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=CODEX_MIRROR_CLOSE_SECONDS)
+        except TimeoutError:
+            _log_degrade("codex_mirror_close_timeout", session_id=session_id)
+            task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
-                await channel.task
-        await self._drain_queue(session_id, channel)
-        await self.flush_open_turns(session_id, channel, reason=reason or "（未结束）")
+                await task
 
     def interrupt(self, session_id: str) -> None:
         """The connection changed under us: close out open turns, keep mirroring.
@@ -1277,7 +1332,7 @@ class CodexForeignTurnMirror:
         channel.wakeup.set()
 
     async def _consume(self, session_id: str, channel: _MirrorChannel) -> None:
-        while True:
+        while not channel.closed:
             try:
                 await asyncio.wait_for(channel.wakeup.wait(), timeout=CODEX_MIRROR_IDLE_CHECK_SECONDS)
             except TimeoutError:
@@ -1297,7 +1352,7 @@ class CodexForeignTurnMirror:
             await self._flush(session_id, channel, turn, reason="（未结束）")
 
     async def _drain_queue(self, session_id: str, channel: _MirrorChannel) -> None:
-        while channel.queue:
+        while channel.queue and not channel.closed:
             await self._handle(session_id, channel, channel.queue.popleft())
 
     def _session(self, session_id: str):
@@ -1325,6 +1380,12 @@ class CodexForeignTurnMirror:
     async def _handle(self, session_id: str, channel: _MirrorChannel, message: dict[str, Any]) -> None:
         if message is _MIRROR_INTERRUPT:
             await self.flush_open_turns(session_id, channel, reason="（连接中断，后续未同步）")
+            return
+        if message is _MIRROR_CLOSE:
+            try:
+                await self.flush_open_turns(session_id, channel, reason=channel.close_reason)
+            finally:
+                channel.closed = True
             return
         turn_id = _codex_message_turn_id(message)
         if not turn_id:
@@ -1366,7 +1427,7 @@ class CodexForeignTurnMirror:
         if item_type == "agentMessage":
             text = _codex_item_text(item).strip()
             if text:
-                turn.agent_messages.append(text)
+                turn.agent_messages.append(_clip(text, CODEX_MIRROR_REPLY_CHARS))
             return
         if item_type == "reasoning":
             return
@@ -1387,7 +1448,8 @@ class CodexForeignTurnMirror:
 
     async def _flush(self, session_id: str, channel: _MirrorChannel, turn: _MirroredTurn, *, reason: str) -> None:
         channel.turns.pop(turn.turn_id, None)
-        dropped = turn.dropped
+        dropped = turn.dropped + channel.unattributed_drops
+        channel.unattributed_drops = 0
         sections = [f"⌨️ 终端回合{reason}"]
         if turn.tool_lines:
             shown = list(turn.tool_lines)[-CODEX_MIRROR_TOOL_LINES_SHOWN:]
