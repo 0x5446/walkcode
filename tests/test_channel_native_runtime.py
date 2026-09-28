@@ -3107,7 +3107,8 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
                     for turn in ("t1", "t2", "t3"):
                         await mirror._handle(session.session_id, channel, self._foreign("item/completed", turn, item={"type": "agentMessage", "text": turn}))
                 self.assertEqual(sorted(channel.turns), ["t2", "t3"])
-                await mirror.interrupt(session.session_id)
+                mirror.interrupt(session.session_id)
+                await mirror._drain_queue(session.session_id, channel)
                 self.assertEqual(channel.turns, {})
 
             asyncio.run(run())
@@ -3128,6 +3129,74 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
             reply = sent[-1][1]["message"].split("\n\n")[-1]
             self.assertTrue(reply.endswith("…（已截断）"))
             self.assertLess(len(reply), 3600)
+
+    def test_mirror_reports_a_turn_whose_messages_were_all_dropped(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime, session, sent = self._mirror_setup(tmp)
+            mirror = runtime_module.CodexForeignTurnMirror(runtime)
+
+            async def run():
+                put = mirror.sink(session.session_id)
+                channel = mirror._channels[session.session_id]
+                channel.task.cancel()
+                with patch.object(runtime_module, "CODEX_MIRROR_QUEUE_LIMIT", 1):
+                    put("wc-thread", self._foreign("item/completed", "lost", item={"type": "agentMessage", "text": "x"}))
+                    put("wc-thread", self._foreign("item/completed", "kept", item={"type": "agentMessage", "text": "y"}))
+                self.assertEqual(channel.turns["lost"].dropped, 1)
+                channel.turns["lost"].last_seen -= runtime_module.CODEX_MIRROR_TURN_IDLE_SECONDS + 1
+                await mirror._drain_queue(session.session_id, channel)
+                await mirror._flush_idle_turns(session.session_id, channel)
+                self.assertNotIn("lost", channel.turns)
+                self.assertIn("kept", channel.turns)  # not idle, still aggregating
+
+            asyncio.run(run())
+            lost = [v["message"] for k, v in sent if k == "mirror:lost:summary"]
+            self.assertEqual(len(lost), 1)
+            self.assertIn("⚠️ 本回合有 1 条终端事件因过多未同步", lost[0])
+
+    def test_mirror_interrupt_marker_survives_overflow(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime, session, _sent = self._mirror_setup(tmp)
+            mirror = runtime_module.CodexForeignTurnMirror(runtime)
+
+            async def run():
+                put = mirror.sink(session.session_id)
+                channel = mirror._channels[session.session_id]
+                channel.task.cancel()
+                mirror.interrupt(session.session_id)
+                with patch.object(runtime_module, "CODEX_MIRROR_QUEUE_LIMIT", 1):
+                    put("wc-thread", self._foreign("item/completed", "a", item={"type": "agentMessage", "text": "1"}))
+                self.assertIn(runtime_module._MIRROR_INTERRUPT, channel.queue)
+
+            asyncio.run(run())
+
+    def test_reconcile_closes_the_mirror_when_subscribing_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime, fake, taken_over = self._reconcile_setup(tmp)
+            fake.fail = True
+
+            async def run():
+                await runtime.reconcile_codex_mirrors()
+                self.assertFalse(runtime._codex_mirror.is_active(taken_over.session_id))
+
+            asyncio.run(run())
+
+    def test_codex_mirror_switch_rejects_unknown_values(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env = {
+                "WALKCODE_CHANNEL": "telegram",
+                "TELEGRAM_BOT_TOKEN": "fake",
+                "WALKCODE_AGENT": "codex",
+                "TELEGRAM_ALLOWED_CHAT_IDS": "123",
+                "WALKCODE_STATE_PATH": str(Path(tmp) / "state.json"),
+                "WALKCODE_CWD": tmp,
+            }
+            self.assertEqual(
+                ChannelNativeConfig.from_env({**env, "WALKCODE_CODEX_MIRROR": "off"}).agent_options["codex"]["mirror"],
+                "off",
+            )
+            with self.assertRaises(ChannelConfigError):
+                ChannelNativeConfig.from_env({**env, "WALKCODE_CODEX_MIRROR": "of"})
 
     class _MirrorTransport:
         def __init__(self):
@@ -3170,9 +3239,12 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
                 self.assertEqual(await runtime.reconcile_codex_mirrors(), 0)  # idempotent
                 fake.generation = 2  # reconnect: re-subscribe
                 self.assertEqual(await runtime.reconcile_codex_mirrors(), 1)
-                taken_over.last_progress_at = (
-                    runtime._now() - runtime_module.CODEX_MIRROR_CANDIDATE_MAX_IDLE_SECONDS - 1
-                )
+                # Idle for days is still a candidate (no recency cutoff)...
+                taken_over.last_progress_at = runtime._now() - 7 * 86400
+                self.assertEqual(await runtime.reconcile_codex_mirrors(), 0)
+                self.assertEqual(set(fake.subscribed), {"tui-thread"})
+                # ...a stopped session is not.
+                taken_over.status = "stopped"
                 await runtime.reconcile_codex_mirrors()
                 self.assertEqual(fake.subscribed, {})
                 self.assertFalse(runtime._codex_mirror.is_active(taken_over.session_id))

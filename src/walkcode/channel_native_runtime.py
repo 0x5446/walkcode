@@ -1160,7 +1160,6 @@ CODEX_MIRROR_NARRATION_CHARS = 300
 CODEX_MIRROR_REPLY_CHARS = 3500
 CODEX_MIRROR_TURN_IDLE_SECONDS = 3600.0
 CODEX_MIRROR_IDLE_CHECK_SECONDS = 60.0
-CODEX_MIRROR_CANDIDATE_MAX_IDLE_SECONDS = 86400.0
 
 
 def _codex_item_text(item: dict[str, Any]) -> str:
@@ -1182,6 +1181,7 @@ def _clip(text: str, limit: int, marker: str = "…（已截断）") -> str:
 class _MirroredTurn:
     def __init__(self, turn_id: str, now: float) -> None:
         self.turn_id = turn_id
+        self.dropped = 0
         self.tool_lines: collections.deque[str] = collections.deque(maxlen=CODEX_MIRROR_TOOL_LINES_KEPT)
         self.tool_total = 0
         self.agent_messages: collections.deque[str] = collections.deque(maxlen=CODEX_MIRROR_NARRATION_SHOWN + 1)
@@ -1195,8 +1195,12 @@ class _MirrorChannel:
         self.queue: collections.deque[dict[str, Any]] = collections.deque()
         self.wakeup = asyncio.Event()
         self.turns: dict[str, _MirroredTurn] = {}
-        self.dropped_by_turn: dict[str, int] = {}
         self.task: asyncio.Task[None] | None = None
+
+
+# Queued in a _MirrorChannel to close out open turns in stream order (the
+# consumer is the only one that ever renders).
+_MIRROR_INTERRUPT = {"method": "walkcode/mirrorInterrupt"}
 
 
 class CodexForeignTurnMirror:
@@ -1225,10 +1229,20 @@ class CodexForeignTurnMirror:
         def _put(_thread_id: str, message: dict[str, Any]) -> None:
             # Runs inside the client reader: non-blocking, never raises.
             if len(channel.queue) >= CODEX_MIRROR_QUEUE_LIMIT:
-                oldest = channel.queue.popleft()
-                turn = _codex_message_turn_id(oldest)
-                channel.dropped_by_turn[turn] = channel.dropped_by_turn.get(turn, 0) + 1
-                _log_degrade("codex_mirror_queue_overflow", session_id=session_id, turn_id=turn)
+                # Drop the oldest real message; an interrupt marker must survive.
+                oldest = next((m for m in channel.queue if m is not _MIRROR_INTERRUPT), None)
+                if oldest is not None:
+                    channel.queue.remove(oldest)
+                turn_id = _codex_message_turn_id(oldest) if oldest is not None else ""
+                if turn_id:
+                    # Count against the turn itself (created if the drop took
+                    # all it had), so its summary — or its idle-timeout close —
+                    # reports the loss and nothing outlives the turn.
+                    turn = channel.turns.get(turn_id)
+                    if turn is None:
+                        turn = channel.turns[turn_id] = _MirroredTurn(turn_id, time.time())
+                    turn.dropped += 1
+                _log_degrade("codex_mirror_queue_overflow", session_id=session_id, turn_id=turn_id)
             channel.queue.append(message)
             channel.wakeup.set()
 
@@ -1249,13 +1263,18 @@ class CodexForeignTurnMirror:
         await self._drain_queue(session_id, channel)
         await self.flush_open_turns(session_id, channel, reason=reason or "（未结束）")
 
-    async def interrupt(self, session_id: str) -> None:
-        """The connection changed under us: close out open turns, keep mirroring."""
+    def interrupt(self, session_id: str) -> None:
+        """The connection changed under us: close out open turns, keep mirroring.
+
+        Queued, not done here: the consumer task is the only renderer, so the
+        close-out lands after everything the old wire delivered and before
+        anything the new one does.
+        """
         channel = self._channels.get(session_id)
         if channel is None:
             return
-        await self._drain_queue(session_id, channel)
-        await self.flush_open_turns(session_id, channel, reason="（连接中断，后续未同步）")
+        channel.queue.append(_MIRROR_INTERRUPT)
+        channel.wakeup.set()
 
     async def _consume(self, session_id: str, channel: _MirrorChannel) -> None:
         while True:
@@ -1266,13 +1285,16 @@ class CodexForeignTurnMirror:
             channel.wakeup.clear()
             try:
                 await self._drain_queue(session_id, channel)
-                now = time.time()
-                for turn in [t for t in channel.turns.values() if now - t.last_seen > CODEX_MIRROR_TURN_IDLE_SECONDS]:
-                    await self._flush(session_id, channel, turn, reason="（未结束）")
+                await self._flush_idle_turns(session_id, channel)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001 - one bad message must not end mirroring
                 _log_degrade("codex_mirror_consume_failed", session_id=session_id, error=exc)
+
+    async def _flush_idle_turns(self, session_id: str, channel: _MirrorChannel) -> None:
+        now = time.time()
+        for turn in [t for t in channel.turns.values() if now - t.last_seen > CODEX_MIRROR_TURN_IDLE_SECONDS]:
+            await self._flush(session_id, channel, turn, reason="（未结束）")
 
     async def _drain_queue(self, session_id: str, channel: _MirrorChannel) -> None:
         while channel.queue:
@@ -1301,10 +1323,13 @@ class CodexForeignTurnMirror:
         return turn
 
     async def _handle(self, session_id: str, channel: _MirrorChannel, message: dict[str, Any]) -> None:
+        if message is _MIRROR_INTERRUPT:
+            await self.flush_open_turns(session_id, channel, reason="（连接中断，后续未同步）")
+            return
         turn_id = _codex_message_turn_id(message)
         if not turn_id:
             return
-        if turn_id not in channel.turns and len(channel.turns) >= CODEX_MIRROR_OPEN_TURNS_LIMIT:
+        while len(channel.turns) >= CODEX_MIRROR_OPEN_TURNS_LIMIT and turn_id not in channel.turns:
             oldest = min(channel.turns.values(), key=lambda t: t.last_seen)
             await self._flush(session_id, channel, oldest, reason="（未结束）")
         turn = self._turn(channel, turn_id)
@@ -1362,7 +1387,7 @@ class CodexForeignTurnMirror:
 
     async def _flush(self, session_id: str, channel: _MirrorChannel, turn: _MirroredTurn, *, reason: str) -> None:
         channel.turns.pop(turn.turn_id, None)
-        dropped = channel.dropped_by_turn.pop(turn.turn_id, 0)
+        dropped = turn.dropped
         sections = [f"⌨️ 终端回合{reason}"]
         if turn.tool_lines:
             shown = list(turn.tool_lines)[-CODEX_MIRROR_TOOL_LINES_SHOWN:]
@@ -3017,11 +3042,11 @@ class ChannelNativeRuntime:
         """session_id -> (thread_id, cwd) for taken-over codex sessions worth watching.
 
         Taken over from a TUI (``tui-`` session ids are TUI-observed sessions),
-        now WalkCode-owned on the codex transport, alive, and active in the
-        last day — subscribing every idle session would load them all into the
-        daemon for nothing.
+        now WalkCode-owned on the codex transport and not stopped. Takeovers
+        are explicit user actions, so this stays a handful of threads; no
+        recency cutoff, which would silently stop mirroring a thread the user
+        comes back to the next day.
         """
-        cutoff = self._now() - CODEX_MIRROR_CANDIDATE_MAX_IDLE_SECONDS
         candidates: dict[str, tuple[str, str]] = {}
         for session in self.state.sessions.iter_sessions():
             if not session.session_id.startswith("tui-") or session.status == "stopped":
@@ -3029,8 +3054,6 @@ class ChannelNativeRuntime:
             if session.transport_kind != "codex_app_server":
                 continue
             if session.writer_owner is None or session.writer_owner.kind != "orchestrator":
-                continue
-            if float(session.last_progress_at or 0) < cutoff:
                 continue
             thread_id = str((session.transport_ref or {}).get("thread_id", "") or "")
             if thread_id:
@@ -3063,11 +3086,13 @@ class ChannelNativeRuntime:
             if self._codex_mirror_threads.get(session_id) == thread_id and transport.foreign_sink_current(thread_id):
                 continue
             if mirror.is_active(session_id):
-                await mirror.interrupt(session_id)
+                mirror.interrupt(session_id)
             try:
                 await transport.subscribe_foreign_mirror(thread_id, cwd=cwd, sink=mirror.sink(session_id))
             except Exception as exc:  # noqa: BLE001 - retried on the next pass
                 _log_degrade("codex_mirror_subscribe_failed", session_id=session_id, error=exc)
+                self._codex_mirror_threads.pop(session_id, None)
+                await mirror.close(session_id)
                 continue
             self._codex_mirror_threads[session_id] = thread_id
             subscribed += 1

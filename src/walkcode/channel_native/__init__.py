@@ -648,6 +648,8 @@ def _configured_agent_options(source: Any) -> dict[str, dict[str, Any]]:
         codex["app_server_socket"] = str(Path(codex_app_server_socket).expanduser())
     codex_mirror = str(source.get("WALKCODE_CODEX_MIRROR") or "").strip().lower()
     if codex_mirror:
+        if codex_mirror not in {"on", "off"}:
+            raise ChannelConfigError(f"invalid WALKCODE_CODEX_MIRROR: {codex_mirror}; expected on or off")
         codex["mirror"] = codex_mirror
     codex_sandbox = str(source.get("WALKCODE_CODEX_SANDBOX") or "").strip()
     if codex_sandbox:
@@ -8394,17 +8396,36 @@ class CodexAppServerTransport:
         (environment context, release marks): this is a watcher, not a submit.
         Idempotent per thread; a new connection generation re-subscribes.
         """
-        params = self._with_sandbox_override({"threadId": thread_id, "cwd": cwd})
-        await self.client.request("thread/resume", params)
+        # Register first: the server may push this thread's events before the
+        # resume response, and anything routed meanwhile must reach the sink.
         self._foreign_sinks[thread_id] = (sink, self._client_generation())
+        params = self._with_sandbox_override({"threadId": thread_id, "cwd": cwd})
+        try:
+            await self.client.request("thread/resume", params)
+        except BaseException:
+            self._foreign_sinks.pop(thread_id, None)
+            raise
+        # Foreign-turn messages that queued before the registration (or under
+        # a previous connection's registration) are handed over, in order.
+        take_queued = getattr(self.client, "take_queued", None)
+        if take_queued is not None:
+            for message in take_queued(thread_id, self._is_unclaimed_foreign):
+                self._hand_off_foreign(thread_id, message, _codex_message_turn_id(message))
 
     def unsubscribe_foreign_mirror(self, thread_id: str) -> None:
         self._foreign_sinks.pop(thread_id, None)
 
+    def _is_unclaimed_foreign(self, message: dict[str, Any]) -> bool:
+        turn_id = _codex_message_turn_id(message)
+        return bool(turn_id) and not self.started_turn(turn_id)
+
     def _route_foreign_message(self, thread_id: str, message: dict[str, Any]) -> bool:
         """Client dispatch hook: take another client's turn off the queue path."""
         entry = self._foreign_sinks.get(thread_id)
-        if entry is None:
+        if entry is None or entry[1] != self._client_generation():
+            # Not registered on THIS connection (reconnected, not yet
+            # re-subscribed): queue it; re-subscribing hands it over, so the
+            # new wire's events never mix into a turn from the old one.
             return False
         turn_id = _codex_message_turn_id(message)
         if not turn_id or self.started_turn(turn_id) or turn_id in self._queued_foreign_turns:

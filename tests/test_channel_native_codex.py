@@ -1147,6 +1147,35 @@ class CodexAppServerTransportTests(unittest.TestCase):
         self.assertEqual(client.parked, [other])
         self.assertNotIn("thread-1", transport._pending_starts)
 
+    def test_subscribe_registers_before_resume_and_hands_over_queued_messages(self):
+        client = self._MirrorClient()
+        seen = []
+        routed_during_resume = []
+        early = self._turn_msg("item/completed", "tui-turn", item={"type": "agentMessage", "text": "early"})
+        client.parked = [early, self._turn_msg("thread/status/changed", "")]
+        transport = CodexAppServerTransport(client=client, event_silence_ceiling=0)
+        original = client.request
+
+        async def request(method, params):
+            if method == "thread/resume":  # an event pushed before the response
+                routed_during_resume.append(client.foreign_router("thread-1", self._turn_msg("x", "tui-turn")))
+            return await original(method, params)
+
+        client.request = request
+        asyncio.run(transport.subscribe_foreign_mirror("thread-1", cwd="/tmp", sink=lambda t, m: seen.append(m)))
+
+        self.assertEqual(routed_during_resume, [True])
+        self.assertEqual(seen[0]["method"], "x")
+        self.assertIn(early, seen)
+        self.assertEqual([m["method"] for m in client.parked], ["thread/status/changed"])
+
+    def test_routing_ignores_a_registration_from_an_older_connection(self):
+        client = self._MirrorClient()
+        transport, seen = self._mirrored_transport(client)
+        client.connection_generation = 2
+        self.assertFalse(client.foreign_router("thread-1", self._turn_msg("item/completed", "tui-turn")))
+        self.assertEqual(seen, [])
+
     def test_mirror_registration_follows_connection_generation_and_restart(self):
         class _Restartable(self._MirrorClient):
             async def restart(self):
