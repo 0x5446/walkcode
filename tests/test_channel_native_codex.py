@@ -500,6 +500,45 @@ class CodexAppServerTransportTests(unittest.TestCase):
         self.assertEqual(transport._active_turns, {})
         self.assertEqual(transport.effective_sandbox, {})
 
+    def test_started_turn_outlives_turn_completion_and_backend_restart(self):
+        # The Stop hook of a turn is drained after the turn has closed, and
+        # hooks queued before a daemon restart are drained after it: both must
+        # still be recognized as WalkCode's own.
+        class _RestartableClient(_FakeCodexClient):
+            async def restart(self):
+                return None
+
+        transport = CodexAppServerTransport(client=_RestartableClient(), event_silence_ceiling=0)
+        handle = asyncio.run(transport.launch(LaunchSpec(cwd="/tmp/project", session_id="s1")))
+        self.assertFalse(transport.started_turn("turn-1"))
+
+        asyncio.run(transport.submit_turn(handle, TurnInput(text="hello"), "idem-1"))
+        transport._active_turns.clear()
+        asyncio.run(transport.restart_backend())
+
+        self.assertTrue(transport.started_turn("turn-1"))
+        self.assertFalse(transport.started_turn("turn-other"))
+        self.assertFalse(transport.started_turn(""))
+
+    def test_started_turns_are_bounded_oldest_first(self):
+        class _CountingClient(_FakeCodexClient):
+            turns = 0
+
+            async def request(self, method, params):
+                if method == "turn/start":
+                    self.turns += 1
+                    return {"turn": {"id": f"turn-{self.turns}"}}
+                return await super().request(method, params)
+
+        transport = CodexAppServerTransport(client=_CountingClient(), event_silence_ceiling=0)
+        handle = asyncio.run(transport.launch(LaunchSpec(cwd="/tmp/project", session_id="s1")))
+        with patch.object(walkcode_channel_native, "CODEX_STARTED_TURNS_LIMIT", 3):
+            for n in range(4):
+                asyncio.run(transport.submit_turn(handle, TurnInput(text="hi"), f"idem-{n}"))
+
+        self.assertFalse(transport.started_turn("turn-1"))
+        self.assertTrue(all(transport.started_turn(f"turn-{n}") for n in (2, 3, 4)))
+
     def test_restart_backend_keeps_the_release_mark_for_parked_drains(self):
         # _released_threads is a signal to drains, not a cache of the old
         # process. Clearing it lets a drain that returns from a batch just

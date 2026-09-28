@@ -5,6 +5,7 @@ import json
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -15,6 +16,7 @@ from walkcode.channel_native import (
     AgentEventType,
     ChannelConfigError,
     ChannelBinding,
+    ControlResult,
     ChannelNativeConfig,
     FakeAgentTransport,
     JsonFileStateStore,
@@ -2732,6 +2734,22 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
         rollout.write_text(json.dumps(meta) + "\n", encoding="utf-8")
         return str(rollout)
 
+    def test_codex_ephemeral_exec_hooks_are_not_mirrored(self):
+        # `codex exec --ephemeral` (deep-review) writes no rollout: codex sends
+        # transcript_path as null. v0.14.27 read the rollout only, so every
+        # deep-review dimension still opened a topic.
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime, api = self._codex_hook_runtime(tmp)
+            payload = {"session_id": "thread-ephemeral", "cwd": tmp, "transcript_path": None}
+            results = [
+                asyncio.run(runtime.process_tui_hook(hook_type=hook, agent="codex", payload=dict(payload)))
+                for hook in ("SessionStart", "UserPromptSubmit", "Stop")
+            ]
+
+            self.assertEqual({r.reason for r in results}, {"codex_exec_hook_ignored"})
+            self.assertEqual(list(runtime.state.sessions.iter_sessions()), [])
+            self.assertEqual(api.calls, [])
+
     def test_codex_exec_hooks_are_not_mirrored(self):
         # `codex exec` (deep-review, scripts) loads the same hooks.json as the
         # TUI; its rollout says source=exec and must never open a topic.
@@ -2798,6 +2816,158 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
                 for s in runtime.state.sessions.iter_sessions()
             )
             self.assertEqual(len(refs), 3, refs)
+
+    # codex 0.157: the TUI and WalkCode share one managed app-server daemon,
+    # which runs the hooks of every thread. This is what a real hook captured
+    # (2026-09-28 probe): the daemon is the only ancestor either way.
+    _CODEX_DAEMON_COMMAND = (
+        "/Users/x/.codex/packages/app-server-daemon/releases/0.157.1/bin/codex"
+        " app-server --listen unix:// --managed-daemon"
+    )
+
+    def _codex_daemon_hook_payload(self, tmp: str, *, thread_id: str, turn_id: str = "") -> dict:
+        stand_in = subprocess.Popen(["sleep", "60"])
+        self.addCleanup(stand_in.kill)
+        # Same fields the real `walkcode native hook` entry stamps, with the
+        # stand-in pid playing the daemon (the hook's parent).
+        payload = {
+            "session_id": thread_id,
+            "cwd": tmp,
+            "transcript_path": self._codex_rollout(tmp, "vscode"),
+            "_walkcode_infer_tui_pid": True,
+            "_walkcode_hook_parent_pid": stand_in.pid,
+            "_walkcode_hook_captured_at": time.time(),
+            "_walkcode_hook_process_tree": [self._CODEX_DAEMON_COMMAND],
+            "_walkcode_hook_process_tree_entries": [
+                {"pid": stand_in.pid, "ppid": 1, "command": self._CODEX_DAEMON_COMMAND}
+            ],
+        }
+        if turn_id:
+            payload["turn_id"] = turn_id
+        return payload
+
+    def _codex_orchestrator_session(self, runtime, tmp: str, thread_id: str):
+        session = runtime.state.sessions.create_structured_session(
+            binding=ChannelBinding(channel_kind="telegram", account_id="bot", chat_id="123", root_message_id="3"),
+            transport_kind="codex_app_server",
+            transport_ref={"handle_id": "h1", "thread_id": thread_id},
+            cwd=tmp,
+            owner=ActorRef("telegram", "456", "Ada"),
+        )
+        # Between turns, as after a finished takeover turn.
+        session.lifecycle_state = "IDLE"
+        return session
+
+    def test_codex_daemon_hook_of_a_tui_turn_is_mirrored(self):
+        # The bug: an app-server in the process tree used to mean "WalkCode's
+        # own session", so every TUI thread on the shared daemon was dropped.
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime, _api = self._codex_hook_runtime(tmp)
+            runtime.transports["codex_app_server"].started_turn = lambda turn_id: turn_id == "walkcode-turn"
+            result = asyncio.run(
+                runtime.process_tui_hook(
+                    hook_type="UserPromptSubmit",
+                    agent="codex",
+                    payload=self._codex_daemon_hook_payload(tmp, thread_id="tui-thread", turn_id="tui-turn"),
+                )
+            )
+
+            self.assertTrue(result.accepted)
+            self.assertNotEqual(result.reason, "internal_headless_hook_ignored")
+            self.assertEqual(len(list(runtime.state.sessions.iter_sessions())), 1)
+
+    def test_codex_hook_of_a_walkcode_started_turn_is_ignored(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime, api = self._codex_hook_runtime(tmp)
+            runtime.transports["codex_app_server"].started_turn = lambda turn_id: turn_id == "walkcode-turn"
+            results = [
+                asyncio.run(
+                    runtime.process_tui_hook(
+                        hook_type=hook,
+                        agent="codex",
+                        payload=self._codex_daemon_hook_payload(tmp, thread_id="wc-thread", turn_id="walkcode-turn"),
+                    )
+                )
+                for hook in ("UserPromptSubmit", "PreToolUse", "Stop")
+            ]
+
+            self.assertEqual({r.reason for r in results}, {"internal_headless_hook_ignored"})
+            self.assertEqual(list(runtime.state.sessions.iter_sessions()), [])
+            self.assertEqual(api.calls, [])
+
+    def test_codex_session_start_on_a_walkcode_session_does_not_claim_it(self):
+        # SessionStart carries no turn id; the orchestrator-owned-session guard
+        # must still keep it from flipping ownership to a "TUI".
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime, api = self._codex_hook_runtime(tmp)
+            session = self._codex_orchestrator_session(runtime, tmp, "wc-thread")
+            result = asyncio.run(
+                runtime.process_tui_hook(
+                    hook_type="SessionStart",
+                    agent="codex",
+                    payload=self._codex_daemon_hook_payload(tmp, thread_id="wc-thread"),
+                )
+            )
+
+            self.assertEqual(result.reason, "internal_headless_hook_ignored")
+            updated = runtime.state.sessions.get(session.session_id)
+            self.assertEqual(updated.writer_owner.kind, "orchestrator")
+            self.assertEqual(updated.transport_kind, "codex_app_server")
+            self.assertEqual(api.calls, [])
+
+    def test_daemon_run_hook_records_the_shared_daemon_not_its_pid_as_the_tui(self):
+        # The parent-pid fallback used to record the daemon as "the TUI"
+        # (allow_terminate=False), so every takeover of a daemon-served TUI
+        # session ended in "TUI process termination is not authorized".
+        payload = {
+            "_walkcode_infer_tui_pid": True,
+            "_walkcode_hook_parent_pid": 27506,
+            "_walkcode_hook_process_tree_entries": [
+                {"pid": 27506, "ppid": 1, "command": self._CODEX_DAEMON_COMMAND}
+            ],
+        }
+
+        self.assertEqual(
+            runtime_module._tui_terminate_ref(payload),
+            {"controller_kind": "shared_app_server"},
+        )
+
+    def test_codex_unattributed_walkcode_hook_never_targets_the_daemon(self):
+        # Hooks of a turn WalkCode cannot attribute (started before a runtime
+        # restart, or typed in the TUI after a takeover) reach the remnant
+        # sentinel. The only process behind them is the shared daemon, which
+        # must never be signalled, and the WalkCode session must not change.
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime, _api = self._codex_hook_runtime(tmp)
+            session = self._codex_orchestrator_session(runtime, tmp, "wc-thread")
+            terminated = []
+
+            class _RecordingController:
+                async def terminate(self, ref, reason):
+                    terminated.append(ref)
+                    return ControlResult(True, state="terminated")
+
+            lifecycle_before = session.lifecycle_state
+            with patch.object(runtime, "_sentinel_process_controller", return_value=_RecordingController()):
+                results = [
+                    asyncio.run(
+                        runtime.process_tui_hook(
+                            hook_type=hook,
+                            agent="codex",
+                            payload=self._codex_daemon_hook_payload(tmp, thread_id="wc-thread", turn_id="unknown-turn"),
+                        )
+                    )
+                    for hook in ("PreToolUse", "Stop")
+                ]
+
+            self.assertTrue(all(r.accepted for r in results))
+            self.assertEqual(terminated, [])
+            updated = runtime.state.sessions.get(session.session_id)
+            self.assertEqual(updated.writer_owner.kind, "orchestrator")
+            # The same shape covers a TUI typing into a thread WalkCode took
+            # over: mirroring it through the TUI render path would flip this
+            # orchestrator session to ACTIVE with nothing ever setting it back.
+            self.assertEqual(updated.lifecycle_state, lifecycle_before)
 
     def test_codex_tui_stop_hook_drains_narration_through_real_entrypoint(self):
         # Entry-level pin for the codex stop-drain wiring: the agent name

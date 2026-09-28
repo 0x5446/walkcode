@@ -4077,6 +4077,11 @@ def _command_is_claude_tui_process(command: str) -> bool:
     return _command_executable_basename(value) in {"claude", "claude-code"}
 
 
+# terminate_ref controller kind for a TUI served by a shared codex app-server
+# daemon: the daemon owns the thread, so takeover attaches instead of killing.
+SHARED_APP_SERVER_CONTROLLER = "shared_app_server"
+
+
 def _command_is_codex_app_server_process(command: str) -> bool:
     # Any `codex app-server ...` form is a walkcode-managed internal process,
     # not a user TUI: the stdio client uses `--stdio`, the managed daemon uses
@@ -8227,6 +8232,12 @@ class ClaudeHeadlessTransport:
         return claude_agent_sdk
 
 
+# How many started turn ids CodexAppServerTransport remembers for hook
+# ownership. Only turns whose hooks are still queued matter, so a few hundred
+# is generous; the cap keeps a long-lived runtime from growing without bound.
+CODEX_STARTED_TURNS_LIMIT = 1024
+
+
 class CodexAppServerTransport:
     kind = "codex_app_server"
     _HITL_SERVER_REQUEST_METHODS = {
@@ -8309,6 +8320,13 @@ class CodexAppServerTransport:
         # needs it, and without it an explicit close could only stop WalkCode
         # from listening while the agent kept running server-side.
         self._active_turns: dict[str, str] = {}
+        # Every turn this transport started, kept past turn completion (the
+        # Stop hook lands around the same moment and is drained later). The
+        # runtime asks started_turn() to tell our own hooks from a TUI's:
+        # under a shared app-server daemon both run hooks from the same
+        # process, so the turn id is the only reliable owner mark. Bounded;
+        # insertion order makes the oldest entry the first key.
+        self._started_turns: dict[str, None] = {}
         # Threads shut down by close_session. The event loop checks this at
         # each batch boundary so a drain parked in client.events() ends with
         # the session instead of hanging around until the silence ceiling.
@@ -8316,6 +8334,10 @@ class CodexAppServerTransport:
         # Codex event types we drop on the floor, logged once each. See
         # _log_unhandled_event_type.
         self._logged_unhandled_types: set[str] = set()
+
+    def started_turn(self, turn_id: str) -> bool:
+        """Did this transport start ``turn_id`` (recently enough to remember)?"""
+        return bool(turn_id) and turn_id in self._started_turns
 
     def capabilities(self) -> TransportCapabilities:
         return TransportCapabilities(
@@ -8455,6 +8477,10 @@ class CodexAppServerTransport:
         turn_id = str(turn.get("id", "") or "") if isinstance(turn, dict) else ""
         if thread_id and turn_id:
             self._active_turns[thread_id] = turn_id
+        if turn_id:
+            self._started_turns[turn_id] = None
+            if len(self._started_turns) > CODEX_STARTED_TURNS_LIMIT:
+                del self._started_turns[next(iter(self._started_turns))]
         # Only a confirmed turn/start clears the mark: a failed submit keeps
         # the context pending so the retry carries it again.
         self._env_context_pending.discard(thread_id)
@@ -12496,6 +12522,11 @@ class Orchestrator:
 
     @staticmethod
     def _takeover_requires_external_tui_termination(session: Session) -> bool:
+        terminate_ref = Orchestrator._takeover_terminate_ref(session) or {}
+        if terminate_ref.get("controller_kind") == SHARED_APP_SERVER_CONTROLLER:
+            # Both the TUI and WalkCode are clients of the daemon that owns the
+            # thread: WalkCode resumes it alongside the TUI, no process to stop.
+            return False
         if session.writer_owner is not None and session.writer_owner.kind == "external_tui":
             return session.status != "stopped" and session.lifecycle_state not in {
                 "EXTERNAL_DETACHED_IMPORTABLE",

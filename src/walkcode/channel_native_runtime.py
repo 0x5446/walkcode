@@ -49,6 +49,7 @@ from .channel_native import (
     LaunchSpec,
     LocalProcessController,
     Orchestrator,
+    SHARED_APP_SERVER_CONTROLLER,
     _atomic_write_json,
     _channel_allowlist_configured,
     _channel_environment_context,
@@ -2769,7 +2770,9 @@ class ChannelNativeRuntime:
         if not resume_ref:
             self.save_state()
             return SubmitResult(True, "missing_resume_ref")
-        if _tui_hook_is_walkcode_headless_transport(transport_kind, payload):
+        if _tui_hook_is_walkcode_headless_transport(transport_kind, payload) or self._tui_hook_is_walkcode_codex_turn(
+            transport_kind, payload
+        ):
             self.save_state()
             return SubmitResult(True, "internal_headless_hook_ignored")
         if transport_kind == "codex_app_server" and _codex_transcript_is_exec(payload):
@@ -2852,6 +2855,23 @@ class ChannelNativeRuntime:
             self.state.inbound_ledger.complete(event_id)
         self.save_state()
         return SubmitResult(True)
+
+    def _tui_hook_is_walkcode_codex_turn(self, transport_kind: str, payload: dict[str, Any]) -> bool:
+        """Is this codex hook from a turn WalkCode itself started?
+
+        The turn id is recorded when turn/start returns, and codex fires the
+        first hook of a turn only after that, so there is no race. Hooks
+        without a turn id (SessionStart) and hooks of turns started before a
+        runtime restart fall through: the orchestrator-owned-session guard
+        and the remnant sentinel handle those without touching the daemon.
+        """
+        if transport_kind != "codex_app_server":
+            return False
+        transport = self.transports.get("codex_app_server")
+        started_turn = getattr(transport, "started_turn", None)
+        if started_turn is None:
+            return False
+        return bool(started_turn(str(payload.get("turn_id", "") or "")))
 
     def _tui_hook_is_unverified_walkcode_owned_session_hook(
         self,
@@ -6481,9 +6501,17 @@ def _tui_terminate_ref(payload: dict[str, Any]) -> dict[str, Any] | None:
         # different same-command terminal it would record the new process's
         # identity and enrich would re-endorse it (round-3 Critical). The
         # captured snapshot is immune to that reuse window.
-        captured_ref = _external_tui_process_ref_from_entries(_tui_hook_process_tree_entries(payload))
+        entries = _tui_hook_process_tree_entries(payload)
+        captured_ref = _external_tui_process_ref_from_entries(entries)
         if captured_ref is not None:
             return {"controller_kind": "process", "process_ref": captured_ref}
+        if entries and _command_is_codex_app_server_process(str(entries[0].get("command", "") or "")):
+            # The hook ran inside a codex app-server (the shared daemon since
+            # codex 0.157), not inside the TUI: the daemon owns the thread and
+            # the TUI is just one of its clients. Record that fact instead of
+            # letting the parent-pid fallback below pass the daemon off as the
+            # TUI — takeover then attaches to the thread, with nothing to stop.
+            return {"controller_kind": SHARED_APP_SERVER_CONTROLLER}
         # Fallback only when the payload carries no captured tree (older hook
         # binaries): best-effort process-group re-probe.
         process_group_ref = _external_tui_process_ref_from_process_group(payload.get("_walkcode_hook_process_group"))
@@ -6546,8 +6574,10 @@ def _tui_hook_is_walkcode_headless_transport(transport_kind: str, payload: dict[
         return False
     if transport_kind == "claude_headless":
         return any(_command_is_claude_headless_sdk_process(command) for command in commands)
-    if transport_kind == "codex_app_server":
-        return any(_command_is_codex_app_server_process(command) for command in commands)
+    # Codex is deliberately absent: since codex 0.157 the TUI and WalkCode
+    # share one managed app-server daemon, which runs every thread's hooks, so
+    # an app-server in the process tree no longer means "ours". Codex hooks
+    # are attributed by turn id instead (_tui_hook_is_walkcode_codex_turn).
     return False
 
 
@@ -6562,7 +6592,14 @@ def _codex_transcript_is_exec(payload: dict[str, Any]) -> bool:
     served by the shared app-server daemon since codex 0.157). The rollout
     already exists when SessionStart fires. Only "exec" is skipped;
     unreadable or unknown shapes stay observed.
+
+    `codex exec --ephemeral` (what deep-review runs) writes no rollout at all:
+    codex still sends the transcript_path key, with a null value. A thread
+    with no transcript has nothing to mirror, so that is skipped too. A
+    payload without the key (older callers) stays observed.
     """
+    if "transcript_path" in payload and not payload["transcript_path"]:
+        return True
     path = str(payload.get("transcript_path", "") or "")
     if not path:
         return False
