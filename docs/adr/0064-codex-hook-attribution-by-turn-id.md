@@ -67,6 +67,18 @@ hook 当成"自己人"丢掉。
 5. **`transcript_path` 键存在而值为空，视为一次性运行，忽略。** 没有 rollout
    的线程本来就无从镜像。键缺失（老调用方、测试）保持原处理。
 
+6. **排水只消费自己那一轮。** 共享 daemon 下 walkcode 的连接也会收到同线程上
+   TUI 回合的事件（接管后两端并存时必然出现）。原排水只按 thread 认
+   `turn/completed`：真机复现里，接管后在 TUI 发一轮（回复 "k"），再从飞书提问，
+   walkcode 把 TUI 的 "k" 当成自己的回复发进话题、替 TUI 回合的命令弹了授权卡，
+   并在 TUI 回合的 `turn/completed` 处结束排水，自己的回答 "4" 滞留在队列里等下
+   一条消息才出来。修复：`CodexAppServerTransport.events()` 用 `_active_turns` 里
+   自己的 turn id 过滤，带其他 turn id（`params.turnId` / `params.turn.id`，真机
+   确认所有回合级 v2 消息都带）的事件一律跳过，只以自己那一轮的 `turn/completed`
+   结束；跳过的外部回合按回合记一次 `codex_foreign_turn_skipped`。不知道自己的
+   turn（未提交就监听）时保持原来不过滤的行为。修复后真机：先排队的 TUI 回合被
+   跳过并留痕，walkcode 拿到自己的回答 "w"，排水在自己的完成事件处结束。
+
 ## 已知缺口（下一步）
 
 - **接管后在 TUI 里继续打字，这些回合不镜像到飞书。** 它们的 turn id 不是
