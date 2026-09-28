@@ -1011,6 +1011,39 @@ class CodexAppServerTransportTests(unittest.TestCase):
 
         self.assertEqual(transport._active_turns.get("thread-1"), "turn-2")
 
+    def test_legacy_event_msg_of_another_turn_does_not_end_our_drain(self):
+        # deep-review v0.14.28 r2 (consistency): the event_msg shape keeps its
+        # turn id in payload.turn_id; a foreign task_complete there must not be
+        # read as our turn's completion.
+        class _BatchedClient(_FakeCodexClient):
+            def __init__(self, batches):
+                super().__init__()
+                self.batches = list(batches)
+
+            async def events(self, thread_id):
+                return self.batches.pop(0) if self.batches else []
+
+        client = _BatchedClient(
+            [
+                [{"type": "event_msg", "payload": {"type": "task_complete", "turn_id": "tui-turn",
+                                                   "last_agent_message": "k"}}],
+                [
+                    {"method": "item/agentMessage/delta",
+                     "params": {"threadId": "thread-1", "turnId": "turn-1", "itemId": "w", "delta": "4"}},
+                    {"method": "turn/completed", "params": {"threadId": "thread-1", "turn": {"id": "turn-1"}}},
+                ],
+            ]
+        )
+        transport = CodexAppServerTransport(client=client, event_silence_ceiling=3600)
+        transport._EMPTY_BATCH_MIN_INTERVAL = 0
+        handle = asyncio.run(transport.launch(LaunchSpec(cwd="/tmp/project", session_id="s1")))
+        asyncio.run(transport.submit_turn(handle, TurnInput(text="hi"), "idem-1"))
+
+        events = _drain_events(transport, handle)
+
+        self.assertEqual([e.type for e in events], [AgentEventType.TURN_DELTA, AgentEventType.TURN_COMPLETED])
+        self.assertEqual(events[0].payload["text"], "4")
+
     def test_events_convert_codex_event_msg_agent_message_and_task_complete(self):
         client = _FakeCodexClient()
         client.event_batches["thread-1"] = [

@@ -85,7 +85,8 @@ hook 当成"自己人"丢掉。
    事件才刷新静默计时；不带 turn id 的线程级事件（`thread/status/changed`、
    `hook/*` 等，TUI 每个回合起止都会触发）照常消费但不算存活证据。回合结束时
    只在 `_active_turns` 仍是刚结束那一轮时才删除，避免把上层在完成事件让出期间
-   提交的下一轮 turn id 删掉（deep-review 第 2 轮完整审查）。
+   提交的下一轮 turn id 删掉；turn id 也从旧式 `event_msg` 的 `payload.turn_id`
+   读取，与线程路由读 `payload.threadId` 一致（deep-review 第 2 轮完整审查）。
 
 ## 回滚
 

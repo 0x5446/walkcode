@@ -8239,13 +8239,22 @@ def _codex_message_turn_id(message: Any) -> str:
 
     Turn-scoped v2 messages carry ``params.turnId`` (``params.turn.id`` on
     turn/started and turn/completed); thread- and account-level ones carry
-    none and belong to no turn.
+    none and belong to no turn. The legacy ``event_msg`` shape, which this
+    transport also converts, keeps it in ``payload.turn_id`` — read there too,
+    the same place _notification_thread_id finds its thread id.
     """
-    params = message.get("params") if isinstance(message, dict) else None
-    if not isinstance(params, dict):
+    if not isinstance(message, dict):
         return ""
-    turn = params.get("turn")
-    return str(params.get("turnId") or (turn.get("id") if isinstance(turn, dict) else "") or "")
+    params = message.get("params")
+    if isinstance(params, dict):
+        turn = params.get("turn")
+        turn_id = params.get("turnId") or (turn.get("id") if isinstance(turn, dict) else "")
+        if turn_id:
+            return str(turn_id)
+    payload = message.get("payload")
+    if isinstance(payload, dict):
+        return str(payload.get("turn_id") or payload.get("turnId") or "")
+    return ""
 
 
 # How many started turn ids CodexAppServerTransport remembers for hook
