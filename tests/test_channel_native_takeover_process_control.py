@@ -509,3 +509,9 @@ class KillOneSwitchedSessionTests(unittest.TestCase):
         ), unittest.mock.patch.object(channel_native_module.os, "kill", side_effect=AssertionError("signalled")):
             result = controller._terminate_sync(ref, "takeover:t1")
         self.assertEqual((result.accepted, result.state), (True, "switched_away"))
+
+    def test_every_session_id_alias_counts(self):
+        for key in ("agent_session_id", "claude_session_id", "resume", "session_id"):
+            with self.subTest(key=key):
+                self.assertEqual(channel_native_module._claude_resume_session_id({key: " s1 "}), "s1")
+        self.assertEqual(channel_native_module._claude_resume_session_id({"session_id": 5}), "")

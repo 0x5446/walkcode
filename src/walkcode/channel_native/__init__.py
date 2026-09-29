@@ -4221,6 +4221,15 @@ def claude_tui_current_session(pid: int, lstart: str) -> str:
     return ""
 
 
+def _claude_resume_session_id(resume_ref: dict[str, Any]) -> str:
+    """The Claude session id in a resume ref, under any alias ClaudeHeadlessTransport.resume accepts."""
+    for key in ("agent_session_id", "claude_session_id", "resume", "session_id"):
+        value = resume_ref.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
 def _claude_process_moved_to_another_session(pid: int, lstart: str, expected_session: str) -> bool:
     """Right before a signal: does this Claude process now run a session other than ``expected``?"""
     if not expected_session:
@@ -12518,7 +12527,7 @@ class Orchestrator:
                     ),
                     idempotency_key=f"takeover_terminating:{takeover_id}",
                 )
-                own_session = str((resume_ref or {}).get("agent_session_id", "") or "")
+                own_session = _claude_resume_session_id(resume_ref or {})
                 termination = await controller.terminate(
                     # ADR 0067: the controller re-checks, right before every
                     # signal, that the process still runs this session — the
@@ -12865,8 +12874,7 @@ class Orchestrator:
     @staticmethod
     def _claude_tui_switched_away(session: Session) -> bool:
         """Is the Claude TUI recorded for this session now running a different session?"""
-        resume_ref = Orchestrator._takeover_resume_ref(session) or {}
-        own = str(resume_ref.get("agent_session_id", "") or "")
+        own = _claude_resume_session_id(Orchestrator._takeover_resume_ref(session) or {})
         controller_kind, process_ref = Orchestrator._normalize_takeover_terminate_ref(
             Orchestrator._takeover_terminate_ref(session) or {}
         )

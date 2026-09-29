@@ -67,3 +67,7 @@ gpt-5.6-sol，correctness + concurrency + goalfit）：2 条（High/Warning）�
 控制器内部的扫描与等待，`SIGKILL` 前也没核对。已把核对移进控制器、紧挨每次
 `os.kill`。
 
+2026-09-29 第 3 轮：correctness 1 条 Medium——旧会话 id 只认 `agent_session_id`，恢复
+逻辑还接受 `claude_session_id`/`resume`/`session_id` 别名；两处核对改为共用
+`_claude_resume_session_id`。concurrency 维度因网络超时未产出，随第 4 轮重跑。
+
