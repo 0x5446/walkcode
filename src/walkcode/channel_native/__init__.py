@@ -4190,6 +4190,34 @@ def _probe_process(pid: int) -> _ProcProbe:
     return _ProcProbe("ok", match.group(2).strip(), match.group(3).strip())
 
 
+def claude_tui_current_session(pid: int, lstart: str) -> str:
+    """The session a live Claude TUI process is running right now; "" if unknown (ADR 0067).
+
+    Claude Code keeps ``<config dir>/sessions/<pid>.json`` with the current
+    ``sessionId`` and the process start time (``procStart``) — updated when
+    ``/clear`` or ``/resume`` switches sessions inside the same process. The
+    start time must match, so a reused pid never answers for another process.
+    """
+    wanted = " ".join(str(lstart or "").split())
+    if pid <= 1 or not wanted:
+        return ""
+    home = Path.home()
+    dirs = [os.environ.get("CLAUDE_CONFIG_DIR", ""), str(home / ".claude")]
+    profiles = home / ".claude-profiles"
+    if profiles.is_dir():
+        dirs.extend(str(child) for child in sorted(profiles.iterdir()))
+    for config_dir in dict.fromkeys(d for d in dirs if d):
+        try:
+            record = json.loads((Path(config_dir) / "sessions" / f"{pid}.json").read_text())
+        except (OSError, ValueError):
+            continue
+        if not isinstance(record, dict):
+            continue
+        if " ".join(str(record.get("procStart", "") or "").split()) == wanted:
+            return str(record.get("sessionId", "") or "")
+    return ""
+
+
 def _probe_processes(pids: list[int]) -> dict[int, _ProcProbe] | None:
     """One ``ps`` for many pids: pid -> ok/gone probe; None when ps itself failed.
 
@@ -12798,11 +12826,33 @@ class Orchestrator:
             # thread: WalkCode resumes it alongside the TUI, no process to stop.
             return False
         if session.writer_owner is not None and session.writer_owner.kind == "external_tui":
-            return session.status != "stopped" and session.lifecycle_state not in {
+            if session.status == "stopped" or session.lifecycle_state in {
                 "EXTERNAL_DETACHED_IMPORTABLE",
                 "EXTERNAL_DETACHED_UNIMPORTABLE",
-            }
+            }:
+                return False
+            # ADR 0067: the TUI process moved on to another session (/clear,
+            # /resume). Stopping it would kill the terminal running THAT
+            # session; this one is no longer being written by anyone.
+            return not Orchestrator._claude_tui_switched_away(session)
         return False
+
+    @staticmethod
+    def _claude_tui_switched_away(session: Session) -> bool:
+        """Is the Claude TUI recorded for this session now running a different session?"""
+        resume_ref = Orchestrator._takeover_resume_ref(session) or {}
+        own = str(resume_ref.get("agent_session_id", "") or "")
+        controller_kind, process_ref = Orchestrator._normalize_takeover_terminate_ref(
+            Orchestrator._takeover_terminate_ref(session) or {}
+        )
+        if not own or controller_kind != "process":
+            return False
+        try:
+            pid = int(process_ref.get("pid", 0) or 0)
+        except (TypeError, ValueError):
+            return False
+        current = claude_tui_current_session(pid, str(process_ref.get("lstart", "") or ""))
+        return bool(current) and current != own
 
     @staticmethod
     def _takeover_resume_ref(session: Session) -> dict[str, Any] | None:
