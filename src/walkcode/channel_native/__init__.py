@@ -4253,9 +4253,13 @@ def _local_lstart_epochs(text: str) -> set[float]:
     epochs = set()
     for isdst in (0, 1):
         try:
-            epochs.add(time.mktime((*parsed[:8], isdst)))
+            epoch = time.mktime((*parsed[:8], isdst))
         except (OverflowError, ValueError):
             continue
+        # mktime "fixes up" a wrong isdst by shifting the hour; keep only
+        # readings that really are this wall time.
+        if time.localtime(epoch)[:6] == parsed[:6]:
+            epochs.add(epoch)
     return epochs
 
 

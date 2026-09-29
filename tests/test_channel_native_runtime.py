@@ -6616,6 +6616,10 @@ class ClaudeTuiSessionSwitchTests(unittest.TestCase):
                         )
                         self.assertEqual(current(210, shanghai), "tz")
                         self.assertEqual(current(210, "Tue Sep 29 11:06:24 2026"), "")  # same text, 8 h apart
+                        (sessions / "213.json").write_text(
+                            json.dumps({"sessionId": "hour-off", "procStart": "Tue Sep 29 10:06:24 2026"})
+                        )
+                        self.assertEqual(current(213, shanghai), "")  # no DST here: one reading only
                     finally:
                         pass
                 time.tzset()
@@ -6631,6 +6635,10 @@ class ClaudeTuiSessionSwitchTests(unittest.TestCase):
                         )
                         self.assertEqual(current(211, "Sun Nov  1 01:30:00 2026"), "late")
                         self.assertEqual(current(212, "Sun Nov  1 01:30:00 2026"), "early")
+                        (sessions / "214.json").write_text(
+                            json.dumps({"sessionId": "hour-off", "procStart": "Tue Sep 29 14:00:00 2026"})
+                        )
+                        self.assertEqual(current(214, "Tue Sep 29 11:00:00 2026"), "")  # ordinary EDT day
                     finally:
                         pass
                 time.tzset()
