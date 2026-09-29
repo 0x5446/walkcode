@@ -1,6 +1,5 @@
 import asyncio
 import json
-import threading
 import unittest
 
 from walkcode.channel_native import PermanentDeliveryError, TransientDeliveryError

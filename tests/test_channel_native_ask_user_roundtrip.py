@@ -4,7 +4,6 @@ import unittest
 from walkcode.channel_native import (
     ActorRef,
     AgentEvent,
-    AgentEventType,
     AuthorizationStore,
     BlockedReason,
     ChannelBinding,

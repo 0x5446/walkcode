@@ -1874,7 +1874,6 @@ class LarkRejectionNoteTests(_LarkRuntimeHarness):
 
 class LarkPermissionCardFlipTests(_LarkRuntimeHarness):
     def test_permission_decision_flips_card_to_result(self):
-        from walkcode.channel_native import ViewModelFactory
         runtime, api, transport = self._runtime(
             env_extra={"LARK_ALLOWED_CHAT_IDS": "oc_chat", "LARK_ALLOWED_OPEN_IDS": "ou_user"},
             scripted_events=[

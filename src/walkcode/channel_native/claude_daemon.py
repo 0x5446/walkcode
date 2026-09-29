@@ -1317,12 +1317,6 @@ class ClaudeDaemonTransport:
     async def set_model(self, handle: TransportHandle, model: str) -> ControlResult:
         return ControlResult(False, "unsupported_by_claude_daemon")
 
-    async def set_permission_mode(self, handle: TransportHandle, mode: str) -> ControlResult:
-        return ControlResult(False, "unsupported_by_claude_daemon")
-
-    async def rewind_checkpoint(self, handle: TransportHandle, checkpoint_id: str) -> ControlResult:
-        return ControlResult(False, "unsupported_by_claude_daemon")
-
     def events(self, handle: TransportHandle) -> list[Any]:
         # Content events come from the hook pipeline; state sync comes from the
         # runtime's subscribe watcher. An empty stream keeps the orchestrator's

@@ -1116,12 +1116,6 @@ class _UnavailableTransport:
     async def set_model(self, handle: TransportHandle, model: str) -> ControlResult:
         return ControlResult(False, self.reason)
 
-    async def set_permission_mode(self, handle: TransportHandle, mode: str) -> ControlResult:
-        return ControlResult(False, self.reason)
-
-    async def rewind_checkpoint(self, handle: TransportHandle, checkpoint_id: str) -> ControlResult:
-        return ControlResult(False, self.reason)
-
     def events(self, handle: TransportHandle) -> list[Any]:
         return []
 

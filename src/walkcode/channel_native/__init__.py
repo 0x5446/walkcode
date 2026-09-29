@@ -3837,10 +3837,6 @@ class AgentTransport(Protocol):
 
     async def set_model(self, handle: TransportHandle, model: str) -> ControlResult: ...
 
-    async def set_permission_mode(self, handle: TransportHandle, mode: str) -> ControlResult: ...
-
-    async def rewind_checkpoint(self, handle: TransportHandle, checkpoint_id: str) -> ControlResult: ...
-
     def events(self, handle: TransportHandle) -> Any: ...
 
 
@@ -4527,8 +4523,6 @@ class FakeAgentTransport:
         self.interrupt_calls: list[str] = []
         self.shutdown_calls: list[str] = []
         self.model_calls: list[str] = []
-        self.permission_mode_calls: list[str] = []
-        self.rewind_calls: list[str] = []
         self.permission_approval_calls: list[tuple[str, dict[str, Any]]] = []
         self.question_answer_calls: list[tuple[str, dict[str, Any]]] = []
 
@@ -4592,14 +4586,6 @@ class FakeAgentTransport:
     async def set_model(self, handle: TransportHandle, model: str) -> ControlResult:
         self.model_calls.append(model)
         return ControlResult(True, state="model_set")
-
-    async def set_permission_mode(self, handle: TransportHandle, mode: str) -> ControlResult:
-        self.permission_mode_calls.append(mode)
-        return ControlResult(True, state="permission_mode_set")
-
-    async def rewind_checkpoint(self, handle: TransportHandle, checkpoint_id: str) -> ControlResult:
-        self.rewind_calls.append(checkpoint_id)
-        return ControlResult(True, state="checkpoint_rewound")
 
     async def events(self, handle: TransportHandle) -> list[AgentEvent]:
         events = self._scripted_events
@@ -7799,22 +7785,6 @@ class ClaudeHeadlessTransport:
     async def set_model(self, handle: TransportHandle, model: str) -> ControlResult:
         return await self._call_client_control(handle, "set_model", model, state="model_set")
 
-    async def set_permission_mode(self, handle: TransportHandle, mode: str) -> ControlResult:
-        return await self._call_client_control(
-            handle,
-            "set_permission_mode",
-            mode,
-            state="permission_mode_set",
-        )
-
-    async def rewind_checkpoint(self, handle: TransportHandle, checkpoint_id: str) -> ControlResult:
-        return await self._call_client_control(
-            handle,
-            "rewind_checkpoint",
-            checkpoint_id,
-            state="checkpoint_rewound",
-        )
-
     async def _call_client_control(
         self,
         handle: TransportHandle,
@@ -8959,12 +8929,6 @@ class CodexAppServerTransport:
 
     async def set_model(self, handle: TransportHandle, model: str) -> ControlResult:
         raise CapabilityUnsupported("Codex app-server model switching is not verified")
-
-    async def set_permission_mode(self, handle: TransportHandle, mode: str) -> ControlResult:
-        raise CapabilityUnsupported("Codex app-server permission-mode switching is not verified")
-
-    async def rewind_checkpoint(self, handle: TransportHandle, checkpoint_id: str) -> ControlResult:
-        raise CapabilityUnsupported("Codex app-server checkpoint rewind is not verified")
 
     def _convert_event(self, event: dict[str, Any], *, thread_id: str = "") -> AgentEvent | None:
         event_type = str(event.get("type", "") or event.get("method", ""))
@@ -11076,36 +11040,6 @@ class Orchestrator:
             self.sessions.get(session_id).model = model
         return result
 
-    async def set_session_permission_mode(
-        self,
-        session_id: str,
-        *,
-        actor: ActorRef,
-        mode: str,
-    ) -> ControlResult:
-        return await self._run_transport_control(
-            session_id,
-            actor=actor,
-            action="set_permission_mode",
-            capability="set_permission_mode",
-            invoke=lambda transport, handle: transport.set_permission_mode(handle, mode),
-        )
-
-    async def rewind_session_checkpoint(
-        self,
-        session_id: str,
-        *,
-        actor: ActorRef,
-        checkpoint_id: str,
-    ) -> ControlResult:
-        return await self._run_transport_control(
-            session_id,
-            actor=actor,
-            action="rewind_checkpoint",
-            capability="checkpoint_rewind",
-            invoke=lambda transport, handle: transport.rewind_checkpoint(handle, checkpoint_id),
-        )
-
     async def archive_session(
         self,
         session_id: str,
@@ -11141,25 +11075,6 @@ class Orchestrator:
         if not getattr(transport.capabilities(), capability):
             return ControlResult(False, BlockedReason.CAPABILITY_DISABLED)
         return await invoke(transport, self._handle_for_session(session))
-
-    def command_menu_for_session(self, session_id: str, *, actor: ActorRef) -> dict[str, Any]:
-        session = self.sessions.get(session_id)
-        authz_result = self._authorize_session_control(session_id, actor, action="command_menu")
-        if not authz_result.allowed:
-            return ViewModelFactory(self.interactions).command_menu([])
-        if session.status == "stopped":
-            if session.archived_at:
-                return ViewModelFactory(self.interactions).command_menu([])
-            return ViewModelFactory(self.interactions).command_menu(
-                [{"action": "archive", "label": "Archive"}]
-            )
-        transport = self.transports[session.transport_kind]
-        caps = transport.capabilities()
-        actions: list[dict[str, Any]] = []
-        if caps.interrupt:
-            actions.append({"action": "interrupt", "label": "Interrupt"})
-        actions.append({"action": "close", "label": "Close"})
-        return ViewModelFactory(self.interactions).command_menu(actions)
 
     def check_session_health(self, session_id: str, *, progress_timeout: float) -> SessionHealth:
         session = self.sessions.get(session_id)
