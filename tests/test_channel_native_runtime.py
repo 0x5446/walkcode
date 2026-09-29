@@ -6619,6 +6619,21 @@ class ClaudeTuiSessionSwitchTests(unittest.TestCase):
                     finally:
                         pass
                 time.tzset()
+                # DST fall-back: 01:30 happens twice in New York; the later one is 06:30 UTC.
+                with patch.dict("os.environ", {"TZ": "America/New_York"}):
+                    time.tzset()
+                    try:
+                        (sessions / "211.json").write_text(
+                            json.dumps({"sessionId": "late", "procStart": "Sun Nov 01 06:30:00 2026"})
+                        )
+                        (sessions / "212.json").write_text(
+                            json.dumps({"sessionId": "early", "procStart": "Sun Nov 01 05:30:00 2026"})
+                        )
+                        self.assertEqual(current(211, "Sun Nov  1 01:30:00 2026"), "late")
+                        self.assertEqual(current(212, "Sun Nov  1 01:30:00 2026"), "early")
+                    finally:
+                        pass
+                time.tzset()
                 self.assertEqual(current(201, "Wed Sep 30 08:00:00 2026"), "")  # pid reused by another process
                 self.assertEqual(current(202, self.LSTART), "")  # no record
                 self.assertEqual(current(201, ""), "")  # no start time to match

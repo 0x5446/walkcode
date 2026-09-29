@@ -1264,12 +1264,14 @@ def _model_slug_matches(slug: str, current: str) -> bool:
     """
     if not slug or not current:
         return False
-    return (
-        current == slug
-        or current.startswith(slug + "-")
-        or current.startswith(slug + "@")
-        or current.startswith(slug + "[")  # context-window suffix: claude-opus-5-5[1m]
-    )
+    if current == slug:
+        return True
+    if not current.startswith(slug):
+        return False
+    # Only a release date (-20260610), a Vertex version (@20260610) or a
+    # context window ([1m]) may follow — never another model number, or
+    # claude-opus-4 would claim claude-opus-4-8.
+    return re.fullmatch(r"(?:-\d{8}|@[^\[]+)?(?:\[[^\]]*\])?", current[len(slug):]) is not None
 
 
 @dataclass(frozen=True)
@@ -4209,8 +4211,8 @@ def claude_tui_current_session(pid: int, lstart: str) -> str:
     ``/clear`` or ``/resume`` switches sessions inside the same process. The
     start time must match, so a reused pid never answers for another process.
     """
-    wanted = _local_lstart_epoch(lstart)
-    if pid <= 1 or wanted is None:
+    wanted = _local_lstart_epochs(lstart)
+    if pid <= 1 or not wanted:
         return ""
     home = Path.home()
     dirs = [os.environ.get("CLAUDE_CONFIG_DIR", ""), str(home / ".claude")]
@@ -4230,7 +4232,7 @@ def claude_tui_current_session(pid: int, lstart: str) -> str:
             continue  # a malformed record answers nothing
         # procStart is `ps lstart` rendered in UTC; our record is local time.
         started = _utc_lstart_epoch(proc_start)
-        if started is not None and abs(started - wanted) < 1.0:
+        if started is not None and any(abs(started - epoch) < 1.0 for epoch in wanted):
             return session_id.strip()
     return ""
 
@@ -4238,12 +4240,23 @@ def claude_tui_current_session(pid: int, lstart: str) -> str:
 _LSTART_FORMAT = "%a %b %d %H:%M:%S %Y"
 
 
-def _local_lstart_epoch(text: str) -> float | None:
-    """Epoch of a C-locale ``ps -o lstart`` string in local time; None if unparsable."""
+def _local_lstart_epochs(text: str) -> set[float]:
+    """Epochs a C-locale ``ps -o lstart`` local-time string can mean (empty if unparsable).
+
+    Usually one; two inside a DST fall-back hour, where the same wall time
+    occurs twice — both are tried rather than letting mktime guess.
+    """
     try:
-        return time.mktime(time.strptime(" ".join(str(text or "").split()), _LSTART_FORMAT))
-    except (ValueError, OverflowError):
-        return None
+        parsed = time.strptime(" ".join(str(text or "").split()), _LSTART_FORMAT)
+    except ValueError:
+        return set()
+    epochs = set()
+    for isdst in (0, 1):
+        try:
+            epochs.add(time.mktime((*parsed[:8], isdst)))
+        except (OverflowError, ValueError):
+            continue
+    return epochs
 
 
 def _utc_lstart_epoch(text: str) -> float | None:
