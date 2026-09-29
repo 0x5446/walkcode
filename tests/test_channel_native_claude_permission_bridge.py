@@ -240,7 +240,10 @@ class PermissionBridgeStreamTests(unittest.TestCase):
         self.assertEqual(client.permission_results[0].behavior, "deny")
         self.assertIn(AgentEventType.TURN_COMPLETED, [e.type for e in events])
 
-    def test_always_allow_returns_updates_and_persists_settings(self):
+    def test_always_allow_returns_updates_and_leaves_profile_settings_alone(self):
+        # Scope comes from the SDK updates. Appending the bare tool name to the
+        # profile settings.json turned "allow this command" into "allow every
+        # Bash call in every project and TUI session".
         with TemporaryDirectory() as config_dir:
             settings_path = Path(config_dir) / "settings.json"
             settings_path.write_text(json.dumps({"permissions": {"allow": ["Read"]}}))
@@ -270,8 +273,7 @@ class PermissionBridgeStreamTests(unittest.TestCase):
             self.assertTrue(result.updated_permissions)
             self.assertEqual(result.updated_permissions[0].type, "addRules")
             persisted = json.loads(settings_path.read_text())
-            self.assertIn("Bash", persisted["permissions"]["allow"])
-            self.assertIn("Read", persisted["permissions"]["allow"])
+            self.assertEqual(persisted["permissions"]["allow"], ["Read"])
 
     def test_always_allow_missing_settings_file_is_silently_skipped(self):
         with TemporaryDirectory() as config_dir:

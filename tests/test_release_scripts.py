@@ -133,6 +133,19 @@ def _sanitized_host_env(environ) -> dict:
     }
 
 
+class RuntimeDependencyTests(unittest.TestCase):
+    def test_runtime_dependencies_are_declared_not_extras(self):
+        # A bare install used to build a venv with neither package: Lark
+        # ingress and the Claude transport both failed at import while the
+        # process stayed up (the 2026-07-24/25 outage).
+        import tomllib
+
+        project = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text())["project"]
+        names = {re.split(r"[<>=!~ ]", dep, maxsplit=1)[0] for dep in project["dependencies"]}
+        self.assertLessEqual({"claude-agent-sdk", "lark-oapi"}, names)
+        self.assertIn("claude-agent-sdk>=0.2.124", project["dependencies"])
+
+
 class HostEnvSanitizationTests(unittest.TestCase):
     def test_strips_walkcode_and_feishu_vars_and_keeps_the_rest(self):
         env = _sanitized_host_env(

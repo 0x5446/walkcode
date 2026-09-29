@@ -156,12 +156,14 @@ class PersistenceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             store = JsonFileStateStore(Path(tmp) / "state.json", now=clock)
             store.save(
-                sessions=sessions,
-                interactions=interactions,
-                outbox=outbox,
-                authz=authz,
-                inbound_ledger=ledger,
-                hitls=hitls,
+                StateSnapshot(
+                    sessions=sessions,
+                    interactions=interactions,
+                    outbox=outbox,
+                    authz=authz,
+                    inbound_ledger=ledger,
+                    hitls=hitls,
+                )
             )
             restored = store.load()
 
@@ -217,11 +219,13 @@ class PersistenceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             store = JsonFileStateStore(Path(tmp) / "state.json", now=clock)
             store.save(
-                sessions=sessions,
-                interactions=interactions,
-                outbox=outbox,
-                authz=AuthorizationStore(now=clock),
-                inbound_ledger=InboundLedger(now=clock),
+                StateSnapshot(
+                    sessions=sessions,
+                    interactions=interactions,
+                    outbox=outbox,
+                    authz=AuthorizationStore(now=clock),
+                    inbound_ledger=InboundLedger(now=clock),
+                )
             )
             restored = store.load()
 

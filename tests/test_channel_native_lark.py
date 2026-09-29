@@ -1793,6 +1793,36 @@ class LarkRejectionNoteTests(_LarkRuntimeHarness):
         # produced — ADR 0059 removed the lease-expiry veto.)
         self.assertTrue(_submit_result_completes_inbound_ledger(result))
 
+    def test_double_slash_rejection_gets_note(self):
+        # Regression: the // escape returned straight after submitting, so a
+        # rejected //compact in a stopped session vanished without a note.
+        from walkcode.channel_native import SubmitResult
+
+        runtime, api, transport = self._runtime(
+            env_extra={"LARK_ALLOWED_CHAT_IDS": "oc_chat", "LARK_ALLOWED_OPEN_IDS": "ou_user"},
+        )
+        submitted = []
+
+        async def deny(inbound, **kwargs):
+            submitted.append(inbound.text)
+            return SubmitResult(False, BlockedReason.SESSION_STOPPED)
+
+        runtime.orchestrator.handle_inbound_event = deny
+        result = asyncio.run(
+            runtime.process_lark_event(
+                self._message_payload(text="//compact", root_id="lark-root", message_id="om_esc")
+            )
+        )
+
+        self.assertFalse(result.accepted)
+        self.assertEqual(submitted, ["/compact"])
+        notes = [
+            p
+            for m, p in api.calls
+            if m == "sendMessage" and "会话已结束" in p.get("view", {}).get("text", "")
+        ]
+        self.assertEqual(len(notes), 1)
+
     def test_missing_resume_ref_rejection_gets_note(self):
         # ADR 0059 R1: "worker gone AND no durable resume ref" must reach the
         # sender as a note instead of vanishing behind a bare re-raise.

@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Any
 
 from .channel_native import (
+    PermanentDeliveryError,
     ActorRef,
     AgentEvent,
     AgentEventType,
@@ -140,6 +141,10 @@ TUI_HOOK_DRAIN_TIMEOUT_SECONDS = 30.0
 TUI_HOOK_DRAIN_BATCH_SIZE = 25
 TUI_HOOK_RECENT_PRIORITY_WINDOW_SECONDS = 300.0
 TUI_HOOK_DRAIN_INTERVAL_SECONDS = 1.0
+# A queued hook that raises this many times in a row is archived: the drain
+# stops at the first failure to keep order, so one hook failing the same way
+# every tick would otherwise block every hook behind it forever.
+TUI_HOOK_MAX_ATTEMPTS = 10
 # Codex session_meta embeds the base instructions (~20KB today); cap the
 # first-line read so a malformed rollout cannot pull a huge line into memory.
 _CODEX_SESSION_META_MAX_BYTES = 1024 * 1024
@@ -215,6 +220,7 @@ class CodexStdioAppServerClient:
     # chunked readuntil accumulation is NOT cancellation-safe (a wait_for
     # timeout mid-line would drop drained bytes and desync the stream).
     _STDOUT_LIMIT = 64 * 1024 * 1024
+    _BUFFERED_NOTIFICATIONS_MAX = 256
     # Shutdown budget for the app-server subprocess. See _discard_process for
     # why SIGTERM comes first and why both waits are bounded.
     _TERMINATE_GRACE_SECONDS = 5.0
@@ -242,7 +248,15 @@ class CodexStdioAppServerClient:
         # every turn/start and approval answer behind it, which is why a
         # message sent from the channel could sit unseen for minutes.
         self._lock = asyncio.Lock()
-        self._buffered_notifications: list[dict[str, Any]] = []
+        # Bounded: account/rateLimits/updated and friends carry no threadId
+        # and arrive all day while nobody listens; an unbounded list grew to
+        # thousands of stale globals, all dumped on the next drain.
+        self._buffered_notifications: collections.deque[dict[str, Any]] = collections.deque(
+            maxlen=self._BUFFERED_NOTIFICATIONS_MAX
+        )
+        self._thread_less_methods_logged: set[str] = set()
+        self._stderr_tail: collections.deque[str] = collections.deque(maxlen=20)
+        self._stderr_task: asyncio.Task | None = None
         self._reader_task: asyncio.Task | None = None
         self._pending_responses: dict[int, asyncio.Future] = {}
         self._thread_queues: dict[str, asyncio.Queue] = {}
@@ -523,12 +537,10 @@ class CodexStdioAppServerClient:
         if len(live) == 1:
             self._queue_for(live[0]).put_nowait(message)
             return
-        _log_degrade(
-            "codex_event_without_thread_id",
-            method=_notification_method(message),
-            live_listeners=len(live),
-            buffered=len(self._buffered_notifications) + 1,
-        )
+        method = _notification_method(message)
+        if method not in self._thread_less_methods_logged:
+            self._thread_less_methods_logged.add(method)
+            _log_degrade("codex_event_without_thread_id", method=method, live_listeners=len(live))
         self._buffered_notifications.append(message)
 
     def _fail_stream(self, exc: BaseException) -> None:
@@ -601,6 +613,13 @@ class CodexStdioAppServerClient:
             env=self._subprocess_env(),
             limit=self._STDOUT_LIMIT,
         )
+        # app-server logs to stderr for its whole life. asyncio buffers an
+        # unread pipe in memory up to 2x `limit` (128 MiB here) before it
+        # stops reading, so nobody reading it is a slow leak that ends in a
+        # blocked server. Drain it continuously and keep only the tail, which
+        # is what explains an exit.
+        self._stderr_tail = collections.deque(maxlen=20)
+        self._stderr_task = asyncio.create_task(self._drain_stderr(self._process, self._stderr_tail))
         await self._handshake()
 
     async def _handshake(self) -> None:
@@ -644,6 +663,22 @@ class CodexStdioAppServerClient:
         # the transport does not un-happen them, and dropping them would
         # silently lose session events.
         process, self._process = self._process, None
+        stderr_task, self._stderr_task = self._stderr_task, None
+        try:
+            await self._terminate_process(process)
+        finally:
+            # A child that inherited stderr can hold the pipe open after the
+            # wrapper exits. Cancelling the drain alone leaves asyncio reading
+            # that pipe into a buffer nobody consumes, so close the process's
+            # pipes too; every restart would otherwise leak one of each.
+            if stderr_task is not None:
+                stderr_task.cancel()
+            transport = getattr(process, "_transport", None)
+            if transport is not None:
+                with contextlib.suppress(Exception):
+                    transport.close()
+
+    async def _terminate_process(self, process: asyncio.subprocess.Process | None) -> None:
         if process is None or process.returncode is not None:
             return
         # SIGTERM, not SIGKILL. `codex app-server --stdio` is a thin node
@@ -717,13 +752,11 @@ class CodexStdioAppServerClient:
                 f"Codex app-server response line exceeded {self._STDOUT_LIMIT} bytes"
             ) from exc
         if not line:
-            stderr = ""
-            if process.stderr is not None:
-                try:
-                    data = await asyncio.wait_for(process.stderr.read(), timeout=0.1)
-                    stderr = data.decode("utf-8", errors="replace").strip()
-                except Exception:
-                    stderr = ""
+            if self._stderr_task is not None:
+                # Let the drain pick up the last lines the exiting server wrote.
+                with contextlib.suppress(asyncio.TimeoutError, TimeoutError):
+                    await asyncio.wait_for(asyncio.shield(self._stderr_task), timeout=0.1)
+            stderr = "\n".join(self._stderr_tail).strip()
             reason = stderr or f"Codex app-server exited with code {process.returncode}"
             raise TransportUnavailable(reason)
         try:
@@ -733,6 +766,24 @@ class CodexStdioAppServerClient:
         if not isinstance(message, dict):
             raise TransportUnavailable("Codex app-server returned non-object JSON")
         return message
+
+    _STDERR_LINE_MAX = 2000
+
+    @classmethod
+    async def _drain_stderr(cls, process: asyncio.subprocess.Process, tail: collections.deque) -> None:
+        # read(), not readline(): readline() raises on a line longer than the
+        # stream limit, which would end the drain while the server lives on.
+        if process.stderr is None:
+            return
+        pending = b""
+        with contextlib.suppress(Exception):
+            while chunk := await process.stderr.read(64 * 1024):
+                *lines, pending = (pending + chunk).split(b"\n")
+                pending = pending[-cls._STDERR_LINE_MAX :]
+                for line in lines:
+                    tail.append(line[: cls._STDERR_LINE_MAX].decode("utf-8", errors="replace").rstrip())
+        if pending:
+            tail.append(pending.decode("utf-8", errors="replace").rstrip())
 
     def _take_buffered(self, thread_id: str) -> list[dict[str, Any]]:
         # Anything a previous, aborted call had already taken comes first —
@@ -757,7 +808,8 @@ class CodexStdioAppServerClient:
                 taken.append(message)
             else:
                 kept.append(message)
-        self._buffered_notifications = kept
+        self._buffered_notifications.clear()
+        self._buffered_notifications.extend(kept)
         return taken
 
     def _require_process(self) -> asyncio.subprocess.Process:
@@ -1133,6 +1185,10 @@ def _notification_thread_id(message: dict[str, Any]) -> str:
         thread_id = str(params.get("threadId", "") or params.get("thread_id", "") or "")
         if thread_id:
             return thread_id
+        # thread/started names its thread as params.thread.id.
+        thread = params.get("thread")
+        if isinstance(thread, dict) and thread.get("id"):
+            return str(thread["id"])
     payload = message.get("payload", {})
     if isinstance(payload, dict):
         return str(payload.get("threadId", "") or payload.get("thread_id", "") or "")
@@ -1526,6 +1582,11 @@ class ChannelNativeRuntime:
         self.last_lark_event_error = ""
         self._telegram_commands_installed = False
         self._tui_hook_queue_dir = _tui_hook_queue_dir(self.state_store.path)
+        self._tui_hook_failures: dict[str, int] = {}
+        # Sessions whose rootless heal failed permanently; skipped until
+        # restart. A per-call "give up" is not enough: any other session's
+        # transient failure keeps the whole load pass retrying every tick.
+        self._rootless_heal_given_up: set[str] = set()
         self._lark_inbox_dir = self.state_store.path.with_name(f"{self.state_store.path.name}.lark-inbox.d")
         self._ingress_lock = asyncio.Lock()
         self._drain_lock = asyncio.Lock()
@@ -2390,75 +2451,67 @@ class ChannelNativeRuntime:
             if str(inbound.text or "").lstrip().startswith("//"):
                 # Escape hatch for agent-native commands shadowed by WalkCode
                 # ones: //model reaches the agent as /model. Claude executes
-                # slash commands natively on the headless channel.
+                # slash commands natively on the headless channel. It then
+                # takes the normal path so a rejection still gets its note.
                 raw_text = str(inbound.text or "")
                 stripped = raw_text.lstrip()
                 inbound = replace(
                     inbound,
                     text=raw_text[: len(raw_text) - len(stripped)] + stripped[1:],
                 )
-                if _telegram_message_is_empty(inbound):
-                    return _ignore_empty_inbound(inbound)
-                inbound = await self._place_lark_new_session(channel, inbound)
-                result = await self.orchestrator.handle_inbound_event(
-                    inbound,
-                    agent_transport_kind=self.config.agent_transport_kind,
-                    cwd=self.config.cwd,
-                )
-                self.save_state()
-                return result
-            command = _telegram_bot_command(inbound)
-            if command:
-                result = await self._handle_telegram_bot_command(channel, inbound, command)
-                if (
-                    not result.accepted
-                    and str(getattr(result, "reason", "") or "") == "stale_inbound"
-                ):
-                    # ADR 0057：滞留的控制命令被拦时同样不能静默（本分支
-                    # 提前返回，走不到通用拒绝提示）。
-                    try:
-                        await channel.send_view(
-                            reply_binding,
-                            {"type": "text", "text": _LARK_REJECTION_NOTES["stale_inbound"]},
-                        )
-                    except Exception:
-                        pass
-                self._complete_lark_local_inbound(inbound)
-                self.save_state()
-                return result
-            selector = _agent_selector_command(inbound)
-            if selector:
-                await channel.send_view(
-                    reply_binding,
-                    {
-                        "type": "agent_selector_rejected",
-                        "message": _agent_selector_rejected_message(
-                            configured_agent=self.config.agent,
-                            requested_agent=selector[0],
-                        ),
-                    },
-                )
-                self._complete_lark_local_inbound(inbound)
-                self.save_state()
-                return SubmitResult(True, "agent_selector_rejected")
-            unknown_slash = _telegram_unknown_slash_command(inbound)
-            if unknown_slash and self._resolve_telegram_command_session(inbound) is None:
-                await channel.send_view(
-                    reply_binding,
-                    {
-                        "type": "text",
-                        "text": (
-                            "未知的斜杠命令。agent 原生斜杠命令请在已有会话话题里发送。"
-                        ),
-                    },
-                )
-                self._complete_lark_local_inbound(inbound)
-                self.save_state()
-                return SubmitResult(True, "lark_unknown_slash_command")
-            if unknown_slash:
-                inbound = replace(
-                    inbound, text=_telegram_agent_command_text(self.config.agent, inbound.text)
-                )
+            else:
+                command = _telegram_bot_command(inbound)
+                if command:
+                    result = await self._handle_telegram_bot_command(channel, inbound, command)
+                    if (
+                        not result.accepted
+                        and str(getattr(result, "reason", "") or "") == "stale_inbound"
+                    ):
+                        # ADR 0057：滞留的控制命令被拦时同样不能静默（本分支
+                        # 提前返回，走不到通用拒绝提示）。
+                        try:
+                            await channel.send_view(
+                                reply_binding,
+                                {"type": "text", "text": _LARK_REJECTION_NOTES["stale_inbound"]},
+                            )
+                        except Exception:
+                            pass
+                    self._complete_lark_local_inbound(inbound)
+                    self.save_state()
+                    return result
+                selector = _agent_selector_command(inbound)
+                if selector:
+                    await channel.send_view(
+                        reply_binding,
+                        {
+                            "type": "agent_selector_rejected",
+                            "message": _agent_selector_rejected_message(
+                                configured_agent=self.config.agent,
+                                requested_agent=selector[0],
+                            ),
+                        },
+                    )
+                    self._complete_lark_local_inbound(inbound)
+                    self.save_state()
+                    return SubmitResult(True, "agent_selector_rejected")
+                unknown_slash = _telegram_unknown_slash_command(inbound)
+                if unknown_slash and self._resolve_telegram_command_session(inbound) is None:
+                    await channel.send_view(
+                        reply_binding,
+                        {
+                            "type": "text",
+                            "text": (
+                                "未知的斜杠命令。agent 原生斜杠命令请在已有会话话题里发送。"
+                            ),
+                        },
+                    )
+                    self._complete_lark_local_inbound(inbound)
+                    self.save_state()
+                    return SubmitResult(True, "lark_unknown_slash_command")
+                if unknown_slash:
+                    inbound = replace(
+                        inbound, text=_telegram_agent_command_text(self.config.agent, inbound.text)
+                    )
             if _telegram_message_is_empty(inbound):
                 return _ignore_empty_inbound(inbound)
             inbound = await self._place_lark_new_session(channel, inbound)
@@ -3514,8 +3567,21 @@ class ChannelNativeRuntime:
                 self._archive_bad_tui_hook(path)
                 continue
             except Exception as exc:
-                print(f"deferred TUI hook retry pending: {type(exc).__name__}: {exc}", file=sys.stderr)
-                break
+                attempts = self._tui_hook_failures.get(path.name, 0) + 1
+                if attempts < TUI_HOOK_MAX_ATTEMPTS:
+                    self._tui_hook_failures[path.name] = attempts
+                    print(f"deferred TUI hook retry pending: {type(exc).__name__}: {exc}", file=sys.stderr)
+                    break
+                self._tui_hook_failures.pop(path.name, None)
+                _log_degrade(
+                    "tui_hook_archived_after_failures",
+                    path=path.name,
+                    attempts=attempts,
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+                self._archive_bad_tui_hook(path)
+                continue
+            self._tui_hook_failures.pop(path.name, None)
             if result.accepted:
                 try:
                     path.unlink()
@@ -5031,8 +5097,9 @@ class ChannelNativeRuntime:
         the channel was down, so the heal runs on the load-time pass; a pass
         with a failed heal stays incomplete so the maintenance tick retries.
 
-        Returns "" (not applicable), "healed", or "retry" (send failed or the
-        session raced to stopped — try again next tick).
+        Returns "" (not applicable, or a permanent send failure), "healed",
+        or "retry" (transient send failure or the session raced to stopped —
+        try again next tick).
         """
         binding = session.channel_binding
         if (
@@ -5042,6 +5109,7 @@ class ChannelNativeRuntime:
             or binding.root_message_id
             or binding.thread_id
             or session.status == "stopped"
+            or session.session_id in self._rootless_heal_given_up
         ):
             return ""
         channel = self.channels.get("lark")
@@ -5081,13 +5149,21 @@ class ChannelNativeRuntime:
                 ),
             )
         except Exception as exc:
+            permanent = isinstance(exc, PermanentDeliveryError)
             _log_degrade(
                 "lark_tui_root_heal_failed",
                 session_id=session.session_id,
                 chat_id=binding.chat_id,
                 agent=agent,
                 error=exc,
+                permanent=permanent,
             )
+            # A permanent failure (bot not in chat, monthly quota spent) fails
+            # identically every 5 s tick; retrying it is what burned the quota
+            # before. Give up until the next restart.
+            if permanent:
+                self._rootless_heal_given_up.add(session.session_id)
+                return ""
             return "retry"
         if not root_id:
             _log_degrade(
@@ -5478,7 +5554,7 @@ class ChannelNativeRuntime:
         if hook_type == "user-prompt-submit" and not text:
             # 空文本不可能是回显；先盖水位再走后面的空文本早退。
             self.orchestrator._stamp_last_user_input(
-                session, float(payload.get("_walkcode_hook_captured_at") or 0.0)
+                session, _payload_captured_at(payload) or 0.0
             )
         if hook_type == "stop" and agent == "codex":
             # Codex (verified against codex-cli 0.144.5) has no MessageDisplay
@@ -5569,7 +5645,7 @@ class ChannelNativeRuntime:
             # ADR 0057：真实终端输入推进"最近一次被人说话"的时刻（hook
             # 捕获时间，非排水时间）；统一走带毒时间戳防护的盖章助手。
             self.orchestrator._stamp_last_user_input(
-                session, float(payload.get("_walkcode_hook_captured_at") or 0.0)
+                session, _payload_captured_at(payload) or 0.0
             )
         session.last_event_seq += 1
         view = (
@@ -5594,14 +5670,7 @@ class ChannelNativeRuntime:
             session.transport_ref.pop("daemon_live", None)
 
     def save_state(self) -> None:
-        self.state_store.save(
-            sessions=self.state.sessions,
-            interactions=self.state.interactions,
-            outbox=self.state.outbox,
-            authz=self.state.authz,
-            inbound_ledger=self.state.inbound_ledger,
-            hitls=self.state.hitls,
-        )
+        self.state_store.save(self.state)
 
     def _describe_channel(self, kind: str, endpoint: ChannelEndpointConfig) -> dict[str, Any]:
         channel = self.channels.get(kind)
@@ -7310,13 +7379,8 @@ def _tui_hook_captured_age(payload: dict[str, Any]) -> float | None:
     live hook apart from a replayed description of a world that may be gone.
     Payloads from pre-0.14.3 hook binaries lack the stamp -> None.
     """
-    import math
-
-    try:
-        captured_at = float(payload.get("_walkcode_hook_captured_at") or 0.0)
-    except (TypeError, ValueError):
-        return None
-    if not math.isfinite(captured_at) or captured_at <= 0:
+    captured_at = _payload_captured_at(payload)
+    if captured_at is None:
         return None
     now = time.time()
     if captured_at > now + 1.0:

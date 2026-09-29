@@ -12,10 +12,13 @@ classifiers = [
     "Programming Language :: Python :: 3",
     "Topic :: Software Development :: Libraries",
 ]
-dependencies = []
-
-[project.optional-dependencies]
-lark = ["lark-oapi>=1.4"]
+# Both are runtime requirements, not extras: a bare install without them
+# builds a venv whose Lark ingress and Claude transport both fail at import —
+# the 2026-07-24/25 silent-disconnect outage.
+dependencies = [
+    "claude-agent-sdk>=0.2.124",
+    "lark-oapi>=1.4",
+]
 
 [project.urls]
 Homepage = "https://github.com/0x5446/walkcode"

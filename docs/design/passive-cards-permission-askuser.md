@@ -35,7 +35,7 @@
   3. 把一个 `AgentEvent(PERMISSION_REQUESTED, {...})` 放进一个**该 handle 的 asyncio.Queue**（见第 2 点），payload 带 tool_name/tool_input/rid/high_risk/suggestions/title。
   4. `await` 那个 Future，拿到决定后转成 `PermissionResultAllow/Deny` 返回给 SDK。
   5. 超时/异常保护：设一个上限（如与 stuck watchdog 对齐），超时默认 deny（fail-safe，别 fail-open 放行未授权工具）。
-- `approve_permission(handle, rid, decision)`：解析 decision（action=allow/allow_once/always_allow/deny），resolve `self._pending_permissions[rid]` 那个 Future。always_allow 时把 ctx.suggestions 或兜底 addRules 放进 PermissionResultAllow.updated_permissions；并**同时写 profile 的 settings.json permissions.allow**（对齐 V2 _add_permission_rule；用 self.config_dir/settings 指向的文件；写不了就跳过不报错）。
+- `approve_permission(handle, rid, decision)`：解析 decision（action=allow/allow_once/always_allow/deny），resolve `self._pending_permissions[rid]` 那个 Future。always_allow 时把 ctx.suggestions 或兜底 addRules 放进 PermissionResultAllow.updated_permissions，由 CLI 按建议的范围持久化。**不要**另外把裸工具名写进 profile 的 settings.json permissions.allow：那会把"允许这条命令"放大成"所有项目、所有会话都允许这个工具"（v0.14.33 已删除该写入）。
 
 ### 2. events() 改成能中途浮出（transport 内,最难的一步）
 - 现在 `events()` 收集 receive_response 到 turn 结束。改成：drain 循环里,除了 SDK 消息,还并发消费第 1 点那个 permission Queue,一旦有 PERMISSION_REQUESTED 就把它 yield/返回给上层,让 orchestrator 立即发卡；然后继续 drain（此时 SDK 那边 can_use_tool 正阻塞等 Future）。

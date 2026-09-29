@@ -18,6 +18,7 @@ from walkcode.channel_native import (
     Orchestrator,
     SessionRegistry,
     SessionRole,
+    StateSnapshot,
     TransportCapabilities,
 )
 
@@ -185,11 +186,13 @@ class SessionListingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             store = JsonFileStateStore(Path(tmp) / "state.json", now=clock)
             store.save(
-                sessions=orchestrator.sessions,
-                interactions=orchestrator.interactions,
-                outbox=orchestrator.outbox,
-                authz=orchestrator.authz,
-                inbound_ledger=InboundLedger(now=clock),
+                StateSnapshot(
+                    sessions=orchestrator.sessions,
+                    interactions=orchestrator.interactions,
+                    outbox=orchestrator.outbox,
+                    authz=orchestrator.authz,
+                    inbound_ledger=InboundLedger(now=clock),
+                )
             )
 
             loaded = store.load().sessions
