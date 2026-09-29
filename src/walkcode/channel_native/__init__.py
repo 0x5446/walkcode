@@ -8,6 +8,7 @@ smaller modules once the boundaries settle.
 from __future__ import annotations
 
 import asyncio
+import calendar
 import contextlib
 import signal
 import subprocess
@@ -4198,8 +4199,8 @@ def claude_tui_current_session(pid: int, lstart: str) -> str:
     ``/clear`` or ``/resume`` switches sessions inside the same process. The
     start time must match, so a reused pid never answers for another process.
     """
-    wanted = " ".join(str(lstart or "").split())
-    if pid <= 1 or not wanted:
+    wanted = _local_lstart_epoch(lstart)
+    if pid <= 1 or wanted is None:
         return ""
     home = Path.home()
     dirs = [os.environ.get("CLAUDE_CONFIG_DIR", ""), str(home / ".claude")]
@@ -4217,9 +4218,30 @@ def claude_tui_current_session(pid: int, lstart: str) -> str:
         proc_start, session_id = record.get("procStart"), record.get("sessionId")
         if not isinstance(proc_start, str) or not isinstance(session_id, str) or not session_id.strip():
             continue  # a malformed record answers nothing
-        if " ".join(proc_start.split()) == wanted:
+        # procStart is `ps lstart` rendered in UTC; our record is local time.
+        started = _utc_lstart_epoch(proc_start)
+        if started is not None and abs(started - wanted) < 1.0:
             return session_id.strip()
     return ""
+
+
+_LSTART_FORMAT = "%a %b %d %H:%M:%S %Y"
+
+
+def _local_lstart_epoch(text: str) -> float | None:
+    """Epoch of a C-locale ``ps -o lstart`` string in local time; None if unparsable."""
+    try:
+        return time.mktime(time.strptime(" ".join(str(text or "").split()), _LSTART_FORMAT))
+    except (ValueError, OverflowError):
+        return None
+
+
+def _utc_lstart_epoch(text: str) -> float | None:
+    """Epoch of the same format read as UTC; None if unparsable."""
+    try:
+        return float(calendar.timegm(time.strptime(" ".join(str(text or "").split()), _LSTART_FORMAT)))
+    except (ValueError, OverflowError):
+        return None
 
 
 def _claude_resume_session_id(resume_ref: dict[str, Any]) -> str:
