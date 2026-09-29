@@ -5124,14 +5124,7 @@ class ChannelNativeRuntime:
             state = await asyncio.to_thread(_process_ref_state_now, process_ref)
         if state != "gone":
             return False
-        if await self._claude_daemon_session_alive(session):
-            # Attach TUI is gone but the daemon worker lives on: this is a
-            # detach, not an end. Keep the session writable via daemon reply.
-            if session.last_progress_event != "external_tui.tui_detached_daemon_alive":
-                session.last_progress_event = "external_tui.tui_detached_daemon_alive"
-                session.last_progress_at = self._now()
-                return True
-            return False
+        worker_alive = await self._claude_daemon_session_alive(session)
         if (
             session.status == "stopped"
             or not _session_is_external_tui_writer(session)
@@ -5140,6 +5133,14 @@ class ChannelNativeRuntime:
             # A hook claimed or revived the session for another process while
             # we awaited the probes: the verdict is about a process it no
             # longer has. The next pass decides afresh.
+            return False
+        if worker_alive:
+            # Attach TUI is gone but the daemon worker lives on: this is a
+            # detach, not an end. Keep the session writable via daemon reply.
+            if session.last_progress_event != "external_tui.tui_detached_daemon_alive":
+                session.last_progress_event = "external_tui.tui_detached_daemon_alive"
+                session.last_progress_at = self._now()
+                return True
             return False
         return self._mark_stale_tui_process_detached(session)
 

@@ -6508,11 +6508,25 @@ class TuiExitSweepTests(unittest.TestCase):
                 }
                 return False
 
-            with patch.object(
-                runtime_module, "_probe_processes", return_value={201: channel_native_module._ProcProbe("gone")}
-            ), patch.object(runtime, "_claude_daemon_session_alive", side_effect=daemon_probe):
-                self.assertEqual(asyncio.run(runtime.sweep_exited_tui_sessions()), 0)
-            self.assertEqual(runtime.state.sessions.get(session.session_id).status, "running")
+            for worker_alive in (False, True):
+                answer = worker_alive
+
+                async def probe(live, answer=answer):
+                    await daemon_probe(live)
+                    return answer
+
+                live = runtime.state.sessions.get(session.session_id)
+                live.transport_ref["terminate_ref"] = {
+                    "controller_kind": "process",
+                    "process_ref": {"pid": 201, "lstart": "Tue Sep 29 11:06:24 2026"},
+                }
+                with patch.object(
+                    runtime_module, "_probe_processes", return_value={201: channel_native_module._ProcProbe("gone")}
+                ), patch.object(runtime, "_claude_daemon_session_alive", side_effect=probe):
+                    self.assertEqual(asyncio.run(runtime.sweep_exited_tui_sessions()), 0)
+                live = runtime.state.sessions.get(session.session_id)
+                self.assertEqual(live.status, "running")
+                self.assertNotEqual(live.last_progress_event, "external_tui.tui_detached_daemon_alive")
 
     def test_single_probe_failure_does_not_end_the_session_on_startup(self):
         with tempfile.TemporaryDirectory() as tmp:
