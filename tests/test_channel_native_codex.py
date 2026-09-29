@@ -2517,7 +2517,8 @@ class CodexStdioStderrTests(unittest.TestCase):
             pid_file = Path(tmp) / "child.pid"
             server = (
                 "import sys, json, subprocess\n"
-                f"child = subprocess.Popen(['sleep', '30'])\n"
+                "child = subprocess.Popen([sys.executable, '-c', "
+                "'import sys, time\\nwhile True: sys.stderr.write(\"z\" * 65536); sys.stderr.flush(); time.sleep(0.01)'])\n"
                 f"open({str(pid_file)!r}, 'w').write(str(child.pid))\n"
                 "req = json.loads(sys.stdin.readline())\n"
                 "print(json.dumps({'id': req['id'], 'result': {}}), flush=True)\n"
@@ -2529,19 +2530,23 @@ class CodexStdioStderrTests(unittest.TestCase):
                 async with client._lock:
                     await client._ensure_started()
                 drain = client._stderr_task
+                stderr = client._process.stderr
                 await client.restart()
-                await asyncio.sleep(0.05)
+                # The child keeps writing: a pipe left open would keep
+                # filling a buffer that nobody reads any more.
+                await asyncio.sleep(0.3)
                 # Checked inside the loop: asyncio.run cancels leftovers on
                 # exit, which would make any drain look finished.
-                return drain.done()
+                return drain.done(), len(stderr._buffer)
 
             try:
-                reclaimed = asyncio.run(asyncio.wait_for(scenario(), timeout=15))
+                reclaimed, unread = asyncio.run(asyncio.wait_for(scenario(), timeout=15))
             finally:
                 with contextlib.suppress(Exception):
                     os.kill(int(pid_file.read_text()), 9)
 
             self.assertTrue(reclaimed)
+            self.assertEqual(unread, 0)
 
 
 class CodexEventRoutingTests(unittest.TestCase):

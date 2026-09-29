@@ -668,10 +668,15 @@ class CodexStdioAppServerClient:
             await self._terminate_process(process)
         finally:
             # A child that inherited stderr can hold the pipe open after the
-            # wrapper exits; the drain would then wait on it forever and
-            # every restart would leak one more.
+            # wrapper exits. Cancelling the drain alone leaves asyncio reading
+            # that pipe into a buffer nobody consumes, so close the process's
+            # pipes too; every restart would otherwise leak one of each.
             if stderr_task is not None:
                 stderr_task.cancel()
+            transport = getattr(process, "_transport", None)
+            if transport is not None:
+                with contextlib.suppress(Exception):
+                    transport.close()
 
     async def _terminate_process(self, process: asyncio.subprocess.Process | None) -> None:
         if process is None or process.returncode is not None:
