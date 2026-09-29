@@ -469,9 +469,15 @@ temporarily stuck. `--json` is only for manual debugging.
 
 For current fallback Codex TUI observation, `~/.codex/hooks.json` must include
 `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`,
-`PermissionRequest`, and `Stop`. Missing `UserPromptSubmit` means the channel
-can show assistant output from later hooks but cannot show the user's TUI
-input. codex-cli (verified 0.144.5) does not emit `MessageDisplay` or
+`PermissionRequest`, and `Stop`. `UserPromptSubmit` is what opens the topic
+(ADR 0066): a TUI session appears in the channel with its first prompt, titled
+by that prompt; opening a TUI without typing anything posts nothing. Without
+`UserPromptSubmit` the TUI never appears in the channel at all.
+
+TUI exit is detected by a maintenance pass every 30 seconds (one batched `ps`
+over the observed sessions' recorded processes, matched by pid and start
+time): a closed terminal's topic turns "ended" within about 30 seconds, no
+restart or `SessionEnd` hook needed. codex-cli (verified 0.144.5) does not emit `MessageDisplay` or
 `PostToolUseFailure` — configuring them is harmless but dead. Assistant text
 therefore has no codex hook carrier: mid-turn narration is mirrored
 incrementally from the rollout transcript (ADR 0055), and the turn-final text

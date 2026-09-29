@@ -26,6 +26,7 @@ from walkcode.channel_native import (
     TransportCapabilities,
     BlockedReason,
 )
+from walkcode import channel_native as channel_native_module
 from walkcode import channel_native_runtime as runtime_module
 from walkcode.channel_native_runtime import ChannelNativeRuntime
 
@@ -2656,7 +2657,7 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
             )
             created = asyncio.run(
                 runtime.process_tui_hook(
-                    hook_type="sync",
+                    hook_type="user-prompt-submit",
                     agent="claude",
                     payload={
                         "session_id": "claude-session-1",
@@ -2776,7 +2777,7 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
             runtime, _api = self._codex_hook_runtime(tmp)
             cli = asyncio.run(
                 runtime.process_tui_hook(
-                    hook_type="sync",
+                    hook_type="user-prompt-submit",
                     agent="codex",
                     payload={
                         "session_id": "thread-cli",
@@ -2787,7 +2788,7 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
             )
             missing = asyncio.run(
                 runtime.process_tui_hook(
-                    hook_type="sync",
+                    hook_type="user-prompt-submit",
                     agent="codex",
                     payload={
                         "session_id": "thread-missing",
@@ -2803,7 +2804,7 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
             nested.write_text("[" * 200_000 + "]" * 200_000 + "\n", encoding="utf-8")
             deep = asyncio.run(
                 runtime.process_tui_hook(
-                    hook_type="sync",
+                    hook_type="user-prompt-submit",
                     agent="codex",
                     payload={"session_id": "thread-nested", "cwd": tmp, "transcript_path": str(nested)},
                 )
@@ -3462,7 +3463,7 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
                 },
             }
             created = asyncio.run(
-                runtime.process_tui_hook(hook_type="sync", agent="codex", payload=dict(base_payload))
+                runtime.process_tui_hook(hook_type="user-prompt-submit", agent="codex", payload=dict(base_payload))
             )
             # First tool hook initializes the narration cursor (fast-forward,
             # history must not replay).
@@ -3728,7 +3729,7 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
             )
             asyncio.run(
                 runtime.process_tui_hook(
-                    hook_type="sync",
+                    hook_type="user-prompt-submit",
                     agent="claude",
                     payload={"session_id": "claude-session-1", "cwd": tmp},
                 )
@@ -3814,7 +3815,7 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
 
             created = asyncio.run(
                 runtime.process_tui_hook(
-                    hook_type="sync",
+                    hook_type="user-prompt-submit",
                     agent="claude",
                     payload={"session_id": "claude-session-1", "cwd": tmp},
                 )
@@ -3956,7 +3957,7 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
             )
 
             queued = runtime.defer_tui_hook(
-                hook_type="SessionStart",
+                hook_type="user-prompt-submit",
                 agent="claude",
                 payload={"session_id": "claude-session-1", "cwd": tmp},
             )
@@ -4119,7 +4120,7 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
 
             asyncio.run(
                 runtime.process_tui_hook(
-                    hook_type="SessionStart",
+                    hook_type="user-prompt-submit",
                     agent="claude",
                     payload={"session_id": "claude-session-1", "cwd": tmp},
                 )
@@ -4206,7 +4207,7 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
             self.assertTrue(result.accepted)
             send_messages = [payload for method, payload in api.calls if method == "sendMessage"]
             self.assertEqual(len(send_messages), 2)
-            self.assertIn("WalkCode session: claude: TUI claude-session-early", send_messages[0]["text"])
+            self.assertIn("WalkCode session: hello from TUI", send_messages[0]["text"])  # titled by the prompt
             self.assertEqual(send_messages[1]["text"], "⌨️ 终端输入\n\nhello from TUI")
             self.assertEqual(runtime.transports["claude_headless"].submitted_turns, [])
             snapshot = JsonFileStateStore(state_path).load()
@@ -4317,7 +4318,7 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
             self.assertNotIn("hidden thought", send_messages[-1]["text"])
             self.assertNotIn("'content'", send_messages[-1]["text"])
 
-    def test_pre_tool_hook_creates_observed_session_when_first_tui_event_is_tool(self):
+    def test_activity_hooks_before_the_first_prompt_open_no_topic(self):
         with tempfile.TemporaryDirectory() as tmp:
             state_path = str(Path(tmp) / "state.json")
             cfg = ChannelNativeConfig.from_env(
@@ -4351,15 +4352,19 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
                 )
             )
 
+            # ADR 0066: SessionStart and activity hooks carry no prompt; a topic
+            # rooted by them could only be titled "TUI <uuid>".
+            for hook_type in ("SessionStart", "sync"):
+                asyncio.run(
+                    runtime.process_tui_hook(
+                        hook_type=hook_type, agent="claude", payload={"session_id": "claude-session-tool-first", "cwd": tmp}
+                    )
+                )
+
             self.assertTrue(result.accepted)
-            send_messages = [payload for method, payload in api.calls if method == "sendMessage"]
-            self.assertTrue(any("WalkCode session: claude: TUI claude-session-tool-first" in item["text"] for item in send_messages))
-            self.assertTrue(any("Agent activity" in item["text"] and "Tool: Bash" in item["text"] for item in send_messages))
-            snapshot = JsonFileStateStore(state_path).load()
-            summaries = snapshot.sessions.list_sessions(channel_kind="telegram")
-            self.assertEqual(len(summaries), 1)
-            session = snapshot.sessions.get(summaries[0].session_id)
-            self.assertEqual(session.last_progress_event, AgentEventType.TOOL_STARTED)
+            self.assertEqual(result.reason, "unobserved_tui_hook")
+            self.assertEqual([m for m, _ in api.calls if m in {"sendMessage", "createForumTopic"}], [])
+            self.assertEqual(JsonFileStateStore(state_path).load().sessions.list_sessions(channel_kind="telegram"), [])
 
     def test_tui_hook_creates_forum_topic_for_observed_session_when_available(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -4383,7 +4388,7 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
 
             result = asyncio.run(
                 runtime.process_tui_hook(
-                    hook_type="sync",
+                    hook_type="user-prompt-submit",
                     agent="codex",
                     payload={
                         "thread_id": "codex-thread-1",
@@ -5405,7 +5410,11 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
                 "cwd": tmp,
             }
 
-            asyncio.run(runtime.process_tui_hook(hook_type="sync", agent="claude", payload=payload))
+            asyncio.run(
+                runtime.process_tui_hook(
+                    hook_type="user-prompt-submit", agent="claude", payload={"session_id": "claude-session-1", "cwd": tmp}
+                )
+            )
             first = asyncio.run(runtime.process_tui_hook(hook_type="stop", agent="claude", payload=payload))
             second = asyncio.run(runtime.process_tui_hook(hook_type="stop", agent="claude", payload=payload))
 
@@ -5436,7 +5445,7 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
 
             created = asyncio.run(
                 runtime.process_tui_hook(
-                    hook_type="sync",
+                    hook_type="user-prompt-submit",
                     agent="codex",
                     payload={"thread_id": "codex-thread-1"},
                 )
@@ -5480,7 +5489,7 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
 
             created = asyncio.run(
                 runtime.process_tui_hook(
-                    hook_type="sync",
+                    hook_type="user-prompt-submit",
                     agent="codex",
                     payload={"thread_id": "codex-thread-1"},
                 )
@@ -5929,19 +5938,18 @@ class TuiHookModelBackfillIntegrationTests(unittest.TestCase):
             api = _ForumTelegramApi()
             runtime = ChannelNativeRuntime.from_config(cfg, telegram_api=api, transports={})
             payload = {
-                "hook_event_name": "SessionStart",
+                "hook_event_name": "UserPromptSubmit",
                 "session_id": "sess-tui-model",
                 "transcript_path": str(transcript),
                 "cwd": tmp,
                 "_walkcode_external_tui_pid": 4242,
             }
-            asyncio.run(runtime.process_tui_hook(hook_type="SessionStart", payload=payload, agent="claude"))
+            asyncio.run(runtime.process_tui_hook(hook_type="UserPromptSubmit", payload=payload, agent="claude"))
             sessions = [
                 s for s in runtime.state.sessions.iter_sessions()
                 if s.transport_kind == "external_tui"
             ]
-            if not sessions:
-                self.skipTest("TUI hook did not create an observed session in this configuration")
+            self.assertEqual(len(sessions), 1)
             self.assertEqual(sessions[0].model, "claude-sonnet-5[1m]")
 
 class OrphanHeadlessSweepTests(unittest.TestCase):
@@ -6368,3 +6376,205 @@ class TuiHookToolEventDedupKeyTests(unittest.TestCase):
             self.assertTrue(first.accepted)
             self.assertTrue(second.accepted)
             self.assertNotEqual(second.reason, BlockedReason.DUPLICATE_INBOUND)
+
+
+class TuiExitSweepTests(unittest.TestCase):
+    """ADR 0066: observed sessions end when their TUI process is gone."""
+
+    def _runtime(self, tmp):
+        cfg = ChannelNativeConfig.from_env(
+            {
+                "WALKCODE_CHANNEL": "telegram",
+                "TELEGRAM_BOT_TOKEN": "fake",
+                "WALKCODE_AGENT": "claude",
+                "WALKCODE_STATE_PATH": str(Path(tmp) / "state.json"),
+                "WALKCODE_CWD": tmp,
+            }
+        )
+        return ChannelNativeRuntime.from_config(
+            cfg,
+            telegram_api=_FakeTelegramApi(),
+            transports={"claude_headless": FakeAgentTransport("claude_headless", _transport_caps())},
+        )
+
+    @staticmethod
+    def _observed(runtime, tmp, name, pid, lstart="Tue Sep 29 11:06:24 2026"):
+        return runtime.state.sessions.create_observed_session(
+            session_id=f"tui-claude-{name}",
+            binding=ChannelBinding("telegram", "bot", "chat", f"thread-{name}", "", capabilities={"status_card": True}),
+            cwd=tmp,
+            external_ref={
+                "source": "native_tui_hook",
+                "resume_ref": {"transport_kind": "claude_headless", "agent_session_id": name},
+                "terminate_ref": {"controller_kind": "process", "process_ref": {"pid": pid, "lstart": lstart}},
+            },
+            owner=ActorRef("telegram", "local_tui", "Claude TUI"),
+        )
+
+    def test_probe_processes_parses_one_ps_for_many_pids(self):
+        out = "  101 Ss   Tue Sep 29 11:06:24 2026\n  102 Z    Tue Sep 29 11:06:25 2026\n"
+        with patch.object(
+            channel_native_module.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, out, "")
+        ) as run:
+            probes = channel_native_module._probe_processes([101, 102, 103, 1])
+        self.assertEqual(run.call_count, 1)
+        self.assertEqual(run.call_args.args[0][-1], "101,102,103")
+        self.assertEqual(probes[101].status, "ok")
+        self.assertEqual(probes[101].lstart, "Tue Sep 29 11:06:24 2026")
+        self.assertEqual(probes[102].status, "gone")  # zombie
+        self.assertEqual(probes[103].status, "gone")  # absent
+
+    def test_probe_processes_treats_a_failed_ps_as_no_answer(self):
+        for result in (
+            subprocess.CompletedProcess([], 2, "", "boom"),
+            subprocess.CompletedProcess([], 0, "garbage line\n", ""),
+        ):
+            with patch.object(channel_native_module.subprocess, "run", return_value=result):
+                self.assertIsNone(channel_native_module._probe_processes([101]))
+        with patch.object(channel_native_module.subprocess, "run", side_effect=subprocess.TimeoutExpired("ps", 1)):
+            self.assertIsNone(channel_native_module._probe_processes([101]))
+
+    def test_process_ref_state_is_three_valued_and_catches_pid_reuse(self):
+        ref = {"pid": 101, "lstart": "Tue Sep  9 11:06:24 2026"}
+        ok = channel_native_module._ProcProbe("ok", "Tue Sep 9 11:06:24 2026")
+        self.assertEqual(runtime_module._process_ref_state(ref, ok), "alive")  # spacing normalized
+        reused = channel_native_module._ProcProbe("ok", "Wed Sep 30 08:00:00 2026")
+        self.assertEqual(runtime_module._process_ref_state(ref, reused), "gone")
+        self.assertEqual(runtime_module._process_ref_state(ref, channel_native_module._ProcProbe("gone")), "gone")
+        self.assertEqual(runtime_module._process_ref_state(ref, channel_native_module._ProcProbe("error")), "unknown")
+
+    def test_sweep_ends_only_sessions_whose_process_is_gone_with_one_ps(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = self._runtime(tmp)
+            dead = self._observed(runtime, tmp, "dead", 201)
+            reused = self._observed(runtime, tmp, "reused", 202)
+            alive = self._observed(runtime, tmp, "alive", 203)
+            probes = {
+                201: channel_native_module._ProcProbe("gone"),
+                202: channel_native_module._ProcProbe("ok", "Wed Sep 30 08:00:00 2026"),
+                203: channel_native_module._ProcProbe("ok", "Tue Sep 29 11:06:24 2026"),
+            }
+            with patch.object(runtime_module, "_probe_processes", return_value=probes) as batch, patch.object(
+                runtime_module, "_probe_process", side_effect=AssertionError("no per-session re-probe")
+            ):
+                marked = asyncio.run(runtime.sweep_exited_tui_sessions())
+
+            self.assertEqual(batch.call_count, 1)
+            self.assertEqual(marked, 2)
+            for session in (dead, reused):
+                updated = runtime.state.sessions.get(session.session_id)
+                self.assertEqual(updated.status, "stopped")
+                self.assertEqual(updated.stop_reason, "external_tui_process_gone")
+            self.assertEqual(runtime.state.sessions.get(alive.session_id).status, "running")
+            # Already stopped: not probed again on the next pass.
+            with patch.object(runtime_module, "_probe_processes", return_value=probes) as batch:
+                asyncio.run(runtime.sweep_exited_tui_sessions())
+            self.assertEqual(sorted(batch.call_args.args[0]), [203])
+
+    def test_sweep_decides_nothing_when_ps_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = self._runtime(tmp)
+            session = self._observed(runtime, tmp, "x", 201)
+            with patch.object(runtime_module, "_probe_processes", return_value=None):
+                self.assertEqual(asyncio.run(runtime.sweep_exited_tui_sessions()), 0)
+            self.assertEqual(runtime.state.sessions.get(session.session_id).status, "running")
+
+    def test_sweep_skips_a_session_whose_process_record_changed_while_ps_ran(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = self._runtime(tmp)
+            session = self._observed(runtime, tmp, "x", 201)
+
+            def probe(pids):
+                # A hook re-claimed the session for a new TUI process meanwhile.
+                live = runtime.state.sessions.get(session.session_id)
+                live.transport_ref["terminate_ref"] = {"controller_kind": "process", "process_ref": {"pid": 301, "lstart": "Tue Sep 29 11:06:24 2026"}}
+                return {201: channel_native_module._ProcProbe("gone")}
+
+            with patch.object(runtime_module, "_probe_processes", side_effect=probe):
+                self.assertEqual(asyncio.run(runtime.sweep_exited_tui_sessions()), 0)
+            self.assertEqual(runtime.state.sessions.get(session.session_id).status, "running")
+
+    def test_a_claim_during_the_daemon_probe_keeps_the_session(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = self._runtime(tmp)
+            session = self._observed(runtime, tmp, "x", 201)
+
+            async def daemon_probe(live):
+                # A fresh TUI hook re-claims the session for a new process
+                # while the (slow) daemon probe is out.
+                live.transport_ref["terminate_ref"] = {
+                    "controller_kind": "process",
+                    "process_ref": {"pid": 301, "lstart": "Tue Sep 29 12:00:00 2026"},
+                }
+                return False
+
+            for worker_alive in (False, True):
+                answer = worker_alive
+
+                async def probe(live, answer=answer):
+                    await daemon_probe(live)
+                    return answer
+
+                live = runtime.state.sessions.get(session.session_id)
+                live.transport_ref["terminate_ref"] = {
+                    "controller_kind": "process",
+                    "process_ref": {"pid": 201, "lstart": "Tue Sep 29 11:06:24 2026"},
+                }
+                with patch.object(
+                    runtime_module, "_probe_processes", return_value={201: channel_native_module._ProcProbe("gone")}
+                ), patch.object(runtime, "_claude_daemon_session_alive", side_effect=probe):
+                    self.assertEqual(asyncio.run(runtime.sweep_exited_tui_sessions()), 0)
+                live = runtime.state.sessions.get(session.session_id)
+                self.assertEqual(live.status, "running")
+                self.assertNotEqual(live.last_progress_event, "external_tui.tui_detached_daemon_alive")
+
+    def test_single_probe_failure_does_not_end_the_session_on_startup(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = self._runtime(tmp)
+            session = self._observed(runtime, tmp, "x", 201)
+            with patch.object(runtime_module, "_probe_process", return_value=channel_native_module._ProcProbe("error")):
+                asyncio.run(runtime._refresh_loaded_tui_observed_bindings())
+            self.assertEqual(runtime.state.sessions.get(session.session_id).status, "running")
+
+    def test_daemon_socket_missing_long_enough_means_no_worker(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = self._runtime(tmp)
+            socket_path = Path(tmp) / "daemon.sock"
+
+            class _Client:
+                def __init__(self):
+                    self.socket_path = str(socket_path)
+
+                answer = None  # probe failed
+
+                async def job_alive(self, short):
+                    return self.answer
+
+            transport = type("T", (), {"client": _Client()})()
+            session = self._observed(runtime, tmp, "x", 201)
+            session.transport_ref["daemon_live"] = True
+            now = [1000.0]
+            runtime._now = lambda: now[0]
+            with patch.object(runtime, "_claude_daemon_transport", return_value=transport), patch.object(
+                runtime_module, "claude_daemon_short_from_resume_ref", return_value="abc"
+            ), patch.object(runtime_module, "_external_claude_resume_ref", return_value={"x": 1}):
+                alive = lambda: asyncio.run(runtime._claude_daemon_session_alive(session))
+                self.assertTrue(alive())  # just went missing: maybe restarting
+                now[0] += runtime_module.CLAUDE_DAEMON_SOCKET_GONE_SECONDS - 1
+                self.assertTrue(alive())
+                socket_path.write_text("")  # back: the clock resets
+                self.assertTrue(alive())
+                socket_path.unlink()
+                now[0] += 1
+                self.assertTrue(alive())
+                now[0] += runtime_module.CLAUDE_DAEMON_SOCKET_GONE_SECONDS
+                self.assertFalse(alive())
+                # The daemon comes back and answers: the clock must reset, so a
+                # later blip gets a fresh window instead of an instant verdict.
+                socket_path.write_text("")
+                transport.client.answer = True
+                self.assertTrue(alive())
+                socket_path.unlink()
+                transport.client.answer = None
+                now[0] += 1
+                self.assertTrue(alive())

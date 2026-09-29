@@ -254,7 +254,9 @@ class ComposeSessionTitleTests(unittest.TestCase):
 class TuiHookTitlePathTests(unittest.TestCase):
     """claude TUI and codex TUI — both deliver turn end through hooks.json."""
 
-    def test_claude_tui_prompt_replaces_the_uuid_placeholder(self):
+    def test_claude_tui_topic_is_titled_by_the_first_prompt_from_the_start(self):
+        # ADR 0066: SessionStart opens nothing; the first prompt opens the
+        # topic, and its very first status card already carries the prompt.
         with tempfile.TemporaryDirectory() as tmp:
             api = _TitleTelegramApi()
             runtime = _tui_runtime(tmp, "claude", api)
@@ -266,9 +268,8 @@ class TuiHookTitlePathTests(unittest.TestCase):
                     payload={"session_id": "claude-title-1", "cwd": tmp},
                 )
             )
-            placeholder = _only_session(runtime)
-            self.assertEqual(placeholder.title_source, "tui_hook")
-            self.assertIn("claude-title-1", placeholder.cached_title)
+            self.assertEqual(runtime.state.sessions.list_sessions(channel_kind="telegram"), [])
+            self.assertEqual([m for m, _ in api.calls if m == "sendMessage"], [])
 
             asyncio.run(
                 runtime.process_tui_hook(
@@ -285,21 +286,25 @@ class TuiHookTitlePathTests(unittest.TestCase):
             session = _only_session(runtime)
             self.assertEqual(session.cached_title, "把话题根标题改成有意义的")
             self.assertEqual(session.title_source, "initial_user_input")
+            sent = [p["text"] for m, p in api.calls if m == "sendMessage"]
+            self.assertIn("把话题根标题改成有意义的", sent[0])
+            self.assertFalse(any("claude-title-1" in text.split("\n")[0] for text in sent))
 
-    def test_codex_tui_stop_hook_digests_when_the_prompt_was_missed(self):
-        # Attaching mid-flight: the first prompt was submitted before the hook
-        # pipeline was watching, so the stop bubble is the only material.
+    def test_codex_tui_stop_hook_digests_when_the_prompt_had_no_text(self):
+        # The first prompt opened the topic but carried no text (e.g. only an
+        # attachment), so the stop bubble is the only title material.
         with tempfile.TemporaryDirectory() as tmp:
             api = _TitleTelegramApi()
             runtime = _tui_runtime(tmp, "codex", api)
 
             asyncio.run(
                 runtime.process_tui_hook(
-                    hook_type="SessionStart",
+                    hook_type="UserPromptSubmit",
                     agent="codex",
                     payload={"session_id": "codex-title-1", "cwd": tmp},
                 )
             )
+            self.assertEqual(_only_session(runtime).title_source, "tui_hook")
             asyncio.run(
                 runtime.process_tui_hook(
                     hook_type="Stop",
