@@ -4203,9 +4203,10 @@ def claude_tui_current_session(pid: int, lstart: str) -> str:
         return ""
     home = Path.home()
     dirs = [os.environ.get("CLAUDE_CONFIG_DIR", ""), str(home / ".claude")]
-    profiles = home / ".claude-profiles"
-    if profiles.is_dir():
-        dirs.extend(str(child) for child in sorted(profiles.iterdir()))
+    try:
+        dirs.extend(str(child) for child in sorted((home / ".claude-profiles").iterdir()))
+    except OSError:
+        pass  # no (readable) profiles dir: the other locations still answer
     for config_dir in dict.fromkeys(d for d in dirs if d):
         try:
             record = json.loads((Path(config_dir) / "sessions" / f"{pid}.json").read_text())

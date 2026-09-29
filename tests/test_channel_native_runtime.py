@@ -6612,6 +6612,21 @@ class ClaudeTuiSessionSwitchTests(unittest.TestCase):
                 self.assertEqual(current(207, "12345"), "")
                 (sessions / "208.json").write_text("{not json")
                 self.assertEqual(current(208, self.LSTART), "")
+            # An unreadable profiles dir does not hide the other locations.
+            default = home / ".claude" / "sessions"
+            default.mkdir(parents=True)
+            (default / "209.json").write_text(json.dumps({"sessionId": "in-default", "procStart": self.LSTART}))
+            real_iterdir = channel_native_module.Path.iterdir
+
+            def iterdir(path):
+                if path.name == ".claude-profiles":
+                    raise PermissionError("denied")
+                return real_iterdir(path)
+
+            with patch.object(channel_native_module.Path, "home", return_value=home), patch.object(
+                channel_native_module.Path, "iterdir", iterdir
+            ), patch.dict("os.environ", {"CLAUDE_CONFIG_DIR": ""}):
+                self.assertEqual(channel_native_module.claude_tui_current_session(209, self.LSTART), "in-default")
 
     def test_sweep_detaches_a_session_whose_process_now_runs_another(self):
         with tempfile.TemporaryDirectory() as tmp:

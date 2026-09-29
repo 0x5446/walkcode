@@ -79,3 +79,6 @@ gpt-5.6-sol，correctness + concurrency + goalfit）：2 条（High/Warning）�
 不可消除的微秒级窗口，写入已知局限，不改代码（理由见 Consequences）。correctness 维度
 网络超时，单独重跑。
 
+2026-09-29 第 4 轮 correctness 重跑：1 条 Medium——`~/.claude-profiles` 不可枚举时
+`iterdir()` 抛错，连带跳过其他配置目录；已单独捕获。
+
