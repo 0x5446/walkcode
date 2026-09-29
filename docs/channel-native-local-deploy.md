@@ -48,10 +48,9 @@ profile split (ADR 0043).
 
 ## Minimal Telegram + Claude Setup
 
-Install or upgrade through the V3 scripts or `walkcode upgrade`; those paths
-install the uv tool with `claude-agent-sdk` available to the `walkcode` CLI.
-If Claude doctor reports unavailable after a manual install, reinstall with
-`uv tool install --with claude-agent-sdk --force --reinstall --refresh-package walkcode`.
+Install with `install.sh` and upgrade with `./upgrade.sh`. `claude-agent-sdk`
+and `lark-oapi` are declared runtime dependencies, so every install path gets
+them.
 
 When both Claude and Codex Telegram runtimes are running, Telegram diagnostics
 may see multiple `walkcode native serve` processes. That is expected for

@@ -158,6 +158,28 @@ class ViewModelRenderingTests(unittest.TestCase):
         self.assertTrue(result.accepted)
         self.assertEqual(store.get(ctx.interaction_id).answers[0], "custom answer")
 
+    def test_expired_other_wait_releases_the_binding(self):
+        # Regression: an expired "Other" wait kept its binding mapping, so the
+        # user's next plain message was swallowed as INVALID_TOKEN with no
+        # notice until the compaction tick removed it.
+        clock = _Clock()
+        store = InteractionStore(now=clock)
+        ctx = store.register_ask_user_question(
+            session_id="s1",
+            generation=4,
+            questions=[{"prompt": "Pick one", "options": ["A", "B"], "allow_other": True}],
+            ttl=60,
+        )
+        key = _binding("telegram").key()
+        store.begin_awaiting_other(ctx.interaction_id, key, question_index=0)
+        self.assertIsNotNone(store.awaiting_context_for_binding(key))
+
+        clock.now += 61
+
+        self.assertIsNone(store.awaiting_context_for_binding(key))
+        self.assertEqual(store.awaiting_other_count(), 0)
+        self.assertIsNone(store.get(ctx.interaction_id).awaiting_other)
+
     def test_model_choice_marks_current_from_dated_and_vertex_model_ids(self):
         store = InteractionStore(now=_Clock())
         models = [

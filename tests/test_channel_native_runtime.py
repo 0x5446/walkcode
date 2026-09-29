@@ -2394,7 +2394,7 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
         self.assertEqual(fake.signals, ["terminate"])
         # Already-parsed notifications are real events that happened; the
         # transport dying must not silently drop them (deep-review round 2).
-        self.assertEqual(client._buffered_notifications, [{"method": "stale"}])
+        self.assertEqual(list(client._buffered_notifications), [{"method": "stale"}])
 
     def test_codex_stdio_client_overlimit_line_from_real_subprocess_discards_process(self):
         # End-to-end over-limit path: a REAL subprocess emits a single line
@@ -3604,6 +3604,20 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
         self.assertEqual(asyncio.run(host._heal_rootless_lark_tui_binding(broken)), "retry")
         self.assertEqual(broken.channel_binding.root_message_id, "")
 
+        # A permanent failure (bot not in chat, monthly quota spent) gives up
+        # instead of re-sending every 5 s tick and burning the quota.
+        from walkcode.channel_native import PermanentDeliveryError as _Permanent
+
+        class _RejectingChannel(_FakeChannel):
+            async def send_view(self, binding, view_model):
+                raise _Permanent("lark code 99991403")
+
+        host.channels = {"lark": _RejectingChannel("lark", _channel_caps())}
+        rejected = _rootless_session()
+        host.state = SimpleNamespace(sessions=_register(rejected))
+        self.assertEqual(asyncio.run(host._heal_rootless_lark_tui_binding(rejected)), "")
+        self.assertEqual(rejected.channel_binding.root_message_id, "")
+
     def test_rootless_heal_send_failure_keeps_load_pass_retryable(self):
         # A transient Lark outage at startup must NOT freeze the one-shot
         # refresh flag: the maintenance tick has to retry until the root is
@@ -4017,6 +4031,59 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
             self.assertEqual(drained, 0)
             # both archived out of the live queue (no infinite retry wedge)
             self.assertEqual(list(qdir.glob("*.json")), [])
+
+    def test_deferred_tui_hook_that_keeps_raising_is_archived(self):
+        # Regression: the drain stops at the first raising hook to keep order,
+        # so a hook that fails the same way every tick blocked every hook
+        # behind it forever.
+        from walkcode import channel_native_runtime as runtime_module
+
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = str(Path(tmp) / "state.json")
+            cfg = ChannelNativeConfig.from_env(
+                {
+                    "WALKCODE_CHANNEL": "telegram",
+                    "TELEGRAM_BOT_TOKEN": "fake",
+                    "WALKCODE_AGENT": "claude",
+                    "TELEGRAM_ALLOWED_CHAT_IDS": "123",
+                    "WALKCODE_STATE_PATH": state_path,
+                    "WALKCODE_CWD": tmp,
+                }
+            )
+            runtime = ChannelNativeRuntime.from_config(
+                cfg,
+                telegram_api=_FakeTelegramApi(),
+                transports={"claude_headless": FakeAgentTransport("claude_headless", _transport_caps())},
+            )
+            qdir = Path(f"{state_path}.tui-hooks.d")
+            qdir.mkdir(parents=True, exist_ok=True)
+            for name in ("00-poison.json", "01-next.json"):
+                (qdir / name).write_text(
+                    json.dumps(
+                        {
+                            "created_at": time.time(),
+                            "hook_type": "SessionStart",
+                            "agent": "claude",
+                            "payload": {"session_id": name, "cwd": tmp},
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+            seen = []
+
+            async def process(*, hook_type, agent, payload):
+                seen.append(payload["session_id"])
+                if payload["session_id"] == "00-poison.json":
+                    raise RecursionError("same failure every time")
+                return runtime_module.SubmitResult(True)
+
+            runtime.process_tui_hook = process
+            for _ in range(runtime_module.TUI_HOOK_MAX_ATTEMPTS):
+                asyncio.run(runtime.drain_deferred_tui_hooks())
+
+            self.assertEqual(list(qdir.glob("*.json")), [])
+            self.assertTrue((qdir / "bad" / "00-poison.json").exists())
+            self.assertEqual(seen.count("01-next.json"), 1)
 
     def test_deferred_tui_hook_filename_uses_nanosecond_order(self):
         with tempfile.TemporaryDirectory() as tmp:

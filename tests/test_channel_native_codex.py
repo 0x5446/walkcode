@@ -8,6 +8,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -2454,6 +2455,34 @@ class _ScriptedWireCodexStdioClient(CodexStdioAppServerClient):
         return self.wire.pop(0)
 
 
+class CodexStdioStderrTests(unittest.TestCase):
+    def test_chatty_stderr_does_not_block_the_server(self):
+        # Regression: stderr was a PIPE nobody read. app-server logs there for
+        # its whole life and asyncio kept every byte in memory (up to 2x the
+        # 64 MiB stream limit) until the exit path finally read it.
+        server = (
+            "import sys, json\n"
+            "sys.stderr.write('x' * 256 * 1024 + '\\nlast words\\n'); sys.stderr.flush()\n"
+            "req = json.loads(sys.stdin.readline())\n"
+            "print(json.dumps({'id': req['id'], 'result': {}}), flush=True)\n"
+            "import time; time.sleep(30)\n"
+        )
+        client = CodexStdioAppServerClient(command=(sys.executable, "-c", server), request_timeout=5)
+
+        async def scenario():
+            async with client._lock:
+                await client._ensure_started()
+            await asyncio.sleep(0.2)
+            unread = len(client._process.stderr._buffer)
+            await client.restart()
+            return unread
+
+        unread = asyncio.run(asyncio.wait_for(scenario(), timeout=10))
+
+        self.assertEqual(unread, 0)
+        self.assertEqual(client._stderr_tail[-1], "last words")
+
+
 class CodexEventRoutingTests(unittest.TestCase):
     def test_thread_less_events_are_not_handed_to_a_foreign_thread(self):
         # Several TUI sessions share one app-server process. An event with no
@@ -2475,7 +2504,7 @@ class CodexEventRoutingTests(unittest.TestCase):
 
         self.assertEqual(events_a, [])
         self.assertEqual(events_b, [])
-        self.assertEqual(client._buffered_notifications, [unaddressed])
+        self.assertEqual(list(client._buffered_notifications), [unaddressed])
 
     def test_buffered_thread_less_event_is_claimed_once_the_others_go_quiet(self):
         # Regression: liveness was keyed on _thread_queues, which is never
@@ -2498,7 +2527,29 @@ class CodexEventRoutingTests(unittest.TestCase):
         events = asyncio.run(scenario())
 
         self.assertEqual(events, [final])
-        self.assertEqual(client._buffered_notifications, [])
+        self.assertEqual(list(client._buffered_notifications), [])
+
+    def test_idle_global_notifications_stay_bounded_and_log_once(self):
+        # Regression: account/rateLimits/updated carries no threadId and
+        # arrives all day while nobody listens; the buffer grew to thousands
+        # and every arrival wrote a degrade line.
+        client = _ScriptedWireCodexStdioClient([])
+        notice = {"jsonrpc": "2.0", "method": "account/rateLimits/updated", "params": {}}
+        with patch("walkcode.channel_native_runtime._log_degrade") as log:
+            for _ in range(client._BUFFERED_NOTIFICATIONS_MAX + 50):
+                client._dispatch(dict(notice))
+
+        self.assertEqual(len(client._buffered_notifications), client._BUFFERED_NOTIFICATIONS_MAX)
+        self.assertEqual(log.call_count, 1)
+
+    def test_thread_started_routes_by_its_thread_object(self):
+        client = _ScriptedWireCodexStdioClient([])
+        started = {"jsonrpc": "2.0", "method": "thread/started", "params": {"thread": {"id": "thread-a"}}}
+
+        client._dispatch(started)
+
+        self.assertEqual(list(client._buffered_notifications), [])
+        self.assertEqual(client._thread_queues["thread-a"].get_nowait(), started)
 
     def test_thread_less_events_still_reach_a_solitary_thread(self):
         client = _ScriptedWireCodexStdioClient(

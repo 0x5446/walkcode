@@ -2715,7 +2715,16 @@ class InteractionStore:
         interaction_id = self._awaiting_other_by_binding.get(binding_key)
         if interaction_id is None:
             return None
-        return self._interactions.get(interaction_id)
+        ctx = self._interactions.get(interaction_id)
+        if ctx is None or ctx.decision is not None or ctx.expires_at <= self._now():
+            # A wait nobody can answer any more must not capture the next
+            # plain message: it would be swallowed with no notice until the
+            # compaction tick removed the mapping.
+            if ctx is not None:
+                ctx.awaiting_other = None
+            self._awaiting_other_by_binding.pop(binding_key, None)
+            return None
+        return ctx
 
     def clear_awaiting_other_for_session(
         self,
@@ -6134,10 +6143,9 @@ class _ClaudePermissionBridge:
 
     _ASK_USER_TOOL_NAMES = frozenset({"AskUserQuestion", "ask_user_question"})
 
-    def __init__(self, *, sdk: Any, timeout: float = 1800.0, on_always_allow: Callable[[str], None] | None = None):
+    def __init__(self, *, sdk: Any, timeout: float = 1800.0):
         self._sdk = sdk
         self._timeout = timeout
-        self._on_always_allow = on_always_allow
         self._queue: asyncio.Queue[AgentEvent] = asyncio.Queue()
         self._pending: dict[str, asyncio.Future] = {}
         self._entries: dict[str, dict[str, Any]] = {}
@@ -6281,10 +6289,10 @@ class _ClaudePermissionBridge:
         if action in {"allow", "allow_once", "accept", "acceptForSession"}:
             return allow_cls()
         if action == "always_allow":
+            # The CLI persists these at the scope the suggestion names. Do
+            # not also write the bare tool name into the profile settings.json:
+            # approving one command must not allow every Bash call everywhere.
             updates = self._always_allow_updates(entry)
-            if self._on_always_allow is not None:
-                with contextlib.suppress(Exception):
-                    self._on_always_allow(str(entry.get("tool_name", "") or ""))
             return allow_cls(updated_permissions=updates or None)
         return self._deny_result(str(decision.get("reason", "") or "Denied via WalkCode"))
 
@@ -8111,11 +8119,7 @@ class ClaudeHeadlessTransport:
             option_kwargs["max_buffer_size"] = self._SDK_MAX_BUFFER_SIZE
         bridge: _ClaudePermissionBridge | None = None
         if options_cls is not None and self._permission_bridging_supported(sdk):
-            bridge = _ClaudePermissionBridge(
-                sdk=sdk,
-                timeout=self.permission_timeout,
-                on_always_allow=self._write_always_allow_rule,
-            )
+            bridge = _ClaudePermissionBridge(sdk=sdk, timeout=self.permission_timeout)
             option_kwargs["can_use_tool"] = bridge.can_use_tool
         try:
             if options_cls is not None:
@@ -8134,39 +8138,6 @@ class ClaudeHeadlessTransport:
             getattr(sdk, "PermissionResultAllow", None) is not None
             and getattr(sdk, "PermissionResultDeny", None) is not None
         )
-
-    def _write_always_allow_rule(self, tool_name: str) -> None:
-        """Persist an always-allow rule into the profile's settings.json.
-
-        Mirrors V2's ``_add_permission_rule``: append the tool to
-        ``permissions.allow`` in the profile settings file. Best-effort — any
-        failure (missing file, unwritable, malformed JSON) is silently skipped so
-        a persistence hiccup never blocks the live decision.
-        """
-        tool_name = str(tool_name or "").strip()
-        if not tool_name:
-            return
-        try:
-            if self.config_dir:
-                settings_path = Path(self.config_dir).expanduser() / "settings.json"
-            else:
-                settings_path = Path.home() / ".claude" / "settings.json"
-            if not settings_path.exists():
-                return
-            settings = json.loads(settings_path.read_text())
-            if not isinstance(settings, dict):
-                return
-            permissions = settings.setdefault("permissions", {})
-            if not isinstance(permissions, dict):
-                return
-            allow = permissions.setdefault("allow", [])
-            if not isinstance(allow, list):
-                return
-            if tool_name not in allow:
-                allow.append(tool_name)
-                settings_path.write_text(json.dumps(settings, indent=2, ensure_ascii=False) + "\n")
-        except Exception:
-            return
 
     @staticmethod
     async def _connect_client(client: Any) -> None:
@@ -10284,42 +10255,18 @@ class JsonFileStateStore:
         self.path = Path(path).expanduser()
         self._now = now
 
-    def save(
-        self,
-        snapshot: StateSnapshot | None = None,
-        *,
-        sessions: SessionRegistry | None = None,
-        interactions: InteractionStore | None = None,
-        outbox: DurableOutbox | None = None,
-        authz: AuthorizationStore | None = None,
-        inbound_ledger: InboundLedger | None = None,
-        hitls: HitlStore | None = None,
-    ) -> None:
-        if snapshot is not None:
-            sessions = snapshot.sessions
-            interactions = snapshot.interactions
-            outbox = snapshot.outbox
-            authz = snapshot.authz
-            inbound_ledger = snapshot.inbound_ledger
-            hitls = snapshot.hitls
-        if (
-            sessions is None
-            or interactions is None
-            or outbox is None
-            or authz is None
-            or inbound_ledger is None
-        ):
-            raise ValueError("state snapshot or all state components are required")
-        if hitls is None:
-            hitls = HitlStore(now=self._now)
+    def save(self, snapshot: StateSnapshot) -> None:
+        # Whole snapshots only: saving from loose components let a caller
+        # omit one (the debug repair commands dropped hitls) and silently
+        # persist it as empty.
         payload = {
             "schema_version": 1,
-            "sessions": sessions.to_dict(),
-            "interactions": interactions.to_dict(),
-            "outbox": outbox.to_dict(),
-            "authz": authz.to_dict(),
-            "inbound_ledger": inbound_ledger.to_dict(),
-            "hitls": hitls.to_dict(),
+            "sessions": snapshot.sessions.to_dict(),
+            "interactions": snapshot.interactions.to_dict(),
+            "outbox": snapshot.outbox.to_dict(),
+            "authz": snapshot.authz.to_dict(),
+            "inbound_ledger": snapshot.inbound_ledger.to_dict(),
+            "hitls": snapshot.hitls.to_dict(),
         }
         _atomic_write_json(self.path, payload)
 

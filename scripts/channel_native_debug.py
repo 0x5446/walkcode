@@ -288,13 +288,7 @@ def _repair_stale_error_sessions(
     state_path = Path(cfg.state_path)
     backup_path = state_path.with_suffix(state_path.suffix + f".bak-{int(now)}")
     shutil.copy2(state_path, backup_path)
-    JsonFileStateStore(str(state_path)).save(
-        sessions=snapshot.sessions,
-        interactions=snapshot.interactions,
-        outbox=snapshot.outbox,
-        authz=snapshot.authz,
-        inbound_ledger=snapshot.inbound_ledger,
-    )
+    JsonFileStateStore(str(state_path)).save(snapshot)
     return {
         "enabled": True,
         "repaired_count": len(repaired),
@@ -343,13 +337,7 @@ def _repair_stale_external_tui_sessions(
     state_path = Path(cfg.state_path)
     backup_path = state_path.with_suffix(state_path.suffix + f".bak-{int(now)}")
     shutil.copy2(state_path, backup_path)
-    JsonFileStateStore(str(state_path)).save(
-        sessions=snapshot.sessions,
-        interactions=snapshot.interactions,
-        outbox=snapshot.outbox,
-        authz=snapshot.authz,
-        inbound_ledger=snapshot.inbound_ledger,
-    )
+    JsonFileStateStore(str(state_path)).save(snapshot)
     return {
         "enabled": True,
         "checked_count": checked,
@@ -459,13 +447,7 @@ def _drop_empty_pending_deliveries(
     shutil.copy2(state_path, backup_path)
     for delivery_id in drop_ids:
         snapshot.outbox._pending.pop(delivery_id, None)
-    JsonFileStateStore(str(state_path)).save(
-        sessions=snapshot.sessions,
-        interactions=snapshot.interactions,
-        outbox=snapshot.outbox,
-        authz=snapshot.authz,
-        inbound_ledger=snapshot.inbound_ledger,
-    )
+    JsonFileStateStore(str(state_path)).save(snapshot)
     return {
         "enabled": True,
         "dropped_count": len(drop_ids),
@@ -685,13 +667,7 @@ def _probe_state_write(state_path: Path) -> dict[str, Any]:
     try:
         store = JsonFileStateStore(probe_path)
         snapshot = _empty_snapshot()
-        store.save(
-            sessions=snapshot.sessions,
-            interactions=snapshot.interactions,
-            outbox=snapshot.outbox,
-            authz=snapshot.authz,
-            inbound_ledger=snapshot.inbound_ledger,
-        )
+        store.save(snapshot)
         restored = store.load()
         counts = _snapshot_counts(restored)
     except Exception as exc:

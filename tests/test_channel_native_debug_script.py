@@ -16,16 +16,21 @@ from walkcode.channel_native import (
     DurableOutbox,
     InboundLedger,
     InteractionStore,
+    HitlStore,
     JsonFileStateStore,
+    StateSnapshot,
     SessionRegistry,
 )
 
+
+
+REPO_ROOT = str(Path(__file__).resolve().parents[1])
 
 class ChannelNativeDebugScriptTests(unittest.TestCase):
     def test_debug_script_help_runs(self):
         result = subprocess.run(
             [sys.executable, "scripts/channel_native_debug.py", "--help"],
-            cwd="/Users/alpha/Documents/workspace/walkcode",
+            cwd=REPO_ROOT,
             check=False,
             capture_output=True,
             text=True,
@@ -59,7 +64,7 @@ class ChannelNativeDebugScriptTests(unittest.TestCase):
                     "state",
                     "--json",
                 ],
-                cwd="/Users/alpha/Documents/workspace/walkcode",
+                cwd=REPO_ROOT,
                 check=False,
                 capture_output=True,
                 text=True,
@@ -99,11 +104,13 @@ class ChannelNativeDebugScriptTests(unittest.TestCase):
                 owner=ActorRef("telegram", "owner", "Owner"),
             )
             JsonFileStateStore(state_path).save(
-                sessions=sessions,
-                interactions=InteractionStore(now=lambda: 1000.0),
-                outbox=DurableOutbox(now=lambda: 1000.0),
-                authz=AuthorizationStore(now=lambda: 1000.0),
-                inbound_ledger=InboundLedger(now=lambda: 1000.0),
+                StateSnapshot(
+                    sessions=sessions,
+                    interactions=InteractionStore(now=lambda: 1000.0),
+                    outbox=DurableOutbox(now=lambda: 1000.0),
+                    authz=AuthorizationStore(now=lambda: 1000.0),
+                    inbound_ledger=InboundLedger(now=lambda: 1000.0),
+                )
             )
 
             result = subprocess.run(
@@ -115,7 +122,7 @@ class ChannelNativeDebugScriptTests(unittest.TestCase):
                     "state",
                     "--json",
                 ],
-                cwd="/Users/alpha/Documents/workspace/walkcode",
+                cwd=REPO_ROOT,
                 check=False,
                 capture_output=True,
                 text=True,
@@ -159,11 +166,13 @@ class ChannelNativeDebugScriptTests(unittest.TestCase):
             session.lifecycle_state = "ERROR_RECOVERABLE"
             session.last_progress_event = "session.error"
             JsonFileStateStore(state_path).save(
-                sessions=sessions,
-                interactions=InteractionStore(now=lambda: 1000.0),
-                outbox=DurableOutbox(now=lambda: 1000.0),
-                authz=AuthorizationStore(now=lambda: 1000.0),
-                inbound_ledger=InboundLedger(now=lambda: 1000.0),
+                StateSnapshot(
+                    sessions=sessions,
+                    interactions=InteractionStore(now=lambda: 1000.0),
+                    outbox=DurableOutbox(now=lambda: 1000.0),
+                    authz=AuthorizationStore(now=lambda: 1000.0),
+                    inbound_ledger=InboundLedger(now=lambda: 1000.0),
+                )
             )
 
             result = subprocess.run(
@@ -176,7 +185,7 @@ class ChannelNativeDebugScriptTests(unittest.TestCase):
                     "--repair-stale-errors",
                     "--json",
                 ],
-                cwd="/Users/alpha/Documents/workspace/walkcode",
+                cwd=REPO_ROOT,
                 check=False,
                 capture_output=True,
                 text=True,
@@ -225,11 +234,13 @@ class ChannelNativeDebugScriptTests(unittest.TestCase):
                 owner=ActorRef("telegram", "owner", "Owner"),
             )
             JsonFileStateStore(state_path).save(
-                sessions=sessions,
-                interactions=InteractionStore(now=lambda: 1000.0),
-                outbox=DurableOutbox(now=lambda: 1000.0),
-                authz=AuthorizationStore(now=lambda: 1000.0),
-                inbound_ledger=InboundLedger(now=lambda: 1000.0),
+                StateSnapshot(
+                    sessions=sessions,
+                    interactions=InteractionStore(now=lambda: 1000.0),
+                    outbox=DurableOutbox(now=lambda: 1000.0),
+                    authz=AuthorizationStore(now=lambda: 1000.0),
+                    inbound_ledger=InboundLedger(now=lambda: 1000.0),
+                )
             )
 
             result = subprocess.run(
@@ -242,7 +253,7 @@ class ChannelNativeDebugScriptTests(unittest.TestCase):
                     "--repair-stale-external-tui",
                     "--json",
                 ],
-                cwd="/Users/alpha/Documents/workspace/walkcode",
+                cwd=REPO_ROOT,
                 check=False,
                 capture_output=True,
                 text=True,
@@ -293,11 +304,13 @@ class ChannelNativeDebugScriptTests(unittest.TestCase):
             )
             session.last_progress_event = "external_tui.stop"
             JsonFileStateStore(state_path).save(
-                sessions=sessions,
-                interactions=InteractionStore(now=lambda: 1000.0),
-                outbox=DurableOutbox(now=lambda: 1000.0),
-                authz=AuthorizationStore(now=lambda: 1000.0),
-                inbound_ledger=InboundLedger(now=lambda: 1000.0),
+                StateSnapshot(
+                    sessions=sessions,
+                    interactions=InteractionStore(now=lambda: 1000.0),
+                    outbox=DurableOutbox(now=lambda: 1000.0),
+                    authz=AuthorizationStore(now=lambda: 1000.0),
+                    inbound_ledger=InboundLedger(now=lambda: 1000.0),
+                )
             )
 
             result = subprocess.run(
@@ -310,7 +323,7 @@ class ChannelNativeDebugScriptTests(unittest.TestCase):
                     "--repair-stale-external-tui",
                     "--json",
                 ],
-                cwd="/Users/alpha/Documents/workspace/walkcode",
+                cwd=REPO_ROOT,
                 check=False,
                 capture_output=True,
                 text=True,
@@ -355,11 +368,13 @@ class ChannelNativeDebugScriptTests(unittest.TestCase):
             )
             session.lifecycle_state = "IDLE"
             JsonFileStateStore(state_path).save(
-                sessions=sessions,
-                interactions=InteractionStore(now=lambda: 1000.0),
-                outbox=DurableOutbox(now=lambda: 1000.0),
-                authz=AuthorizationStore(now=lambda: 1000.0),
-                inbound_ledger=InboundLedger(now=lambda: 1000.0),
+                StateSnapshot(
+                    sessions=sessions,
+                    interactions=InteractionStore(now=lambda: 1000.0),
+                    outbox=DurableOutbox(now=lambda: 1000.0),
+                    authz=AuthorizationStore(now=lambda: 1000.0),
+                    inbound_ledger=InboundLedger(now=lambda: 1000.0),
+                )
             )
 
             result = subprocess.run(
@@ -371,7 +386,7 @@ class ChannelNativeDebugScriptTests(unittest.TestCase):
                     "state",
                     "--json",
                 ],
-                cwd="/Users/alpha/Documents/workspace/walkcode",
+                cwd=REPO_ROOT,
                 check=False,
                 capture_output=True,
                 text=True,
@@ -409,11 +424,13 @@ class ChannelNativeDebugScriptTests(unittest.TestCase):
                 owner=ActorRef("telegram", "owner", "Owner"),
             )
             JsonFileStateStore(state_path).save(
-                sessions=sessions,
-                interactions=InteractionStore(now=lambda: 1000.0),
-                outbox=DurableOutbox(now=lambda: 1000.0),
-                authz=AuthorizationStore(now=lambda: 1000.0),
-                inbound_ledger=InboundLedger(now=lambda: 1000.0),
+                StateSnapshot(
+                    sessions=sessions,
+                    interactions=InteractionStore(now=lambda: 1000.0),
+                    outbox=DurableOutbox(now=lambda: 1000.0),
+                    authz=AuthorizationStore(now=lambda: 1000.0),
+                    inbound_ledger=InboundLedger(now=lambda: 1000.0),
+                )
             )
 
             result = subprocess.run(
@@ -425,7 +442,7 @@ class ChannelNativeDebugScriptTests(unittest.TestCase):
                     "state",
                     "--json",
                 ],
-                cwd="/Users/alpha/Documents/workspace/walkcode",
+                cwd=REPO_ROOT,
                 check=False,
                 capture_output=True,
                 text=True,
@@ -459,7 +476,7 @@ class ChannelNativeDebugScriptTests(unittest.TestCase):
                     "outbox",
                     "--json",
                 ],
-                cwd="/Users/alpha/Documents/workspace/walkcode",
+                cwd=REPO_ROOT,
                 check=False,
                 capture_output=True,
                 text=True,
@@ -490,12 +507,27 @@ class ChannelNativeDebugScriptTests(unittest.TestCase):
                 view_model={"type": "turn_completed", "message": ""},
                 idempotency_key="empty",
             )
+            # The repair must keep every other component: it used to save from
+            # loose parts and silently wiped the HITL ledger.
+            hitls = HitlStore(now=lambda: 1000.0)
+            hitls.register_request(
+                session_id="s1",
+                generation=1,
+                transport_kind="claude_headless",
+                transport_request_id="req-1",
+                native_method="can_use_tool",
+                native_params={},
+                prompt_kind="permission",
+            )
             JsonFileStateStore(state_path).save(
-                sessions=SessionRegistry(now=lambda: 1000.0),
-                interactions=InteractionStore(now=lambda: 1000.0),
-                outbox=outbox,
-                authz=AuthorizationStore(now=lambda: 1000.0),
-                inbound_ledger=InboundLedger(now=lambda: 1000.0),
+                StateSnapshot(
+                    sessions=SessionRegistry(now=lambda: 1000.0),
+                    interactions=InteractionStore(now=lambda: 1000.0),
+                    outbox=outbox,
+                    authz=AuthorizationStore(now=lambda: 1000.0),
+                    inbound_ledger=InboundLedger(now=lambda: 1000.0),
+                    hitls=hitls,
+                )
             )
 
             result = subprocess.run(
@@ -508,7 +540,7 @@ class ChannelNativeDebugScriptTests(unittest.TestCase):
                     "--drop-empty-pending",
                     "--json",
                 ],
-                cwd="/Users/alpha/Documents/workspace/walkcode",
+                cwd=REPO_ROOT,
                 check=False,
                 capture_output=True,
                 text=True,
@@ -519,6 +551,7 @@ class ChannelNativeDebugScriptTests(unittest.TestCase):
             snapshot = JsonFileStateStore(state_path).load()
             self.assertEqual(snapshot.outbox.pending_count(), 0)
             self.assertTrue(list(Path(tmp).glob("state.json.bak-*")))
+            self.assertEqual(len(snapshot.hitls.to_dict()["requests"]), 1)
 
     def test_agent_smoke_dry_run_does_not_start_transport(self):
         class _Transport:
