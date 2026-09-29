@@ -700,7 +700,7 @@ class TerminateTargetGoneAndWaitTests(unittest.TestCase):
                 return _ProcProbe("ok", "L", f"claude --session-id {SESSION_UUID}")
             return _ProcProbe("gone")
 
-        def fake_kill_one(self, pid, expected_lstart="", expected_command=""):
+        def fake_kill_one(self, pid, expected_lstart="", expected_command="", *, expected_session=""):
             killed.append(pid)
             return ControlResult(True, state="terminated")
 

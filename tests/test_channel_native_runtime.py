@@ -6578,3 +6578,83 @@ class TuiExitSweepTests(unittest.TestCase):
                 transport.client.answer = None
                 now[0] += 1
                 self.assertTrue(alive())
+
+
+class ClaudeTuiSessionSwitchTests(unittest.TestCase):
+    """ADR 0067: a Claude TUI that /clear'ed or /resume'd away no longer owns the old topic."""
+
+    LSTART = "Tue Sep 29 11:06:24 2026"
+    _runtime = TuiExitSweepTests._runtime
+    _observed = staticmethod(TuiExitSweepTests._observed)
+
+    def test_current_session_comes_from_claudes_own_pid_record(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            sessions = home / ".claude-profiles" / "personal" / "sessions"
+            sessions.mkdir(parents=True)
+            (sessions / "201.json").write_text(
+                json.dumps({"pid": 201, "sessionId": "now-running", "procStart": "Tue Sep 29 11:06:24 2026"})
+            )
+            with patch.object(channel_native_module.Path, "home", return_value=home), patch.dict(
+                "os.environ", {"CLAUDE_CONFIG_DIR": ""}
+            ):
+                current = channel_native_module.claude_tui_current_session
+                self.assertEqual(current(201, "Tue Sep 29  11:06:24 2026"), "now-running")  # spacing normalized
+                self.assertEqual(current(201, "Wed Sep 30 08:00:00 2026"), "")  # pid reused by another process
+                self.assertEqual(current(202, self.LSTART), "")  # no record
+                self.assertEqual(current(201, ""), "")  # no start time to match
+                (sessions / "205.json").write_text(json.dumps({"pid": 205, "sessionId": "x"}))
+                self.assertEqual(current(205, ""), "")  # neither side has a start time: no answer
+                for bad in (42, ["x"], {"id": "x"}, "   ", None):
+                    (sessions / "206.json").write_text(json.dumps({"sessionId": bad, "procStart": self.LSTART}))
+                    self.assertEqual(current(206, self.LSTART), "", bad)  # malformed: unknown, not "switched"
+                (sessions / "207.json").write_text(json.dumps({"sessionId": "s", "procStart": 12345}))
+                self.assertEqual(current(207, "12345"), "")
+                (sessions / "208.json").write_text("{not json")
+                self.assertEqual(current(208, self.LSTART), "")
+            # An unreadable profiles dir does not hide the other locations.
+            default = home / ".claude" / "sessions"
+            default.mkdir(parents=True)
+            (default / "209.json").write_text(json.dumps({"sessionId": "in-default", "procStart": self.LSTART}))
+            real_iterdir = channel_native_module.Path.iterdir
+
+            def iterdir(path):
+                if path.name == ".claude-profiles":
+                    raise PermissionError("denied")
+                return real_iterdir(path)
+
+            with patch.object(channel_native_module.Path, "home", return_value=home), patch.object(
+                channel_native_module.Path, "iterdir", iterdir
+            ), patch.dict("os.environ", {"CLAUDE_CONFIG_DIR": ""}):
+                self.assertEqual(channel_native_module.claude_tui_current_session(209, self.LSTART), "in-default")
+
+    def test_sweep_detaches_a_session_whose_process_now_runs_another(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = self._runtime(tmp)
+            left = self._observed(runtime, tmp, "left", 201, self.LSTART)
+            current = self._observed(runtime, tmp, "current", 202, self.LSTART)
+            daemon = self._observed(runtime, tmp, "daemon", 203, self.LSTART)
+            daemon.transport_ref["daemon_live"] = True
+            running = {201: "another", 202: "current", 203: "another"}
+            probes = {pid: channel_native_module._ProcProbe("ok", self.LSTART) for pid in running}
+            with patch.object(runtime_module, "_probe_processes", return_value=probes), patch.object(
+                channel_native_module, "claude_tui_current_session", side_effect=lambda pid, lstart: running[pid]
+            ):
+                self.assertEqual(asyncio.run(runtime.sweep_exited_tui_sessions()), 1)
+            gone = runtime.state.sessions.get(left.session_id)
+            self.assertEqual(gone.status, "stopped")
+            self.assertEqual(gone.stop_reason, "external_tui_session_switched")
+            self.assertEqual(gone.writer_owner.kind, "none")
+            self.assertEqual(runtime.state.sessions.get(current.session_id).status, "running")
+            self.assertEqual(runtime.state.sessions.get(daemon.session_id).status, "running")
+
+    def test_takeover_never_stops_a_terminal_that_moved_to_another_session(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = self._runtime(tmp)
+            session = self._observed(runtime, tmp, "left", 201, self.LSTART)
+            needs_stop = channel_native_module.Orchestrator._takeover_requires_external_tui_termination
+            for running, expected in (("another", False), ("left", True), ("", True)):
+                with self.subTest(running=running), patch.object(
+                    channel_native_module, "claude_tui_current_session", return_value=running
+                ):
+                    self.assertIs(needs_stop(session), expected)

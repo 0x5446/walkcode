@@ -3234,12 +3234,24 @@ class ChannelNativeRuntime:
             ):
                 continue  # claimed, revived or stopped while ps ran
             state = _process_ref_state(process_ref, probes.get(pid, _ProcProbe("error")))
-            if await self._maybe_mark_stale_tui_process_detached(session, state=state):
+            if state == "alive" and self._tui_switched_away(session):
+                # ADR 0067: the process lives on but runs another session now
+                # (/clear, /resume) — this topic is no longer the terminal's.
+                self._mark_stale_tui_process_detached(session, reason="external_tui_session_switched")
+                marked += 1
+                await self.orchestrator.refresh_session_status_card(session)
+            elif await self._maybe_mark_stale_tui_process_detached(session, state=state):
                 marked += 1
                 await self.orchestrator.refresh_session_status_card(session)
         if marked:
             self.save_state()
         return marked
+
+    @staticmethod
+    def _tui_switched_away(session) -> bool:
+        if isinstance(session.transport_ref, dict) and session.transport_ref.get("daemon_live"):
+            return False  # a daemon worker may carry it on (ADR 0048)
+        return Orchestrator._claude_tui_switched_away(session)
 
     async def _sweep_exited_tui_sessions_forever(self, *, interval: float) -> None:
         while True:
@@ -5144,7 +5156,7 @@ class ChannelNativeRuntime:
             return False
         return self._mark_stale_tui_process_detached(session)
 
-    def _mark_stale_tui_process_detached(self, session) -> bool:
+    def _mark_stale_tui_process_detached(self, session, *, reason: str = "external_tui_process_gone") -> bool:
         changed = False
         if session.status != "stopped":
             session.status = "stopped"
@@ -5157,8 +5169,8 @@ class ChannelNativeRuntime:
         if session.lifecycle_state != target_state:
             session.lifecycle_state = target_state
             changed = True
-        if session.stop_reason != "external_tui_process_gone":
-            session.stop_reason = "external_tui_process_gone"
+        if session.stop_reason != reason:
+            session.stop_reason = reason
             changed = True
         if session.writer_owner is None or session.writer_owner.kind != "none":
             session.writer_owner = WriterOwner(kind="none")

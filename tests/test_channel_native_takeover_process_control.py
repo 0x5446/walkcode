@@ -4,6 +4,7 @@ import sys
 import unittest
 import unittest.mock
 
+from walkcode import channel_native as channel_native_module
 from walkcode.channel_native import (
     ActorRef,
     AuthorizationStore,
@@ -99,7 +100,7 @@ def _action_token(channel: FakeChannelAdapter, action: str) -> str:
     return next(item["token"] for item in view["actions"] if item["action"] == action)
 
 
-def _setup(*, terminate_ref=None, controller=None, transport=None):
+def _setup(*, terminate_ref=None, controller=None, transport=None, agent_session_id=""):
     clock = _Clock()
     sessions = SessionRegistry(now=clock)
     interactions = InteractionStore(now=clock)
@@ -125,6 +126,8 @@ def _setup(*, terminate_ref=None, controller=None, transport=None):
             "transport_ref": {"handle_id": "resume-h", "session_id": "native-1"},
         },
     }
+    if agent_session_id:
+        external_ref["resume_ref"]["agent_session_id"] = agent_session_id
     if terminate_ref is not None:
         external_ref["terminate_ref"] = terminate_ref
     session = sessions.create_observed_session(
@@ -424,3 +427,91 @@ class TakeoverProcessControlTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TakeoverSwitchedAwayTests(unittest.TestCase):
+    """ADR 0067: never stop a Claude TUI that now runs another session."""
+
+    def _takeover(self, switched, agent_session_id="claude-old"):
+        orchestrator, channel, transport, controller, session = _setup(
+            terminate_ref={"controller_kind": "fake-process", "process_ref": {"pid": 123, "allow_terminate": True}},
+            controller=FakeExternalTuiController("fake-process"),
+            agent_session_id=agent_session_id,
+        )
+        asyncio.run(
+            orchestrator.submit_user_input(
+                session.session_id, TurnInput(text="run tests"), actor=_actor(), generation=session.generation
+            )
+        )
+        with unittest.mock.patch.object(Orchestrator, "_claude_tui_switched_away", side_effect=switched):
+            result = asyncio.run(
+                orchestrator.handle_inbound_event(
+                    _callback(_action_token(channel, "takeover_and_send")),
+                    agent_transport_kind="fake-transport",
+                    cwd="/tmp/project",
+                )
+            )
+        return result, controller, transport
+
+    def test_a_terminal_that_moved_on_before_the_takeover_is_left_running(self):
+        result, controller, transport = self._takeover(lambda session: True)
+        self.assertTrue(result.accepted)
+        self.assertEqual(controller.terminate_calls, [])
+        self.assertEqual([turn.text for turn in transport.submitted_turns], ["run tests"])
+
+    def test_the_controller_is_told_which_session_it_may_stop(self):
+        result, controller, _ = self._takeover(lambda session: False)
+        self.assertTrue(result.accepted)
+        self.assertEqual(controller.terminate_calls[0]["ref"]["expected_claude_session"], "claude-old")
+
+
+class KillOneSwitchedSessionTests(unittest.TestCase):
+    """ADR 0067: the last check sits right before each signal."""
+
+    LSTART = "Tue Sep 29 11:06:24 2026"
+
+    def _kill(self, sessions, *, exits_after_term=False):
+        controller = LocalProcessController(kill_after_timeout=True)
+        probe = channel_native_module._ProcProbe("ok", self.LSTART, "claude")
+        signals = []
+        with unittest.mock.patch.object(channel_native_module, "_probe_process", return_value=probe), unittest.mock.patch.object(
+            channel_native_module, "claude_tui_current_session", side_effect=sessions
+        ), unittest.mock.patch.object(channel_native_module.os, "kill", side_effect=lambda pid, sig: signals.append(sig)), unittest.mock.patch.object(
+            controller, "_wait_exited", return_value=exits_after_term
+        ):
+            result = controller._kill_one(123, self.LSTART, "claude", expected_session="claude-old")
+        return result, signals
+
+    def test_no_sigterm_once_the_process_runs_another_session(self):
+        result, signals = self._kill(lambda pid, lstart: "claude-new")
+        self.assertEqual((result.accepted, result.state), (True, "switched_away"))
+        self.assertEqual(signals, [])
+
+    def test_no_sigkill_if_it_switched_while_we_waited(self):
+        answers = iter(["claude-old", "claude-new"])
+        result, signals = self._kill(lambda pid, lstart: next(answers))
+        self.assertEqual(result.state, "switched_away")
+        self.assertEqual(signals, [channel_native_module.signal.SIGTERM])
+
+    def test_unknown_or_same_session_is_stopped_as_before(self):
+        for answer in ("", "claude-old"):
+            with self.subTest(answer=answer):
+                result, signals = self._kill(lambda pid, lstart, a=answer: a, exits_after_term=True)
+                self.assertEqual((result.accepted, result.state), (True, "terminated"))
+                self.assertEqual(signals, [channel_native_module.signal.SIGTERM])
+
+    def test_terminate_passes_the_expected_session_down_to_the_signal(self):
+        controller = LocalProcessController(kill_after_timeout=True)
+        probe = channel_native_module._ProcProbe("ok", self.LSTART, "claude")
+        ref = {"pid": 123, "allow_terminate": True, "lstart": self.LSTART, "command": "claude", "expected_claude_session": "claude-old"}
+        with unittest.mock.patch.object(channel_native_module, "_probe_process", return_value=probe), unittest.mock.patch.object(
+            channel_native_module, "claude_tui_current_session", return_value="claude-new"
+        ), unittest.mock.patch.object(channel_native_module.os, "kill", side_effect=AssertionError("signalled")):
+            result = controller._terminate_sync(ref, "takeover:t1")
+        self.assertEqual((result.accepted, result.state), (True, "switched_away"))
+
+    def test_every_session_id_alias_counts(self):
+        for key in ("agent_session_id", "claude_session_id", "resume", "session_id"):
+            with self.subTest(key=key):
+                self.assertEqual(channel_native_module._claude_resume_session_id({key: " s1 "}), "s1")
+        self.assertEqual(channel_native_module._claude_resume_session_id({"session_id": 5}), "")

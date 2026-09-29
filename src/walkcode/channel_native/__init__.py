@@ -4190,6 +4190,58 @@ def _probe_process(pid: int) -> _ProcProbe:
     return _ProcProbe("ok", match.group(2).strip(), match.group(3).strip())
 
 
+def claude_tui_current_session(pid: int, lstart: str) -> str:
+    """The session a live Claude TUI process is running right now; "" if unknown (ADR 0067).
+
+    Claude Code keeps ``<config dir>/sessions/<pid>.json`` with the current
+    ``sessionId`` and the process start time (``procStart``) — updated when
+    ``/clear`` or ``/resume`` switches sessions inside the same process. The
+    start time must match, so a reused pid never answers for another process.
+    """
+    wanted = " ".join(str(lstart or "").split())
+    if pid <= 1 or not wanted:
+        return ""
+    home = Path.home()
+    dirs = [os.environ.get("CLAUDE_CONFIG_DIR", ""), str(home / ".claude")]
+    try:
+        dirs.extend(str(child) for child in sorted((home / ".claude-profiles").iterdir()))
+    except OSError:
+        pass  # no (readable) profiles dir: the other locations still answer
+    for config_dir in dict.fromkeys(d for d in dirs if d):
+        try:
+            record = json.loads((Path(config_dir) / "sessions" / f"{pid}.json").read_text())
+        except (OSError, ValueError):
+            continue
+        if not isinstance(record, dict):
+            continue
+        proc_start, session_id = record.get("procStart"), record.get("sessionId")
+        if not isinstance(proc_start, str) or not isinstance(session_id, str) or not session_id.strip():
+            continue  # a malformed record answers nothing
+        if " ".join(proc_start.split()) == wanted:
+            return session_id.strip()
+    return ""
+
+
+def _claude_resume_session_id(resume_ref: dict[str, Any]) -> str:
+    """The Claude session id in a resume ref, under any alias ClaudeHeadlessTransport.resume accepts."""
+    for key in ("agent_session_id", "claude_session_id", "resume", "session_id"):
+        value = resume_ref.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _claude_process_moved_to_another_session(pid: int, lstart: str, expected_session: str) -> bool:
+    """Right before a signal: does this Claude process now run a session other than ``expected``?"""
+    if not expected_session:
+        return False
+    current = claude_tui_current_session(pid, lstart)
+    if current and current != expected_session:
+        _log_degrade("terminate_skipped_switched_session", pid=pid, expected=expected_session, current=current)
+        return True
+    return False
+
+
 def _probe_processes(pids: list[int]) -> dict[int, _ProcProbe] | None:
     """One ``ps`` for many pids: pid -> ok/gone probe; None when ps itself failed.
 
@@ -4323,15 +4375,18 @@ class LocalProcessController:
             seen.add(tpid)
             deduped.append((tpid, ls, cmd))
         final_state = "already_exited"
+        expected_session = str(ref.get("expected_claude_session", "") or "")
         for tpid, ls, cmd in deduped:
-            result = self._kill_one(tpid, ls, cmd)
+            result = self._kill_one(tpid, ls, cmd, expected_session=expected_session)
             if not result.accepted:
                 return result
             if result.state != "already_exited":
                 final_state = result.state
         return ControlResult(True, state=final_state)
 
-    def _kill_one(self, pid: int, expected_lstart: str = "", expected_command: str = "") -> ControlResult:
+    def _kill_one(
+        self, pid: int, expected_lstart: str = "", expected_command: str = "", *, expected_session: str = ""
+    ) -> ControlResult:
         probe = _probe_process(pid)
         if probe.status == "gone":
             return ControlResult(True, state="already_exited")
@@ -4350,6 +4405,8 @@ class LocalProcessController:
                 current_command=probe.command,
             )
             return ControlResult(True, state="already_exited")
+        if _claude_process_moved_to_another_session(pid, expected_lstart, expected_session):
+            return ControlResult(True, state="switched_away")
         try:
             os.kill(pid, signal.SIGTERM)
         except ProcessLookupError:
@@ -4374,6 +4431,8 @@ class LocalProcessController:
             # Our target died during the wait and the pid was reused; the
             # original is gone, which is what we wanted.
             return ControlResult(True, state="terminated")
+        if _claude_process_moved_to_another_session(pid, expected_lstart, expected_session):
+            return ControlResult(True, state="switched_away")
         try:
             os.kill(pid, signal.SIGKILL)
         except ProcessLookupError:
@@ -12469,8 +12528,12 @@ class Orchestrator:
                     ),
                     idempotency_key=f"takeover_terminating:{takeover_id}",
                 )
+                own_session = _claude_resume_session_id(resume_ref or {})
                 termination = await controller.terminate(
-                    process_ref,
+                    # ADR 0067: the controller re-checks, right before every
+                    # signal, that the process still runs this session — the
+                    # user may /clear or /resume away at any point until then.
+                    {**process_ref, "expected_claude_session": own_session} if own_session else process_ref,
                     reason=f"takeover:{takeover_id}",
                 )
                 if not termination.accepted:
@@ -12798,11 +12861,32 @@ class Orchestrator:
             # thread: WalkCode resumes it alongside the TUI, no process to stop.
             return False
         if session.writer_owner is not None and session.writer_owner.kind == "external_tui":
-            return session.status != "stopped" and session.lifecycle_state not in {
+            if session.status == "stopped" or session.lifecycle_state in {
                 "EXTERNAL_DETACHED_IMPORTABLE",
                 "EXTERNAL_DETACHED_UNIMPORTABLE",
-            }
+            }:
+                return False
+            # ADR 0067: the TUI process moved on to another session (/clear,
+            # /resume). Stopping it would kill the terminal running THAT
+            # session; this one is no longer being written by anyone.
+            return not Orchestrator._claude_tui_switched_away(session)
         return False
+
+    @staticmethod
+    def _claude_tui_switched_away(session: Session) -> bool:
+        """Is the Claude TUI recorded for this session now running a different session?"""
+        own = _claude_resume_session_id(Orchestrator._takeover_resume_ref(session) or {})
+        controller_kind, process_ref = Orchestrator._normalize_takeover_terminate_ref(
+            Orchestrator._takeover_terminate_ref(session) or {}
+        )
+        if not own or controller_kind != "process":
+            return False
+        try:
+            pid = int(process_ref.get("pid", 0) or 0)
+        except (TypeError, ValueError):
+            return False
+        current = claude_tui_current_session(pid, str(process_ref.get("lstart", "") or ""))
+        return bool(current) and current != own
 
     @staticmethod
     def _takeover_resume_ref(session: Session) -> dict[str, Any] | None:
