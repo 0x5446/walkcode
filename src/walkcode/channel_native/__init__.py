@@ -5414,7 +5414,6 @@ class LarkChannelAdapter:
             max_callback_payload_bytes=2048,
             edit_rate_limit_hint="patch cards asynchronously",
         )
-        self.sent_texts: list[str] = []
 
     def capabilities(self) -> ChannelCapabilities:
         return self._capabilities
@@ -5527,7 +5526,6 @@ class LarkChannelAdapter:
             "view": dict(view_model),
         }
         result = await self.api.call(method, payload)
-        self.sent_texts.append(text)
         return str(result.get("data", {}).get("message_id", ""))
 
     async def edit_view(self, binding: ChannelBinding, message_id: str, view_model: dict[str, Any]) -> bool:
@@ -5588,9 +5586,6 @@ class LarkChannelAdapter:
             local_path=local_path,
             source_message_id=attachment.source_message_id,
         )
-
-    def rendered_text(self) -> str:
-        return "\n".join(self.sent_texts)
 
     @staticmethod
     def _is_interactive(view_model: dict[str, Any]) -> bool:

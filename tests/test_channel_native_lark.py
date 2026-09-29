@@ -44,6 +44,10 @@ class _FakeLarkApi(LarkBotApi):
         return {"ok": True, "data": {"message_id": f"lark-msg-{len(self.calls)}"}}
 
 
+def _sent_text(api) -> str:
+    return "\n".join(payload["text"] for method, payload in api.calls if method in {"sendMessage", "sendCard"})
+
+
 def _transport_caps() -> TransportCapabilities:
     return TransportCapabilities(
         structured_input=True,
@@ -538,7 +542,7 @@ class LarkOrchestratorTests(unittest.TestCase):
 
         self.assertTrue(result.accepted)
         self.assertEqual([turn.text for turn in transport.submitted_turns], ["run tests"])
-        self.assertIn("done", channel.rendered_text())
+        self.assertIn("done", _sent_text(channel.api))
 
 
 class InboundMessageTypeTests(unittest.TestCase):
@@ -648,7 +652,7 @@ class LarkInboxReliabilityTests(_LarkRuntimeHarness):
             asyncio.run(runtime._process_lark_inbox_item(path))
         self.assertEqual(process.call_count, 1)
         self.assertEqual(json.loads(path.with_suffix(".failed").read_text()), payload)
-        self.assertIn("结果未能确认", runtime.channels["lark"].rendered_text())
+        self.assertIn("结果未能确认", _sent_text(runtime.channels["lark"].api))
         self.assertIn("agent result unknown", runtime.last_lark_event_error)
         self.assertTrue(runtime.state.inbound_ledger.seen("lark:" + payload["event_id"]))
         self.assertEqual(transport.submitted_turns, [])
@@ -710,7 +714,7 @@ class LarkInboxReliabilityTests(_LarkRuntimeHarness):
             "action": {"value": {"token": "short-token", "action": "allow"}},
         }}
         asyncio.run(runtime._report_lark_inbound_failure(payload))
-        self.assertIn("结果未能确认", runtime.channels["lark"].rendered_text())
+        self.assertIn("结果未能确认", _sent_text(runtime.channels["lark"].api))
         self.assertTrue(runtime.state.inbound_ledger.seen("lark:callback-failed"))
         self.assertEqual(transport.submitted_turns, [])
 
