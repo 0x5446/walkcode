@@ -13,7 +13,6 @@ import os
 import stat
 import random
 import re
-import shlex
 import shutil
 import secrets
 import struct
@@ -59,7 +58,6 @@ from .channel_native import (
     _channel_environment_context,
     _codex_message_turn_id,
     _codex_tool_event,
-    _command_executable_basename,
     _command_is_claude_headless_sdk_process,
     _command_is_claude_tui_process,
     _command_is_codex_app_server_process,
@@ -72,7 +70,6 @@ from .channel_native import (
     _ProcProbe,
     compose_session_title,
     _proc_identity_matches,
-    _ps_lstart_command,
     OutboxDispatcher,
     ResumeSpec,
     SessionRegistry,

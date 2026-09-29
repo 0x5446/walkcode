@@ -35,7 +35,6 @@ from typing import Any, AsyncIterator
 
 from . import (
     CapabilityUnsupported,
-    ClaudeHeadlessTransport,
     ControlResult,
     _compose_turn_text,
     LaunchSpec,

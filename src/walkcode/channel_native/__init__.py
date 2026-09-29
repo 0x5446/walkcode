@@ -1409,9 +1409,6 @@ class AuthorizationStore:
             return AuthorizationResult(True, role=role)
         return AuthorizationResult(False, BlockedReason.UNAUTHORIZED, role=role)
 
-    def audit_events(self) -> list[dict[str, Any]]:
-        return list(self._audit)
-
     def to_dict(self) -> dict[str, Any]:
         grants = []
         for session_id, roles in self._roles.items():
@@ -2705,12 +2702,6 @@ class InteractionStore:
             return None
         return self._interactions.get(token_state.interaction_id)
 
-    def action_for_token(self, token: str) -> str:
-        token_state = self._tokens.get(token)
-        if token_state is None or token_state.expires_at <= self._now():
-            return ""
-        return token_state.action
-
     def awaiting_context_for_binding(self, binding_key: BindingKey) -> InteractionContext | None:
         interaction_id = self._awaiting_other_by_binding.get(binding_key)
         if interaction_id is None:
@@ -3323,54 +3314,6 @@ class ViewModelFactory:
                 }
                 for action in actions
             ],
-        }
-
-    def takeover_confirmation_for_context(
-        self,
-        ctx: InteractionContext,
-        *,
-        recoverability: str,
-        summary: str,
-    ) -> dict[str, Any]:
-        actions = [
-            {
-                "action": "confirm_takeover",
-                "label": "Confirm takeover and send",
-                "token": self.interactions.create_callback_token(
-                    ctx.interaction_id,
-                    "confirm_takeover",
-                    generation=ctx.generation,
-                ),
-            },
-            {
-                "action": "keep_readonly",
-                "label": "Keep read-only",
-                "token": self.interactions.create_callback_token(
-                    ctx.interaction_id,
-                    "keep_readonly",
-                    generation=ctx.generation,
-                ),
-            },
-            {
-                "action": "manual_instructions",
-                "label": "Manual steps",
-                "token": self.interactions.create_callback_token(
-                    ctx.interaction_id,
-                    "manual_instructions",
-                    generation=ctx.generation,
-                ),
-            },
-        ]
-        return {
-            "type": "takeover_confirmation",
-            "interaction_id": ctx.interaction_id,
-            "session_id": ctx.session_id,
-            "generation": ctx.generation,
-            "takeover_id": str(ctx.tool_input.get("takeover_id", "")),
-            "blocked_input_id": str(ctx.tool_input.get("blocked_input_id", "")),
-            "recoverability": recoverability,
-            "summary": summary,
-            "actions": actions,
         }
 
     @staticmethod
@@ -4027,10 +3970,6 @@ class FakeChannelAdapter:
     async def ack_callback(self, inbound: InboundEvent) -> None:
         self.acknowledged_callbacks.append(inbound.event_id)
 
-    async def delete_message(self, binding: ChannelBinding, message_id: str) -> bool:
-        self.deleted_messages.append({"binding": binding.key(), "message_id": str(message_id)})
-        return True
-
     async def download_attachment(self, attachment: AttachmentRef) -> AttachmentRef:
         self.downloaded_attachments.append(attachment.source_id)
         if attachment.local_path:
@@ -4354,16 +4293,6 @@ def _proc_identity_matches(probe: _ProcProbe, expected_lstart: str, expected_com
     return True
 
 
-def _ps_lstart_command(pid: int) -> tuple[str, str] | None:
-    """Compatibility shim: identity tuple when the pid is live, else None.
-
-    Only for non-critical callers that genuinely cannot distinguish gone from
-    error. Termination and ledger-hygiene paths use `_probe_process` directly.
-    """
-    probe = _probe_process(pid)
-    return (probe.lstart, probe.command) if probe.status == "ok" else None
-
-
 class LocalProcessController:
     kind = "process"
 
@@ -4579,30 +4508,6 @@ class LocalProcessController:
                 return True
             time.sleep(self.poll_interval)
         return False
-
-    @staticmethod
-    def _pid_running(pid: int) -> bool:
-        try:
-            result = subprocess.run(
-                ["ps", "-o", "stat=", "-p", str(pid)],
-                env=_c_locale_env(),
-                capture_output=True,
-                text=True,
-                timeout=1,
-            )
-        except Exception:
-            try:
-                os.kill(pid, 0)
-            except ProcessLookupError:
-                return False
-            except PermissionError:
-                return True
-            return True
-        if result.returncode != 0:
-            return False
-        stat = result.stdout.strip()
-        return bool(stat) and not stat.startswith("Z")
-
 
 class FakeAgentTransport:
     def __init__(
@@ -5343,30 +5248,6 @@ class TelegramChannelAdapter:
         result = await self.api.call("pinChatMessage", payload)
         return bool(result.get("ok", True))
 
-    async def close_topic(self, binding: ChannelBinding) -> bool:
-        if not binding.thread_id:
-            return False
-        result = await self.api.call(
-            "closeForumTopic",
-            {
-                "chat_id": binding.chat_id,
-                "message_thread_id": int(binding.thread_id),
-            },
-        )
-        return bool(result.get("ok", True))
-
-    async def reopen_topic(self, binding: ChannelBinding) -> bool:
-        if not binding.thread_id:
-            return False
-        result = await self.api.call(
-            "reopenForumTopic",
-            {
-                "chat_id": binding.chat_id,
-                "message_thread_id": int(binding.thread_id),
-            },
-        )
-        return bool(result.get("ok", True))
-
     async def send_action(self, binding: ChannelBinding, action: str = "typing") -> bool:
         payload: dict[str, Any] = {"chat_id": binding.chat_id, "action": action}
         if binding.thread_id:
@@ -5399,18 +5280,6 @@ class TelegramChannelAdapter:
             ],
         }
         result = await self.api.call("setMyCommands", payload)
-        return bool(result.get("ok", True))
-
-    async def delete_message(self, binding: ChannelBinding, message_id: str) -> bool:
-        if not message_id:
-            return False
-        result = await self.api.call(
-            "deleteMessage",
-            {
-                "chat_id": binding.chat_id,
-                "message_id": int(message_id),
-            },
-        )
         return bool(result.get("ok", True))
 
     async def ack_callback(self, inbound: InboundEvent) -> None:
@@ -10034,18 +9903,6 @@ class HitlStore:
             and request.expires_at > now
         ]
 
-    def request_for_transport(
-        self,
-        *,
-        session_id: str,
-        transport_kind: str,
-        transport_request_id: str,
-    ) -> HitlRequest | None:
-        hitl_id = self._by_transport.get((session_id, transport_kind, transport_request_id))
-        if not hitl_id:
-            return None
-        return self._requests.get(hitl_id)
-
     def mark_decided(
         self,
         hitl_request_id: str,
@@ -10068,11 +9925,6 @@ class HitlStore:
         self._decisions[hitl_request_id] = decision
         return decision
 
-    def mark_stale(self, hitl_request_id: str) -> None:
-        request = self._requests.get(hitl_request_id)
-        if request is not None and request.status == "pending":
-            request.status = "stale"
-
     def mark_pending_for_session_stale(
         self,
         session_id: str,
@@ -10089,12 +9941,6 @@ class HitlStore:
 
     def decision_for(self, hitl_request_id: str) -> HitlDecision | None:
         return self._decisions.get(hitl_request_id)
-
-    def request_count(self) -> int:
-        return len(self._requests)
-
-    def decision_count(self) -> int:
-        return len(self._decisions)
 
     def compact(self) -> dict[str, int]:
         now = self._now()
@@ -12944,22 +12790,6 @@ class Orchestrator:
                 if key not in {"controller_kind", "kind", "process_ref"}
             }
         return controller_kind, process_ref
-
-    async def _submit_prepared_inbound(
-        self,
-        session: Session,
-        inbound: InboundEvent,
-        actor: ActorRef,
-    ) -> SubmitResult:
-        turn = await self.prepare_turn_from_inbound(inbound)
-        if isinstance(turn, SubmitResult):
-            return turn
-        return await self.submit_user_input(
-            session.session_id,
-            turn,
-            actor=actor,
-            generation=session.generation,
-        )
 
     async def _handle_ask_user_decision(
         self,
