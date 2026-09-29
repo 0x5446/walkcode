@@ -18,7 +18,7 @@ The first supported view models are:
 - `ask_user_question`
 - `health`
 - `error`
-- `command_menu`
+- `command_menu` (retired 2026-09-29: nothing produced it)
 - `takeover_prompt`
 
 Channel adapters translate those views into native UI:
