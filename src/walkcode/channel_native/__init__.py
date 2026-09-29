@@ -3530,6 +3530,10 @@ class DurableOutbox:
         item = self._find_by_idempotency_key(idempotency_key)
         return item.message_id if item is not None and item.delivery_id in self._sent else ""
 
+    def is_pending(self, idempotency_key: str) -> bool:
+        item = self._find_by_idempotency_key(idempotency_key)
+        return item is not None and item.delivery_id in self._pending
+
     def get(self, delivery_id: str) -> DeliveryItem:
         if delivery_id in self._pending:
             return self._pending[delivery_id]
@@ -12779,26 +12783,23 @@ class Orchestrator:
             idempotency_key=f"tui_conflict:{kind}:{dedupe_key or pid}",
         )
 
-    async def retire_gate_card(self, session_id: str, rid: str) -> bool:
-        """Retire a blocking-gate card whose hook gave up and handed the
-        prompt to the terminal.
+    def settle_timed_out_gate(self, session_id: str, rid: str) -> HitlRequest | None:
+        """Close a blocking-gate prompt whose hook returned without a card
+        decision (timed out and handed the prompt to the terminal).
 
-        Only a click used to flip a card, so a prompt answered in the
-        terminal after the hook timed out kept live buttons forever. Settle
-        the HITL request and its interaction (old tokens stop working) and
-        edit the card in place — the outbox kept the card's message id.
-        Returns False when nothing was pending (already decided on the card).
+        Only a click used to settle a gate card, so a prompt answered in the
+        terminal kept live buttons forever. The HITL request goes stale and
+        its interaction is recorded as answered in the terminal, so old
+        tokens stop working. Returns the request, or None when it was not
+        pending (decided on the card already). The card itself is edited
+        separately by ``retire_gate_card``, which may need several passes.
         """
-        try:
-            session = self.sessions.get(session_id)
-        except KeyError:
-            return False
         request = next(
             (r for r in self.hitls.pending_for_session(session_id) if r.transport_request_id == rid),
             None,
         )
         if request is None:
-            return False
+            return None
         request.status = "stale"
         if request.interaction_id:
             try:
@@ -12809,26 +12810,48 @@ class Orchestrator:
                 ctx.decision = {"action": "terminal"}
                 ctx.decided_at = self._now()
                 ctx.awaiting_other = None
+        return request
+
+    async def retire_gate_card(self, session_id: str, rid: str, request: HitlRequest) -> str:
+        """Edit a settled gate card into its terminal result.
+
+        Returns "done", "gone" (nothing left to edit: session, channel or the
+        card's delivery is gone) or "retry" (the card is still queued for
+        delivery, or the edit failed) — the caller bounds the retries.
+        """
+        try:
+            session = self.sessions.get(session_id)
+        except KeyError:
+            return "gone"
         binding = session.channel_binding
         channel = self.channels.get(binding.channel_kind) if binding is not None else None
-        message_id = self.outbox.sent_message_id(f"{session_id}:{request.generation}:gate:{rid}")
-        if channel is None or not message_id or not channel.capabilities().editable_message:
-            return True
+        if channel is None or not channel.capabilities().editable_message:
+            return "gone"
+        key = f"{session_id}:{request.generation}:gate:{rid}"
+        message_id = self.outbox.sent_message_id(key)
+        if not message_id:
+            # Still queued (a retry may deliver the original card later) or
+            # dead / compacted. Only a queued card is worth waiting for.
+            return "retry" if self.outbox.is_pending(key) else "gone"
         view = ViewModelFactory.decision_result(
             kind=request.prompt_kind,
             action="terminal",
             detail="飞书上没有及时作答，已转到终端。",
         )
+        error = "edit_view returned False"
         try:
-            await channel.edit_view(binding, message_id, view)
+            if await channel.edit_view(binding, message_id, view):
+                return "done"
         except Exception as exc:
-            _log_degrade(
-                "gate_card_retire_edit_failed",
-                session_id=session_id,
-                rid=rid,
-                error=f"{type(exc).__name__}: {exc}",
-            )
-        return True
+            error = f"{type(exc).__name__}: {exc}"
+        _log_degrade(
+            "gate_card_retire_edit_failed",
+            session_id=session_id,
+            rid=rid,
+            message_id=message_id,
+            error=error,
+        )
+        return "retry"
 
     async def post_claude_gate_prompt(self, session_id: str, request: dict[str, Any]) -> bool:
         """Post a permission / AskUserQuestion card for a PreToolUse gate request.

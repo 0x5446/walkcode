@@ -5,6 +5,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 from pathlib import Path
 
 from walkcode.channel_native import (
@@ -13,6 +14,7 @@ from walkcode.channel_native import (
     ChannelBinding,
     ChannelNativeConfig,
     TransportHandle,
+    TransientDeliveryError,
     TransportUnavailable,
 )
 from walkcode.channel_native import claude_gate
@@ -734,6 +736,81 @@ class GateDrainTests(unittest.TestCase):
             asyncio.run(runtime.drain_claude_gate_requests())
             self.assertEqual(len([m for m, _ in api.calls if m.startswith("edit")]), 1)
 
+    def _edits(self, api):
+        return [payload for method, payload in api.calls if method.startswith("edit")]
+
+    def test_card_delivered_after_the_timeout_is_still_retired(self):
+        # The card's first send failed and sat in the outbox retry queue when
+        # the hook timed out: there was no message id to edit yet. The retry
+        # later delivered the original card with live buttons.
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime, _session, api = _runtime_with_observed_session(tmp)
+            state = runtime.state_store.path
+            channel = runtime.channels["telegram"]
+            real_send = channel.send_view
+            failures = {"left": 1}
+
+            async def flaky_send(binding, view):
+                if failures["left"]:
+                    failures["left"] -= 1
+                    raise TransientDeliveryError("temporarily down")
+                return await real_send(binding, view)
+
+            channel.send_view = flaky_send
+            claude_gate.write_pending(state, self._pending_for_session())
+            asyncio.run(runtime.drain_claude_gate_requests())
+            claude_gate.cleanup_gate_files(state, "toolu_edit_1")  # hook timed out
+            asyncio.run(runtime.drain_claude_gate_requests())
+            self.assertEqual(self._edits(api), [])  # nothing sent yet to edit
+
+            outbox = runtime.orchestrator.outbox
+            for item in outbox._pending.values():
+                item.next_attempt_at = 0.0
+            asyncio.run(runtime.orchestrator._flush_outbox())  # retry delivers the card
+            asyncio.run(runtime.drain_claude_gate_requests())
+
+            self.assertEqual(len(self._edits(api)), 1)
+            self.assertEqual(runtime._gate_cards_retiring, {})
+
+    def test_failed_card_edit_is_logged_and_retried(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime, _session, api = _runtime_with_observed_session(tmp)
+            state = runtime.state_store.path
+            channel = runtime.channels["telegram"]
+            real_edit = channel.edit_view
+            refusals = {"left": 1}
+
+            async def refusing_edit(binding, message_id, view):
+                if refusals["left"]:
+                    refusals["left"] -= 1
+                    return False
+                return await real_edit(binding, message_id, view)
+
+            channel.edit_view = refusing_edit
+            claude_gate.write_pending(state, self._pending_for_session())
+            asyncio.run(runtime.drain_claude_gate_requests())
+            claude_gate.cleanup_gate_files(state, "toolu_edit_1")
+            with mock.patch("walkcode.channel_native._log_degrade") as log:
+                asyncio.run(runtime.drain_claude_gate_requests())
+            self.assertEqual(log.call_args.args[0], "gate_card_retire_edit_failed")
+            self.assertIn("toolu_edit_1", runtime._gate_cards_retiring)
+
+            asyncio.run(runtime.drain_claude_gate_requests())
+
+            self.assertEqual(len(self._edits(api)), 1)
+            self.assertEqual(runtime._gate_cards_retiring, {})
+
+    def test_unreadable_pending_file_is_not_mistaken_for_a_returned_hook(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime, _session, api = _runtime_with_observed_session(tmp)
+            state = runtime.state_store.path
+            claude_gate.write_pending(state, self._pending_for_session())
+            asyncio.run(runtime.drain_claude_gate_requests())
+            claude_gate.pending_path(state, "toolu_edit_1").write_text("{half-written")
+            asyncio.run(runtime.drain_claude_gate_requests())
+            self.assertEqual(len(runtime.orchestrator.hitls.pending_for_session("observed-1")), 1)
+            self.assertEqual(self._edits(api), [])
+
     def test_card_decided_on_the_channel_is_not_retired(self):
         with tempfile.TemporaryDirectory() as tmp:
             runtime, _session, api = _runtime_with_observed_session(tmp)
@@ -1038,6 +1115,11 @@ class NotifyGateDrainTests(unittest.TestCase):
             self.assertIsNotNone(gate)
             self.assertEqual(gate["session_id"], "observed-1")
             self.assertEqual(gate["short"], SHORT)
+            # The runtime removed the pending itself: a later pass must not
+            # read that as a blocking hook having timed out.
+            asyncio.run(runtime.drain_claude_gate_requests())
+            self.assertEqual(len(runtime.orchestrator.hitls.pending_for_session("observed-1")), 1)
+            self.assertFalse([m for m, _ in api.calls if m.startswith("edit")])
 
     def test_notify_unroutable_pending_removed_without_decision(self):
         with tempfile.TemporaryDirectory() as tmp:
