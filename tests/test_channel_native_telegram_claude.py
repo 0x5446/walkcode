@@ -13,7 +13,6 @@ from walkcode.channel_native import (
     ActorRef,
     AgentEvent,
     AgentEventType,
-    BlockedReason,
     ChannelBinding,
     ClaudeHeadlessTransport,
     DurableOutbox,

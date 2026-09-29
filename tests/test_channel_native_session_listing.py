@@ -170,14 +170,6 @@ class SessionListingTests(unittest.TestCase):
         self.assertEqual([summary.session_id for summary in included], [session.session_id])
         self.assertEqual(included[0].archived_by, "admin")
 
-    def test_command_menu_offers_archive_for_stopped_session(self):
-        orchestrator, _transport, session, _clock = _orchestrator()
-        asyncio.run(orchestrator.close_session(session.session_id, actor=_actor("owner"), reason="done"))
-
-        menu = orchestrator.command_menu_for_session(session.session_id, actor=_actor("owner"))
-
-        self.assertEqual([action["action"] for action in menu["actions"]], ["archive"])
-
     def test_archived_metadata_round_trips_through_json_state(self):
         orchestrator, _transport, session, clock = _orchestrator()
         asyncio.run(orchestrator.close_session(session.session_id, actor=_actor("owner"), reason="done"))

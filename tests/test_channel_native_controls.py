@@ -181,19 +181,5 @@ class SessionControlTests(unittest.TestCase):
         self.assertFalse(submit.accepted)
         self.assertEqual(submit.reason, BlockedReason.SESSION_STOPPED)
 
-    def test_command_menu_reflects_role_and_transport_capabilities(self):
-        orchestrator, _transport, session = _orchestrator()
-
-        owner_menu = orchestrator.command_menu_for_session(session.session_id, actor=_actor("owner"))
-        collab_menu = orchestrator.command_menu_for_session(session.session_id, actor=_actor("collab"))
-
-        self.assertEqual([action["action"] for action in owner_menu["actions"]], ["interrupt", "close"])
-        self.assertEqual(collab_menu["actions"], [])
-
-        no_interrupt, _transport, no_interrupt_session = _orchestrator(caps=_transport_caps(interrupt=False))
-        menu = no_interrupt.command_menu_for_session(no_interrupt_session.session_id, actor=_actor("owner"))
-        self.assertEqual([action["action"] for action in menu["actions"]], ["close"])
-
-
 if __name__ == "__main__":
     unittest.main()

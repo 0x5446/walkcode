@@ -234,7 +234,7 @@ V3 does not inherit the old Feishu/tmux/hook runtime. Before switching:
 - unload `~/Library/LaunchAgents/com.walkcode*.plist` files that run `walkcode serve` or `walkcode start`;
 - replace hook commands in each profile's `{CLAUDE_CONFIG_DIR}/settings.json` or `{CODEX_HOME}/hooks.json` with `WALKCODE_ENV_FILE=... walkcode native hook ...` only if TUI observation and takeover are needed;
 - keep `~/.agent-control-plane/agent-wrappers.sh` only as a V3 pure pass-through helper; remove wrappers that contain tmux, old `walkcode hook/serve/start/status/test-inject`, old WalkCode env, or `FEISHU_*`;
-- convert old `FEISHU_*` env values to `LARK_*` (the `LegacyFeishuEnvConverter` prints suggestions);
+- rename old `FEISHU_*` env values to their `LARK_*` counterparts by hand (`FEISHU_APP_ID` → `LARK_APP_ID`, etc.); V3 never reads `FEISHU_*`;
 - give each profile x agent its own bot, env file, state file, and runtime process.
 
 See [docs/lark-profile-deploy.md](docs/lark-profile-deploy.md) and

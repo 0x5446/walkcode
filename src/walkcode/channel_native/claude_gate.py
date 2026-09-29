@@ -374,10 +374,6 @@ def ask_updated_input(tool_input: dict[str, Any], answers: dict[Any, Any]) -> di
     return {"questions": questions, "answers": answers_map}
 
 
-def gate_kind(tool_name: str) -> str:
-    return KIND_ASK_USER if str(tool_name or "") in ASK_USER_TOOL_NAMES else KIND_PERMISSION
-
-
 def _allow_rule_covers(rule: str, tool_name: str, tool_input: dict[str, Any]) -> bool:
     rule = str(rule or "").strip()
     if not rule:

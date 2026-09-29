@@ -5849,14 +5849,14 @@ class TranscriptModelBackfillTests(unittest.TestCase):
                 )
             )
             self.assertEqual(
-                runtime_module._transcript_model_from_payload({"transcript_path": str(transcript)}),
+                runtime_module._transcript_meta_from_payload({"transcript_path": str(transcript)})[0],
                 "claude-sonnet-5[1m]",
             )
 
     def test_missing_or_absent_transcript_returns_empty(self):
-        self.assertEqual(runtime_module._transcript_model_from_payload({}), "")
+        self.assertEqual(runtime_module._transcript_meta_from_payload({})[0], "")
         self.assertEqual(
-            runtime_module._transcript_model_from_payload({"transcript_path": "/nonexistent/x.jsonl"}),
+            runtime_module._transcript_meta_from_payload({"transcript_path": "/nonexistent/x.jsonl"})[0],
             "",
         )
 

@@ -12,7 +12,6 @@ to reach a terminal state before spawning the next one.
 
 import asyncio
 import os
-import signal
 import subprocess
 import sys
 import time

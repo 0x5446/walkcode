@@ -203,7 +203,7 @@ V3 不继承旧版 Feishu/tmux/hook runtime。切换前清理：
 - 卸载或停掉运行 `walkcode serve` / `walkcode start` 的 `~/Library/LaunchAgents/com.walkcode*.plist`。
 - 把各 profile 的 `{CLAUDE_CONFIG_DIR}/settings.json`、`{CODEX_HOME}/hooks.json` 里的 hook 改成 `WALKCODE_ENV_FILE=... walkcode native hook ...`，仅在需要 TUI 只读观测和 takeover 时配置。
 - `~/.agent-control-plane/agent-wrappers.sh` 只能保留 V3 纯转发 helper；包含 tmux、旧 `walkcode hook/serve/start/status/test-inject`、旧 WalkCode env 或 `FEISHU_*` 的 wrapper 必须清掉。
-- 把旧 `~/.walkcode/*.env` 里的 `FEISHU_*` 转成 `LARK_*`（有 `LegacyFeishuEnvConverter` 提示）。
+- 把旧 `~/.walkcode/*.env` 里的 `FEISHU_*` 手工改名为对应的 `LARK_*`（`FEISHU_APP_ID` → `LARK_APP_ID` 等）；V3 不读 `FEISHU_*`。
 - 给每个 profile × agent 分配独立 bot、env、state 和 runtime。
 
 更多部署与验收细节见 [docs/lark-profile-deploy.md](docs/lark-profile-deploy.md)

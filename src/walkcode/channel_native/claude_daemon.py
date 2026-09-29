@@ -35,7 +35,6 @@ from typing import Any, AsyncIterator
 
 from . import (
     CapabilityUnsupported,
-    ClaudeHeadlessTransport,
     ControlResult,
     _compose_turn_text,
     LaunchSpec,
@@ -1316,12 +1315,6 @@ class ClaudeDaemonTransport:
         return ControlResult(True, state="killed")
 
     async def set_model(self, handle: TransportHandle, model: str) -> ControlResult:
-        return ControlResult(False, "unsupported_by_claude_daemon")
-
-    async def set_permission_mode(self, handle: TransportHandle, mode: str) -> ControlResult:
-        return ControlResult(False, "unsupported_by_claude_daemon")
-
-    async def rewind_checkpoint(self, handle: TransportHandle, checkpoint_id: str) -> ControlResult:
         return ControlResult(False, "unsupported_by_claude_daemon")
 
     def events(self, handle: TransportHandle) -> list[Any]:

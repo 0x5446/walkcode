@@ -37,7 +37,6 @@ from walkcode.channel_native import (
     ControlResult,
     FakeAgentTransport,
     LocalProcessController,
-    TransportCapabilities,
     _command_is_codex_app_server_process,
     _command_is_external_tui_process,
     _proc_identity_matches,
@@ -635,7 +634,6 @@ class EnrichTerminateRefTests(unittest.TestCase):
 
     def test_probe_error_does_not_disarm(self):
         # Cluster C: a transient probe error must not mutate authorization.
-        import walkcode.channel_native as cn
 
         # _enrich_terminate_ref lives in the runtime module and calls the
         # _probe_process imported into that namespace — patch it there.

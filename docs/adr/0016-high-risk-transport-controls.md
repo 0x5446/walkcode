@@ -18,6 +18,11 @@ Add explicit `AgentTransport` control methods:
 
 The Orchestrator exposes owner/admin-only methods for each operation, checks stopped-session state, then gates on transport capabilities before invoking the transport. Codex keeps these capabilities disabled until real app-server support is validated. Claude headless delegates to injected client methods when present.
 
+*Retired (2026-09-29):* `set_permission_mode` / `rewind_checkpoint` and their
+Orchestrator entry points were removed — no channel ever exposed them, and
+the Claude SDK has no `rewind_checkpoint` at all. `set_model` remains (wired to
+`/model`).
+
 ## Consequences
 
 - High-risk controls are no longer implied by capability flags.

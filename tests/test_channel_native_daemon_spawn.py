@@ -33,7 +33,6 @@ from walkcode.channel_native import (
 from unittest.mock import patch
 
 from walkcode.channel_native.claude_daemon import (
-    OBSERVER_ATTACH_ID,
     ClaudeDaemonTransport,
     parse_backgrounded_short,
 )
