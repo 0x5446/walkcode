@@ -6494,6 +6494,26 @@ class TuiExitSweepTests(unittest.TestCase):
                 self.assertEqual(asyncio.run(runtime.sweep_exited_tui_sessions()), 0)
             self.assertEqual(runtime.state.sessions.get(session.session_id).status, "running")
 
+    def test_a_claim_during_the_daemon_probe_keeps_the_session(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = self._runtime(tmp)
+            session = self._observed(runtime, tmp, "x", 201)
+
+            async def daemon_probe(live):
+                # A fresh TUI hook re-claims the session for a new process
+                # while the (slow) daemon probe is out.
+                live.transport_ref["terminate_ref"] = {
+                    "controller_kind": "process",
+                    "process_ref": {"pid": 301, "lstart": "Tue Sep 29 12:00:00 2026"},
+                }
+                return False
+
+            with patch.object(
+                runtime_module, "_probe_processes", return_value={201: channel_native_module._ProcProbe("gone")}
+            ), patch.object(runtime, "_claude_daemon_session_alive", side_effect=daemon_probe):
+                self.assertEqual(asyncio.run(runtime.sweep_exited_tui_sessions()), 0)
+            self.assertEqual(runtime.state.sessions.get(session.session_id).status, "running")
+
     def test_single_probe_failure_does_not_end_the_session_on_startup(self):
         with tempfile.TemporaryDirectory() as tmp:
             runtime = self._runtime(tmp)
@@ -6511,8 +6531,10 @@ class TuiExitSweepTests(unittest.TestCase):
                 def __init__(self):
                     self.socket_path = str(socket_path)
 
+                answer = None  # probe failed
+
                 async def job_alive(self, short):
-                    return None  # probe failed
+                    return self.answer
 
             transport = type("T", (), {"client": _Client()})()
             session = self._observed(runtime, tmp, "x", 201)
@@ -6533,3 +6555,12 @@ class TuiExitSweepTests(unittest.TestCase):
                 self.assertTrue(alive())
                 now[0] += runtime_module.CLAUDE_DAEMON_SOCKET_GONE_SECONDS
                 self.assertFalse(alive())
+                # The daemon comes back and answers: the clock must reset, so a
+                # later blip gets a fresh window instead of an instant verdict.
+                socket_path.write_text("")
+                transport.client.answer = True
+                self.assertTrue(alive())
+                socket_path.unlink()
+                transport.client.answer = None
+                now[0] += 1
+                self.assertTrue(alive())

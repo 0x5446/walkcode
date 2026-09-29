@@ -3563,13 +3563,16 @@ class ChannelNativeRuntime:
             alive = await transport.client.job_alive(short)
         except Exception:
             alive = None
+        # Every probe updates the missing-socket clock, so a daemon that came
+        # back resets it and a later blip starts a fresh 60 s window.
+        socket_gone = self._claude_daemon_socket_gone(transport)
         if alive is None:
             # Probe failure means "unknown", not "dead": a socket blip or a
             # restarting daemon must not let stop paths end a live session.
             # But a socket FILE missing for CLAUDE_DAEMON_SOCKET_GONE_SECONDS
             # means no daemon is running: the stale daemon_live flag would
             # otherwise keep the session "running" forever (ADR 0066).
-            if self._claude_daemon_socket_gone(transport):
+            if socket_gone:
                 return False
             # Fall back to the last observed state (settled clears the flag).
             return bool(
@@ -5116,6 +5119,7 @@ class ChannelNativeRuntime:
         process_ref = _external_tui_process_ref(session)
         if not process_ref:
             return False
+        identity = _process_ref_identity(process_ref)
         if not state:
             state = await asyncio.to_thread(_process_ref_state_now, process_ref)
         if state != "gone":
@@ -5127,6 +5131,15 @@ class ChannelNativeRuntime:
                 session.last_progress_event = "external_tui.tui_detached_daemon_alive"
                 session.last_progress_at = self._now()
                 return True
+            return False
+        if (
+            session.status == "stopped"
+            or not _session_is_external_tui_writer(session)
+            or _process_ref_identity(_external_tui_process_ref(session)) != identity
+        ):
+            # A hook claimed or revived the session for another process while
+            # we awaited the probes: the verdict is about a process it no
+            # longer has. The next pass decides afresh.
             return False
         return self._mark_stale_tui_process_detached(session)
 
@@ -8038,6 +8051,10 @@ def _process_ref_pid(process_ref: dict[str, Any]) -> int:
         return int(process_ref.get("pid", 0) or 0)
     except (TypeError, ValueError, AttributeError):
         return 0
+
+
+def _process_ref_identity(process_ref: dict[str, Any]) -> tuple[int, str]:
+    return _process_ref_pid(process_ref), " ".join(str(process_ref.get("lstart", "") or "").split())
 
 
 def _process_ref_state(process_ref: dict[str, Any], probe: _ProcProbe) -> str:
