@@ -4221,6 +4221,17 @@ def claude_tui_current_session(pid: int, lstart: str) -> str:
     return ""
 
 
+def _claude_process_moved_to_another_session(pid: int, lstart: str, expected_session: str) -> bool:
+    """Right before a signal: does this Claude process now run a session other than ``expected``?"""
+    if not expected_session:
+        return False
+    current = claude_tui_current_session(pid, lstart)
+    if current and current != expected_session:
+        _log_degrade("terminate_skipped_switched_session", pid=pid, expected=expected_session, current=current)
+        return True
+    return False
+
+
 def _probe_processes(pids: list[int]) -> dict[int, _ProcProbe] | None:
     """One ``ps`` for many pids: pid -> ok/gone probe; None when ps itself failed.
 
@@ -4354,15 +4365,18 @@ class LocalProcessController:
             seen.add(tpid)
             deduped.append((tpid, ls, cmd))
         final_state = "already_exited"
+        expected_session = str(ref.get("expected_claude_session", "") or "")
         for tpid, ls, cmd in deduped:
-            result = self._kill_one(tpid, ls, cmd)
+            result = self._kill_one(tpid, ls, cmd, expected_session=expected_session)
             if not result.accepted:
                 return result
             if result.state != "already_exited":
                 final_state = result.state
         return ControlResult(True, state=final_state)
 
-    def _kill_one(self, pid: int, expected_lstart: str = "", expected_command: str = "") -> ControlResult:
+    def _kill_one(
+        self, pid: int, expected_lstart: str = "", expected_command: str = "", *, expected_session: str = ""
+    ) -> ControlResult:
         probe = _probe_process(pid)
         if probe.status == "gone":
             return ControlResult(True, state="already_exited")
@@ -4381,6 +4395,8 @@ class LocalProcessController:
                 current_command=probe.command,
             )
             return ControlResult(True, state="already_exited")
+        if _claude_process_moved_to_another_session(pid, expected_lstart, expected_session):
+            return ControlResult(True, state="switched_away")
         try:
             os.kill(pid, signal.SIGTERM)
         except ProcessLookupError:
@@ -4405,6 +4421,8 @@ class LocalProcessController:
             # Our target died during the wait and the pid was reused; the
             # original is gone, which is what we wanted.
             return ControlResult(True, state="terminated")
+        if _claude_process_moved_to_another_session(pid, expected_lstart, expected_session):
+            return ControlResult(True, state="switched_away")
         try:
             os.kill(pid, signal.SIGKILL)
         except ProcessLookupError:
@@ -12500,16 +12518,14 @@ class Orchestrator:
                     ),
                     idempotency_key=f"takeover_terminating:{takeover_id}",
                 )
-                if self._claude_tui_switched_away(session):
-                    # ADR 0067: re-checked after the last await — the user may
-                    # have /clear'ed or /resume'd away while we resumed. Then
-                    # the process runs another session; leave it alone.
-                    termination = ControlResult(True, state="switched_away")
-                else:
-                    termination = await controller.terminate(
-                        process_ref,
-                        reason=f"takeover:{takeover_id}",
-                    )
+                own_session = str((resume_ref or {}).get("agent_session_id", "") or "")
+                termination = await controller.terminate(
+                    # ADR 0067: the controller re-checks, right before every
+                    # signal, that the process still runs this session — the
+                    # user may /clear or /resume away at any point until then.
+                    {**process_ref, "expected_claude_session": own_session} if own_session else process_ref,
+                    reason=f"takeover:{takeover_id}",
+                )
                 if not termination.accepted:
                     self.sessions.fail_takeover(
                         takeover_id,
