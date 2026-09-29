@@ -54,6 +54,10 @@ Claude 进程里 `/clear` 或 `/resume` 到别的会话时，进程还在，只�
 - `/clear`、`/resume` 后约 30 秒旧话题变"已结束"；这 30 秒内即使点接管也不会结束终端。
 - 依赖 Claude Code 的 `sessions/<pid>.json`（2.1.283 实测存在）。文件格式变了或不存在
   时一律"未知"，退回 ADR 0066 行为，不会误判。
+- **已知局限**：读 `sessions/<pid>.json` 与 `os.kill` 之间仍有微秒级窗口——操作系统
+  没有"按另一进程内部状态条件发信号"的原子操作，防 pid 复用的身份核对也有同样的
+  窗口。用户手动 `/clear` 恰好落在这一瞬间的概率可忽略；为此放弃自动接管代价过大。
+  30 秒检测若恰在用户切回时把会话标为已分离，该进程下一条 hook 会由现有复活逻辑恢复。
 - 回滚：去掉两处核对即回到 ADR 0066 行为。
 
 ## 审查记录
@@ -70,4 +74,8 @@ gpt-5.6-sol，correctness + concurrency + goalfit）：2 条（High/Warning）�
 2026-09-29 第 3 轮：correctness 1 条 Medium——旧会话 id 只认 `agent_session_id`，恢复
 逻辑还接受 `claude_session_id`/`resume`/`session_id` 别名；两处核对改为共用
 `_claude_resume_session_id`。concurrency 维度因网络超时未产出，随第 4 轮重跑。
+
+2026-09-29 第 4 轮（整分支）：concurrency 1 条 High——检查与信号之间仍非原子。评估为
+不可消除的微秒级窗口，写入已知局限，不改代码（理由见 Consequences）。correctness 维度
+网络超时，单独重跑。
 
