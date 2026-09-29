@@ -6772,3 +6772,21 @@ class TuiSessionSwitchTests(unittest.TestCase):
             asyncio.run(runtime.process_tui_hook(hook_type="SessionStart", agent="claude", payload=payload))
             self.assertEqual(runtime.state.sessions.get(old.session_id).status, "stopped")
 
+
+    def test_a_late_hook_cannot_revive_the_old_topic_before_the_new_session_has_one(self):
+        # /clear fired SessionStart for the new session (no topic until its
+        # first prompt); then a hook the old session emitted earlier arrives.
+        for late in ("UserPromptSubmit", "Notification"):
+            with self.subTest(late=late), tempfile.TemporaryDirectory() as tmp:
+                runtime = self._runtime(tmp)
+                old = self._observed(runtime, tmp, "old", 201, self.LSTART)
+                old.transport_ref["last_hook_captured_at"] = time.time() - 30
+                self._hook(runtime, tmp, "SessionStart", "new", age=5.0)
+                self.assertEqual(runtime.state.sessions.get(old.session_id).status, "stopped")
+                self._hook(runtime, tmp, late, "old", age=10.0)
+                left = runtime.state.sessions.get(old.session_id)
+                self.assertEqual(left.status, "stopped")
+                self.assertEqual(left.writer_owner.kind, "none")
+                # A genuine /resume back later still revives it.
+                self._hook(runtime, tmp, "SessionStart", "old")
+                self.assertEqual(runtime.state.sessions.get(old.session_id).status, "running")

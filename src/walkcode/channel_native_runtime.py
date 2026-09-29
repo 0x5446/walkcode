@@ -4603,7 +4603,7 @@ class ChannelNativeRuntime:
         )
         if existing_id:
             session = self.state.sessions.get(existing_id)
-            if session.status == "stopped" and self._tui_process_moved_on(payload, session.session_id):
+            if session.status == "stopped" and self._tui_process_moved_on(payload, session):
                 # ADR 0067: the process this hook came from sent a later hook
                 # for another session. Reviving on this one would hand the old
                 # topic a takeover button that kills the terminal now running
@@ -4811,12 +4811,15 @@ class ChannelNativeRuntime:
             and _process_ref_identity(_external_tui_process_ref(session)) == identity
         ]
 
-    def _tui_process_moved_on(self, payload: dict[str, Any], session_id: str) -> bool:
+    def _tui_process_moved_on(self, payload: dict[str, Any], session) -> bool:
         """Did this hook's process send a later hook for another session?"""
         identity = _captured_tui_process_identity(payload)
         captured_at = _payload_captured_at(payload)
         if identity[0] <= 1 or not identity[1] or captured_at is None:
             return False
+        if captured_at < _tui_ref_stamp(session, "superseded_at"):
+            return True
+        session_id = session.session_id
         return any(
             session.session_id != session_id and _tui_hook_capture_stamp(session) > captured_at
             for session in self._running_sessions_on_tui_process(identity)
@@ -4858,6 +4861,11 @@ class ChannelNativeRuntime:
             if session.session_id == winner:
                 continue
             self._mark_stale_tui_process_detached(session, reason="external_tui_session_switched")
+            if isinstance(session.transport_ref, dict):
+                # Remember what it lost to: the winner may have no topic yet
+                # (a SessionStart before the first prompt), so a later running
+                # session is not always there to refuse a late revival.
+                session.transport_ref["superseded_at"] = best
             retired += 1
             await self.orchestrator.refresh_session_status_card(session)
         return retired
@@ -8128,13 +8136,17 @@ def _process_ref_pid(process_ref: dict[str, Any]) -> int:
         return 0
 
 
-def _tui_hook_capture_stamp(session: Any) -> float:
-    """Latest capture time of the hooks accepted for this session (0.0 if none)."""
+def _tui_ref_stamp(session: Any, key: str) -> float:
     ref = session.transport_ref if isinstance(session.transport_ref, dict) else {}
     try:
-        return float(ref.get("last_hook_captured_at") or 0.0)
+        return float(ref.get(key) or 0.0)
     except (TypeError, ValueError):
         return 0.0
+
+
+def _tui_hook_capture_stamp(session: Any) -> float:
+    """Latest capture time of the hooks accepted for this session (0.0 if none)."""
+    return _tui_ref_stamp(session, "last_hook_captured_at")
 
 
 def _stamp_tui_hook_capture(session: Any, payload: dict[str, Any]) -> None:
