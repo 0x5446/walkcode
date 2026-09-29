@@ -3324,14 +3324,14 @@ class ChannelNativeRuntime:
             self.save_state()
             return SubmitResult(True, "internal_headless_hook_ignored")
 
-        if await self._retire_sessions_switched_away(transport_kind, resume_ref, payload):
-            self.save_state()
         event_id = _tui_event_id(hook_type, transport_kind, resume_ref, payload)
         ledger_started = False
         if self.state.inbound_ledger is not None and not self.state.inbound_ledger.start(event_id):
             return SubmitResult(True, BlockedReason.DUPLICATE_INBOUND)
         ledger_started = self.state.inbound_ledger is not None
         try:
+            # After dedupe: a duplicate delivery must not act twice (ADR 0067).
+            await self._retire_sessions_switched_away(transport_kind, resume_ref, payload)
             session = await self._claim_or_create_tui_observed_session(
                 hook_type=hook_type,
                 agent_name=agent_name,
@@ -4600,6 +4600,19 @@ class ChannelNativeRuntime:
         )
         if existing_id:
             session = self.state.sessions.get(existing_id)
+            captured_at = _payload_captured_at(payload)
+            if (
+                session.status == "stopped"
+                and session.stop_reason == "external_tui_session_switched"
+                and captured_at is not None
+                and captured_at < session.last_progress_at
+            ):
+                # ADR 0067: the TUI moved on to another session after this hook
+                # was captured. Reviving on it would hand the old topic a
+                # takeover button that kills the terminal now running the
+                # other session; a real /resume back sends a newer hook.
+                _log_degrade("tui_revival_refused", session_id=session.session_id, hook_type=hook_type, reason="switched_away")
+                return session
             if session.status == "stopped":
                 # Off the event loop: the identity re-probe shells out to `ps`
                 # per entry and can block for seconds during a deferred drain,
@@ -4798,16 +4811,15 @@ class ChannelNativeRuntime:
         One TUI process runs one session at a time. After ``/clear`` or
         ``/resume`` the process is still alive, so the exit sweep (ADR 0066)
         never ends the session it left — and a takeover there would kill the
-        terminal now running another session. Only fresh hooks decide: a
-        replayed old hook must not end a session that started after it.
+        terminal now running another session. Only a hook captured after the
+        other session was claimed decides (a late hook from the session the
+        process left must not end the one it moved to), and only by the
+        process identity captured at hook time — never a consume-time ps.
         """
-        if not self._tui_hook_is_fresh(payload):
+        captured_at = _payload_captured_at(payload)
+        if captured_at is None or not self._tui_hook_is_fresh(payload):
             return 0
-        terminate_ref = _tui_terminate_ref(payload) or {}
-        controller_kind, process_ref = Orchestrator._normalize_takeover_terminate_ref(terminate_ref)
-        if controller_kind != "process" or not isinstance(process_ref, dict):
-            return 0
-        identity = _process_ref_identity(process_ref)
+        identity = _captured_tui_process_identity(payload)
         if identity[0] <= 1 or not identity[1]:
             return 0
         current = self.state.sessions.find_by_resume_ref(transport_kind=transport_kind, resume_ref=resume_ref)
@@ -4820,6 +4832,10 @@ class ChannelNativeRuntime:
                 or (isinstance(session.transport_ref, dict) and session.transport_ref.get("daemon_live"))
                 or _process_ref_identity(_external_tui_process_ref(session)) != identity
             ):
+                continue
+            if captured_at < float(getattr(session.writer_owner, "acquired_at", 0.0) or 0.0):
+                # Captured before that session was even claimed: a late hook
+                # from the one the process left, not evidence of a new switch.
                 continue
             self._mark_stale_tui_process_detached(session, reason="external_tui_session_switched")
             retired += 1
@@ -8090,6 +8106,28 @@ def _process_ref_pid(process_ref: dict[str, Any]) -> int:
         return int(process_ref.get("pid", 0) or 0)
     except (TypeError, ValueError, AttributeError):
         return 0
+
+
+def _captured_tui_process_identity(payload: dict[str, Any]) -> tuple[int, str]:
+    """Hook-time (pid, start time) of the TUI process; (0, "") if not captured.
+
+    Only what the hook itself carried: an explicit process/terminate ref or
+    the captured process tree. Never re-probes at consume time — a replayed
+    hook's pid may belong to another process by then (ADR 0067).
+    """
+    terminate_ref = payload.get("terminate_ref")
+    if isinstance(terminate_ref, dict) and terminate_ref:
+        controller_kind, process_ref = Orchestrator._normalize_takeover_terminate_ref(terminate_ref)
+        return _process_ref_identity(process_ref) if controller_kind == "process" else (0, "")
+    process_ref = payload.get("process_ref")
+    if isinstance(process_ref, dict) and process_ref:
+        return _process_ref_identity(process_ref)
+    captured = payload.get("_walkcode_hook_process_tree_entries")
+    if isinstance(captured, list) and captured:
+        ref = _external_tui_process_ref_from_entries(_tui_hook_process_tree_entries(payload))
+        if ref is not None:
+            return _process_ref_identity(ref)
+    return (0, "")
 
 
 def _process_ref_identity(process_ref: dict[str, Any]) -> tuple[int, str]:

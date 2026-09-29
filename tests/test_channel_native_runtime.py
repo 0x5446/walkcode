@@ -6653,3 +6653,69 @@ class TuiSessionSwitchTests(unittest.TestCase):
             self._hook(runtime, tmp, "SessionStart", "new")
             self.assertEqual(runtime.state.sessions.get(daemon.session_id).status, "running")
             self.assertEqual(runtime.state.sessions.get(taken.session_id).status, "running")
+
+    def test_a_late_hook_from_the_left_session_neither_ends_the_new_one_nor_revives_the_old(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = self._runtime(tmp)
+            old = self._observed(runtime, tmp, "old", 201, self.LSTART)
+            self._hook(runtime, tmp, "SessionStart", "new")  # /clear: old ends
+            self._hook(runtime, tmp, "UserPromptSubmit", "new")  # new topic
+            new_id = runtime.state.sessions.find_by_resume_ref(
+                transport_kind="claude_headless", resume_ref={"agent_session_id": "new"}
+            )
+            self.assertIsNotNone(new_id)
+            # A hook the old session emitted before the switch, delivered late
+            # (still inside the freshness window, not a duplicate).
+            self._hook(runtime, tmp, "Stop", "old", age=5.0)
+            self.assertEqual(runtime.state.sessions.get(new_id).status, "running")
+            left = runtime.state.sessions.get(old.session_id)
+            self.assertEqual(left.status, "stopped")
+            self.assertEqual(left.writer_owner.kind, "none")  # no takeover button came back
+
+    def test_resuming_back_revives_the_old_session_and_ends_the_other(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = self._runtime(tmp)
+            old = self._observed(runtime, tmp, "old", 201, self.LSTART)
+            self._hook(runtime, tmp, "SessionStart", "new")
+            self._hook(runtime, tmp, "UserPromptSubmit", "new")
+            new_id = runtime.state.sessions.find_by_resume_ref(
+                transport_kind="claude_headless", resume_ref={"agent_session_id": "new"}
+            )
+            time.sleep(0.01)
+            self._hook(runtime, tmp, "SessionStart", "old")  # /resume old
+            self.assertEqual(runtime.state.sessions.get(old.session_id).status, "running")
+            self.assertEqual(runtime.state.sessions.get(new_id).stop_reason, "external_tui_session_switched")
+
+    def test_a_duplicate_delivery_does_not_act_again(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = self._runtime(tmp)
+            old = self._observed(runtime, tmp, "old", 201, self.LSTART)
+            payload = {
+                "session_id": "new",
+                "cwd": tmp,
+                "process_ref": {"pid": 201, "lstart": self.LSTART},
+                "_walkcode_hook_captured_at": time.time(),
+            }
+            asyncio.run(runtime.process_tui_hook(hook_type="Stop", agent="claude", payload=dict(payload)))
+            # Pretend the old session came back legitimately in between.
+            live = runtime.state.sessions.get(old.session_id)
+            live.status = "running"
+            live.writer_owner = runtime_module.WriterOwner(kind="external_tui", acquired_at=time.time() - 60)
+            again = asyncio.run(runtime.process_tui_hook(hook_type="Stop", agent="claude", payload=dict(payload)))
+            self.assertEqual(again.reason, BlockedReason.DUPLICATE_INBOUND)
+            self.assertEqual(runtime.state.sessions.get(old.session_id).status, "running")
+
+    def test_only_the_hook_time_identity_counts_never_a_fresh_ps(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = self._runtime(tmp)
+            old = self._observed(runtime, tmp, "old", 201, self.LSTART)
+            payload = {
+                "session_id": "new",
+                "cwd": tmp,
+                "_walkcode_infer_tui_pid": True,
+                "_walkcode_hook_pid": 201,
+                "_walkcode_hook_captured_at": time.time(),
+            }
+            with patch.object(runtime_module, "_process_tree_entries", side_effect=AssertionError("consume-time ps")):
+                self.assertEqual(asyncio.run(runtime._retire_sessions_switched_away("claude_headless", {"agent_session_id": "new"}, payload)), 0)
+            self.assertEqual(runtime.state.sessions.get(old.session_id).status, "running")
