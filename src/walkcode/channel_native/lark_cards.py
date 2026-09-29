@@ -588,22 +588,6 @@ def _model_choice_card(view: dict[str, Any]) -> dict[str, Any]:
     return _card_message("🧠 切换模型", "blue", elements)
 
 
-def _command_menu_card(view: dict[str, Any]) -> dict[str, Any]:
-    buttons = [
-        _button(action)
-        for action in view.get("actions", [])
-        if isinstance(action, dict) and action.get("token")
-    ]
-    if buttons:
-        return _card_message("⌨️ 会话操作", "blue", [_action_row(buttons)])
-    rows = [
-        f"- `{escape_lark_md(str(action.get('action', '')))}` {escape_lark_md(_inline(str(action.get('label', ''))))}"
-        for action in view.get("actions", [])
-        if isinstance(action, dict)
-    ]
-    return _card_message("⌨️ 会话操作", "blue", [_md_div("\n".join(rows) or "—")])
-
-
 _CARD_RENDERERS = {
     "permission_prompt": _permission_card,
     "ask_user_question": _ask_user_question_card,
@@ -615,7 +599,6 @@ _CARD_RENDERERS = {
     "hitl_stale": _hitl_stale_card,
     "error": _error_card,
     "session_chooser": _session_chooser_card,
-    "command_menu": _command_menu_card,
     "model_choice": _model_choice_card,
     "decision_result": _decision_result_card,
     "tui_conflict_notice": _tui_conflict_notice_card,

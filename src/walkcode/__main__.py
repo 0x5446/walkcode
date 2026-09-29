@@ -9,7 +9,6 @@ import re
 import shlex
 import subprocess
 import sys
-import tomllib
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -123,89 +122,6 @@ def _current_version() -> str:
         return "unknown"
 
 
-def _ensure_codex_hooks_feature(config_toml: Path) -> None:
-    """Ensure `[features] hooks = true` for Codex native hook observation."""
-
-    if not config_toml.exists():
-        config_toml.parent.mkdir(parents=True, exist_ok=True)
-        config_toml.write_text("[features]\nhooks = true\n", encoding="utf-8")
-        return
-
-    content = config_toml.read_text(encoding="utf-8")
-    try:
-        data = tomllib.loads(content)
-    except tomllib.TOMLDecodeError:
-        data = {}
-    features = data.get("features", {}) if isinstance(data, dict) else {}
-    if isinstance(features, dict) and features.get("hooks") is True:
-        return
-
-    new_content = _set_features_hooks_true(content)
-    try:
-        check = tomllib.loads(new_content)
-    except tomllib.TOMLDecodeError:
-        if data:
-            print(
-                f"[walkcode] skipped enabling codex hooks flag: editing {config_toml} "
-                "would produce invalid TOML; please set [features] hooks = true manually",
-                file=sys.stderr,
-            )
-            return
-    else:
-        if not isinstance(check, dict) or check.get("features", {}).get("hooks") is not True:
-            if data:
-                print(
-                    f"[walkcode] skipped enabling codex hooks flag: editing {config_toml} "
-                    "would not yield a valid [features] hooks = true; please set it manually",
-                    file=sys.stderr,
-                )
-                return
-
-    config_toml.write_text(new_content, encoding="utf-8")
-
-
-def _set_features_hooks_true(content: str) -> str:
-    """Return TOML content with `[features] hooks = true` set."""
-
-    lines = content.splitlines(keepends=True)
-    out: list[str] = []
-    in_features = False
-    saw_features = False
-    saw_hooks = False
-    header_pos = -1
-
-    for line in lines:
-        stripped = line.strip()
-        is_header = stripped.startswith("[") and "]" in stripped
-        if is_header:
-            if in_features and not saw_hooks and header_pos >= 0:
-                out.insert(header_pos + 1, "hooks = true\n")
-                saw_hooks = True
-            compact = stripped.split("#", 1)[0].replace(" ", "")
-            in_features = compact == "[features]"
-            if in_features:
-                saw_features = True
-                saw_hooks = False
-                header_pos = len(out)
-            out.append(line)
-            continue
-
-        if in_features and _HOOKS_ASSIGN.match(line):
-            out.append("hooks = true\n" if line.endswith("\n") else "hooks = true")
-            saw_hooks = True
-            continue
-
-        out.append(line)
-
-    if in_features and not saw_hooks and header_pos >= 0:
-        out.insert(header_pos + 1, "hooks = true\n")
-    elif not saw_features:
-        sep = "" if not out or out[-1].endswith("\n") else "\n"
-        out.append(sep + "[features]\nhooks = true\n")
-
-    return "".join(out)
-
-
 def cmd_install_hooks(_args) -> None:
     print(
         "walkcode install-hooks is not part of the V3 runtime. "
@@ -213,14 +129,6 @@ def cmd_install_hooks(_args) -> None:
         file=sys.stderr,
     )
     raise SystemExit(2)
-
-
-def _install_claude_hooks(_args) -> None:
-    cmd_install_hooks(_args)
-
-
-def _install_codex_hooks(_args) -> None:
-    cmd_install_hooks(_args)
 
 
 def _parse_launchd_labels(listing: str) -> list[str]:

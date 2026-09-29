@@ -237,7 +237,7 @@ class ViewModelRenderingTests(unittest.TestCase):
         view = ViewModelFactory(store).model_choice(ctx)
         self.assertEqual([a["label"] for a in view["actions"]], ["✓ Opus 5.5（当前）"])
 
-    def test_health_error_command_and_takeover_views_are_platform_neutral(self):
+    def test_health_view_is_platform_neutral(self):
         factory = ViewModelFactory(InteractionStore(now=_Clock()))
 
         health = factory.health_view(
@@ -248,16 +248,8 @@ class ViewModelRenderingTests(unittest.TestCase):
             elapsed=12.5,
             cwd="/tmp/project",
         )
-        error = factory.error_view(code="transport_missing", message="SDK missing", retryable=False)
-        menu = factory.command_menu([{"action": "interrupt", "label": "Interrupt"}])
-        takeover = factory.takeover_prompt(
-            takeover_id="t1",
-            blocked_input_id="b1",
-            recoverability="native_resume_available",
-            summary="run tests",
-        )
 
-        for view in (health, error, menu, takeover):
+        for view in (health,):
             self.assertIsInstance(view, dict)
             self.assertIn("type", view)
             self.assertNotIn("telegram_html", view)

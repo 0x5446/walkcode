@@ -3407,7 +3407,6 @@ class ChannelNativeRuntime:
                     not session.model
                     or not session.last_usage
                     or hook_type == "stop"
-                    or _tui_hook_stops_session(hook_type)
                 ):
                     transcript_model, transcript_usage = _transcript_meta_from_payload(payload)
                     meta_changed = False
@@ -3436,16 +3435,6 @@ class ChannelNativeRuntime:
             if ledger_started:
                 self.state.inbound_ledger.fail(event_id)
             raise
-        if session.status != "stopped" and _tui_hook_stops_session(hook_type):
-            if await self._claude_daemon_session_alive(session):
-                # Daemon-native session: the TUI process exiting is a detach
-                # (the worker keeps running); the session ends on the daemon's
-                # settled event, not here.
-                session.last_progress_at = self._now()
-                session.last_progress_event = "external_tui.tui_detached_daemon_alive"
-            else:
-                self._mark_tui_session_stopped(session, hook_type=hook_type)
-            await self.orchestrator.refresh_session_status_card(session)
         if ledger_started:
             self.state.inbound_ledger.complete(event_id)
         self.save_state()
@@ -6919,10 +6908,6 @@ def _payload_hook_event_name(payload: dict[str, Any]) -> str:
     )
 
 
-def _transcript_model_from_payload(payload: dict[str, Any]) -> str:
-    return _transcript_meta_from_payload(payload)[0]
-
-
 def _transcript_meta_from_payload(payload: dict[str, Any]) -> tuple[str, dict[str, Any]]:
     """Read model slug + last-turn usage from the transcript a hook points at.
 
@@ -7952,10 +7937,6 @@ def _tui_visible_text_from_content_blocks(blocks: list[Any]) -> str:
         if isinstance(text, str) and text:
             parts.append(text)
     return "\n".join(parts)
-
-
-def _tui_hook_stops_session(hook_type: str) -> bool:
-    return str(hook_type or "").strip().lower() in {"process-exit", "process-exited"}
 
 
 def _is_idle_notification_text(text: str) -> bool:

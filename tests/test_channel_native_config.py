@@ -3,7 +3,6 @@ import unittest
 from walkcode.channel_native import (
     ChannelConfigError,
     ChannelNativeConfig,
-    LegacyFeishuEnvConverter,
 )
 
 
@@ -359,13 +358,6 @@ class ChannelNativeConfigTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ChannelConfigError, "no channel"):
             ChannelNativeConfig.from_env(env)
-
-        report = LegacyFeishuEnvConverter.from_env(env)
-
-        self.assertEqual(report.suggested_env["LARK_APP_ID"], "old-app")
-        self.assertEqual(report.suggested_env["LARK_APP_SECRET"], "old-secret")
-        self.assertEqual(report.suggested_env["LARK_RECEIVE_ID"], "old-chat")
-        self.assertIn("FEISHU_*", " ".join(report.warnings))
 
     def test_channel_must_be_explicit_even_when_token_exists(self):
         with self.assertRaisesRegex(ChannelConfigError, "no channel"):

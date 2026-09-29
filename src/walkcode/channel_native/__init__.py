@@ -372,12 +372,6 @@ class ChannelNativeConfig:
 
 
 @dataclass(frozen=True)
-class LegacyEnvConversionReport:
-    suggested_env: dict[str, str]
-    warnings: list[str] = field(default_factory=list)
-
-
-@dataclass(frozen=True)
 class E2EGateSpec:
     name: str
     flag: str
@@ -445,33 +439,6 @@ class ChannelNativeE2EGates:
 
     def all(self) -> dict[str, E2EGateResult]:
         return {name: self.evaluate(name) for name in self._SPECS}
-
-
-class LegacyFeishuEnvConverter:
-    _MAPPING = {
-        "FEISHU_APP_ID": "LARK_APP_ID",
-        "FEISHU_APP_SECRET": "LARK_APP_SECRET",
-        "FEISHU_RECEIVE_ID": "LARK_RECEIVE_ID",
-        "FEISHU_RECEIVE_ID_TYPE": "LARK_RECEIVE_ID_TYPE",
-        "FEISHU_OPENAPI_DOMAIN": "LARK_OPENAPI_DOMAIN",
-    }
-
-    @classmethod
-    def from_env(cls, env: dict[str, str] | None = None) -> LegacyEnvConversionReport:
-        source = os.environ if env is None else env
-        suggested = {
-            new_key: source[old_key]
-            for old_key, new_key in cls._MAPPING.items()
-            if source.get(old_key)
-        }
-        warnings = []
-        if suggested:
-            warnings.append(
-                "FEISHU_* variables are legacy-only; channel-native runtime reads LARK_* instead."
-            )
-        else:
-            warnings.append("no FEISHU_* variables found to convert")
-        return LegacyEnvConversionReport(suggested_env=suggested, warnings=warnings)
 
 
 def _split_csv(raw: str) -> list[str]:
@@ -3465,14 +3432,6 @@ class ViewModelFactory:
         }
 
     @staticmethod
-    def error_view(*, code: str, message: str, retryable: bool) -> dict[str, Any]:
-        return {"type": "error", "code": code, "message": message, "retryable": retryable}
-
-    @staticmethod
-    def command_menu(actions: list[dict[str, Any]]) -> dict[str, Any]:
-        return {"type": "command_menu", "actions": [dict(action) for action in actions]}
-
-    @staticmethod
     def session_chooser(
         *,
         reason: str,
@@ -3495,26 +3454,6 @@ class ViewModelFactory:
                 for item in sessions
             ],
         }
-
-    @staticmethod
-    def takeover_prompt(
-        *,
-        takeover_id: str,
-        blocked_input_id: str,
-        recoverability: str,
-        summary: str,
-    ) -> dict[str, Any]:
-        return {
-            "type": "takeover_prompt",
-            "takeover_id": takeover_id,
-            "blocked_input_id": blocked_input_id,
-            "recoverability": recoverability,
-            "summary": summary,
-            "actions": [
-                {"action": "takeover_and_send", "label": "Take over and send" if str(summary or "").strip() else "Take over"},
-            ],
-        }
-
 
 @dataclass
 class DeliveryItem:
@@ -4863,8 +4802,6 @@ def render_view_text(view_model: dict[str, Any]) -> str:
         return "\n".join(rows)
     if view_type == "error":
         return f"{view_model.get('code', 'error')}: {view_model.get('message', '')}"
-    if view_type == "command_menu":
-        return "Commands"
     if view_type == "model_choice":
         return "Choose a model"
     if view_type == "decision_result":
@@ -11364,7 +11301,6 @@ class Orchestrator:
                 # blips on a healthy one.
                 binding.capabilities.pop("root_card_edit_failures", None)
                 self._status_card_fingerprints[session.session_id] = (message_id, fingerprint)
-                await self._sync_readonly_topic_state(session)
                 return
             if message_id == binding.root_message_id and self._root_card_edit_may_retry(
                 binding, session, message_id, edit_error
@@ -11394,7 +11330,6 @@ class Orchestrator:
                 fingerprint,
             )
         await self._pin_status_card_if_requested(channel, binding)
-        await self._sync_readonly_topic_state(session)
 
     @staticmethod
     def _status_card_actions(session: Session) -> list[dict[str, Any]]:
@@ -11416,9 +11351,6 @@ class Orchestrator:
             await pin(binding, binding.health_message_id)
         except Exception:
             return
-
-    async def _sync_readonly_topic_state(self, session: Session) -> None:
-        return
 
     def _authorize_session_control(
         self,
@@ -11593,7 +11525,6 @@ class Orchestrator:
                                     generation=session.generation,
                                     ack_message_id=inbound.message_id,
                                 )
-                                await self._delete_blocked_readonly_input_if_possible(inbound, session, result)
                         else:
                             session = self.sessions.get(resolution.session_id)
                             if self._inbound_is_stale_for_session(inbound, session):
@@ -11614,7 +11545,6 @@ class Orchestrator:
                                     generation=session.generation,
                                     ack_message_id=inbound.message_id,
                                 )
-                                await self._delete_blocked_readonly_input_if_possible(inbound, session, result)
         except Exception:
             if ledger_started and self.inbound_ledger is not None:
                 self.inbound_ledger.fail(inbound.event_id)
@@ -11625,14 +11555,6 @@ class Orchestrator:
             else:
                 self.inbound_ledger.fail(inbound.event_id)
         return result
-
-    async def _delete_blocked_readonly_input_if_possible(
-        self,
-        inbound: InboundEvent,
-        session: Session,
-        result: SubmitResult,
-    ) -> None:
-        return
 
     @staticmethod
     def _root_message_id_for_new_binding(inbound: InboundEvent) -> str:
@@ -13521,8 +13443,6 @@ __all__ = [
     "LarkBotApi",
     "LarkChannelAdapter",
     "LaunchSpec",
-    "LegacyEnvConversionReport",
-    "LegacyFeishuEnvConverter",
     "LocalProcessController",
     "Orchestrator",
     "OutboxDispatcher",
