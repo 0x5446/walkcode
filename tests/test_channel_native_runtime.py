@@ -3530,6 +3530,7 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
 
         host = _HealHost()
         host.config = _Cfg()
+        host._rootless_heal_given_up = set()
         channel = _FakeChannel("lark", _channel_caps())
         host.channels = {"lark": channel}
 
@@ -3608,8 +3609,11 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
         # instead of re-sending every 5 s tick and burning the quota.
         from walkcode.channel_native import PermanentDeliveryError as _Permanent
 
+        sends = []
+
         class _RejectingChannel(_FakeChannel):
             async def send_view(self, binding, view_model):
+                sends.append(binding)
                 raise _Permanent("lark code 99991403")
 
         host.channels = {"lark": _RejectingChannel("lark", _channel_caps())}
@@ -3617,6 +3621,10 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
         host.state = SimpleNamespace(sessions=_register(rejected))
         self.assertEqual(asyncio.run(host._heal_rootless_lark_tui_binding(rejected)), "")
         self.assertEqual(rejected.channel_binding.root_message_id, "")
+        # Remembered: another session's transient failure keeps the load
+        # pass retrying, and this one must not be re-sent on those ticks.
+        self.assertEqual(asyncio.run(host._heal_rootless_lark_tui_binding(rejected)), "")
+        self.assertEqual(len(sends), 1)
 
     def test_rootless_heal_send_failure_keeps_load_pass_retryable(self):
         # A transient Lark outage at startup must NOT freeze the one-shot
@@ -3688,6 +3696,7 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
             def __init__(self):
                 self._loaded_tui_observed_bindings_refreshed = False
                 self.saved = 0
+                self._rootless_heal_given_up = set()
 
             def _grant_tui_channel_owners(self, session_id, binding):
                 return None
@@ -4078,9 +4087,15 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
                 return runtime_module.SubmitResult(True)
 
             runtime.process_tui_hook = process
-            for _ in range(runtime_module.TUI_HOOK_MAX_ATTEMPTS):
+            for _ in range(runtime_module.TUI_HOOK_MAX_ATTEMPTS - 1):
                 asyncio.run(runtime.drain_deferred_tui_hooks())
+            # Still inside the budget: kept in order, nothing behind it ran.
+            self.assertTrue((qdir / "00-poison.json").exists())
+            self.assertNotIn("01-next.json", seen)
 
+            asyncio.run(runtime.drain_deferred_tui_hooks())
+
+            self.assertEqual(seen.count("00-poison.json"), runtime_module.TUI_HOOK_MAX_ATTEMPTS)
             self.assertEqual(list(qdir.glob("*.json")), [])
             self.assertTrue((qdir / "bad" / "00-poison.json").exists())
             self.assertEqual(seen.count("01-next.json"), 1)

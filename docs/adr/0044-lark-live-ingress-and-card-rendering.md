@@ -108,6 +108,10 @@ battle-tested and is ported rather than reinvented
 - Dependency: `lark-oapi` ships as the `lark` optional extra and via
   `walkcode upgrade`'s `--with lark-oapi`, keeping core
   `dependencies = []` (same pattern as `claude-agent-sdk`).
+  *Superseded (v0.14.33):* both `lark-oapi` and `claude-agent-sdk` are now
+  declared runtime dependencies in `pyproject.toml`. The empty core list let a
+  bare install build a venv whose ingress failed at import (the 2026-07-24/25
+  silent-disconnect outage).
 
 ## Consequences
 

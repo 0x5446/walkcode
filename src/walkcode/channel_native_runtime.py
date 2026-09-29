@@ -663,6 +663,17 @@ class CodexStdioAppServerClient:
         # the transport does not un-happen them, and dropping them would
         # silently lose session events.
         process, self._process = self._process, None
+        stderr_task, self._stderr_task = self._stderr_task, None
+        try:
+            await self._terminate_process(process)
+        finally:
+            # A child that inherited stderr can hold the pipe open after the
+            # wrapper exits; the drain would then wait on it forever and
+            # every restart would leak one more.
+            if stderr_task is not None:
+                stderr_task.cancel()
+
+    async def _terminate_process(self, process: asyncio.subprocess.Process | None) -> None:
         if process is None or process.returncode is not None:
             return
         # SIGTERM, not SIGKILL. `codex app-server --stdio` is a thin node
@@ -751,13 +762,23 @@ class CodexStdioAppServerClient:
             raise TransportUnavailable("Codex app-server returned non-object JSON")
         return message
 
-    @staticmethod
-    async def _drain_stderr(process: asyncio.subprocess.Process, tail: collections.deque) -> None:
+    _STDERR_LINE_MAX = 2000
+
+    @classmethod
+    async def _drain_stderr(cls, process: asyncio.subprocess.Process, tail: collections.deque) -> None:
+        # read(), not readline(): readline() raises on a line longer than the
+        # stream limit, which would end the drain while the server lives on.
         if process.stderr is None:
             return
+        pending = b""
         with contextlib.suppress(Exception):
-            while line := await process.stderr.readline():
-                tail.append(line.decode("utf-8", errors="replace").rstrip())
+            while chunk := await process.stderr.read(64 * 1024):
+                *lines, pending = (pending + chunk).split(b"\n")
+                pending = pending[-cls._STDERR_LINE_MAX :]
+                for line in lines:
+                    tail.append(line[: cls._STDERR_LINE_MAX].decode("utf-8", errors="replace").rstrip())
+        if pending:
+            tail.append(pending.decode("utf-8", errors="replace").rstrip())
 
     def _take_buffered(self, thread_id: str) -> list[dict[str, Any]]:
         # Anything a previous, aborted call had already taken comes first —
@@ -1557,6 +1578,10 @@ class ChannelNativeRuntime:
         self._telegram_commands_installed = False
         self._tui_hook_queue_dir = _tui_hook_queue_dir(self.state_store.path)
         self._tui_hook_failures: dict[str, int] = {}
+        # Sessions whose rootless heal failed permanently; skipped until
+        # restart. A per-call "give up" is not enough: any other session's
+        # transient failure keeps the whole load pass retrying every tick.
+        self._rootless_heal_given_up: set[str] = set()
         self._lark_inbox_dir = self.state_store.path.with_name(f"{self.state_store.path.name}.lark-inbox.d")
         self._ingress_lock = asyncio.Lock()
         self._drain_lock = asyncio.Lock()
@@ -5079,6 +5104,7 @@ class ChannelNativeRuntime:
             or binding.root_message_id
             or binding.thread_id
             or session.status == "stopped"
+            or session.session_id in self._rootless_heal_given_up
         ):
             return ""
         channel = self.channels.get("lark")
@@ -5130,7 +5156,10 @@ class ChannelNativeRuntime:
             # A permanent failure (bot not in chat, monthly quota spent) fails
             # identically every 5 s tick; retrying it is what burned the quota
             # before. Give up until the next restart.
-            return "" if permanent else "retry"
+            if permanent:
+                self._rootless_heal_given_up.add(session.session_id)
+                return ""
+            return "retry"
         if not root_id:
             _log_degrade(
                 "lark_tui_root_heal_failed",

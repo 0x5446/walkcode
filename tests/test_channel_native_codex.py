@@ -2483,6 +2483,67 @@ class CodexStdioStderrTests(unittest.TestCase):
         self.assertEqual(client._stderr_tail[-1], "last words")
 
 
+    def test_overlong_stderr_line_does_not_end_the_drain(self):
+        # readline() raises on a line past the stream limit; the drain used to
+        # die there while the server kept writing.
+        class _SmallLimitClient(CodexStdioAppServerClient):
+            _STDOUT_LIMIT = 1024
+
+        server = (
+            "import sys, json\n"
+            "req = json.loads(sys.stdin.readline())\n"
+            "sys.stderr.write('y' * 8192 + '\\nafter\\n'); sys.stderr.flush()\n"
+            "print(json.dumps({'id': req['id'], 'result': {}}), flush=True)\n"
+            "import time; time.sleep(30)\n"
+        )
+        client = _SmallLimitClient(command=(sys.executable, "-c", server), request_timeout=5)
+
+        async def scenario():
+            async with client._lock:
+                await client._ensure_started()
+            await asyncio.sleep(0.2)
+            tail = list(client._stderr_tail)
+            await client.restart()
+            return tail
+
+        tail = asyncio.run(asyncio.wait_for(scenario(), timeout=10))
+
+        self.assertEqual(tail[-1], "after")
+
+    def test_restart_reclaims_drain_when_a_child_holds_stderr(self):
+        # A child that inherited stderr keeps the pipe open after the server
+        # exits; without a cancel, each restart leaked one waiting drain.
+        with tempfile.TemporaryDirectory() as tmp:
+            pid_file = Path(tmp) / "child.pid"
+            server = (
+                "import sys, json, subprocess\n"
+                f"child = subprocess.Popen(['sleep', '30'])\n"
+                f"open({str(pid_file)!r}, 'w').write(str(child.pid))\n"
+                "req = json.loads(sys.stdin.readline())\n"
+                "print(json.dumps({'id': req['id'], 'result': {}}), flush=True)\n"
+                "import time; time.sleep(30)\n"
+            )
+            client = CodexStdioAppServerClient(command=(sys.executable, "-c", server), request_timeout=5)
+
+            async def scenario():
+                async with client._lock:
+                    await client._ensure_started()
+                drain = client._stderr_task
+                await client.restart()
+                await asyncio.sleep(0.05)
+                # Checked inside the loop: asyncio.run cancels leftovers on
+                # exit, which would make any drain look finished.
+                return drain.done()
+
+            try:
+                reclaimed = asyncio.run(asyncio.wait_for(scenario(), timeout=15))
+            finally:
+                with contextlib.suppress(Exception):
+                    os.kill(int(pid_file.read_text()), 9)
+
+            self.assertTrue(reclaimed)
+
+
 class CodexEventRoutingTests(unittest.TestCase):
     def test_thread_less_events_are_not_handed_to_a_foreign_thread(self):
         # Several TUI sessions share one app-server process. An event with no
