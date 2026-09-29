@@ -1673,6 +1673,7 @@ def _delivery_to_dict(item: DeliveryItem) -> dict[str, Any]:
         "finished_at": item.finished_at,
         "claim_owner": item.claim_owner,
         "claim_until": item.claim_until,
+        "message_id": item.message_id,
     }
 
 
@@ -1690,6 +1691,7 @@ def _delivery_from_dict(data: dict[str, Any]) -> DeliveryItem:
         finished_at=float(data.get("finished_at", 0.0)),
         claim_owner=str(data.get("claim_owner", "")),
         claim_until=float(data.get("claim_until", 0.0)),
+        message_id=str(data.get("message_id", "")),
     )
 
 
@@ -3469,6 +3471,9 @@ class DeliveryItem:
     finished_at: float = 0.0
     claim_owner: str = ""
     claim_until: float = 0.0
+    # Platform id of the sent message, so a card can be edited later without
+    # a click (e.g. retiring a prompt the terminal answered instead).
+    message_id: str = ""
 
 
 class DurableOutbox:
@@ -3520,6 +3525,14 @@ class DurableOutbox:
                 if item.idempotency_key == idempotency_key:
                     return item
         return None
+
+    def sent_message_id(self, idempotency_key: str) -> str:
+        item = self._find_by_idempotency_key(idempotency_key)
+        return item.message_id if item is not None and item.delivery_id in self._sent else ""
+
+    def is_pending(self, idempotency_key: str) -> bool:
+        item = self._find_by_idempotency_key(idempotency_key)
+        return item is not None and item.delivery_id in self._pending
 
     def get(self, delivery_id: str) -> DeliveryItem:
         if delivery_id in self._pending:
@@ -3577,6 +3590,7 @@ class DurableOutbox:
         *,
         claim_owner: str = "",
         retry_after: float | None = None,
+        message_id: str = "",
     ) -> bool:
         item = self._pending.get(delivery_id)
         if item is None:
@@ -3587,6 +3601,7 @@ class DurableOutbox:
         item.last_error = error
         if status == DeliveryStatus.SENT:
             item.finished_at = self._now()
+            item.message_id = message_id
             self._sent[delivery_id] = self._pending.pop(delivery_id)
             return True
         elif status == DeliveryStatus.PERMANENT_FAILURE:
@@ -3829,7 +3844,7 @@ class OutboxDispatcher:
             root_message_id=root_message_id,
         )
         try:
-            await channel.send_view(binding, item.view_model)
+            message_id = await channel.send_view(binding, item.view_model)
         except PermanentDeliveryError as exc:
             self.outbox.record_result(
                 item.delivery_id,
@@ -3857,6 +3872,7 @@ class OutboxDispatcher:
                 item.delivery_id,
                 DeliveryStatus.SENT,
                 claim_owner=self.owner,
+                message_id=str(message_id or ""),
             )
         self._notify_state_changed()
 
@@ -12766,6 +12782,77 @@ class Orchestrator:
             ),
             idempotency_key=f"tui_conflict:{kind}:{dedupe_key or pid}",
         )
+
+    def settle_timed_out_gate(self, session_id: str, rid: str) -> HitlRequest | None:
+        """Close a blocking-gate prompt whose hook returned without a card
+        decision (timed out and handed the prompt to the terminal).
+
+        Only a click used to settle a gate card, so a prompt answered in the
+        terminal kept live buttons forever. The HITL request goes stale and
+        its interaction is recorded as answered in the terminal, so old
+        tokens stop working. Returns the request, or None when it was not
+        pending (decided on the card already). The card itself is edited
+        separately by ``retire_gate_card``, which may need several passes.
+        """
+        request = next(
+            (r for r in self.hitls.pending_for_session(session_id) if r.transport_request_id == rid),
+            None,
+        )
+        if request is None:
+            return None
+        request.status = "stale"
+        if request.interaction_id:
+            try:
+                ctx = self.interactions.get(request.interaction_id)
+            except KeyError:
+                ctx = None
+            if ctx is not None and ctx.decision is None:
+                ctx.decision = {"action": "terminal"}
+                ctx.decided_at = self._now()
+                ctx.awaiting_other = None
+        return request
+
+    async def retire_gate_card(self, session_id: str, rid: str, request: HitlRequest) -> str:
+        """Edit a settled gate card into its terminal result.
+
+        Returns "done", "gone" (nothing left to edit: session, channel or the
+        card's delivery is gone), "queued" (the card is still waiting in the
+        outbox, which bounds its own retries) or "retry" (the edit failed —
+        the caller bounds these).
+        """
+        try:
+            session = self.sessions.get(session_id)
+        except KeyError:
+            return "gone"
+        binding = session.channel_binding
+        channel = self.channels.get(binding.channel_kind) if binding is not None else None
+        if channel is None or not channel.capabilities().editable_message:
+            return "gone"
+        key = f"{session_id}:{request.generation}:gate:{rid}"
+        message_id = self.outbox.sent_message_id(key)
+        if not message_id:
+            # Still queued (a retry may deliver the original card later) or
+            # dead / compacted. Only a queued card is worth waiting for.
+            return "queued" if self.outbox.is_pending(key) else "gone"
+        view = ViewModelFactory.decision_result(
+            kind=request.prompt_kind,
+            action="terminal",
+            detail="飞书上没有及时作答，已转到终端。",
+        )
+        error = "edit_view returned False"
+        try:
+            if await channel.edit_view(binding, message_id, view):
+                return "done"
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+        _log_degrade(
+            "gate_card_retire_edit_failed",
+            session_id=session_id,
+            rid=rid,
+            message_id=message_id,
+            error=error,
+        )
+        return "retry"
 
     async def post_claude_gate_prompt(self, session_id: str, request: dict[str, Any]) -> bool:
         """Post a permission / AskUserQuestion card for a PreToolUse gate request.

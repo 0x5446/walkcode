@@ -116,6 +116,9 @@ CLAUDE_DAEMON_ADOPT_MIN_AGE_SECONDS = 60.0
 # attach, short enough not to stall the ingress path if the daemon is wedged.
 CLAUDE_DAEMON_OBSERVER_READY_TIMEOUT_SECONDS = 3.0
 CLAUDE_GATE_DRAIN_INTERVAL_SECONDS = 1.0
+# Failed edits of a settled gate card (about one pass a second) before giving
+# up on it. Waiting for the card's delivery does not count.
+CLAUDE_GATE_RETIRE_MAX_TRIES = 120
 # A pending gate request that cannot be routed to an observed session (or
 # whose card cannot be delivered) is answered "pass" after this grace, so the
 # blocking hook falls back to the native terminal flow instead of waiting out
@@ -1592,6 +1595,14 @@ class ChannelNativeRuntime:
         # the user chose "always allow" for (in-memory: hooks cannot persist
         # permission rules, so the scope is this runtime process).
         self._gate_dispatched: dict[str, float] = {}
+        # Blocking-gate cards now on screen, rid -> session id. When the hook's
+        # pending file disappears the hook has returned (decided or timed out to
+        # the terminal); a still-pending card is then retired.
+        self._gate_block_cards: dict[str, str] = {}
+        # Settled cards still to be edited: rid -> (session id, request, tries).
+        # The edit can lag (card still queued for delivery, transient edit
+        # failure), so it is retried on later passes, bounded.
+        self._gate_cards_retiring: dict[str, tuple[str, Any, int]] = {}
         # ADR 0065: foreign-turn mirror (created on first reconcile) and the
         # thread each mirrored session is subscribed to.
         self._codex_mirror: CodexForeignTurnMirror | None = None
@@ -4175,6 +4186,8 @@ class ChannelNativeRuntime:
                     if transport is not None:
                         transport.register_notify_gate(rid, request, session_id=session_id)
                     claude_gate.remove_pending(state_path, rid)
+                else:
+                    self._gate_block_cards[rid] = session_id
                 self._gate_dispatched[rid] = now
                 processed += 1
                 self.save_state()
@@ -4190,6 +4203,29 @@ class ChannelNativeRuntime:
         for rid in list(self._gate_dispatched):
             if rid not in live_rids:
                 self._gate_dispatched.pop(rid, None)
+        for rid, session_id in list(self._gate_block_cards.items()):
+            # live_rids only holds files that parsed; a read error must not
+            # look like the hook having returned.
+            if rid in live_rids or claude_gate.pending_path(state_path, rid).exists():
+                continue
+            self._gate_block_cards.pop(rid, None)
+            async with self._ingress_lock:
+                request = self.orchestrator.settle_timed_out_gate(session_id, rid)
+            if request is not None:
+                claude_gate.trace("settle_card_hook_gone", rid=rid)
+                self._gate_cards_retiring[rid] = (session_id, request, 0)
+                self.save_state()
+        for rid, (session_id, request, tries) in list(self._gate_cards_retiring.items()):
+            outcome = await self.orchestrator.retire_gate_card(session_id, rid, request)
+            if outcome == "queued":
+                # Waiting on delivery (possibly a long rate-limit backoff) is
+                # not a failed edit; the outbox ends it by sending or dying.
+                continue
+            if outcome == "retry" and tries + 1 < CLAUDE_GATE_RETIRE_MAX_TRIES:
+                self._gate_cards_retiring[rid] = (session_id, request, tries + 1)
+                continue
+            self._gate_cards_retiring.pop(rid, None)
+            claude_gate.trace("retire_card", rid=rid, outcome=outcome, tries=tries + 1)
         # Documented contract: decision files whose pending is gone (stale card
         # clicked after the hook gave up) are reaped here.
         for orphan in claude_gate.list_orphan_decision_paths(state_path):
