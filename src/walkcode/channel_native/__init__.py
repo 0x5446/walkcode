@@ -1264,7 +1264,12 @@ def _model_slug_matches(slug: str, current: str) -> bool:
     """
     if not slug or not current:
         return False
-    return current == slug or current.startswith(slug + "-") or current.startswith(slug + "@")
+    return (
+        current == slug
+        or current.startswith(slug + "-")
+        or current.startswith(slug + "@")
+        or current.startswith(slug + "[")  # context-window suffix: claude-opus-5-5[1m]
+    )
 
 
 @dataclass(frozen=True)
@@ -3161,6 +3166,11 @@ class ViewModelFactory:
             key=len,
             default="",
         )
+        if current and not matched_slug:
+            # The session runs a model the configured list does not name (the
+            # list is hand-maintained): still show what is current.
+            entries.insert(0, (current, current))
+            matched_slug = current
         actions = []
         for slug, display in entries:
             actions.append(
@@ -11243,13 +11253,20 @@ class Orchestrator:
         actor: ActorRef,
         model: str,
     ) -> ControlResult:
-        result = await self._run_transport_control(
-            session_id,
-            actor=actor,
-            action="set_model",
-            capability="set_model",
-            invoke=lambda transport, handle: transport.set_model(handle, model),
-        )
+        try:
+            result = await self._run_transport_control(
+                session_id,
+                actor=actor,
+                action="set_model",
+                capability="set_model",
+                invoke=lambda transport, handle: transport.set_model(handle, model),
+            )
+        except Exception as exc:  # noqa: BLE001 - the provider's refusal is the answer the user needs
+            # e.g. Claude: 'Couldn't confirm model "x" with the API' when the
+            # route does not serve that model. Reported as a failed switch
+            # ("模型切换失败：<reason>") instead of an unconfirmed inbound.
+            _log_degrade("set_model_failed", session_id=session_id, model=model, error=exc)
+            return ControlResult(False, str(exc) or type(exc).__name__)
         if result.accepted:
             self.sessions.get(session_id).model = model
         return result
