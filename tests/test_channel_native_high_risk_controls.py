@@ -228,3 +228,20 @@ class HighRiskTransportControlTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SetModelRefusalTests(unittest.TestCase):
+    def test_a_provider_refusal_is_a_failed_switch_with_its_reason(self):
+        orchestrator, transport, session = _orchestrator()
+        before = orchestrator.sessions.get(session.session_id).model
+
+        async def refuse(handle, model):
+            raise RuntimeError(f"Couldn't confirm model \"{model}\" with the API.")
+
+        transport.set_model = refuse
+        result = asyncio.run(
+            orchestrator.set_session_model(session.session_id, actor=_actor("owner"), model="claude-sonnet-5-5")
+        )
+        self.assertFalse(result.accepted)
+        self.assertIn('confirm model "claude-sonnet-5-5"', result.reason)
+        self.assertEqual(orchestrator.sessions.get(session.session_id).model, before)

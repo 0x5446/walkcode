@@ -6580,6 +6580,12 @@ class TuiExitSweepTests(unittest.TestCase):
                 self.assertTrue(alive())
 
 
+def _as_utc_lstart(local_lstart: str) -> str:
+    """How Claude's sessions/<pid>.json writes procStart: ps lstart rendered in UTC."""
+    fmt = "%a %b %d %H:%M:%S %Y"
+    return time.strftime(fmt, time.gmtime(time.mktime(time.strptime(local_lstart, fmt))))
+
+
 class ClaudeTuiSessionSwitchTests(unittest.TestCase):
     """ADR 0067: a Claude TUI that /clear'ed or /resume'd away no longer owns the old topic."""
 
@@ -6593,20 +6599,56 @@ class ClaudeTuiSessionSwitchTests(unittest.TestCase):
             sessions = home / ".claude-profiles" / "personal" / "sessions"
             sessions.mkdir(parents=True)
             (sessions / "201.json").write_text(
-                json.dumps({"pid": 201, "sessionId": "now-running", "procStart": "Tue Sep 29 11:06:24 2026"})
+                json.dumps({"pid": 201, "sessionId": "now-running", "procStart": _as_utc_lstart(self.LSTART)})
             )
             with patch.object(channel_native_module.Path, "home", return_value=home), patch.dict(
                 "os.environ", {"CLAUDE_CONFIG_DIR": ""}
             ):
                 current = channel_native_module.claude_tui_current_session
                 self.assertEqual(current(201, "Tue Sep 29  11:06:24 2026"), "now-running")  # spacing normalized
+                # The record is UTC, ours is local: only the same instant matches.
+                with patch.dict("os.environ", {"TZ": "Asia/Shanghai"}):
+                    time.tzset()
+                    try:
+                        shanghai = "Tue Sep 29 19:06:24 2026"
+                        (sessions / "210.json").write_text(
+                            json.dumps({"sessionId": "tz", "procStart": "Tue Sep 29 11:06:24 2026"})
+                        )
+                        self.assertEqual(current(210, shanghai), "tz")
+                        self.assertEqual(current(210, "Tue Sep 29 11:06:24 2026"), "")  # same text, 8 h apart
+                        (sessions / "213.json").write_text(
+                            json.dumps({"sessionId": "hour-off", "procStart": "Tue Sep 29 10:06:24 2026"})
+                        )
+                        self.assertEqual(current(213, shanghai), "")  # no DST here: one reading only
+                    finally:
+                        pass
+                time.tzset()
+                # DST fall-back: 01:30 happens twice in New York; the later one is 06:30 UTC.
+                with patch.dict("os.environ", {"TZ": "America/New_York"}):
+                    time.tzset()
+                    try:
+                        (sessions / "211.json").write_text(
+                            json.dumps({"sessionId": "late", "procStart": "Sun Nov 01 06:30:00 2026"})
+                        )
+                        (sessions / "212.json").write_text(
+                            json.dumps({"sessionId": "early", "procStart": "Sun Nov 01 05:30:00 2026"})
+                        )
+                        self.assertEqual(current(211, "Sun Nov  1 01:30:00 2026"), "late")
+                        self.assertEqual(current(212, "Sun Nov  1 01:30:00 2026"), "early")
+                        (sessions / "214.json").write_text(
+                            json.dumps({"sessionId": "hour-off", "procStart": "Tue Sep 29 14:00:00 2026"})
+                        )
+                        self.assertEqual(current(214, "Tue Sep 29 11:00:00 2026"), "")  # ordinary EDT day
+                    finally:
+                        pass
+                time.tzset()
                 self.assertEqual(current(201, "Wed Sep 30 08:00:00 2026"), "")  # pid reused by another process
                 self.assertEqual(current(202, self.LSTART), "")  # no record
                 self.assertEqual(current(201, ""), "")  # no start time to match
                 (sessions / "205.json").write_text(json.dumps({"pid": 205, "sessionId": "x"}))
                 self.assertEqual(current(205, ""), "")  # neither side has a start time: no answer
                 for bad in (42, ["x"], {"id": "x"}, "   ", None):
-                    (sessions / "206.json").write_text(json.dumps({"sessionId": bad, "procStart": self.LSTART}))
+                    (sessions / "206.json").write_text(json.dumps({"sessionId": bad, "procStart": _as_utc_lstart(self.LSTART)}))
                     self.assertEqual(current(206, self.LSTART), "", bad)  # malformed: unknown, not "switched"
                 (sessions / "207.json").write_text(json.dumps({"sessionId": "s", "procStart": 12345}))
                 self.assertEqual(current(207, "12345"), "")
@@ -6615,7 +6657,7 @@ class ClaudeTuiSessionSwitchTests(unittest.TestCase):
             # An unreadable profiles dir does not hide the other locations.
             default = home / ".claude" / "sessions"
             default.mkdir(parents=True)
-            (default / "209.json").write_text(json.dumps({"sessionId": "in-default", "procStart": self.LSTART}))
+            (default / "209.json").write_text(json.dumps({"sessionId": "in-default", "procStart": _as_utc_lstart(self.LSTART)}))
             real_iterdir = channel_native_module.Path.iterdir
 
             def iterdir(path):

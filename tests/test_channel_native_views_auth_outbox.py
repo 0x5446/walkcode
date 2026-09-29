@@ -192,6 +192,29 @@ class ViewModelRenderingTests(unittest.TestCase):
         self.assertEqual(labels, ["Opus 4", "✓ Opus 4.8（当前）"])
         self.assertEqual(view["current"], "claude-opus-4-8")
 
+    def test_model_choice_shows_a_current_model_the_list_does_not_name(self):
+        store = InteractionStore(now=_Clock())
+        models = [{"slug": "claude-sonnet-5", "display_name": "Sonnet 5"}]
+        ctx = store.register_model_choice(session_id="s1", generation=1, models=models, current="claude-opus-5-5")
+        view = ViewModelFactory(store).model_choice(ctx)
+        self.assertEqual([a["label"] for a in view["actions"]], ["✓ claude-opus-5-5（当前）", "Sonnet 5"])
+        self.assertEqual(view["current"], "claude-opus-5-5")
+
+    def test_a_shorter_slug_never_claims_another_model(self):
+        store = InteractionStore(now=_Clock())
+        models = [{"slug": "claude-opus-4", "display_name": "Opus 4"}]
+        ctx = store.register_model_choice(session_id="s1", generation=1, models=models, current="claude-opus-4-8[1m]")
+        view = ViewModelFactory(store).model_choice(ctx)
+        self.assertEqual([a["label"] for a in view["actions"]], ["✓ claude-opus-4-8[1m]（当前）", "Opus 4"])
+        self.assertEqual(view["actions"][0]["action"], "claude-opus-4-8[1m]")
+
+    def test_model_choice_matches_a_context_window_suffix(self):
+        store = InteractionStore(now=_Clock())
+        models = [{"slug": "claude-opus-5-5", "display_name": "Opus 5.5"}]
+        ctx = store.register_model_choice(session_id="s1", generation=1, models=models, current="claude-opus-5-5[1m]")
+        view = ViewModelFactory(store).model_choice(ctx)
+        self.assertEqual([a["label"] for a in view["actions"]], ["✓ Opus 5.5（当前）"])
+
     def test_health_error_command_and_takeover_views_are_platform_neutral(self):
         factory = ViewModelFactory(InteractionStore(now=_Clock()))
 

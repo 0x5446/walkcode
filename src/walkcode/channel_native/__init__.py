@@ -8,6 +8,7 @@ smaller modules once the boundaries settle.
 from __future__ import annotations
 
 import asyncio
+import calendar
 import contextlib
 import signal
 import subprocess
@@ -1263,7 +1264,14 @@ def _model_slug_matches(slug: str, current: str) -> bool:
     """
     if not slug or not current:
         return False
-    return current == slug or current.startswith(slug + "-") or current.startswith(slug + "@")
+    if current == slug:
+        return True
+    if not current.startswith(slug):
+        return False
+    # Only a release date (-20260610), a Vertex version (@20260610) or a
+    # context window ([1m]) may follow — never another model number, or
+    # claude-opus-4 would claim claude-opus-4-8.
+    return re.fullmatch(r"(?:-\d{8}|@[^\[]+)?(?:\[[^\]]*\])?", current[len(slug):]) is not None
 
 
 @dataclass(frozen=True)
@@ -3160,6 +3168,11 @@ class ViewModelFactory:
             key=len,
             default="",
         )
+        if current and not matched_slug:
+            # The session runs a model the configured list does not name (the
+            # list is hand-maintained): still show what is current.
+            entries.insert(0, (current, current))
+            matched_slug = current
         actions = []
         for slug, display in entries:
             actions.append(
@@ -4198,7 +4211,7 @@ def claude_tui_current_session(pid: int, lstart: str) -> str:
     ``/clear`` or ``/resume`` switches sessions inside the same process. The
     start time must match, so a reused pid never answers for another process.
     """
-    wanted = " ".join(str(lstart or "").split())
+    wanted = _local_lstart_epochs(lstart)
     if pid <= 1 or not wanted:
         return ""
     home = Path.home()
@@ -4217,9 +4230,45 @@ def claude_tui_current_session(pid: int, lstart: str) -> str:
         proc_start, session_id = record.get("procStart"), record.get("sessionId")
         if not isinstance(proc_start, str) or not isinstance(session_id, str) or not session_id.strip():
             continue  # a malformed record answers nothing
-        if " ".join(proc_start.split()) == wanted:
+        # procStart is `ps lstart` rendered in UTC; our record is local time.
+        started = _utc_lstart_epoch(proc_start)
+        if started is not None and any(abs(started - epoch) < 1.0 for epoch in wanted):
             return session_id.strip()
     return ""
+
+
+_LSTART_FORMAT = "%a %b %d %H:%M:%S %Y"
+
+
+def _local_lstart_epochs(text: str) -> set[float]:
+    """Epochs a C-locale ``ps -o lstart`` local-time string can mean (empty if unparsable).
+
+    Usually one; two inside a DST fall-back hour, where the same wall time
+    occurs twice — both are tried rather than letting mktime guess.
+    """
+    try:
+        parsed = time.strptime(" ".join(str(text or "").split()), _LSTART_FORMAT)
+    except ValueError:
+        return set()
+    epochs = set()
+    for isdst in (0, 1):
+        try:
+            epoch = time.mktime((*parsed[:8], isdst))
+        except (OverflowError, ValueError):
+            continue
+        # mktime "fixes up" a wrong isdst by shifting the hour; keep only
+        # readings that really are this wall time.
+        if time.localtime(epoch)[:6] == parsed[:6]:
+            epochs.add(epoch)
+    return epochs
+
+
+def _utc_lstart_epoch(text: str) -> float | None:
+    """Epoch of the same format read as UTC; None if unparsable."""
+    try:
+        return float(calendar.timegm(time.strptime(" ".join(str(text or "").split()), _LSTART_FORMAT)))
+    except (ValueError, OverflowError):
+        return None
 
 
 def _claude_resume_session_id(resume_ref: dict[str, Any]) -> str:
@@ -11221,13 +11270,20 @@ class Orchestrator:
         actor: ActorRef,
         model: str,
     ) -> ControlResult:
-        result = await self._run_transport_control(
-            session_id,
-            actor=actor,
-            action="set_model",
-            capability="set_model",
-            invoke=lambda transport, handle: transport.set_model(handle, model),
-        )
+        try:
+            result = await self._run_transport_control(
+                session_id,
+                actor=actor,
+                action="set_model",
+                capability="set_model",
+                invoke=lambda transport, handle: transport.set_model(handle, model),
+            )
+        except Exception as exc:  # noqa: BLE001 - the provider's refusal is the answer the user needs
+            # e.g. Claude: 'Couldn't confirm model "x" with the API' when the
+            # route does not serve that model. Reported as a failed switch
+            # ("模型切换失败：<reason>") instead of an unconfirmed inbound.
+            _log_degrade("set_model_failed", session_id=session_id, model=model, error=exc)
+            return ControlResult(False, str(exc) or type(exc).__name__)
         if result.accepted:
             self.sessions.get(session_id).model = model
         return result
