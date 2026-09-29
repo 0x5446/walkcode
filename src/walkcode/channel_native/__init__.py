@@ -4190,6 +4190,42 @@ def _probe_process(pid: int) -> _ProcProbe:
     return _ProcProbe("ok", match.group(2).strip(), match.group(3).strip())
 
 
+def _probe_processes(pids: list[int]) -> dict[int, _ProcProbe] | None:
+    """One ``ps`` for many pids: pid -> ok/gone probe; None when ps itself failed.
+
+    macOS ``ps -p a,b,c`` prints one line per live pid and nothing for absent
+    ones; it exits 0 if any pid exists and 1 if none does. Anything else —
+    timeout, a higher exit code, a line we cannot parse — is a failed probe
+    for the whole batch, never a "gone" (ADR 0066).
+    """
+    wanted = sorted({pid for pid in pids if pid > 1})
+    if not wanted:
+        return {}
+    try:
+        result = subprocess.run(
+            ["ps", "-o", "pid=,stat=,lstart=", "-p", ",".join(str(pid) for pid in wanted)],
+            env=_c_locale_env(),
+            capture_output=True,
+            text=True,
+            timeout=1,
+        )
+    except Exception:
+        return None
+    if result.returncode not in (0, 1):
+        return None
+    probes = {pid: _ProcProbe("gone") for pid in wanted}
+    for line in result.stdout.splitlines():
+        if not line.strip():
+            continue
+        match = re.match(r"^\s*(\d+)\s+(\S+)\s+(\w{3}\s+\w{3}\s+\d{1,2}\s+[\d:]{8}\s+\d{4})\s*$", line)
+        if match is None:
+            return None
+        pid = int(match.group(1))
+        if pid in probes and not match.group(2).startswith("Z"):
+            probes[pid] = _ProcProbe("ok", match.group(3).strip())
+    return probes
+
+
 def _proc_identity_matches(probe: _ProcProbe, expected_lstart: str, expected_command: str) -> bool:
     """True if a live probe matches the recorded identity.
 

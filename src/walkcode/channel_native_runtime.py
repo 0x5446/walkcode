@@ -67,6 +67,9 @@ from .channel_native import (
     _command_is_external_tui_process,
     _log_degrade,
     _probe_process,
+    _probe_processes,
+    _ProcProbe,
+    compose_session_title,
     _proc_identity_matches,
     _ps_lstart_command,
     OutboxDispatcher,
@@ -143,6 +146,11 @@ _CODEX_SESSION_META_MAX_BYTES = 1024 * 1024
 OUTBOX_FLUSH_INTERVAL_SECONDS = 1.0
 STATE_COMPACT_INTERVAL_SECONDS = 300.0
 TUI_BINDING_REFRESH_INTERVAL_SECONDS = 5.0
+# ADR 0066: how often live TUI processes behind observed sessions are checked
+# (one batched ps per pass), and how long the Claude daemon socket must stay
+# missing before a daemon worker counts as gone.
+TUI_EXIT_SWEEP_INTERVAL_SECONDS = 30.0
+CLAUDE_DAEMON_SOCKET_GONE_SECONDS = 60.0
 # 被 @ 进别人的飞书话题时，最多读回多少条既有讨论作为首轮上下文。够覆盖一场
 # 有来有回的讨论，又不至于让一个长话题把整个回合的输入撑爆。
 LARK_THREAD_CONTEXT_MESSAGE_LIMIT = 50
@@ -1537,6 +1545,9 @@ class ChannelNativeRuntime:
         self._codex_mirror: CodexForeignTurnMirror | None = None
         self._codex_mirror_threads: dict[str, str] = {}
         self._gate_always_allow: set[tuple[str, str]] = set()
+        # ADR 0066: since when the Claude daemon socket file has been missing
+        # (0 = present / not yet seen missing).
+        self._daemon_socket_missing_since = 0.0
         daemon_transport = self._claude_daemon_transport()
         if daemon_transport is not None:
             daemon_transport.on_gate_decision = self._record_gate_decision
@@ -2959,6 +2970,10 @@ class ChannelNativeRuntime:
                 self._reconcile_codex_mirrors_forever(interval=TUI_BINDING_REFRESH_INTERVAL_SECONDS),
                 name="walkcode-codex-mirror-reconcile",
             ),
+            asyncio.create_task(
+                self._sweep_exited_tui_sessions_forever(interval=TUI_EXIT_SWEEP_INTERVAL_SECONDS),
+                name="walkcode-tui-exit-sweep",
+            ),
             *(
                 [
                     asyncio.create_task(
@@ -3182,6 +3197,56 @@ class ChannelNativeRuntime:
                 await self.reconcile_codex_mirrors()
             except Exception as exc:  # noqa: BLE001 - maintenance must keep running
                 print(f"codex mirror reconcile deferred: {type(exc).__name__}: {exc}", file=sys.stderr)
+            await asyncio.sleep(interval)
+
+    async def sweep_exited_tui_sessions(self) -> int:
+        """Mark observed sessions whose TUI process exited; returns how many (ADR 0066).
+
+        Claude TUIs send no exit hook WalkCode acts on, so without this a
+        closed terminal leaves its topic "running" until the next restart.
+        One ps for every candidate; a failed ps decides nothing this pass.
+        """
+        snapshot: list[tuple[str, int, str]] = []
+        for session in self.state.sessions.iter_sessions():
+            if session.status == "stopped" or not _session_is_external_tui_writer(session):
+                continue
+            process_ref = _external_tui_process_ref(session)
+            pid = _process_ref_pid(process_ref)
+            if pid > 1:
+                snapshot.append((session.session_id, pid, str(process_ref.get("lstart", "") or "")))
+        if not snapshot:
+            return 0
+        probes = await asyncio.to_thread(_probe_processes, [pid for _, pid, _ in snapshot])
+        if probes is None:
+            return 0
+        marked = 0
+        for session_id, pid, lstart in snapshot:
+            try:
+                session = self.state.sessions.get(session_id)
+            except KeyError:
+                continue
+            process_ref = _external_tui_process_ref(session)
+            if (
+                session.status == "stopped"
+                or not _session_is_external_tui_writer(session)
+                or _process_ref_pid(process_ref) != pid
+                or str(process_ref.get("lstart", "") or "") != lstart
+            ):
+                continue  # claimed, revived or stopped while ps ran
+            state = _process_ref_state(process_ref, probes.get(pid, _ProcProbe("error")))
+            if await self._maybe_mark_stale_tui_process_detached(session, state=state):
+                marked += 1
+                await self.orchestrator.refresh_session_status_card(session)
+        if marked:
+            self.save_state()
+        return marked
+
+    async def _sweep_exited_tui_sessions_forever(self, *, interval: float) -> None:
+        while True:
+            try:
+                await self.sweep_exited_tui_sessions()
+            except Exception as exc:  # noqa: BLE001 - maintenance must keep running
+                print(f"TUI exit sweep deferred: {type(exc).__name__}: {exc}", file=sys.stderr)
             await asyncio.sleep(interval)
 
     async def _refresh_loaded_tui_observed_bindings_forever(
@@ -3501,12 +3566,27 @@ class ChannelNativeRuntime:
         if alive is None:
             # Probe failure means "unknown", not "dead": a socket blip or a
             # restarting daemon must not let stop paths end a live session.
+            # But a socket FILE missing for CLAUDE_DAEMON_SOCKET_GONE_SECONDS
+            # means no daemon is running: the stale daemon_live flag would
+            # otherwise keep the session "running" forever (ADR 0066).
+            if self._claude_daemon_socket_gone(transport):
+                return False
             # Fall back to the last observed state (settled clears the flag).
             return bool(
                 isinstance(session.transport_ref, dict)
                 and session.transport_ref.get("daemon_live")
             )
         return alive
+
+    def _claude_daemon_socket_gone(self, transport) -> bool:
+        socket_path = str(getattr(transport.client, "socket_path", "") or "")
+        if not socket_path or os.path.exists(socket_path):
+            self._daemon_socket_missing_since = 0.0
+            return False
+        now = self._now()
+        if not self._daemon_socket_missing_since:
+            self._daemon_socket_missing_since = now
+        return now - self._daemon_socket_missing_since >= CLAUDE_DAEMON_SOCKET_GONE_SECONDS
 
     # -- daemon-native spawn + list adoption (ADR 0048) -----------------------
 
@@ -4677,7 +4757,18 @@ class ChannelNativeRuntime:
         if not _tui_hook_can_create_session(hook_type):
             return None
 
-        binding = await self._create_tui_observed_binding(agent_name, transport_kind, resume_ref, payload)
+        # Title the topic by the first prompt from the start, so the root card
+        # never shows the session uuid first.
+        title, title_source = compose_session_title(user_text=_tui_hook_text(hook_type, payload))
+        if not title:
+            title = _telegram_session_topic_name(
+                agent_name,
+                f"TUI {_resume_ref_identity(transport_kind, resume_ref)}",
+            )
+            title_source = "tui_hook"
+        binding = await self._create_tui_observed_binding(
+            agent_name, transport_kind, resume_ref, payload, title=title
+        )
         session_id = self._tui_observed_session_id(agent_name, transport_kind, resume_ref)
         session = self.state.sessions.create_observed_session(
             session_id=session_id,
@@ -4686,11 +4777,10 @@ class ChannelNativeRuntime:
             external_ref=external_ref,
             owner=actor,
         )
-        session.cached_title = _telegram_session_topic_name(
-            agent_name,
-            f"TUI {_resume_ref_identity(transport_kind, resume_ref)}",
-        )
-        session.title_source = "tui_hook"
+        session.cached_title = title
+        session.title_source = title_source
+        if title_source != "tui_hook":
+            session.title_refreshed_at = self._now()
         self._grant_tui_channel_owners(session.session_id, binding)
         await self.orchestrator.refresh_session_status_card(session)
         return session
@@ -5016,9 +5106,19 @@ class ChannelNativeRuntime:
         # invalidates the entry belonging to the card left in the main chat.
         return "healed"
 
-    async def _maybe_mark_stale_tui_process_detached(self, session) -> bool:
+    async def _maybe_mark_stale_tui_process_detached(self, session, *, state: str = "") -> bool:
+        """End an observed session whose TUI process is gone.
+
+        ``state`` is a probe result the caller already has (the periodic
+        sweep's batched ps); without one, probe this session's process now.
+        Only ``gone`` acts — ``unknown`` (ps failed) changes nothing.
+        """
         process_ref = _external_tui_process_ref(session)
-        if not process_ref or _process_ref_is_running(process_ref):
+        if not process_ref:
+            return False
+        if not state:
+            state = await asyncio.to_thread(_process_ref_state_now, process_ref)
+        if state != "gone":
             return False
         if await self._claude_daemon_session_alive(session):
             # Attach TUI is gone but the daemon worker lives on: this is a
@@ -5028,14 +5128,9 @@ class ChannelNativeRuntime:
                 session.last_progress_at = self._now()
                 return True
             return False
-        return self._mark_stale_tui_process_detached_if_needed(session)
+        return self._mark_stale_tui_process_detached(session)
 
-    def _mark_stale_tui_process_detached_if_needed(self, session) -> bool:
-        process_ref = _external_tui_process_ref(session)
-        if not process_ref:
-            return False
-        if _process_ref_is_running(process_ref):
-            return False
+    def _mark_stale_tui_process_detached(self, session) -> bool:
         changed = False
         if session.status != "stopped":
             session.status = "stopped"
@@ -5105,12 +5200,16 @@ class ChannelNativeRuntime:
         transport_kind: str,
         resume_ref: dict[str, Any],
         payload: dict[str, Any],
+        *,
+        title: str = "",
     ) -> ChannelBinding:
+        title = title or _telegram_session_topic_name(
+            agent_name,
+            f"TUI {_resume_ref_identity(transport_kind, resume_ref)}",
+        )
         channel_kind = self.config.channel.kind
         if channel_kind == "lark":
-            return await self._create_lark_tui_observed_binding(
-                agent_name, transport_kind, resume_ref
-            )
+            return await self._create_lark_tui_observed_binding(title)
         if channel_kind != "telegram":
             raise ChannelConfigError(
                 f"TUI observed session ingress is not supported for channel: {channel_kind}"
@@ -5130,10 +5229,7 @@ class ChannelNativeRuntime:
             thread_id = await self._create_telegram_topic_for_chat_if_possible(
                 channel,
                 chat_id=chat_id,
-                topic_name=_telegram_session_topic_name(
-                    agent_name,
-                    f"TUI {_resume_ref_identity(transport_kind, resume_ref)}",
-                ),
+                topic_name=title,
             )
         return ChannelBinding(
             channel_kind="telegram",
@@ -5150,12 +5246,7 @@ class ChannelNativeRuntime:
             },
         )
 
-    async def _create_lark_tui_observed_binding(
-        self,
-        agent_name: str,
-        transport_kind: str,
-        resume_ref: dict[str, Any],
-    ) -> ChannelBinding:
+    async def _create_lark_tui_observed_binding(self, title: str) -> ChannelBinding:
         chat_id = _tui_lark_chat_id(self.config.channel)
         if not chat_id:
             raise ChannelConfigError(
@@ -5188,13 +5279,10 @@ class ChannelNativeRuntime:
                 ),
                 ViewModelFactory.health_view(
                     status="running",
-                    # Same string the caller stamps as cached_title, so the
-                    # card does not re-title itself on the first refresh. The
-                    # first prompt replaces it with something readable.
-                    title=_telegram_session_topic_name(
-                        agent_name,
-                        f"TUI {_resume_ref_identity(transport_kind, resume_ref)}",
-                    ),
+                    # Same string the caller stamps as cached_title (the first
+                    # prompt), so the card does not re-title itself on the
+                    # first refresh.
+                    title=title,
                     session_id="",
                     transport="external_tui",
                     elapsed=0.0,
@@ -6912,7 +7000,11 @@ def _tui_hook_can_claim_existing_session(hook_type: str) -> bool:
 
 
 def _tui_hook_can_create_session(hook_type: str) -> bool:
-    return hook_type in {"sync", "session-start", "user-prompt-submit", "pre-tool"}
+    # ADR 0066: a topic appears with the user's first prompt, titled by it.
+    # SessionStart (opened, closed or /resume'd away without a word) and
+    # activity hooks carry no prompt and would only root an empty
+    # "TUI <uuid>" topic; they still act on a session that already exists.
+    return hook_type == "user-prompt-submit"
 
 
 def _tui_resume_ref(transport_kind: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -7941,27 +8033,38 @@ def _external_tui_process_ref(session: Any) -> dict[str, Any]:
     return process_ref
 
 
-def _process_ref_is_running(process_ref: dict[str, Any]) -> bool:
+def _process_ref_pid(process_ref: dict[str, Any]) -> int:
     try:
-        pid = int(process_ref.get("pid", 0) or 0)
-    except (TypeError, ValueError):
-        return False
+        return int(process_ref.get("pid", 0) or 0)
+    except (TypeError, ValueError, AttributeError):
+        return 0
+
+
+def _process_ref_state(process_ref: dict[str, Any], probe: _ProcProbe) -> str:
+    """``alive`` / ``gone`` / ``unknown`` for a recorded TUI process (ADR 0066).
+
+    A live pid whose start time differs from the record is a reused pid —
+    the recorded process is gone.
+    """
+    if probe.status == "error":
+        return "unknown"
+    if probe.status == "gone":
+        return "gone"
+    recorded = " ".join(str(process_ref.get("lstart", "") or "").split())
+    if recorded and recorded != " ".join(probe.lstart.split()):
+        return "gone"
+    return "alive"
+
+
+def _process_ref_state_now(process_ref: dict[str, Any]) -> str:
+    pid = _process_ref_pid(process_ref)
     if pid <= 1 or pid == os.getpid():
-        return False
-    try:
-        result = subprocess.run(
-            ["ps", "-o", "stat=", "-p", str(pid)],
-            env=_c_locale_env(),
-            capture_output=True,
-            text=True,
-            timeout=1,
-        )
-    except Exception:
-        return False
-    if result.returncode != 0:
-        return False
-    stat = result.stdout.strip()
-    return bool(stat) and "Z" not in stat.upper()
+        return "unknown"
+    return _process_ref_state(process_ref, _probe_process(pid))
+
+
+def _session_is_external_tui_writer(session: Any) -> bool:
+    return session.writer_owner is not None and session.writer_owner.kind == "external_tui"
 
 
 def _safe_error_message(exc: Exception, *secrets: str) -> str:

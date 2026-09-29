@@ -1308,7 +1308,7 @@ class LarkTuiObservationTests(_LarkRuntimeHarness):
 
         created = asyncio.run(
             runtime.process_tui_hook(
-                hook_type="sync", agent="claude", payload=self._tui_payload(self._tmp.name)
+                hook_type="user-prompt-submit", agent="claude", payload=self._tui_payload(self._tmp.name)
             )
         )
         stopped = asyncio.run(
@@ -1342,10 +1342,10 @@ class LarkTuiObservationTests(_LarkRuntimeHarness):
         self.assertEqual(len(forwarded), 1)
         self.assertEqual(forwarded[0]["root_id"], "lark-msg-1")
 
-    def test_first_prompt_patches_the_root_card_title(self):
-        # The point of rooting on a card: the thread's collapsed view starts
-        # out showing the session uuid and has to become readable once the
-        # user's first prompt arrives.
+    def test_root_card_is_titled_by_the_first_prompt(self):
+        # ADR 0066: the topic appears with the first prompt, and the root card
+        # (the thread's collapsed view) carries that prompt from its first send
+        # — no "TUI <uuid>" root that has to be patched afterwards.
         runtime, api, transport = self._runtime(
             env_extra={"LARK_ALLOWED_CHAT_IDS": "oc_chat"}
         )
@@ -1355,7 +1355,7 @@ class LarkTuiObservationTests(_LarkRuntimeHarness):
                 hook_type="sync", agent="claude", payload=self._tui_payload(self._tmp.name)
             )
         )
-        self.assertEqual(api.calls[0][1]["view"]["title"], "claude: TUI claude-session-1")
+        self.assertEqual(api.calls, [])
 
         asyncio.run(
             runtime.process_tui_hook(
@@ -1370,14 +1370,7 @@ class LarkTuiObservationTests(_LarkRuntimeHarness):
         )
         self.assertEqual(session.cached_title, "把话题根标题改成有意义的")
         self.assertEqual(session.title_source, "initial_user_input")
-        # Patched in place — the root message id never changes.
-        retitled = [
-            payload
-            for method, payload in api.calls
-            if method == "editCard" and payload["view"].get("title") == "把话题根标题改成有意义的"
-        ]
-        self.assertTrue(retitled)
-        self.assertEqual(retitled[-1]["message_id"], "lark-msg-1")
+        self.assertEqual(api.calls[0][1]["view"]["title"], "把话题根标题改成有意义的")
 
     def test_tui_hook_without_lark_chat_raises_config_error(self):
         runtime, api, transport = self._runtime()
@@ -1387,7 +1380,7 @@ class LarkTuiObservationTests(_LarkRuntimeHarness):
         ):
             asyncio.run(
                 runtime.process_tui_hook(
-                    hook_type="sync", agent="claude", payload=self._tui_payload(self._tmp.name)
+                    hook_type="user-prompt-submit", agent="claude", payload=self._tui_payload(self._tmp.name)
                 )
             )
 
@@ -1401,7 +1394,7 @@ class LarkTuiObservationTests(_LarkRuntimeHarness):
 
         created = asyncio.run(
             runtime.process_tui_hook(
-                hook_type="sync", agent="claude", payload=self._tui_payload(self._tmp.name)
+                hook_type="user-prompt-submit", agent="claude", payload=self._tui_payload(self._tmp.name)
             )
         )
 
@@ -1423,7 +1416,7 @@ class LarkTuiTakeoverAuthzTests(_LarkRuntimeHarness):
 
         asyncio.run(
             runtime.process_tui_hook(
-                hook_type="sync",
+                hook_type="user-prompt-submit",
                 agent="claude",
                 payload={
                     "session_id": "claude-session-9",
@@ -1452,7 +1445,7 @@ class LarkTuiTakeoverAuthzTests(_LarkRuntimeHarness):
         )
         asyncio.run(
             runtime.process_tui_hook(
-                hook_type="sync",
+                hook_type="user-prompt-submit",
                 agent="claude",
                 payload={
                     "session_id": "claude-session-9",
@@ -1495,7 +1488,7 @@ class LarkTuiTakeoverAuthzTests(_LarkRuntimeHarness):
         )
         asyncio.run(
             runtime.process_tui_hook(
-                hook_type="sync",
+                hook_type="user-prompt-submit",
                 agent="claude",
                 payload={
                     "session_id": "claude-session-9",
