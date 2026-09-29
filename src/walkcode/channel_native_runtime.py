@@ -1592,6 +1592,10 @@ class ChannelNativeRuntime:
         # the user chose "always allow" for (in-memory: hooks cannot persist
         # permission rules, so the scope is this runtime process).
         self._gate_dispatched: dict[str, float] = {}
+        # Blocking-gate cards now on screen, rid -> session id. When the hook's
+        # pending file disappears the hook has returned (decided or timed out to
+        # the terminal); a still-pending card is then retired.
+        self._gate_block_cards: dict[str, str] = {}
         # ADR 0065: foreign-turn mirror (created on first reconcile) and the
         # thread each mirrored session is subscribed to.
         self._codex_mirror: CodexForeignTurnMirror | None = None
@@ -4175,6 +4179,8 @@ class ChannelNativeRuntime:
                     if transport is not None:
                         transport.register_notify_gate(rid, request, session_id=session_id)
                     claude_gate.remove_pending(state_path, rid)
+                else:
+                    self._gate_block_cards[rid] = session_id
                 self._gate_dispatched[rid] = now
                 processed += 1
                 self.save_state()
@@ -4190,6 +4196,15 @@ class ChannelNativeRuntime:
         for rid in list(self._gate_dispatched):
             if rid not in live_rids:
                 self._gate_dispatched.pop(rid, None)
+        for rid, session_id in list(self._gate_block_cards.items()):
+            if rid in live_rids:
+                continue
+            self._gate_block_cards.pop(rid, None)
+            async with self._ingress_lock:
+                retired = await self.orchestrator.retire_gate_card(session_id, rid)
+            if retired:
+                claude_gate.trace("retire_card_hook_gone", rid=rid)
+                self.save_state()
         # Documented contract: decision files whose pending is gone (stale card
         # clicked after the hook gave up) are reaped here.
         for orphan in claude_gate.list_orphan_decision_paths(state_path):

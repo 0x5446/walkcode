@@ -704,6 +704,48 @@ class GateDrainTests(unittest.TestCase):
             asyncio.run(runtime.drain_claude_gate_requests())
             self.assertIsNone(claude_gate.read_decision(state, "toolu_orphaned"))
 
+    def test_card_is_retired_when_the_hook_hands_the_prompt_to_the_terminal(self):
+        # Regression: a blocking hook that timed out handed the prompt to the
+        # terminal, the user answered there, and the card kept live buttons
+        # forever — only a click could flip it.
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime, _session, api = _runtime_with_observed_session(tmp)
+            state = runtime.state_store.path
+            claude_gate.write_pending(state, self._pending_for_session())
+            asyncio.run(runtime.drain_claude_gate_requests())
+            card_call = next(
+                i for i, (method, payload) in enumerate(api.calls)
+                if method == "sendMessage" and "Edit" in str(payload.get("text", ""))
+            )
+            card_id = str(card_call + 1)  # the fake API numbers messages by call index
+            [hitl] = runtime.orchestrator.hitls.pending_for_session("observed-1")
+            ctx = runtime.orchestrator.interactions.get(hitl.interaction_id)
+
+            claude_gate.cleanup_gate_files(state, "toolu_edit_1")  # hook timed out
+            asyncio.run(runtime.drain_claude_gate_requests())
+
+            edits = [payload for method, payload in api.calls if method.startswith("edit")]
+            self.assertEqual(len(edits), 1)
+            self.assertEqual(str(edits[0].get("message_id")), card_id)
+            self.assertIn("终端", str(edits[0]))
+            self.assertEqual(runtime.orchestrator.hitls.pending_for_session("observed-1"), [])
+            self.assertEqual(ctx.decision, {"action": "terminal"})
+            # Idempotent: nothing left to retire on the next pass.
+            asyncio.run(runtime.drain_claude_gate_requests())
+            self.assertEqual(len([m for m, _ in api.calls if m.startswith("edit")]), 1)
+
+    def test_card_decided_on_the_channel_is_not_retired(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime, _session, api = _runtime_with_observed_session(tmp)
+            state = runtime.state_store.path
+            claude_gate.write_pending(state, self._pending_for_session())
+            asyncio.run(runtime.drain_claude_gate_requests())
+            [hitl] = runtime.orchestrator.hitls.pending_for_session("observed-1")
+            hitl.status = "decided"  # a card click settled it first
+            claude_gate.cleanup_gate_files(state, "toolu_edit_1")
+            asyncio.run(runtime.drain_claude_gate_requests())
+            self.assertFalse([m for m, _ in api.calls if m.startswith("edit")])
+
     def test_gate_prompt_interaction_outlives_default_token_ttl(self):
         # The blocking hook waits up to 30 min; the card must stay decidable
         # for that whole window, not the 10-min token default.

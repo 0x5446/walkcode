@@ -438,6 +438,22 @@ class RetentionPolicyTests(unittest.TestCase):
         self.assertEqual(removed["interactions"], 1)
         self.assertEqual(store.interaction_count(), 0)
 
+    def test_sent_message_id_survives_a_state_round_trip(self):
+        # A blocking-gate card is retired by editing it after a restart too;
+        # that needs the platform message id to be persisted with the item.
+        outbox = DurableOutbox(now=lambda: 1000.0)
+        item = outbox.enqueue(
+            channel_binding_key=("lark", "bot", "chat", "", "root"),
+            view_model={"type": "text", "text": "card"},
+            idempotency_key="s1:0:gate:toolu_1",
+        )
+        outbox.record_result(item.delivery_id, DeliveryStatus.SENT, message_id="om_card")
+
+        restored = DurableOutbox.from_dict(outbox.to_dict(), now=lambda: 1000.0)
+
+        self.assertEqual(restored.sent_message_id("s1:0:gate:toolu_1"), "om_card")
+        self.assertEqual(restored.sent_message_id("missing"), "")
+
     def test_outbox_compaction_prunes_sent_and_dead_after_retention(self):
         clock = _Clock()
         outbox = DurableOutbox(
