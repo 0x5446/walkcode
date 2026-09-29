@@ -6578,3 +6578,78 @@ class TuiExitSweepTests(unittest.TestCase):
                 transport.client.answer = None
                 now[0] += 1
                 self.assertTrue(alive())
+
+
+class TuiSessionSwitchTests(unittest.TestCase):
+    """ADR 0067: a TUI process that switched sessions ends the one it left."""
+
+    LSTART = "Tue Sep 29 11:06:24 2026"
+    _observed = staticmethod(TuiExitSweepTests._observed)
+
+    def _runtime(self, tmp):
+        cfg = ChannelNativeConfig.from_env(
+            {
+                "WALKCODE_CHANNEL": "telegram",
+                "TELEGRAM_BOT_TOKEN": "fake",
+                "WALKCODE_AGENT": "claude",
+                "TELEGRAM_ALLOWED_CHAT_IDS": "123",
+                "WALKCODE_STATE_PATH": str(Path(tmp) / "state.json"),
+                "WALKCODE_CWD": tmp,
+            }
+        )
+        return ChannelNativeRuntime.from_config(
+            cfg,
+            telegram_api=_FakeTelegramApi(),
+            transports={"claude_headless": FakeAgentTransport("claude_headless", _transport_caps())},
+        )
+
+    def _hook(self, runtime, tmp, hook_type, session_id, *, pid=201, lstart=LSTART, age=0.0):
+        payload = {
+            "session_id": session_id,
+            "cwd": tmp,
+            "process_ref": {"pid": pid, "lstart": lstart},
+            "_walkcode_hook_captured_at": time.time() - age,
+        }
+        return asyncio.run(runtime.process_tui_hook(hook_type=hook_type, agent="claude", payload=payload))
+
+    def test_clear_or_resume_ends_the_session_the_process_left(self):
+        for hook_type in ("SessionStart", "UserPromptSubmit"):
+            with self.subTest(hook_type=hook_type), tempfile.TemporaryDirectory() as tmp:
+                runtime = self._runtime(tmp)
+                old = self._observed(runtime, tmp, "old", 201, self.LSTART)
+                self._hook(runtime, tmp, hook_type, "new")
+                left = runtime.state.sessions.get(old.session_id)
+                self.assertEqual(left.status, "stopped")
+                self.assertEqual(left.lifecycle_state, "EXTERNAL_DETACHED_IMPORTABLE")
+                self.assertEqual(left.stop_reason, "external_tui_session_switched")
+                self.assertEqual(left.writer_owner.kind, "none")  # no takeover button
+
+    def test_same_session_other_process_or_stale_hook_changes_nothing(self):
+        cases = {
+            "own session": {"session_id": "old"},
+            "other process (pid reused)": {"session_id": "new", "lstart": "Wed Sep 30 08:00:00 2026"},
+            "other pid": {"session_id": "new", "pid": 202},
+            "stale replay": {"session_id": "new", "age": 3600.0},
+            "no start time": {"session_id": "new", "lstart": "", "recorded": ""},
+        }
+        for label, kwargs in cases.items():
+            with self.subTest(label), tempfile.TemporaryDirectory() as tmp:
+                runtime = self._runtime(tmp)
+                old = self._observed(runtime, tmp, "old", 201, kwargs.pop("recorded", self.LSTART))
+                generation = old.generation
+                session_id = kwargs.pop("session_id")
+                self._hook(runtime, tmp, "SessionStart", session_id, **kwargs)
+                after = runtime.state.sessions.get(old.session_id)
+                self.assertEqual(after.status, "running")
+                self.assertEqual(after.generation, generation)  # never ended (and revived)
+
+    def test_daemon_backed_and_taken_over_sessions_are_left_alone(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = self._runtime(tmp)
+            daemon = self._observed(runtime, tmp, "daemon", 201, self.LSTART)
+            daemon.transport_ref["daemon_live"] = True
+            taken = self._observed(runtime, tmp, "taken", 201, self.LSTART)
+            taken.writer_owner = runtime_module.WriterOwner(kind="orchestrator")
+            self._hook(runtime, tmp, "SessionStart", "new")
+            self.assertEqual(runtime.state.sessions.get(daemon.session_id).status, "running")
+            self.assertEqual(runtime.state.sessions.get(taken.session_id).status, "running")

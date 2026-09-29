@@ -3324,6 +3324,8 @@ class ChannelNativeRuntime:
             self.save_state()
             return SubmitResult(True, "internal_headless_hook_ignored")
 
+        if await self._retire_sessions_switched_away(transport_kind, resume_ref, payload):
+            self.save_state()
         event_id = _tui_event_id(hook_type, transport_kind, resume_ref, payload)
         ledger_started = False
         if self.state.inbound_ledger is not None and not self.state.inbound_ledger.start(event_id):
@@ -4788,6 +4790,42 @@ class ChannelNativeRuntime:
         await self.orchestrator.refresh_session_status_card(session)
         return session
 
+    async def _retire_sessions_switched_away(
+        self, transport_kind: str, resume_ref: dict[str, Any], payload: dict[str, Any]
+    ) -> int:
+        """End sessions this hook's TUI process has switched away from (ADR 0067).
+
+        One TUI process runs one session at a time. After ``/clear`` or
+        ``/resume`` the process is still alive, so the exit sweep (ADR 0066)
+        never ends the session it left — and a takeover there would kill the
+        terminal now running another session. Only fresh hooks decide: a
+        replayed old hook must not end a session that started after it.
+        """
+        if not self._tui_hook_is_fresh(payload):
+            return 0
+        terminate_ref = _tui_terminate_ref(payload) or {}
+        controller_kind, process_ref = Orchestrator._normalize_takeover_terminate_ref(terminate_ref)
+        if controller_kind != "process" or not isinstance(process_ref, dict):
+            return 0
+        identity = _process_ref_identity(process_ref)
+        if identity[0] <= 1 or not identity[1]:
+            return 0
+        current = self.state.sessions.find_by_resume_ref(transport_kind=transport_kind, resume_ref=resume_ref)
+        retired = 0
+        for session in list(self.state.sessions.iter_sessions()):
+            if (
+                session.session_id == current
+                or session.status == "stopped"
+                or not _session_is_external_tui_writer(session)
+                or (isinstance(session.transport_ref, dict) and session.transport_ref.get("daemon_live"))
+                or _process_ref_identity(_external_tui_process_ref(session)) != identity
+            ):
+                continue
+            self._mark_stale_tui_process_detached(session, reason="external_tui_session_switched")
+            retired += 1
+            await self.orchestrator.refresh_session_status_card(session)
+        return retired
+
     def _tui_hook_fresh_seconds(self) -> float:
         return self.config.tui_hook_fresh_seconds
 
@@ -5144,7 +5182,7 @@ class ChannelNativeRuntime:
             return False
         return self._mark_stale_tui_process_detached(session)
 
-    def _mark_stale_tui_process_detached(self, session) -> bool:
+    def _mark_stale_tui_process_detached(self, session, *, reason: str = "external_tui_process_gone") -> bool:
         changed = False
         if session.status != "stopped":
             session.status = "stopped"
@@ -5157,8 +5195,8 @@ class ChannelNativeRuntime:
         if session.lifecycle_state != target_state:
             session.lifecycle_state = target_state
             changed = True
-        if session.stop_reason != "external_tui_process_gone":
-            session.stop_reason = "external_tui_process_gone"
+        if session.stop_reason != reason:
+            session.stop_reason = reason
             changed = True
         if session.writer_owner is None or session.writer_owner.kind != "none":
             session.writer_owner = WriterOwner(kind="none")
