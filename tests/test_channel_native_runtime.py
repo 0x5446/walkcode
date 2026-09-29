@@ -6617,6 +6617,7 @@ class TuiSessionSwitchTests(unittest.TestCase):
             with self.subTest(hook_type=hook_type), tempfile.TemporaryDirectory() as tmp:
                 runtime = self._runtime(tmp)
                 old = self._observed(runtime, tmp, "old", 201, self.LSTART)
+                old.transport_ref["last_hook_captured_at"] = time.time() - 30  # it hooked before
                 self._hook(runtime, tmp, hook_type, "new")
                 left = runtime.state.sessions.get(old.session_id)
                 self.assertEqual(left.status, "stopped")
@@ -6629,13 +6630,14 @@ class TuiSessionSwitchTests(unittest.TestCase):
             "own session": {"session_id": "old"},
             "other process (pid reused)": {"session_id": "new", "lstart": "Wed Sep 30 08:00:00 2026"},
             "other pid": {"session_id": "new", "pid": 202},
-            "stale replay": {"session_id": "new", "age": 3600.0},
+            "older than the session's own last hook": {"session_id": "new", "age": 30.0, "stamp_age": 10.0},
             "no start time": {"session_id": "new", "lstart": "", "recorded": ""},
         }
         for label, kwargs in cases.items():
             with self.subTest(label), tempfile.TemporaryDirectory() as tmp:
                 runtime = self._runtime(tmp)
                 old = self._observed(runtime, tmp, "old", 201, kwargs.pop("recorded", self.LSTART))
+                old.transport_ref["last_hook_captured_at"] = time.time() - kwargs.pop("stamp_age", 0.0)
                 generation = old.generation
                 session_id = kwargs.pop("session_id")
                 self._hook(runtime, tmp, "SessionStart", session_id, **kwargs)
@@ -6665,8 +6667,10 @@ class TuiSessionSwitchTests(unittest.TestCase):
             )
             self.assertIsNotNone(new_id)
             # A hook the old session emitted before the switch, delivered late
-            # (still inside the freshness window, not a duplicate).
+            # (not a duplicate): it must not even briefly revive the old topic.
+            generation = runtime.state.sessions.get(old.session_id).generation
             self._hook(runtime, tmp, "Stop", "old", age=5.0)
+            self.assertEqual(runtime.state.sessions.get(old.session_id).generation, generation)
             self.assertEqual(runtime.state.sessions.get(new_id).status, "running")
             left = runtime.state.sessions.get(old.session_id)
             self.assertEqual(left.status, "stopped")
@@ -6717,7 +6721,7 @@ class TuiSessionSwitchTests(unittest.TestCase):
                 "_walkcode_hook_captured_at": time.time(),
             }
             with patch.object(runtime_module, "_process_tree_entries", side_effect=AssertionError("consume-time ps")):
-                self.assertEqual(asyncio.run(runtime._retire_sessions_switched_away("claude_headless", {"agent_session_id": "new"}, payload)), 0)
+                self.assertEqual(asyncio.run(runtime._settle_tui_process_sessions("claude_headless", {"agent_session_id": "new"}, payload)), 0)
             self.assertEqual(runtime.state.sessions.get(old.session_id).status, "running")
 
     def test_a_backlog_is_ordered_by_capture_time_not_processing_time(self):
@@ -6736,11 +6740,35 @@ class TuiSessionSwitchTests(unittest.TestCase):
             self.assertEqual(runtime.state.sessions.get(new_id).stop_reason, "external_tui_session_switched")
             self.assertEqual(runtime.state.sessions.get(old.session_id).status, "running")
 
-    def test_switching_back_within_the_ledger_ttl_is_not_a_duplicate(self):
+    def test_out_of_order_delivery_still_lets_the_latest_capture_win(self):
+        # The process ran old -> new -> old (captured 20, 15, 10 s ago); the
+        # hooks arrive as: old@10s, old@20s, new@15s.
         with tempfile.TemporaryDirectory() as tmp:
             runtime = self._runtime(tmp)
-            self._observed(runtime, tmp, "old", 201, self.LSTART)
-            first = self._hook(runtime, tmp, "SessionStart", "new", age=2.0)
-            second = self._hook(runtime, tmp, "SessionStart", "new", age=1.0)
-            self.assertTrue(first.accepted)
-            self.assertNotEqual(second.reason, BlockedReason.DUPLICATE_INBOUND)
+            old = self._observed(runtime, tmp, "old", 201, self.LSTART)
+            self._hook(runtime, tmp, "Stop", "old", age=10.0)
+            self._hook(runtime, tmp, "Notification", "old", age=20.0)  # late, must not move the stamp back
+            self._hook(runtime, tmp, "UserPromptSubmit", "new", age=15.0)
+            new_id = runtime.state.sessions.find_by_resume_ref(
+                transport_kind="claude_headless", resume_ref={"agent_session_id": "new"}
+            )
+            self.assertEqual(runtime.state.sessions.get(old.session_id).status, "running")
+            new = runtime.state.sessions.get(new_id)
+            self.assertEqual(new.status, "stopped")
+            self.assertEqual(new.writer_owner.kind, "none")  # no takeover button onto the terminal
+
+    def test_a_tie_goes_to_the_hooks_own_session(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = self._runtime(tmp)
+            old = self._observed(runtime, tmp, "old", 201, self.LSTART)
+            captured = time.time()
+            old.transport_ref["last_hook_captured_at"] = captured
+            payload = {
+                "session_id": "new",
+                "cwd": tmp,
+                "process_ref": {"pid": 201, "lstart": self.LSTART},
+                "_walkcode_hook_captured_at": captured,
+            }
+            asyncio.run(runtime.process_tui_hook(hook_type="SessionStart", agent="claude", payload=payload))
+            self.assertEqual(runtime.state.sessions.get(old.session_id).status, "stopped")
+

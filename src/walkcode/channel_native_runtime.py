@@ -3330,8 +3330,6 @@ class ChannelNativeRuntime:
             return SubmitResult(True, BlockedReason.DUPLICATE_INBOUND)
         ledger_started = self.state.inbound_ledger is not None
         try:
-            # After dedupe: a duplicate delivery must not act twice (ADR 0067).
-            await self._retire_sessions_switched_away(transport_kind, resume_ref, payload)
             session = await self._claim_or_create_tui_observed_session(
                 hook_type=hook_type,
                 agent_name=agent_name,
@@ -3339,6 +3337,11 @@ class ChannelNativeRuntime:
                 resume_ref=resume_ref,
                 payload=payload,
             )
+            if session is not None and session.status != "stopped":
+                _stamp_tui_hook_capture(session, payload)
+            # ADR 0067: one TUI process runs one session at a time — the one
+            # whose hook was captured last stays, any other ends.
+            await self._settle_tui_process_sessions(transport_kind, resume_ref, payload)
             if session is None:
                 if ledger_started:
                     self.state.inbound_ledger.complete(event_id)
@@ -4583,12 +4586,6 @@ class ChannelNativeRuntime:
             "hook_type": hook_type,
             "resume_ref": {"transport_kind": transport_kind, **dict(resume_ref)},
         }
-        captured_at = _payload_captured_at(payload)
-        if captured_at is not None:
-            # Capture time of the hook that claims/creates/revives the session:
-            # session switches are ordered by capture time, never by when a
-            # queued hook happened to be processed (ADR 0067).
-            external_ref["claimed_captured_at"] = captured_at
         raw_hook_type = _payload_hook_event_name(payload)
         if raw_hook_type and _normalize_tui_hook_type(raw_hook_type) != hook_type:
             external_ref["raw_hook_type"] = raw_hook_type
@@ -4606,16 +4603,11 @@ class ChannelNativeRuntime:
         )
         if existing_id:
             session = self.state.sessions.get(existing_id)
-            if (
-                session.status == "stopped"
-                and session.stop_reason == "external_tui_session_switched"
-                and captured_at is not None
-                and captured_at < _session_ref_float(session, "switched_away_captured_at")
-            ):
-                # ADR 0067: the TUI moved on to another session after this hook
-                # was captured. Reviving on it would hand the old topic a
-                # takeover button that kills the terminal now running the
-                # other session; a real /resume back sends a newer hook.
+            if session.status == "stopped" and self._tui_process_moved_on(payload, session.session_id):
+                # ADR 0067: the process this hook came from sent a later hook
+                # for another session. Reviving on this one would hand the old
+                # topic a takeover button that kills the terminal now running
+                # that other session; a real /resume back sends a newer hook.
                 _log_degrade("tui_revival_refused", session_id=session.session_id, hook_type=hook_type, reason="switched_away")
                 return session
             if session.status == "stopped":
@@ -4808,43 +4800,64 @@ class ChannelNativeRuntime:
         await self.orchestrator.refresh_session_status_card(session)
         return session
 
-    async def _retire_sessions_switched_away(
+    def _running_sessions_on_tui_process(self, identity: tuple[int, str]) -> list[Any]:
+        """Running TUI-owned sessions whose recorded process is ``identity``."""
+        return [
+            session
+            for session in self.state.sessions.iter_sessions()
+            if session.status != "stopped"
+            and _session_is_external_tui_writer(session)
+            and not (isinstance(session.transport_ref, dict) and session.transport_ref.get("daemon_live"))
+            and _process_ref_identity(_external_tui_process_ref(session)) == identity
+        ]
+
+    def _tui_process_moved_on(self, payload: dict[str, Any], session_id: str) -> bool:
+        """Did this hook's process send a later hook for another session?"""
+        identity = _captured_tui_process_identity(payload)
+        captured_at = _payload_captured_at(payload)
+        if identity[0] <= 1 or not identity[1] or captured_at is None:
+            return False
+        return any(
+            session.session_id != session_id and _tui_hook_capture_stamp(session) > captured_at
+            for session in self._running_sessions_on_tui_process(identity)
+        )
+
+    async def _settle_tui_process_sessions(
         self, transport_kind: str, resume_ref: dict[str, Any], payload: dict[str, Any]
     ) -> int:
-        """End sessions this hook's TUI process has switched away from (ADR 0067).
+        """Keep only the session this TUI process hooked last; end the others (ADR 0067).
 
-        One TUI process runs one session at a time. After ``/clear`` or
-        ``/resume`` the process is still alive, so the exit sweep (ADR 0066)
-        never ends the session it left — and a takeover there would kill the
-        terminal now running another session. Only a hook captured after the
-        other session was claimed decides (a late hook from the session the
-        process left must not end the one it moved to), and only by the
-        process identity captured at hook time — never a consume-time ps.
+        After ``/clear`` or ``/resume`` the process lives on, so the exit sweep
+        (ADR 0066) never ends the session it left — and a takeover there kills
+        the terminal now running another session. Every session remembers the
+        latest capture time of its hooks (it never moves back); the hook just
+        processed stands for its own session even before that one has a topic.
+        Whatever order queued hooks arrive in, the latest capture wins. Only the
+        process identity captured at hook time counts — never a fresh ps.
         """
-        captured_at = _payload_captured_at(payload)
-        if captured_at is None or not self._tui_hook_is_fresh(payload):
-            return 0
         identity = _captured_tui_process_identity(payload)
-        if identity[0] <= 1 or not identity[1]:
+        captured_at = _payload_captured_at(payload)
+        if identity[0] <= 1 or not identity[1] or captured_at is None:
             return 0
         current = self.state.sessions.find_by_resume_ref(transport_kind=transport_kind, resume_ref=resume_ref)
+        running = self._running_sessions_on_tui_process(identity)
+        if not running:
+            return 0
+        # Candidates: every running session by its stamp, plus this hook's own
+        # session (which may have no topic yet) at least at this capture time.
+        # The latest wins; ties go to the hook's session.
+        own_key = current or ""
+        stamps = {session.session_id: _tui_hook_capture_stamp(session) for session in running}
+        own_stamp = max(stamps.get(own_key, 0.0), captured_at)
+        winner, best = own_key, own_stamp
+        for session_id, stamp in stamps.items():
+            if stamp > best:
+                winner, best = session_id, stamp
         retired = 0
-        for session in list(self.state.sessions.iter_sessions()):
-            if (
-                session.session_id == current
-                or session.status == "stopped"
-                or not _session_is_external_tui_writer(session)
-                or (isinstance(session.transport_ref, dict) and session.transport_ref.get("daemon_live"))
-                or _process_ref_identity(_external_tui_process_ref(session)) != identity
-            ):
-                continue
-            if captured_at < _session_ref_float(session, "claimed_captured_at"):
-                # Captured before that session was even claimed: a late hook
-                # from the one the process left, not evidence of a new switch.
+        for session in running:
+            if session.session_id == winner:
                 continue
             self._mark_stale_tui_process_detached(session, reason="external_tui_session_switched")
-            if isinstance(session.transport_ref, dict):
-                session.transport_ref["switched_away_captured_at"] = captured_at
             retired += 1
             await self.orchestrator.refresh_session_status_card(session)
         return retired
@@ -7634,10 +7647,6 @@ def _tui_event_id(
                 payload.get("timestamp", "")
                 or payload.get("created_at", "")
                 or payload.get("_walkcode_deferred_id", "")
-                # Last resort: two SessionStarts of one session (switch away
-                # and back within the ledger TTL) must not look like one
-                # delivery (ADR 0067). Stamped once at hook ingress.
-                or payload.get("_walkcode_hook_captured_at", "")
             ),
         }
         suffix = hashlib.sha1(json.dumps(stable, sort_keys=True).encode("utf-8")).hexdigest()
@@ -8119,15 +8128,20 @@ def _process_ref_pid(process_ref: dict[str, Any]) -> int:
         return 0
 
 
-def _session_ref_float(session: Any, key: str) -> float:
-    """A float stamp from the session's transport/owner ref (0.0 if absent)."""
-    for ref in (session.transport_ref, getattr(session.writer_owner, "external_ref", None)):
-        if isinstance(ref, dict) and ref.get(key) is not None:
-            try:
-                return float(ref[key])
-            except (TypeError, ValueError):
-                return 0.0
-    return 0.0
+def _tui_hook_capture_stamp(session: Any) -> float:
+    """Latest capture time of the hooks accepted for this session (0.0 if none)."""
+    ref = session.transport_ref if isinstance(session.transport_ref, dict) else {}
+    try:
+        return float(ref.get("last_hook_captured_at") or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _stamp_tui_hook_capture(session: Any, payload: dict[str, Any]) -> None:
+    captured_at = _payload_captured_at(payload)
+    if captured_at is not None and isinstance(session.transport_ref, dict):
+        # Monotonic: a late-delivered older hook never moves it back.
+        session.transport_ref["last_hook_captured_at"] = max(_tui_hook_capture_stamp(session), captured_at)
 
 
 def _captured_tui_process_identity(payload: dict[str, Any]) -> tuple[int, str]:
