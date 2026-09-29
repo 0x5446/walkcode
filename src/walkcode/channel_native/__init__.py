@@ -4213,8 +4213,11 @@ def claude_tui_current_session(pid: int, lstart: str) -> str:
             continue
         if not isinstance(record, dict):
             continue
-        if " ".join(str(record.get("procStart", "") or "").split()) == wanted:
-            return str(record.get("sessionId", "") or "")
+        proc_start, session_id = record.get("procStart"), record.get("sessionId")
+        if not isinstance(proc_start, str) or not isinstance(session_id, str) or not session_id.strip():
+            continue  # a malformed record answers nothing
+        if " ".join(proc_start.split()) == wanted:
+            return session_id.strip()
     return ""
 
 
@@ -12497,10 +12500,16 @@ class Orchestrator:
                     ),
                     idempotency_key=f"takeover_terminating:{takeover_id}",
                 )
-                termination = await controller.terminate(
-                    process_ref,
-                    reason=f"takeover:{takeover_id}",
-                )
+                if self._claude_tui_switched_away(session):
+                    # ADR 0067: re-checked after the last await — the user may
+                    # have /clear'ed or /resume'd away while we resumed. Then
+                    # the process runs another session; leave it alone.
+                    termination = ControlResult(True, state="switched_away")
+                else:
+                    termination = await controller.terminate(
+                        process_ref,
+                        reason=f"takeover:{takeover_id}",
+                    )
                 if not termination.accepted:
                     self.sessions.fail_takeover(
                         takeover_id,

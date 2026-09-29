@@ -6605,6 +6605,13 @@ class ClaudeTuiSessionSwitchTests(unittest.TestCase):
                 self.assertEqual(current(201, ""), "")  # no start time to match
                 (sessions / "205.json").write_text(json.dumps({"pid": 205, "sessionId": "x"}))
                 self.assertEqual(current(205, ""), "")  # neither side has a start time: no answer
+                for bad in (42, ["x"], {"id": "x"}, "   ", None):
+                    (sessions / "206.json").write_text(json.dumps({"sessionId": bad, "procStart": self.LSTART}))
+                    self.assertEqual(current(206, self.LSTART), "", bad)  # malformed: unknown, not "switched"
+                (sessions / "207.json").write_text(json.dumps({"sessionId": "s", "procStart": 12345}))
+                self.assertEqual(current(207, "12345"), "")
+                (sessions / "208.json").write_text("{not json")
+                self.assertEqual(current(208, self.LSTART), "")
 
     def test_sweep_detaches_a_session_whose_process_now_runs_another(self):
         with tempfile.TemporaryDirectory() as tmp:

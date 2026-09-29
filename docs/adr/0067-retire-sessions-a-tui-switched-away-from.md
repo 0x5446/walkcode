@@ -20,11 +20,16 @@ Claude 进程里 `/clear` 或 `/resume` 到别的会话时，进程还在，只�
 `<配置目录>/sessions/<pid>.json`，含当前 `sessionId` 与进程启动时间 `procStart`，
 `/clear`、`/resume` 切换时随之更新。`claude_tui_current_session(pid, lstart)` 在
 `$CLAUDE_CONFIG_DIR`、`~/.claude`、`~/.claude-profiles/*` 下找这个文件，**启动时间
-必须与会话记录的一致**（pid 被复用时不会答成别的进程），找不到或对不上就答"未知"。
+必须与会话记录的一致**（pid 被复用时不会答成别的进程）；`sessionId`、`procStart`
+必须是字符串且会话 id 非空。找不到、对不上、格式不对（含写到一半的 JSON）都答"未知"。
 
 1. **接管不再误杀**（消除风险的根本一步）：`_takeover_requires_external_tui_termination`
    在要结束进程之前核对——进程当前跑的若是别的会话，就不结束它，直接在后台恢复
    旧会话（旧会话此时没有任何写者，不存在双写）。"未知"照旧结束，行为不变。
+   **在最后一次 await 之后、发信号之前再核对一次**：恢复旧会话要花几秒，用户可能
+   在这期间切走。反方向（接管那几秒里恰好 `/resume` 回同一会话）不另做处理：该会话
+   此时已归 WalkCode，终端再发 hook 即由残留哨兵（ADR 0053）结束，与"接管后终端
+   仍在写"的所有情形同一处理。
 2. **显示随之修正**：ADR 0066 的 30 秒退出检测对"进程还活着"的会话顺带核对；进程
    已换会话的，标为已分离（`EXTERNAL_DETACHED_*`，`stop_reason=external_tui_session_switched`），
    "运行中"与接管按钮消失，会话仍可导入、继续。带 `daemon_live` 的会话不动
@@ -48,3 +53,11 @@ Claude 进程里 `/clear` 或 `/resume` 到别的会话时，进程还在，只�
 - 依赖 Claude Code 的 `sessions/<pid>.json`（2.1.283 实测存在）。文件格式变了或不存在
   时一律"未知"，退回 ADR 0066 行为，不会误判。
 - 回滚：去掉两处核对即回到 ADR 0066 行为。
+
+## 审查记录
+
+2026-09-29 第 2 版代码审查（~/.codex 额度用尽，改用 codex personal / Command Code
+gpt-5.6-sol，correctness + concurrency + goalfit）：2 条（High/Warning），均已修——
+接管判定跨多次 await 缓存到发信号时（→ 发信号前再核对）；`sessionId` 类型异常时
+被当成有效会话（→ 只认非空字符串）。
+

@@ -424,3 +424,40 @@ class TakeoverProcessControlTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TakeoverSwitchedAwayTests(unittest.TestCase):
+    """ADR 0067: never stop a Claude TUI that now runs another session."""
+
+    def _takeover(self, switched):
+        orchestrator, channel, transport, controller, session = _setup(
+            terminate_ref={"controller_kind": "fake-process", "process_ref": {"pid": 123, "allow_terminate": True}},
+            controller=FakeExternalTuiController("fake-process"),
+        )
+        asyncio.run(
+            orchestrator.submit_user_input(
+                session.session_id, TurnInput(text="run tests"), actor=_actor(), generation=session.generation
+            )
+        )
+        with unittest.mock.patch.object(Orchestrator, "_claude_tui_switched_away", side_effect=switched):
+            result = asyncio.run(
+                orchestrator.handle_inbound_event(
+                    _callback(_action_token(channel, "takeover_and_send")),
+                    agent_transport_kind="fake-transport",
+                    cwd="/tmp/project",
+                )
+            )
+        return result, controller, transport
+
+    def test_a_terminal_that_moved_on_before_the_takeover_is_left_running(self):
+        result, controller, transport = self._takeover(lambda session: True)
+        self.assertTrue(result.accepted)
+        self.assertEqual(controller.terminate_calls, [])
+        self.assertEqual([turn.text for turn in transport.submitted_turns], ["run tests"])
+
+    def test_a_terminal_that_moves_on_during_the_takeover_is_left_running(self):
+        answers = iter([False, True])  # at decision time, then right before the signal
+        result, controller, transport = self._takeover(lambda session: next(answers))
+        self.assertTrue(result.accepted)
+        self.assertEqual(controller.terminate_calls, [])
+        self.assertEqual([turn.text for turn in transport.submitted_turns], ["run tests"])
