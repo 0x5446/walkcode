@@ -6719,3 +6719,28 @@ class TuiSessionSwitchTests(unittest.TestCase):
             with patch.object(runtime_module, "_process_tree_entries", side_effect=AssertionError("consume-time ps")):
                 self.assertEqual(asyncio.run(runtime._retire_sessions_switched_away("claude_headless", {"agent_session_id": "new"}, payload)), 0)
             self.assertEqual(runtime.state.sessions.get(old.session_id).status, "running")
+
+    def test_a_backlog_is_ordered_by_capture_time_not_processing_time(self):
+        # Both hooks sat in the deferred queue and are processed now, in order:
+        # the new session's first prompt (captured 20 s ago), then /resume back
+        # to the old one (captured 19 s ago).
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = self._runtime(tmp)
+            old = self._observed(runtime, tmp, "old", 201, self.LSTART)
+            self._hook(runtime, tmp, "UserPromptSubmit", "new", age=20.0)
+            new_id = runtime.state.sessions.find_by_resume_ref(
+                transport_kind="claude_headless", resume_ref={"agent_session_id": "new"}
+            )
+            self.assertEqual(runtime.state.sessions.get(old.session_id).status, "stopped")
+            self._hook(runtime, tmp, "SessionStart", "old", age=19.0)
+            self.assertEqual(runtime.state.sessions.get(new_id).stop_reason, "external_tui_session_switched")
+            self.assertEqual(runtime.state.sessions.get(old.session_id).status, "running")
+
+    def test_switching_back_within_the_ledger_ttl_is_not_a_duplicate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = self._runtime(tmp)
+            self._observed(runtime, tmp, "old", 201, self.LSTART)
+            first = self._hook(runtime, tmp, "SessionStart", "new", age=2.0)
+            second = self._hook(runtime, tmp, "SessionStart", "new", age=1.0)
+            self.assertTrue(first.accepted)
+            self.assertNotEqual(second.reason, BlockedReason.DUPLICATE_INBOUND)

@@ -4583,6 +4583,12 @@ class ChannelNativeRuntime:
             "hook_type": hook_type,
             "resume_ref": {"transport_kind": transport_kind, **dict(resume_ref)},
         }
+        captured_at = _payload_captured_at(payload)
+        if captured_at is not None:
+            # Capture time of the hook that claims/creates/revives the session:
+            # session switches are ordered by capture time, never by when a
+            # queued hook happened to be processed (ADR 0067).
+            external_ref["claimed_captured_at"] = captured_at
         raw_hook_type = _payload_hook_event_name(payload)
         if raw_hook_type and _normalize_tui_hook_type(raw_hook_type) != hook_type:
             external_ref["raw_hook_type"] = raw_hook_type
@@ -4600,12 +4606,11 @@ class ChannelNativeRuntime:
         )
         if existing_id:
             session = self.state.sessions.get(existing_id)
-            captured_at = _payload_captured_at(payload)
             if (
                 session.status == "stopped"
                 and session.stop_reason == "external_tui_session_switched"
                 and captured_at is not None
-                and captured_at < session.last_progress_at
+                and captured_at < _session_ref_float(session, "switched_away_captured_at")
             ):
                 # ADR 0067: the TUI moved on to another session after this hook
                 # was captured. Reviving on it would hand the old topic a
@@ -4833,11 +4838,13 @@ class ChannelNativeRuntime:
                 or _process_ref_identity(_external_tui_process_ref(session)) != identity
             ):
                 continue
-            if captured_at < float(getattr(session.writer_owner, "acquired_at", 0.0) or 0.0):
+            if captured_at < _session_ref_float(session, "claimed_captured_at"):
                 # Captured before that session was even claimed: a late hook
                 # from the one the process left, not evidence of a new switch.
                 continue
             self._mark_stale_tui_process_detached(session, reason="external_tui_session_switched")
+            if isinstance(session.transport_ref, dict):
+                session.transport_ref["switched_away_captured_at"] = captured_at
             retired += 1
             await self.orchestrator.refresh_session_status_card(session)
         return retired
@@ -7627,6 +7634,10 @@ def _tui_event_id(
                 payload.get("timestamp", "")
                 or payload.get("created_at", "")
                 or payload.get("_walkcode_deferred_id", "")
+                # Last resort: two SessionStarts of one session (switch away
+                # and back within the ledger TTL) must not look like one
+                # delivery (ADR 0067). Stamped once at hook ingress.
+                or payload.get("_walkcode_hook_captured_at", "")
             ),
         }
         suffix = hashlib.sha1(json.dumps(stable, sort_keys=True).encode("utf-8")).hexdigest()
@@ -8106,6 +8117,17 @@ def _process_ref_pid(process_ref: dict[str, Any]) -> int:
         return int(process_ref.get("pid", 0) or 0)
     except (TypeError, ValueError, AttributeError):
         return 0
+
+
+def _session_ref_float(session: Any, key: str) -> float:
+    """A float stamp from the session's transport/owner ref (0.0 if absent)."""
+    for ref in (session.transport_ref, getattr(session.writer_owner, "external_ref", None)):
+        if isinstance(ref, dict) and ref.get(key) is not None:
+            try:
+                return float(ref[key])
+            except (TypeError, ValueError):
+                return 0.0
+    return 0.0
 
 
 def _captured_tui_process_identity(payload: dict[str, Any]) -> tuple[int, str]:

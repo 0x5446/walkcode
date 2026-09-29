@@ -22,16 +22,19 @@ Claude 进程里 `/clear` 或 `/resume` 到别的会话时，进程还在，只�
 （`EXTERNAL_DETACHED_*`，`stop_reason=external_tui_session_switched`）并刷新状态卡：
 "运行中"与接管按钮随之消失，会话仍可导入、继续。
 
-- 在入站去重之后、建会话/认领之前做，覆盖所有观察类 hook（重复投递不会再动一次）。`/clear`、`/resume` 都会触发
+- 在入站去重之后、建会话/认领之前做，覆盖所有观察类 hook（重复投递不会再动一次）。
+  没有显式事件号的 hook，去重键最后用捕获时间兜底：同一会话切走又切回的两次
+  SessionStart 不会被当成一次投递。`/clear`、`/resume` 都会触发
   SessionStart，旧话题当场收尾，不必等新会话的第一句话（新会话照 ADR 0066 在
   首句时才建话题）。
-- **时序**：只认新鲜 hook（捕获时间在 `tui_hook_fresh_seconds` 内），且 hook 的
-  捕获时间不早于待收尾会话当前写者的认领时间——旧会话在切换前发出、晚到的 hook
-  不能收尾此后才被认领的新会话。
+- **时序一律按 hook 捕获时间**（处理时间受延迟队列积压影响，不能用来排先后）：
+  认领/新建/复活会话时，把那条 hook 的捕获时间记为 `claimed_captured_at`；只认
+  新鲜 hook，且其捕获时间不早于待收尾会话的 `claimed_captured_at`——旧会话在切换
+  前发出、晚到的 hook 不能收尾此后才被认领的新会话。
 - **只认 hook 捕获时的进程身份**：显式 process/terminate ref 或捕获的进程树；缺失
   就跳过，从不在处理时重新 `ps`（重放的 hook，其 pid 此时可能已属于别的进程）。
-- **旧会话不被晚到 hook 复活**：因切换被收尾的会话，拒绝捕获时间早于收尾时刻的
-  hook 复活它（否则接管按钮回来，误杀风险重现）；真正 `/resume` 回来发的是更新的
+- **旧会话不被晚到 hook 复活**：收尾时记下触发切换那条 hook 的捕获时间
+  `switched_away_captured_at`；因切换被收尾的会话，拒绝捕获时间早于它的 hook 复活（否则接管按钮回来，误杀风险重现）；真正 `/resume` 回来发的是更新的
   hook，照常复活。
 - 不动带 `daemon_live` 标记的会话（daemon worker 可能独立存活，ADR 0048）、不动
   已接管会话（写者不是 external_tui）、不动 codex 共享 daemon 会话（没有进程记录）。
@@ -51,4 +54,10 @@ goalfit）：concurrency 报 1 条 Critical，三维共识同一根源——收�
 新鲜度不看先后：切换前发出、晚到的旧会话 hook 会收尾新会话，并借复活逻辑让旧话题
 重新出现接管按钮；另有处理时 `ps` 取身份（pid 复用误判、违反"不调 ps"）。已按上文
 "时序""只认捕获身份""不被晚到 hook 复活"三条修复，并补回归测试。
+
+2026-09-29 代码审查第 2 轮：两维共识 1 条 Critical——两处守卫拿 hook 捕获时间比
+处理时写入的时间（`acquired_at`、`last_progress_at`），队列积压时顺序颠倒，旧话题
+仍留接管按钮；另 1 条 High——无事件号的 SessionStart 去重键不含时间，一小时内切回
+被当重复丢弃。改为全程记录并比较捕获时间（`claimed_captured_at` /
+`switched_away_captured_at`），去重键以捕获时间兜底。
 
