@@ -21,6 +21,7 @@ from walkcode.channel_native import claude_gate
 from walkcode.channel_native import claude_daemon as claude_daemon_mod
 from walkcode.channel_native.claude_daemon import ClaudeDaemonTransport
 from walkcode.channel_native_runtime import ChannelNativeRuntime
+import walkcode.channel_native_runtime as runtime_mod
 
 
 AGENT_SESSION_ID = "5ca3e37c-1111-2222-3333-444455556666"
@@ -762,6 +763,13 @@ class GateDrainTests(unittest.TestCase):
             claude_gate.cleanup_gate_files(state, "toolu_edit_1")  # hook timed out
             asyncio.run(runtime.drain_claude_gate_requests())
             self.assertEqual(self._edits(api), [])  # nothing sent yet to edit
+
+            # A long rate-limit backoff outlasts the edit retry budget; waiting
+            # for delivery must not use it up.
+            with mock.patch.object(runtime_mod, "CLAUDE_GATE_RETIRE_MAX_TRIES", 2):
+                for _ in range(5):
+                    asyncio.run(runtime.drain_claude_gate_requests())
+            self.assertIn("toolu_edit_1", runtime._gate_cards_retiring)
 
             outbox = runtime.orchestrator.outbox
             for item in outbox._pending.values():

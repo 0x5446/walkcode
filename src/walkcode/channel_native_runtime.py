@@ -116,8 +116,8 @@ CLAUDE_DAEMON_ADOPT_MIN_AGE_SECONDS = 60.0
 # attach, short enough not to stall the ingress path if the daemon is wedged.
 CLAUDE_DAEMON_OBSERVER_READY_TIMEOUT_SECONDS = 3.0
 CLAUDE_GATE_DRAIN_INTERVAL_SECONDS = 1.0
-# Passes (about one a second) to wait for a settled gate card to be delivered
-# and edited before giving up on it.
+# Failed edits of a settled gate card (about one pass a second) before giving
+# up on it. Waiting for the card's delivery does not count.
 CLAUDE_GATE_RETIRE_MAX_TRIES = 120
 # A pending gate request that cannot be routed to an observed session (or
 # whose card cannot be delivered) is answered "pass" after this grace, so the
@@ -4217,6 +4217,10 @@ class ChannelNativeRuntime:
                 self.save_state()
         for rid, (session_id, request, tries) in list(self._gate_cards_retiring.items()):
             outcome = await self.orchestrator.retire_gate_card(session_id, rid, request)
+            if outcome == "queued":
+                # Waiting on delivery (possibly a long rate-limit backoff) is
+                # not a failed edit; the outbox ends it by sending or dying.
+                continue
             if outcome == "retry" and tries + 1 < CLAUDE_GATE_RETIRE_MAX_TRIES:
                 self._gate_cards_retiring[rid] = (session_id, request, tries + 1)
                 continue

@@ -12816,8 +12816,9 @@ class Orchestrator:
         """Edit a settled gate card into its terminal result.
 
         Returns "done", "gone" (nothing left to edit: session, channel or the
-        card's delivery is gone) or "retry" (the card is still queued for
-        delivery, or the edit failed) — the caller bounds the retries.
+        card's delivery is gone), "queued" (the card is still waiting in the
+        outbox, which bounds its own retries) or "retry" (the edit failed —
+        the caller bounds these).
         """
         try:
             session = self.sessions.get(session_id)
@@ -12832,7 +12833,7 @@ class Orchestrator:
         if not message_id:
             # Still queued (a retry may deliver the original card later) or
             # dead / compacted. Only a queued card is worth waiting for.
-            return "retry" if self.outbox.is_pending(key) else "gone"
+            return "queued" if self.outbox.is_pending(key) else "gone"
         view = ViewModelFactory.decision_result(
             kind=request.prompt_kind,
             action="terminal",
