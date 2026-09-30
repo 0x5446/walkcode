@@ -44,8 +44,8 @@ from walkcode.channel_native import (
     _probe_process,
     _terminate_ref_session_id,
 )
-from walkcode import channel_native_runtime as runtime_module
 from walkcode.channel_native import process_control
+from walkcode.channel_native import tui_hooks as tui_hooks_module
 from walkcode.channel_native_runtime import (
     ChannelNativeRuntime,
     _enrich_terminate_ref,
@@ -236,7 +236,7 @@ class SentinelRemnantTerminationTests(unittest.TestCase):
             with (
                 patch.object(ChannelNativeRuntime, "_sentinel_process_controller", return_value=fake),
                 patch.object(
-                    runtime_module,
+                    tui_hooks_module,
                     "_probe_process",
                     lambda pid: _ProcProbe("ok", "Sun Jul 19 10:20:02 2026", "claude") if pid == 54321 else _ProcProbe("gone"),
                 ),
@@ -326,7 +326,7 @@ class SentinelRemnantTerminationTests(unittest.TestCase):
             with (
                 patch.object(ChannelNativeRuntime, "_sentinel_process_controller", return_value=fake),
                 patch.object(
-                    runtime_module,
+                    tui_hooks_module,
                     "_probe_process",
                     lambda pid: _ProcProbe("ok", "Sun Jul 19 10:20:02 2026", "claude") if pid == 54321 else _ProcProbe("gone"),
                 ),
@@ -400,13 +400,13 @@ class ClaimFreshnessTests(unittest.TestCase):
                 # captured BEFORE the owner acquired -> predates.
                 "_walkcode_hook_captured_at": float(session.writer_owner.acquired_at) - 100.0,
             }
-            real_probe = runtime_module._probe_process
+            real_probe = tui_hooks_module._probe_process
             def fake_probe(pid):
                 real = real_probe(pid)
                 if pid == live_pid and real.status == "ok":
                     return _ProcProbe("ok", "Sun Jul 19 10:20:02 2026", "claude")
                 return real
-            with patch.object(runtime_module, "_probe_process", side_effect=fake_probe):
+            with patch.object(tui_hooks_module, "_probe_process", side_effect=fake_probe):
                 result = self._run_hook(runtime, payload)
             self.assertTrue(result.accepted)
             updated = runtime.state.sessions.get(session.session_id)
@@ -431,7 +431,7 @@ class ClaimFreshnessTests(unittest.TestCase):
                 ],
                 "_walkcode_hook_captured_at": captured_at,
             }
-            real_probe = runtime_module._probe_process
+            real_probe = tui_hooks_module._probe_process
 
             def fake_probe(pid):
                 real = real_probe(pid)
@@ -439,7 +439,7 @@ class ClaimFreshnessTests(unittest.TestCase):
                     return _ProcProbe("ok", "Sun Jul 19 10:20:02 2026", "claude")
                 return real
 
-            with patch.object(runtime_module, "_probe_process", side_effect=fake_probe):
+            with patch.object(tui_hooks_module, "_probe_process", side_effect=fake_probe):
                 result = self._run_hook(runtime, payload)
             self.assertTrue(result.accepted)
             updated = runtime.state.sessions.get(session.session_id)
@@ -634,9 +634,9 @@ class EnrichTerminateRefTests(unittest.TestCase):
     def test_probe_error_does_not_disarm(self):
         # Cluster C: a transient probe error must not mutate authorization.
 
-        # _enrich_terminate_ref lives in the runtime module and calls the
+        # _enrich_terminate_ref lives in channel_native.tui_hooks and calls the
         # _probe_process imported into that namespace — patch it there.
-        with patch.object(runtime_module, "_probe_process", return_value=_ProcProbe("error")):
+        with patch.object(tui_hooks_module, "_probe_process", return_value=_ProcProbe("error")):
             enriched = _enrich_terminate_ref(self._ref(pid=4242, command="claude"))
         process_ref = enriched["process_ref"]
         self.assertTrue(process_ref["allow_terminate"])
@@ -786,7 +786,7 @@ class LiveTuiIdentityTests(unittest.TestCase):
                 {"pid": live_pid, "ppid": 1, "lstart": "Sun Jul 19 10:20:02 2026", "command": "claude"},
             ],
         }
-        real_probe = runtime_module._probe_process
+        real_probe = tui_hooks_module._probe_process
 
         def fake_probe(pid):
             real = real_probe(pid)
@@ -794,7 +794,7 @@ class LiveTuiIdentityTests(unittest.TestCase):
                 return _ProcProbe("ok", "Sun Jul 19 11:00:00 2026", "vim notes.txt")
             return real
 
-        with patch.object(runtime_module, "_probe_process", side_effect=fake_probe):
+        with patch.object(tui_hooks_module, "_probe_process", side_effect=fake_probe):
             self.assertFalse(_tui_hook_has_live_tui_process("claude_headless", payload))
 
 

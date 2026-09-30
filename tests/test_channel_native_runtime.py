@@ -28,6 +28,7 @@ from walkcode.channel_native import (
 )
 from walkcode import channel_native as channel_native_module
 from walkcode.channel_native import orchestrator as channel_native_orchestrator
+from walkcode.channel_native import tui_hooks as tui_hooks_module
 from walkcode import channel_native_runtime as runtime_module
 from walkcode.channel_native_runtime import ChannelNativeRuntime
 
@@ -4576,7 +4577,7 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
             # liveness to the real process.
             live = subprocess.Popen(["sleep", "60"])
             self.addCleanup(lambda: (live.kill(), live.wait(timeout=2.0)))
-            real_probe = runtime_module._probe_process
+            real_probe = tui_hooks_module._probe_process
 
             def fake_probe(pid):
                 from walkcode.channel_native import _ProcProbe as _PP
@@ -4586,7 +4587,7 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
                     return _PP("ok", "Sun Jul 19 10:20:02 2026", "/usr/local/bin/claude")
                 return real
 
-            with patch.object(runtime_module, "_probe_process", side_effect=fake_probe):
+            with patch.object(tui_hooks_module, "_probe_process", side_effect=fake_probe):
                 result = asyncio.run(
                     runtime.process_tui_hook(
                         hook_type="PostToolUse",
@@ -5966,7 +5967,7 @@ class TuiExitSweepTests(unittest.TestCase):
                 203: channel_native_module._ProcProbe("ok", "Tue Sep 29 11:06:24 2026"),
             }
             with patch.object(runtime_module, "_probe_processes", return_value=probes) as batch, patch.object(
-                runtime_module, "_probe_process", side_effect=AssertionError("no per-session re-probe")
+                tui_hooks_module, "_probe_process", side_effect=AssertionError("no per-session re-probe")
             ):
                 marked = asyncio.run(runtime.sweep_exited_tui_sessions())
 
@@ -6009,7 +6010,7 @@ class TuiExitSweepTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             runtime = self._runtime(tmp)
             session = self._observed(runtime, tmp, "x", 201)
-            with patch.object(runtime_module, "_probe_process", return_value=channel_native_module._ProcProbe("error")):
+            with patch.object(tui_hooks_module, "_probe_process", return_value=channel_native_module._ProcProbe("error")):
                 asyncio.run(runtime._refresh_loaded_tui_observed_bindings())
             self.assertEqual(runtime.state.sessions.get(session.session_id).status, "running")
 

@@ -868,13 +868,13 @@ class CodexStopDrainTests(unittest.TestCase):
         # path must LOOP until the cursor reaches the capture boundary, or
         # the advance would silently skip everything after the first batch
         # (deep-review round 1). Cap shrunk so each read consumes ~1 line.
-        import walkcode.channel_native_runtime as runtime_module
+        import walkcode.channel_native.tui_hooks as tui_hooks_module
 
         self._run("pre-tool", self._stamped_payload(tool_name="Bash", tool_use_id="t1"))
         for i in range(5):
             self._append(_codex_agent_message(f"第{i}段"))
         self._append(_codex_agent_message("最终回复"))
-        with patch.object(runtime_module, "_TRANSCRIPT_READ_MAX_BYTES", 128):
+        with patch.object(tui_hooks_module, "_TRANSCRIPT_READ_MAX_BYTES", 128):
             self._run("stop", self._stamped_payload(last_assistant_message="最终回复"))
 
         deltas = [v["view"]["text"] for v in self._views("turn_delta")]
