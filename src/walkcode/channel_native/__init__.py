@@ -3785,8 +3785,6 @@ class AgentTransport(Protocol):
         answers: dict[str, Any],
     ) -> None: ...
 
-    async def interrupt(self, handle: TransportHandle, reason: str) -> ControlResult: ...
-
     async def shutdown(self, handle: TransportHandle, mode: str) -> ControlResult: ...
 
     async def set_model(self, handle: TransportHandle, model: str) -> ControlResult: ...
@@ -4475,7 +4473,6 @@ class FakeAgentTransport:
         self.handles: list[TransportHandle] = []
         self.resume_specs: list[ResumeSpec] = []
         self.call_log: list[str] = []
-        self.interrupt_calls: list[str] = []
         self.shutdown_calls: list[str] = []
         self.model_calls: list[str] = []
         self.permission_approval_calls: list[tuple[str, dict[str, Any]]] = []
@@ -4513,10 +4510,6 @@ class FakeAgentTransport:
     ) -> None:
         self.call_log.append("submit_turn")
         self.submitted_turns.append(turn)
-
-    async def interrupt(self, handle: TransportHandle, reason: str) -> ControlResult:
-        self.interrupt_calls.append(reason)
-        return ControlResult(True, state="interrupted")
 
     async def approve_permission(
         self,
@@ -7703,14 +7696,6 @@ class ClaudeHeadlessTransport:
             raise CapabilityUnsupported("Claude headless AskUserQuestion answers are not available")
         await _maybe_await(answer(rid, answers))
 
-    async def interrupt(self, handle: TransportHandle, reason: str) -> ControlResult:
-        bridge = self._bridges.get(handle.handle_id)
-        if bridge is not None:
-            # Release callbacks awaiting a decision so the interrupted turn's
-            # blocked can_use_tool returns (deny) instead of hanging.
-            bridge.fail_pending_default_deny(reason="interrupted")
-        return await self._call_client_control(handle, "interrupt", reason, state="interrupted")
-
     async def shutdown(self, handle: TransportHandle, mode: str) -> ControlResult:
         bridge = self._bridges.pop(handle.handle_id, None)
         if bridge is not None:
@@ -10844,29 +10829,6 @@ class Orchestrator:
             return SubmitResult(False, BlockedReason.CAPABILITY_DISABLED)
         attachments = [await channel.download_attachment(attachment) for attachment in inbound.attachments]
         return TurnInput(text=inbound.text, attachments=attachments, created_at=inbound.created_at)
-
-    async def interrupt_session(
-        self,
-        session_id: str,
-        *,
-        actor: ActorRef,
-        reason: str,
-    ) -> ControlResult:
-        session = self.sessions.get(session_id)
-        authz_result = self._authorize_session_control(session_id, actor, action="interrupt")
-        if not authz_result.allowed:
-            return ControlResult(False, authz_result.reason)
-        if session.status == "stopped":
-            return ControlResult(False, BlockedReason.SESSION_STOPPED)
-        transport = self.transports[session.transport_kind]
-        if not transport.capabilities().interrupt:
-            return ControlResult(False, BlockedReason.CAPABILITY_DISABLED)
-        result = await transport.interrupt(self._handle_for_session(session), reason)
-        if result.accepted:
-            session.lifecycle_state = "INTERRUPTED"
-            session.interrupt_reason = reason
-            await self.refresh_session_status_card(session)
-        return result
 
     async def close_session(
         self,

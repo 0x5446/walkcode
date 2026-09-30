@@ -163,7 +163,6 @@ class HealthWatchdogTests(unittest.TestCase):
         self.assertEqual(health.reason, "progress_timeout")
         self.assertEqual(health.view_model["type"], "health")
         self.assertEqual(health.view_model["status"], "stale")
-        self.assertEqual(transport.interrupt_calls, [])
         self.assertEqual(transport.shutdown_calls, [])
         self.assertEqual(orchestrator.sessions.get(session.session_id).status, "running")
 

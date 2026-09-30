@@ -2160,47 +2160,25 @@ class TakeoverInjectedTurnRegressionTests(unittest.TestCase):
         # Signature binding (not try/except) decides the call shape: a
         # TypeError raised INSIDE the method must propagate, not trigger a
         # silent second bare invocation.
-        class _BuggyInterruptClient(_stream_client_class()):
+        class _BuggySetModelClient(_stream_client_class()):
             def __init__(self, options=None):
                 super().__init__(options)
                 self.calls = 0
 
-            async def interrupt(self, reason):
+            async def set_model(self, model):
                 self.calls += 1
                 raise TypeError("internal bug")
 
         async def scenario():
-            transport = _transport(_BuggyInterruptClient)
+            transport = _transport(_BuggySetModelClient)
             handle = await transport.launch_session(cwd="/tmp/p", session_id="s1")
             client = transport._clients[handle.handle_id]
             with self.assertRaises(TypeError):
-                await transport.interrupt(handle, "user_requested")
+                await transport.set_model(handle, "claude-sonnet-5-5")
             return client
 
         client = asyncio.run(scenario())
         self.assertEqual(client.calls, 1, "internal TypeError triggered a hidden retry")
-
-    def test_interrupt_tolerates_argless_sdk_signature(self):
-        # The real SDK's interrupt() takes no arguments; forwarding a reason
-        # must not fail the control call.
-        class _ArglessInterruptClient(_stream_client_class()):
-            def __init__(self, options=None):
-                super().__init__(options)
-                self.interrupted = False
-
-            async def interrupt(self):
-                self.interrupted = True
-
-        async def scenario():
-            transport = _transport(_ArglessInterruptClient)
-            handle = await transport.launch_session(cwd="/tmp/p", session_id="s1")
-            client = transport._clients[handle.handle_id]
-            result = await transport.interrupt(handle, "user_requested")
-            return result, client
-
-        result, client = asyncio.run(scenario())
-        self.assertTrue(result.accepted)
-        self.assertTrue(client.interrupted)
 
     def test_mid_turn_steering_submit_survives_current_turn_result(self):
         # A submit issued while a turn is streaming (queued steering input):

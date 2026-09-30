@@ -94,33 +94,9 @@ def _orchestrator(*, caps=None):
 
 
 class SessionControlTests(unittest.TestCase):
-    def test_owner_can_interrupt_when_transport_supports_it(self):
+    def test_reviewer_cannot_close(self):
         orchestrator, transport, session = _orchestrator()
 
-        result = asyncio.run(
-            orchestrator.interrupt_session(
-                session.session_id,
-                actor=_actor("owner"),
-                reason="user requested",
-            )
-        )
-
-        self.assertTrue(result.accepted)
-        self.assertEqual(transport.interrupt_calls, ["user requested"])
-        updated = orchestrator.sessions.get(session.session_id)
-        self.assertEqual(updated.lifecycle_state, "INTERRUPTED")
-        self.assertEqual(updated.interrupt_reason, "user requested")
-
-    def test_collaborator_and_reviewer_cannot_interrupt_or_close(self):
-        orchestrator, transport, session = _orchestrator()
-
-        interrupt = asyncio.run(
-            orchestrator.interrupt_session(
-                session.session_id,
-                actor=_actor("collab"),
-                reason="stop",
-            )
-        )
         close = asyncio.run(
             orchestrator.close_session(
                 session.session_id,
@@ -129,27 +105,9 @@ class SessionControlTests(unittest.TestCase):
             )
         )
 
-        self.assertFalse(interrupt.accepted)
-        self.assertEqual(interrupt.reason, BlockedReason.UNAUTHORIZED)
         self.assertFalse(close.accepted)
         self.assertEqual(close.reason, BlockedReason.UNAUTHORIZED)
-        self.assertEqual(transport.interrupt_calls, [])
         self.assertEqual(transport.shutdown_calls, [])
-
-    def test_interrupt_capability_disabled_does_not_call_transport(self):
-        orchestrator, transport, session = _orchestrator(caps=_transport_caps(interrupt=False))
-
-        result = asyncio.run(
-            orchestrator.interrupt_session(
-                session.session_id,
-                actor=_actor("owner"),
-                reason="stop",
-            )
-        )
-
-        self.assertFalse(result.accepted)
-        self.assertEqual(result.reason, BlockedReason.CAPABILITY_DISABLED)
-        self.assertEqual(transport.interrupt_calls, [])
 
     def test_close_marks_session_stopped_and_blocks_future_submits(self):
         orchestrator, transport, session = _orchestrator()

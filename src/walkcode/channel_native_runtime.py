@@ -1112,9 +1112,6 @@ class _UnavailableTransport:
     ) -> None:
         raise CapabilityUnsupported(self.reason)
 
-    async def interrupt(self, handle: TransportHandle, reason: str) -> ControlResult:
-        return ControlResult(False, self.reason)
-
     async def shutdown(self, handle: TransportHandle, mode: str) -> ControlResult:
         return ControlResult(False, self.reason)
 
@@ -1906,13 +1903,7 @@ class ChannelNativeRuntime:
         selector = _agent_selector_command(inbound)
         if selector:
             await channel.send_view(
-                ChannelBinding(
-                    channel_kind=inbound.channel_kind,
-                    account_id=inbound.account_id,
-                    chat_id=inbound.chat_id,
-                    thread_id=inbound.thread_id,
-                    root_message_id=inbound.root_message_id or inbound.message_id,
-                ),
+                _inbound_reply_binding(inbound),
                 {
                     "type": "agent_selector_rejected",
                     "message": _agent_selector_rejected_message(
@@ -1926,13 +1917,7 @@ class ChannelNativeRuntime:
         unknown_slash = _telegram_unknown_slash_command(inbound)
         if unknown_slash and self._resolve_telegram_command_session(inbound) is None:
             await channel.send_view(
-                ChannelBinding(
-                    channel_kind=inbound.channel_kind,
-                    account_id=inbound.account_id,
-                    chat_id=inbound.chat_id,
-                    thread_id=inbound.thread_id,
-                    root_message_id=inbound.root_message_id or inbound.message_id,
-                ),
+                _inbound_reply_binding(inbound),
                 {
                     "type": "text",
                     "text": (
@@ -2099,13 +2084,7 @@ class ChannelNativeRuntime:
     def _telegram_command_reply_binding(self, inbound, session=None) -> ChannelBinding:
         if session is not None and session.channel_binding is not None:
             return session.channel_binding
-        return ChannelBinding(
-            channel_kind=inbound.channel_kind,
-            account_id=inbound.account_id,
-            chat_id=inbound.chat_id,
-            thread_id=inbound.thread_id,
-            root_message_id=inbound.root_message_id or inbound.message_id,
-        )
+        return _inbound_reply_binding(inbound)
 
     def _telegram_runtime_status_view(self) -> dict[str, Any]:
         active = [
@@ -2278,13 +2257,7 @@ class ChannelNativeRuntime:
             return
         try:
             await send_action(
-                ChannelBinding(
-                    channel_kind=inbound.channel_kind,
-                    account_id=inbound.account_id,
-                    chat_id=inbound.chat_id,
-                    thread_id=inbound.thread_id,
-                    root_message_id=inbound.root_message_id or inbound.message_id,
-                ),
+                _inbound_reply_binding(inbound),
                 "typing",
             )
         except Exception:
@@ -2296,13 +2269,7 @@ class ChannelNativeRuntime:
             return
         try:
             await react_to_message(
-                ChannelBinding(
-                    channel_kind=inbound.channel_kind,
-                    account_id=inbound.account_id,
-                    chat_id=inbound.chat_id,
-                    thread_id=inbound.thread_id,
-                    root_message_id=inbound.root_message_id or inbound.message_id,
-                ),
+                _inbound_reply_binding(inbound),
                 inbound.message_id,
                 "✅",
             )
@@ -2430,8 +2397,6 @@ class ChannelNativeRuntime:
             and inbound.event_id != "lark:"
             and ledger.seen(inbound.event_id)
         ):
-            from .channel_native import _log_degrade
-
             # Dropped silently toward the user (a duplicate needs no reply),
             # but never silently toward the operator: redeliveries are the
             # symptom of the WS drop/ack loss this dedup exists for.
@@ -2449,13 +2414,7 @@ class ChannelNativeRuntime:
             # After the authz gates on purpose: expanding costs an API call,
             # and an unauthorized sender must not be able to spend it.
             inbound = await self._expand_lark_merge_forward(channel, inbound)
-            reply_binding = ChannelBinding(
-                channel_kind=inbound.channel_kind,
-                account_id=inbound.account_id,
-                chat_id=inbound.chat_id,
-                thread_id=inbound.thread_id,
-                root_message_id=inbound.root_message_id or inbound.message_id,
-            )
+            reply_binding = _inbound_reply_binding(inbound)
             if str(inbound.text or "").lstrip().startswith("//"):
                 # Escape hatch for agent-native commands shadowed by WalkCode
                 # ones: //model reaches the agent as /model. Claude executes
@@ -2537,18 +2496,10 @@ class ChannelNativeRuntime:
             if note:
                 try:
                     await channel.send_view(
-                        ChannelBinding(
-                            channel_kind=inbound.channel_kind,
-                            account_id=inbound.account_id,
-                            chat_id=inbound.chat_id,
-                            thread_id=inbound.thread_id,
-                            root_message_id=inbound.root_message_id or inbound.message_id,
-                        ),
+                        _inbound_reply_binding(inbound),
                         {"type": "text", "text": note},
                     )
                 except Exception as exc:
-                    from .channel_native import _log_degrade
-
                     _log_degrade(
                         "lark_rejection_note_send_failed",
                         reason=str(result.reason or ""),
@@ -3386,10 +3337,8 @@ class ChannelNativeRuntime:
             _stamp_transcript_size(payload)
         hook_type = _normalize_tui_hook_type(hook_type or _payload_hook_event_name(payload))
         if not hook_type:
-            self.save_state()
             return SubmitResult(True, "missing_hook_type")
         if not _tui_hook_observes_session(hook_type):
-            self.save_state()
             return SubmitResult(True, "non_observation_hook")
         agent_name = _normalize_tui_agent(agent or str(payload.get("agent", "") or ""))
         if not agent_name:
@@ -3397,28 +3346,24 @@ class ChannelNativeRuntime:
         transport_kind = _agent_to_transport_kind(agent_name)
         resume_ref = _tui_resume_ref(transport_kind, payload)
         if not resume_ref:
-            self.save_state()
             return SubmitResult(True, "missing_resume_ref")
         if _tui_hook_is_walkcode_headless_transport(transport_kind, payload) or self._tui_hook_is_walkcode_codex_turn(
             transport_kind, payload
         ):
-            self.save_state()
             return SubmitResult(True, "internal_headless_hook_ignored")
         if transport_kind == "codex_app_server" and _codex_transcript_is_exec(payload):
-            self.save_state()
             return SubmitResult(True, "codex_exec_hook_ignored")
         if (
             _tui_hook_can_claim_existing_session(hook_type)
             and self._tui_hook_is_unverified_walkcode_owned_session_hook(transport_kind, resume_ref, payload)
         ):
-            self.save_state()
             return SubmitResult(True, "internal_headless_hook_ignored")
 
         event_id = _tui_event_id(hook_type, transport_kind, resume_ref, payload)
-        ledger_started = False
-        if self.state.inbound_ledger is not None and not self.state.inbound_ledger.start(event_id):
+        # Nothing above changed state: ignored hooks return without a save
+        # (a full fsync'd rewrite of a multi-MB state file per tool call).
+        if not self.state.inbound_ledger.start(event_id):
             return SubmitResult(True, BlockedReason.DUPLICATE_INBOUND)
-        ledger_started = self.state.inbound_ledger is not None
         try:
             session = await self._claim_or_create_tui_observed_session(
                 hook_type=hook_type,
@@ -3428,8 +3373,7 @@ class ChannelNativeRuntime:
                 payload=payload,
             )
             if session is None:
-                if ledger_started:
-                    self.state.inbound_ledger.complete(event_id)
+                self.state.inbound_ledger.complete(event_id)
                 self.save_state()
                 return SubmitResult(True, "unobserved_tui_hook")
             if session.status != "stopped":
@@ -3466,11 +3410,9 @@ class ChannelNativeRuntime:
             # (asyncio.CancelledError) must also release the ledger entry —
             # an event stuck in_progress makes the replay look like a
             # duplicate and the queued hook is then dropped as "processed".
-            if ledger_started:
-                self.state.inbound_ledger.fail(event_id)
+            self.state.inbound_ledger.fail(event_id)
             raise
-        if ledger_started:
-            self.state.inbound_ledger.complete(event_id)
+        self.state.inbound_ledger.complete(event_id)
         self.save_state()
         return SubmitResult(True)
 
@@ -3716,8 +3658,6 @@ class ChannelNativeRuntime:
         transport = self._claude_daemon_transport()
         if transport is None:
             return None
-        from .channel_native import _log_degrade
-
         headless = self.transports.get("claude_headless")
         settings = ""
         cli_path = ""
@@ -3852,8 +3792,6 @@ class ChannelNativeRuntime:
         """
         if not short:
             return
-        from .channel_native import _log_degrade
-
         transport.stop_observer(short)
         try:
             await transport.client.kill(short)
@@ -5947,7 +5885,7 @@ class ChannelNativeRuntime:
                 "submit_blocked_reason": "",
             }
         resolution = self.state.sessions.resolve_active_binding(
-            inbound.binding_key(), revival_eligible=self._revival_transport_ready
+            inbound.binding_key(), revival_eligible=self.orchestrator._revival_transport_ready
         )
         if resolution.reason:
             if resolution.reason == BlockedReason.AMBIGUOUS_SESSION:
@@ -5977,7 +5915,7 @@ class ChannelNativeRuntime:
                     "submit_would_accept": False,
                     "submit_blocked_reason": authz.reason,
                 }
-        if _session_is_channel_revival_candidate(session) and self._revival_transport_ready(session):
+        if _session_is_channel_revival_candidate(session) and self.orchestrator._revival_transport_ready(session):
             # ADR 0054: the real submit path revives this session instead of
             # dead-ending at SESSION_STOPPED — report it as submittable.
             return {
@@ -6075,16 +6013,6 @@ class ChannelNativeRuntime:
             "submit_would_accept": True,
             "submit_blocked_reason": "",
         }
-
-    def _revival_transport_ready(self, session) -> bool:
-        """Mirror of Orchestrator._revival_transport_ready for the doctor path."""
-        transport = self.transports.get(session.transport_kind)
-        if transport is None:
-            return False
-        try:
-            return bool(transport.capabilities().resume_after_complete)
-        except Exception:
-            return False
 
     def _summarize_new_session_gate(self, transport_kind: str | None = None) -> dict[str, Any]:
         selected_transport = transport_kind or self.config.agent_transport_kind
@@ -6376,6 +6304,18 @@ def _codex_home_path(codex_home: str = "") -> Path:
     if codex_home:
         return Path(codex_home).expanduser()
     return Path.home() / ".codex"
+
+
+def _inbound_reply_binding(inbound) -> ChannelBinding:
+    """Where a direct reply to this inbound goes: its thread, rooted on the
+    thread root (or on the message itself when it starts one)."""
+    return ChannelBinding(
+        channel_kind=inbound.channel_kind,
+        account_id=inbound.account_id,
+        chat_id=inbound.chat_id,
+        thread_id=inbound.thread_id,
+        root_message_id=inbound.root_message_id or inbound.message_id,
+    )
 
 
 def _build_codex_app_server_client(config: ChannelNativeConfig) -> Any:
@@ -6910,8 +6850,6 @@ def _ignore_empty_inbound(inbound: Any) -> SubmitResult:
     without a trace the visible symptom is "the bot ignored me" with no
     evidence in the ledger, the outbox, or the agent transcript.
     """
-    from .channel_native import _log_degrade
-
     _log_degrade(
         "empty_inbound_ignored",
         channel=getattr(inbound, "channel_kind", ""),
