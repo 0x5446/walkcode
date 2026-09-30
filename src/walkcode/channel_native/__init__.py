@@ -3327,6 +3327,16 @@ class DeliveryItem:
     message_id: str = ""
 
 
+def _sent_view_stub(view_model: dict[str, Any]) -> dict[str, Any]:
+    """What a delivered item keeps of its view: only the type.
+
+    Sent items stay for a day to dedupe by idempotency key and to remember the
+    platform message id; the full card body was dead weight (about 1 MB of a
+    busy instance's state file, rewritten with fsync on every save).
+    """
+    return {"type": str(view_model.get("type", "") or "")}
+
+
 class DurableOutbox:
     def __init__(
         self,
@@ -3456,6 +3466,7 @@ class DurableOutbox:
         if status == DeliveryStatus.SENT:
             item.finished_at = self._now()
             item.message_id = message_id
+            item.view_model = _sent_view_stub(item.view_model)
             self._sent[delivery_id] = self._pending.pop(delivery_id)
             return True
         elif status == DeliveryStatus.PERMANENT_FAILURE:
@@ -3526,6 +3537,8 @@ class DurableOutbox:
         }
         outbox._dead = {str(key): _delivery_from_dict(value) for key, value in data.get("dead", {}).items()}
         outbox._sent = {str(key): _delivery_from_dict(value) for key, value in data.get("sent", {}).items()}
+        for item in outbox._sent.values():
+            item.view_model = _sent_view_stub(item.view_model)
         return outbox
 
 

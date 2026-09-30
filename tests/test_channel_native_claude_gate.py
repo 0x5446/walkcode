@@ -918,9 +918,9 @@ class GateWithoutDaemonTests(unittest.TestCase):
                 time.sleep(0.02)
             asyncio.run(runtime.drain_claude_gate_requests())
             card = next(
-                item.view_model
-                for item in runtime.orchestrator.outbox._sent.values()
-                if item.idempotency_key.endswith(f"gate:{rid}")
+                payload["view"]
+                for method, payload in api.calls
+                if isinstance(payload.get("view"), dict) and payload["view"].get("type") == "permission_prompt"
             )
             token = next(a["token"] for a in card["actions"] if a["action"] == "allow")
             binding = session.channel_binding
