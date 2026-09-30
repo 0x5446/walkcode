@@ -141,6 +141,8 @@ TUI_HOOK_DRAIN_TIMEOUT_SECONDS = 30.0
 TUI_HOOK_DRAIN_BATCH_SIZE = 25
 TUI_HOOK_RECENT_PRIORITY_WINDOW_SECONDS = 300.0
 TUI_HOOK_DRAIN_INTERVAL_SECONDS = 1.0
+CODEX_MIRROR_RETRY_MIN_SECONDS = 5.0
+CODEX_MIRROR_RETRY_MAX_SECONDS = 300.0
 # A queued hook that raises this many times in a row is archived: the drain
 # stops at the first failure to keep order, so one hook failing the same way
 # every tick would otherwise block every hook behind it forever.
@@ -1607,6 +1609,10 @@ class ChannelNativeRuntime:
         # thread each mirrored session is subscribed to.
         self._codex_mirror: CodexForeignTurnMirror | None = None
         self._codex_mirror_threads: dict[str, str] = {}
+        # session id -> (retry at [monotonic], current delay, last error). A failing
+        # subscribe (e.g. the daemon executable is missing) used to be retried on
+        # every 5 s pass forever, spawning a codex process and a log line each time.
+        self._codex_mirror_backoff: dict[str, tuple[float, float, str]] = {}
         self._gate_always_allow: set[tuple[str, str]] = set()
         # ADR 0066: since when the Claude daemon socket file has been missing
         # (0 = present / not yet seen missing).
@@ -3229,19 +3235,36 @@ class ChannelNativeRuntime:
                 transport.unsubscribe_foreign_mirror(thread_id)
                 self._codex_mirror_threads.pop(session_id, None)
                 await mirror.close(session_id)
+        for session_id in list(self._codex_mirror_backoff):
+            if session_id not in candidates:
+                self._codex_mirror_backoff.pop(session_id, None)
         subscribed = 0
+        now = time.monotonic()
         for session_id, (thread_id, cwd) in candidates.items():
             if self._codex_mirror_threads.get(session_id) == thread_id and transport.foreign_sink_current(thread_id):
+                continue
+            retry_at, delay, last_error = self._codex_mirror_backoff.get(session_id, (0.0, 0.0, ""))
+            if now < retry_at:
                 continue
             if mirror.is_active(session_id):
                 mirror.interrupt(session_id)
             try:
                 await transport.subscribe_foreign_mirror(thread_id, cwd=cwd, sink=mirror.sink(session_id))
-            except Exception as exc:  # noqa: BLE001 - retried on the next pass
-                _log_degrade("codex_mirror_subscribe_failed", session_id=session_id, error=exc)
+            except Exception as exc:  # noqa: BLE001 - retried with backoff
+                error = f"{type(exc).__name__}: {exc}"
+                delay = min(max(delay * 2, CODEX_MIRROR_RETRY_MIN_SECONDS), CODEX_MIRROR_RETRY_MAX_SECONDS)
+                if error != last_error:
+                    _log_degrade(
+                        "codex_mirror_subscribe_failed",
+                        session_id=session_id,
+                        error=error,
+                        retry_in=int(delay),
+                    )
+                self._codex_mirror_backoff[session_id] = (now + delay, delay, error)
                 self._codex_mirror_threads.pop(session_id, None)
                 await mirror.close(session_id)
                 continue
+            self._codex_mirror_backoff.pop(session_id, None)
             self._codex_mirror_threads[session_id] = thread_id
             subscribed += 1
         return subscribed
@@ -6361,7 +6384,7 @@ def _build_codex_app_server_client(config: ChannelNativeConfig) -> Any:
     socket_path = str(options.get("app_server_socket", "") or "")
     codex_home = str(options.get("codex_home", "") or "")
     if mode == "auto":
-        if _codex_standalone_daemon_available(codex_home):
+        if _codex_managed_daemon_available(codex_home):
             return CodexManagedAppServerClient(socket_path=socket_path, codex_home=codex_home)
         return CodexStdioAppServerClient(codex_home=codex_home)
     if mode in {"daemon", "managed", "shared"}:
@@ -6373,8 +6396,13 @@ def _build_codex_app_server_client(config: ChannelNativeConfig) -> Any:
     )
 
 
-def _codex_standalone_daemon_available(codex_home: str = "") -> bool:
-    return (_codex_home_path(codex_home) / "packages" / "standalone" / "current" / "codex").exists()
+def _codex_managed_daemon_available(codex_home: str = "") -> bool:
+    # The executable `codex app-server daemon start` runs. exists() follows
+    # the `current` symlink, so a dangling one (its release dir was deleted —
+    # 2026-09-29 bfjdfhnf-codex outage) falls back to stdio instead of
+    # failing every request. The standalone CLI package says nothing about it.
+    daemon = _codex_home_path(codex_home) / "packages" / "app-server-daemon" / "current" / "bin" / "codex"
+    return daemon.exists()
 
 
 def _build_external_tui_controllers() -> dict[str, Any]:
