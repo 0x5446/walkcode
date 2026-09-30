@@ -267,7 +267,6 @@ class ChannelRoutingTests(unittest.TestCase):
         old.status = "stopped"
         old.lifecycle_state = "STOPPED"
         old.writer_owner = None
-        old.writer_lease = None
         general_message = channel.parse_update(
             {
                 "update_id": 3,

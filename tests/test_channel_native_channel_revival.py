@@ -93,7 +93,7 @@ def _transport_caps(**overrides) -> TransportCapabilities:
 
 def _headless_orchestrator(transport=None):
     clock = _Clock()
-    authz = AuthorizationStore(now=clock)
+    authz = AuthorizationStore()
     transport = transport or FakeAgentTransport("claude_headless", _transport_caps())
     channel = FakeChannelAdapter("telegram", _channel_caps())
     orchestrator = Orchestrator(
@@ -117,7 +117,6 @@ def _sweep_to_stopped(session, *, stop_reason: str = "runtime_restart"):
     session.stop_reason = stop_reason
     session.lifecycle_state = "STOPPED"
     session.writer_owner = None
-    session.writer_lease = None
     session.transport_ref = {"handle_id": "h-old", "agent_session_id": "agent-sess-1"}
 
 
@@ -498,7 +497,7 @@ class ChannelRevivalTests(unittest.TestCase):
 
     def test_stopped_external_tui_candidate_gets_takeover_prompt_not_revival(self):
         clock = _Clock()
-        authz = AuthorizationStore(now=clock)
+        authz = AuthorizationStore()
         transport = FakeAgentTransport("fake-transport", _transport_caps())
         channel = FakeChannelAdapter("telegram", _channel_caps())
         orchestrator = Orchestrator(

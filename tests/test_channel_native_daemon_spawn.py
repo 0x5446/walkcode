@@ -298,7 +298,7 @@ class OrchestratorDaemonSpawnerTests(unittest.TestCase):
     def _orchestrator(self, *, daemon_client=None):
         clock = lambda: 1000.0
         sessions = SessionRegistry(now=clock)
-        authz = AuthorizationStore(now=clock)
+        authz = AuthorizationStore()
         channel = FakeChannelAdapter("telegram", _channel_caps())
         transports = {"claude_headless": _fake_structured_transport()}
         if daemon_client is not None:

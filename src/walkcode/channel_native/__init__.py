@@ -28,7 +28,7 @@ import urllib.parse
 import urllib.request
 import random
 
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal, NamedTuple, Protocol
@@ -141,7 +141,6 @@ class BlockedReason:
     DUPLICATE_INBOUND = "duplicate_inbound"
     EXTERNAL_TUI_READONLY = "external_tui_readonly"
     INVALID_TOKEN = "invalid_token"
-    LEASE_EXPIRED = "lease_expired"
     NOT_EXTERNAL_TUI = "not_external_tui"
     NOT_FOUND = "not_found"
     SESSION_RUNNING = "session_running"
@@ -234,7 +233,6 @@ class ChannelBinding:
     root_message_id: str = ""
     last_message_id: str = ""
     health_message_id: str = ""
-    subscribed: bool = False
     capabilities: dict[str, Any] = field(default_factory=dict)
 
     def key(self) -> BindingKey:
@@ -268,8 +266,6 @@ class ChannelEndpointConfig:
     kind: str
     credentials: dict[str, str]
     options: dict[str, Any] = field(default_factory=dict)
-    priority: int = 0
-    legacy: bool = False
 
 
 @dataclass(frozen=True)
@@ -308,9 +304,9 @@ class ChannelNativeConfig:
             )
 
         if channel_kind == "telegram":
-            channel = _telegram_config_from_env(source, priority=0)
+            channel = _telegram_config_from_env(source)
         elif channel_kind == "lark":
-            channel = _lark_config_from_env(source, priority=0)
+            channel = _lark_config_from_env(source)
         else:
             raise ChannelConfigError(f"unknown channel configured: {channel_kind}")
 
@@ -698,7 +694,7 @@ def _agent_to_transport_kind(agent: str) -> str:
     raise ChannelConfigError(f"unknown agent configured: {agent}")
 
 
-def _telegram_config_from_env(source: Any, *, priority: int) -> ChannelEndpointConfig:
+def _telegram_config_from_env(source: Any) -> ChannelEndpointConfig:
     token = source.get("TELEGRAM_BOT_TOKEN", "")
     if not token:
         raise ChannelConfigError("missing TELEGRAM_BOT_TOKEN for telegram channel")
@@ -729,11 +725,10 @@ def _telegram_config_from_env(source: Any, *, priority: int) -> ChannelEndpointC
             "webhook_url": webhook_url,
             "polling": _env_bool(source.get("TELEGRAM_POLLING"), default=not bool(webhook_url)),
         },
-        priority=priority,
     )
 
 
-def _lark_config_from_env(source: Any, *, priority: int) -> ChannelEndpointConfig:
+def _lark_config_from_env(source: Any) -> ChannelEndpointConfig:
     app_id = source.get("LARK_APP_ID", "")
     app_secret = source.get("LARK_APP_SECRET", "")
     missing = [key for key, value in (("LARK_APP_ID", app_id), ("LARK_APP_SECRET", app_secret)) if not value]
@@ -755,7 +750,6 @@ def _lark_config_from_env(source: Any, *, priority: int) -> ChannelEndpointConfi
             "allowed_open_ids": tuple(_split_csv(source.get("LARK_ALLOWED_OPEN_IDS", ""))),
             "tui_chat_id": str(source.get("WALKCODE_LARK_TUI_CHAT_ID", "") or "").strip(),
         },
-        priority=priority,
     )
 
 
@@ -850,20 +844,6 @@ class WriterOwner:
 
 
 @dataclass
-class WriterLease:
-    lease_id: str
-    session_id: str
-    generation: int
-    owner_kind: str
-    holder_ref: dict[str, Any]
-    heartbeat_at: float
-    expires_at: float
-
-    def expired(self, now: float) -> bool:
-        return now >= self.expires_at
-
-
-@dataclass
 class BlockedInput:
     blocked_input_id: str
     session_id: str
@@ -871,9 +851,8 @@ class BlockedInput:
     text: str
     attachments: list[AttachmentRef]
     idempotency_key: str
-    state: Literal["blocked", "cancelled", "submitted", "not_delivered", "expired"]
+    state: Literal["blocked", "cancelled", "submitted", "not_delivered"]
     created_at: float
-    expires_at: float
     submit_after_takeover: bool = True
 
 
@@ -905,7 +884,6 @@ class Session:
     channel_binding: ChannelBinding | None = None
     lifecycle_state: str = "NEW"
     writer_owner: WriterOwner | None = None
-    writer_lease: WriterLease | None = None
     generation: int = 0
     last_event_seq: int = 0
     blocked_inputs: dict[str, BlockedInput] = field(default_factory=dict)
@@ -918,7 +896,6 @@ class Session:
     title_refreshed_at: float = 0.0
     status: Literal["running", "stopped"] = "running"
     stop_reason: str = ""
-    interrupt_reason: str = ""
     running_since: float = 0.0
     last_progress_at: float = 0.0
     last_progress_event: str = ""
@@ -1170,6 +1147,61 @@ def _session_is_channel_revival_candidate(session: Session) -> bool:
     return bool(_durable_resume_ref(session))
 
 
+def _session_has_durable_resume_ref(session: Any) -> bool:
+    ref = getattr(session, "transport_ref", {}) or {}
+    transport_kind = str(getattr(session, "transport_kind", ""))
+    if transport_kind == "external_tui":
+        nested = ref.get("resume_ref") if isinstance(ref, dict) else None
+        if not isinstance(nested, dict):
+            return False
+        nested_kind = str(nested.get("transport_kind", "") or nested.get("kind", ""))
+        return _resume_ref_is_durable(nested_kind, nested)
+    return _resume_ref_is_durable(transport_kind, ref)
+
+
+def _resume_ref_is_durable(transport_kind: str, ref: dict[str, Any]) -> bool:
+    if transport_kind in _STRUCTURED_TRANSPORT_KINDS:
+        return bool(agent_session_id(transport_kind, ref))
+    return bool(ref)
+
+
+# Session retention (maintenance compaction). Stopped sessions used to be kept
+# forever — with their bindings, grants, takeovers and blocked user text — and
+# the whole ledger is rewritten on every save. A stopped session is dropped
+# once it has been idle for its window and nothing still points at it.
+#
+# The long window covers sessions a message in their topic can still bring
+# back: ADR 0054 channel revival (involuntary stop + durable resume ref) and
+# TUI-observed sessions, which a topic reply resumes through the takeover
+# prompt when their resume ref is durable. Everything else (archived, no
+# topic, no resumable identity) can never continue and gets the short window.
+SESSION_REVIVABLE_RETENTION_SECONDS = 90 * 86400.0
+SESSION_FINAL_RETENTION_SECONDS = 7 * 86400.0
+
+
+def _session_revivable_from_topic(session: Session) -> bool:
+    if session.archived_at or session.channel_binding is None:
+        return False
+    if _session_is_channel_revival_candidate(session):
+        return True
+    return _session_is_external_tui_takeover_candidate(session) and _session_has_durable_resume_ref(session)
+
+
+def _session_last_activity(session: Session) -> float:
+    stamps = [
+        session.created_at,
+        session.running_since,
+        session.last_progress_at,
+        session.last_user_input_at,
+        session.title_refreshed_at,
+        session.archived_at,
+    ]
+    # A topic reply to a stopped TUI session only records a blocked input
+    # (and a takeover prompt); it must count as activity too.
+    stamps.extend(blocked.created_at for blocked in session.blocked_inputs.values())
+    return max(stamps)
+
+
 def _external_claude_resume_ref(session: Session) -> dict[str, Any]:
     """The Claude-native resume_ref of a TUI-observed session, if any.
 
@@ -1313,19 +1345,9 @@ class AuthorizationResult:
     role: str = ""
 
 
-@dataclass
-class PendingBinding:
-    pending_key: str
-    binding: ChannelBinding
-    cwd: str
-    created_at: float
-
-
 class AuthorizationStore:
-    def __init__(self, *, now: Callable[[], float] = time.time):
-        self._now = now
+    def __init__(self) -> None:
         self._roles: dict[str, dict[tuple[str, str], str]] = {}
-        self._audit: list[dict[str, Any]] = []
 
     def grant(self, session_id: str, actor: ActorRef, role: str) -> None:
         if role not in {
@@ -1336,16 +1358,10 @@ class AuthorizationStore:
         }:
             raise ValueError(f"unknown session role: {role}")
         self._roles.setdefault(session_id, {})[(actor.channel_kind, actor.actor_id)] = role
-        self._audit.append(
-            {
-                "type": "role_granted",
-                "session_id": session_id,
-                "actor": actor.actor_id,
-                "channel_kind": actor.channel_kind,
-                "role": role,
-                "ts": self._now(),
-            }
-        )
+
+    def drop_sessions(self, session_ids: Iterable[str]) -> int:
+        """Forget every grant of the given sessions; returns how many sessions had any."""
+        return sum(1 for session_id in session_ids if self._roles.pop(session_id, None) is not None)
 
     def role_for(self, session_id: str, actor: ActorRef) -> str:
         return self._roles.get(session_id, {}).get((actor.channel_kind, actor.actor_id), "")
@@ -1402,16 +1418,13 @@ class AuthorizationStore:
                         "role": role,
                     }
                 )
-        return {"grants": grants, "audit": list(self._audit)}
+        return {"grants": grants}
 
     @classmethod
-    def from_dict(
-        cls,
-        data: dict[str, Any],
-        *,
-        now: Callable[[], float] = time.time,
-    ) -> "AuthorizationStore":
-        store = cls(now=now)
+    def from_dict(cls, data: dict[str, Any]) -> "AuthorizationStore":
+        # Files written before v0.14.36 also carry an "audit" list: an
+        # append-only log of every grant that nothing ever read. Ignored.
+        store = cls()
         for grant in data.get("grants", []):
             if not isinstance(grant, dict):
                 continue
@@ -1421,7 +1434,6 @@ class AuthorizationStore:
             role = str(grant.get("role", ""))
             if session_id and channel_kind and actor_id and role:
                 store._roles.setdefault(session_id, {})[(channel_kind, actor_id)] = role
-        store._audit = [dict(item) for item in data.get("audit", []) if isinstance(item, dict)]
         return store
 
 
@@ -1446,7 +1458,6 @@ def _binding_to_dict(binding: ChannelBinding | None) -> dict[str, Any] | None:
         "root_message_id": binding.root_message_id,
         "last_message_id": binding.last_message_id,
         "health_message_id": binding.health_message_id,
-        "subscribed": binding.subscribed,
         "capabilities": capabilities,
     }
 
@@ -1467,7 +1478,6 @@ def _binding_from_dict(data: dict[str, Any] | None) -> ChannelBinding | None:
         root_message_id=str(data.get("root_message_id", "")),
         last_message_id=str(data.get("last_message_id", "")),
         health_message_id=str(data.get("health_message_id", "")),
-        subscribed=bool(data.get("subscribed", False)),
         capabilities=capabilities,
     )
 
@@ -1534,34 +1544,6 @@ def _writer_owner_from_dict(data: dict[str, Any] | None) -> WriterOwner | None:
     )
 
 
-def _writer_lease_to_dict(lease: WriterLease | None) -> dict[str, Any] | None:
-    if lease is None:
-        return None
-    return {
-        "lease_id": lease.lease_id,
-        "session_id": lease.session_id,
-        "generation": lease.generation,
-        "owner_kind": lease.owner_kind,
-        "holder_ref": dict(lease.holder_ref),
-        "heartbeat_at": lease.heartbeat_at,
-        "expires_at": lease.expires_at,
-    }
-
-
-def _writer_lease_from_dict(data: dict[str, Any] | None) -> WriterLease | None:
-    if not data:
-        return None
-    return WriterLease(
-        lease_id=str(data.get("lease_id", "")),
-        session_id=str(data.get("session_id", "")),
-        generation=int(data.get("generation", 0)),
-        owner_kind=str(data.get("owner_kind", "")),
-        holder_ref=dict(data.get("holder_ref", {})),
-        heartbeat_at=float(data.get("heartbeat_at", 0.0)),
-        expires_at=float(data.get("expires_at", 0.0)),
-    )
-
-
 def _blocked_input_to_dict(blocked: BlockedInput) -> dict[str, Any]:
     return {
         "blocked_input_id": blocked.blocked_input_id,
@@ -1572,7 +1554,6 @@ def _blocked_input_to_dict(blocked: BlockedInput) -> dict[str, Any]:
         "idempotency_key": blocked.idempotency_key,
         "state": blocked.state,
         "created_at": blocked.created_at,
-        "expires_at": blocked.expires_at,
         "submit_after_takeover": blocked.submit_after_takeover,
     }
 
@@ -1590,7 +1571,6 @@ def _blocked_input_from_dict(data: dict[str, Any]) -> BlockedInput:
         idempotency_key=str(data.get("idempotency_key", "")),
         state=data.get("state", "blocked"),
         created_at=float(data.get("created_at", 0.0)),
-        expires_at=float(data.get("expires_at", 0.0)),
         submit_after_takeover=bool(data.get("submit_after_takeover", True)),
     )
 
@@ -1605,7 +1585,6 @@ def _session_to_dict(session: Session) -> dict[str, Any]:
         "channel_binding": _binding_to_dict(session.channel_binding),
         "lifecycle_state": session.lifecycle_state,
         "writer_owner": _writer_owner_to_dict(session.writer_owner),
-        "writer_lease": _writer_lease_to_dict(session.writer_lease),
         "generation": session.generation,
         "last_event_seq": session.last_event_seq,
         "blocked_inputs": {
@@ -1616,7 +1595,6 @@ def _session_to_dict(session: Session) -> dict[str, Any]:
         "title_refreshed_at": session.title_refreshed_at,
         "status": session.status,
         "stop_reason": session.stop_reason,
-        "interrupt_reason": session.interrupt_reason,
         "running_since": session.running_since,
         "last_progress_at": session.last_progress_at,
         "last_progress_event": session.last_progress_event,
@@ -1641,7 +1619,6 @@ def _session_from_dict(data: dict[str, Any]) -> Session:
         channel_binding=_binding_from_dict(data.get("channel_binding")),
         lifecycle_state=str(data.get("lifecycle_state", "NEW")),
         writer_owner=_writer_owner_from_dict(data.get("writer_owner")),
-        writer_lease=_writer_lease_from_dict(data.get("writer_lease")),
         generation=int(data.get("generation", 0)),
         last_event_seq=int(data.get("last_event_seq", 0)),
         blocked_inputs={
@@ -1654,7 +1631,6 @@ def _session_from_dict(data: dict[str, Any]) -> Session:
         title_refreshed_at=float(data.get("title_refreshed_at", 0.0)),
         status=data.get("status", "running"),
         stop_reason=str(data.get("stop_reason", "")),
-        interrupt_reason=str(data.get("interrupt_reason", "")),
         running_since=float(data.get("running_since", 0.0)),
         last_progress_at=float(data.get("last_progress_at", 0.0)),
         last_user_input_at=float(data.get("last_user_input_at", 0.0)),
@@ -1710,13 +1686,10 @@ def _delivery_from_dict(data: dict[str, Any]) -> DeliveryItem:
 
 
 class SessionRegistry:
-    def __init__(self, *, now: Callable[[], float] = time.time, lease_ttl: float = 30.0):
+    def __init__(self, *, now: Callable[[], float] = time.time):
         self._now = now
-        self._lease_ttl = lease_ttl
         self._sessions: dict[str, Session] = {}
         self._binding_to_session: dict[BindingKey, str] = {}
-        self._pending: dict[str, PendingBinding] = {}
-        self._pending_by_binding: dict[BindingKey, str] = {}
         self._takeovers: dict[str, TakeoverTransaction] = {}
 
     def get(self, session_id: str) -> Session:
@@ -1874,39 +1847,49 @@ class SessionRegistry:
             session.archive_reason = reason
         return ControlResult(True, state="archived")
 
-    def add_pending_binding(self, *, pending_key: str, binding: ChannelBinding, cwd: str) -> str:
-        pending = PendingBinding(
-            pending_key=pending_key,
-            binding=binding,
-            cwd=cwd,
-            created_at=self._now(),
-        )
-        self._pending[pending_key] = pending
-        self._pending_by_binding[binding.key()] = pending_key
-        return pending_key
+    def prune_stopped_sessions(self, *, referenced: set[str]) -> list[str]:
+        """Drop stopped sessions past their retention window (see
+        SESSION_REVIVABLE_RETENTION_SECONDS); ``referenced`` ids are kept.
 
-    def resolve_pending_by_binding(self, key: BindingKey) -> str | None:
-        return self._pending_by_binding.get(key)
+        Removes the sessions' binding index entries and takeovers too; blocked
+        inputs live inside the session. Returns the removed session ids.
+        """
+        now = self._now()
+        removed: set[str] = set()
+        for session_id, session in self._sessions.items():
+            if session.status != "stopped" or session_id in referenced:
+                continue
+            window = (
+                SESSION_REVIVABLE_RETENTION_SECONDS
+                if _session_revivable_from_topic(session)
+                else SESSION_FINAL_RETENTION_SECONDS
+            )
+            if now - _session_last_activity(session) >= window:
+                removed.add(session_id)
+        if not removed:
+            return []
+        for session_id in removed:
+            del self._sessions[session_id]
+        self._binding_to_session = {
+            key: session_id
+            for key, session_id in self._binding_to_session.items()
+            if session_id not in removed
+        }
+        self._takeovers = {
+            takeover_id: tx
+            for takeover_id, tx in self._takeovers.items()
+            if tx.session_id not in removed
+        }
+        return sorted(removed)
 
-    def commit_pending(
-        self,
-        pending_key: str,
-        *,
-        session_id: str,
-        transport_kind: str,
-        transport_ref: dict[str, Any],
-        owner: ActorRef,
-    ) -> Session:
-        pending = self._pending.pop(pending_key)
-        self._pending_by_binding.pop(pending.binding.key(), None)
-        return self.create_structured_session(
-            session_id=session_id,
-            binding=pending.binding,
-            transport_kind=transport_kind,
-            transport_ref=transport_ref,
-            cwd=pending.cwd,
-            owner=owner,
-        )
+    def binding_keys_by_session(self) -> dict[str, set[BindingKey]]:
+        keys: dict[str, set[BindingKey]] = {}
+        for key, session_id in self._binding_to_session.items():
+            keys.setdefault(session_id, set()).add(key)
+        for session_id, session in self._sessions.items():
+            if session.channel_binding is not None:
+                keys.setdefault(session_id, set()).add(session.channel_binding.key())
+        return keys
 
     def create_structured_session(
         self,
@@ -1920,15 +1903,6 @@ class SessionRegistry:
     ) -> Session:
         sid = session_id or f"sess-{uuid.uuid4().hex}"
         now = self._now()
-        lease = WriterLease(
-            lease_id=f"lease-{uuid.uuid4().hex}",
-            session_id=sid,
-            generation=0,
-            owner_kind="orchestrator",
-            holder_ref={"transport_kind": transport_kind},
-            heartbeat_at=now,
-            expires_at=now + self._lease_ttl,
-        )
         session = Session(
             schema_version=1,
             session_id=sid,
@@ -1943,7 +1917,6 @@ class SessionRegistry:
                 actor_id=owner.actor_id,
                 acquired_at=now,
             ),
-            writer_lease=lease,
             generation=0,
             running_since=now,
             last_progress_at=now,
@@ -1978,7 +1951,6 @@ class SessionRegistry:
                 external_ref=dict(external_ref),
                 acquired_at=now,
             ),
-            writer_lease=None,
             generation=0,
             last_progress_at=now,
             last_progress_event="external_tui.observed",
@@ -2006,8 +1978,8 @@ class SessionRegistry:
         # the generation fence above, the external-TUI ownership check, and
         # the transport's atomic close-old→verify-dead→create-new resume
         # barrier; worker liveness is proven by the submit itself
-        # (TransportUnavailable → resume fallback). The lease stays as
-        # bookkeeping only.
+        # (TransportUnavailable → resume fallback). The lease itself was
+        # write-only after that and has been removed from the state model.
         return SubmitResult(True)
 
     def acquire_structured_writer(
@@ -2032,15 +2004,6 @@ class SessionRegistry:
             transport_kind=transport_kind,
             actor_id=owner.actor_id,
             acquired_at=now,
-        )
-        session.writer_lease = WriterLease(
-            lease_id=f"lease-{uuid.uuid4().hex}",
-            session_id=session.session_id,
-            generation=session.generation,
-            owner_kind="orchestrator",
-            holder_ref={"transport_kind": transport_kind},
-            heartbeat_at=now,
-            expires_at=now + self._lease_ttl,
         )
         session.last_progress_at = now
         session.last_progress_event = "writer.reacquired"
@@ -2075,7 +2038,6 @@ class SessionRegistry:
         session.stop_reason = ""
         session.lifecycle_state = "IDLE"
         session.writer_owner = None
-        session.writer_lease = None
         session.background_tasks = []
         session.last_progress_at = now
         session.last_progress_event = "session.revived_by_channel"
@@ -2096,7 +2058,6 @@ class SessionRegistry:
         session.stop_reason = "revive_failed"
         session.lifecycle_state = "STOPPED"
         session.writer_owner = None
-        session.writer_lease = None
         session.last_progress_at = self._now()
         session.last_progress_event = "session.revive_failed"
 
@@ -2129,7 +2090,6 @@ class SessionRegistry:
             external_ref=ref,
             acquired_at=now,
         )
-        session.writer_lease = None
         session.last_progress_at = now
         session.last_progress_event = "external_tui.claimed"
         return SubmitResult(True)
@@ -2141,7 +2101,6 @@ class SessionRegistry:
         actor: ActorRef,
         turn: TurnInput,
         generation: int,
-        ttl: float = 600.0,
     ) -> SubmitResult:
         session = self._sessions[session_id]
         if generation != session.generation:
@@ -2159,7 +2118,6 @@ class SessionRegistry:
             idempotency_key=f"blocked:{blocked_id}",
             state="blocked",
             created_at=now,
-            expires_at=now + ttl,
         )
         return SubmitResult(False, BlockedReason.EXTERNAL_TUI_READONLY, blocked_input_id=blocked_id)
 
@@ -2195,7 +2153,6 @@ class SessionRegistry:
         *,
         requested_by: ActorRef,
         generation: int,
-        ttl: float = 600.0,
     ) -> TakeoverTransaction:
         session = self._require_takeover_session(session_id, generation)
         existing = self._find_takeover_only_transaction(session_id, generation)
@@ -2212,7 +2169,6 @@ class SessionRegistry:
             idempotency_key=f"takeover-only:{blocked_id}",
             state="blocked",
             created_at=now,
-            expires_at=now + ttl,
             submit_after_takeover=False,
         )
         tx = TakeoverTransaction(
@@ -2303,15 +2259,6 @@ class SessionRegistry:
             actor_id=(tx.approved_by or tx.requested_by).actor_id,
             acquired_at=now,
         )
-        session.writer_lease = WriterLease(
-            lease_id=f"lease-{uuid.uuid4().hex}",
-            session_id=session.session_id,
-            generation=new_generation,
-            owner_kind="orchestrator",
-            holder_ref={"transport_kind": transport_kind},
-            heartbeat_at=now,
-            expires_at=now + self._lease_ttl,
-        )
         session.generation = new_generation
         session.last_progress_at = now
         session.last_progress_event = "takeover.completed"
@@ -2335,19 +2282,9 @@ class SessionRegistry:
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "lease_ttl": self._lease_ttl,
             "sessions": {key: _session_to_dict(value) for key, value in self._sessions.items()},
             "binding_to_session": {
                 json.dumps(list(key)): value for key, value in self._binding_to_session.items()
-            },
-            "pending": {
-                key: {
-                    "pending_key": value.pending_key,
-                    "binding": _binding_to_dict(value.binding),
-                    "cwd": value.cwd,
-                    "created_at": value.created_at,
-                }
-                for key, value in self._pending.items()
             },
             "takeovers": {key: self._takeover_to_dict(value) for key, value in self._takeovers.items()},
         }
@@ -2359,7 +2296,9 @@ class SessionRegistry:
         *,
         now: Callable[[], float] = time.time,
     ) -> "SessionRegistry":
-        registry = cls(now=now, lease_ttl=float(data.get("lease_ttl", 30.0)))
+        # Files written before v0.14.36 also carry "lease_ttl" and "pending"
+        # (the retired writer-lease and pending-binding bookkeeping): ignored.
+        registry = cls(now=now)
         registry._sessions = {
             str(key): _session_from_dict(value)
             for key, value in data.get("sessions", {}).items()
@@ -2378,20 +2317,6 @@ class SessionRegistry:
                 for session_id, session in registry._sessions.items()
                 if session.channel_binding is not None
             }
-        for key, value in data.get("pending", {}).items():
-            if not isinstance(value, dict):
-                continue
-            binding = _binding_from_dict(value.get("binding"))
-            if binding is None:
-                continue
-            pending = PendingBinding(
-                pending_key=str(value.get("pending_key", key)),
-                binding=binding,
-                cwd=str(value.get("cwd", "")),
-                created_at=float(value.get("created_at", 0.0)),
-            )
-            registry._pending[pending.pending_key] = pending
-            registry._pending_by_binding[binding.key()] = pending.pending_key
         registry._takeovers = {
             str(key): cls._takeover_from_dict(value)
             for key, value in data.get("takeovers", {}).items()
@@ -2453,7 +2378,6 @@ class InteractionContext:
     high_risk: bool = False
     kind: str = "permission"
     questions: list[dict[str, Any]] = field(default_factory=list)
-    current_index: int = 0
     answers: dict[int, Any] = field(default_factory=dict)
     awaiting_other: dict[str, Any] | None = None
     decision: dict[str, Any] | None = None
@@ -2773,6 +2697,9 @@ class InteractionStore:
     def token_count(self) -> int:
         return len(self._tokens)
 
+    def undecided_session_ids(self) -> set[str]:
+        return {ctx.session_id for ctx in self._interactions.values() if ctx.decision is None}
+
     def awaiting_other_count(self) -> int:
         return len(self._awaiting_other_by_binding)
 
@@ -3022,7 +2949,6 @@ class InteractionStore:
             "high_risk": ctx.high_risk,
             "kind": ctx.kind,
             "questions": [dict(question) for question in ctx.questions],
-            "current_index": ctx.current_index,
             "answers": {str(key): value for key, value in ctx.answers.items()},
             "awaiting_other": dict(ctx.awaiting_other) if ctx.awaiting_other else None,
             "decision": dict(ctx.decision) if ctx.decision else None,
@@ -3048,7 +2974,6 @@ class InteractionStore:
             high_risk=bool(data.get("high_risk", False)),
             kind=str(data.get("kind", "permission")),
             questions=[dict(question) for question in data.get("questions", []) if isinstance(question, dict)],
-            current_index=int(data.get("current_index", 0)),
             answers={int(key): value for key, value in data.get("answers", {}).items()},
             awaiting_other=dict(data["awaiting_other"]) if isinstance(data.get("awaiting_other"), dict) else None,
             decision=dict(data["decision"]) if isinstance(data.get("decision"), dict) else None,
@@ -3546,6 +3471,9 @@ class DurableOutbox:
 
     def sent_count(self) -> int:
         return len(self._sent)
+
+    def pending_binding_keys(self) -> set[BindingKey]:
+        return {tuple(item.channel_binding_key) for item in self._pending.values()}  # type: ignore[misc]
 
     def pending_items(self) -> list[DeliveryItem]:
         now = self._now()
@@ -9538,23 +9466,14 @@ class HitlRequest:
     transport_kind: str
     transport_request_id: str
     native_method: str
-    native_params: dict[str, Any]
     prompt_kind: str
     created_at: float
     expires_at: float
     status: str = "pending"
-    channel_binding_key: BindingKey | None = None
+    # Read by the gate card retire path (v0.14.34) to close the matching card.
     interaction_id: str = ""
-
-
-@dataclass
-class HitlDecision:
-    hitl_request_id: str
-    actor: ActorRef
-    action: str
-    native_response: dict[str, Any]
-    decided_at: float
-    delivery_status: str
+    # When the request was answered; the retention clock for "decided".
+    decided_at: float = 0.0
 
 
 class HitlStore:
@@ -9570,7 +9489,6 @@ class HitlStore:
         self._decided_retention = decided_retention
         self._requests: dict[str, HitlRequest] = {}
         self._by_transport: dict[tuple[str, str, str], str] = {}
-        self._decisions: dict[str, HitlDecision] = {}
 
     def register_request(
         self,
@@ -9580,9 +9498,7 @@ class HitlStore:
         transport_kind: str,
         transport_request_id: str,
         native_method: str,
-        native_params: dict[str, Any],
         prompt_kind: str,
-        channel_binding_key: BindingKey | None = None,
     ) -> HitlRequest:
         key = (session_id, transport_kind, transport_request_id)
         existing_id = self._by_transport.get(key)
@@ -9598,11 +9514,9 @@ class HitlStore:
             transport_kind=transport_kind,
             transport_request_id=transport_request_id,
             native_method=native_method,
-            native_params=dict(native_params),
             prompt_kind=prompt_kind,
             created_at=now,
             expires_at=now + self._request_ttl,
-            channel_binding_key=channel_binding_key,
         )
         self._requests[request.hitl_request_id] = request
         self._by_transport[key] = request.hitl_request_id
@@ -9616,6 +9530,9 @@ class HitlStore:
     def get(self, hitl_request_id: str) -> HitlRequest:
         return self._requests[hitl_request_id]
 
+    def pending_session_ids(self) -> set[str]:
+        return {request.session_id for request in self._requests.values() if request.status == "pending"}
+
     def pending_for_session(self, session_id: str) -> list[HitlRequest]:
         now = self._now()
         return [
@@ -9626,27 +9543,10 @@ class HitlStore:
             and request.expires_at > now
         ]
 
-    def mark_decided(
-        self,
-        hitl_request_id: str,
-        *,
-        actor: ActorRef,
-        action: str,
-        native_response: dict[str, Any],
-        delivery_status: str,
-    ) -> HitlDecision:
+    def mark_decided(self, hitl_request_id: str) -> None:
         request = self._requests[hitl_request_id]
         request.status = "decided"
-        decision = HitlDecision(
-            hitl_request_id=hitl_request_id,
-            actor=actor,
-            action=action,
-            native_response=dict(native_response),
-            decided_at=self._now(),
-            delivery_status=delivery_status,
-        )
-        self._decisions[hitl_request_id] = decision
-        return decision
+        request.decided_at = self._now()
 
     def mark_pending_for_session_stale(
         self,
@@ -9662,21 +9562,19 @@ class HitlStore:
             stale.append(request)
         return stale
 
-    def decision_for(self, hitl_request_id: str) -> HitlDecision | None:
-        return self._decisions.get(hitl_request_id)
-
     def compact(self) -> dict[str, int]:
         now = self._now()
         removed_requests = 0
         for hitl_id, request in list(self._requests.items()):
-            decided = self._decisions.get(hitl_id)
             if request.status == "pending" and request.expires_at <= now:
                 request.status = "expired"
             if request.status in {"decided", "stale", "expired"}:
-                reference_time = decided.decided_at if decided is not None else request.expires_at
+                # Requests decided before v0.14.36 carry no decided_at; they
+                # were answered before expiring, so expires_at is a later,
+                # still bounded, reference.
+                reference_time = request.decided_at or request.expires_at
                 if reference_time + self._decided_retention <= now:
                     self._requests.pop(hitl_id, None)
-                    self._decisions.pop(hitl_id, None)
                     self._by_transport.pop(
                         (request.session_id, request.transport_kind, request.transport_request_id),
                         None,
@@ -9691,10 +9589,6 @@ class HitlStore:
             "requests": {
                 hitl_id: self._request_to_dict(request)
                 for hitl_id, request in self._requests.items()
-            },
-            "decisions": {
-                hitl_id: self._decision_to_dict(decision)
-                for hitl_id, decision in self._decisions.items()
             },
         }
 
@@ -9715,11 +9609,9 @@ class HitlStore:
             for hitl_id, value in data.get("requests", {}).items()
             if isinstance(value, dict)
         }
-        store._decisions = {
-            str(hitl_id): cls._decision_from_dict(value)
-            for hitl_id, value in data.get("decisions", {}).items()
-            if isinstance(value, dict)
-        }
+        # Files written before v0.14.36 also carry "decisions" (a write-only
+        # copy of each answer) and per-request native_params /
+        # channel_binding_key: ignored.
         for hitl_id, request in store._requests.items():
             store._by_transport[
                 (request.session_id, request.transport_kind, request.transport_request_id)
@@ -9735,21 +9627,16 @@ class HitlStore:
             "transport_kind": request.transport_kind,
             "transport_request_id": request.transport_request_id,
             "native_method": request.native_method,
-            "native_params": dict(request.native_params),
             "prompt_kind": request.prompt_kind,
             "created_at": request.created_at,
             "expires_at": request.expires_at,
             "status": request.status,
-            "channel_binding_key": list(request.channel_binding_key) if request.channel_binding_key else None,
             "interaction_id": request.interaction_id,
+            "decided_at": request.decided_at,
         }
 
     @staticmethod
     def _request_from_dict(data: dict[str, Any]) -> HitlRequest:
-        raw_binding = data.get("channel_binding_key")
-        binding_key: BindingKey | None = None
-        if isinstance(raw_binding, list) and len(raw_binding) == 5:
-            binding_key = tuple(str(part) for part in raw_binding)  # type: ignore[assignment]
         return HitlRequest(
             hitl_request_id=str(data.get("hitl_request_id", "")),
             session_id=str(data.get("session_id", "")),
@@ -9757,35 +9644,12 @@ class HitlStore:
             transport_kind=str(data.get("transport_kind", "")),
             transport_request_id=str(data.get("transport_request_id", "")),
             native_method=str(data.get("native_method", "")),
-            native_params=dict(data.get("native_params", {})),
             prompt_kind=str(data.get("prompt_kind", "")),
             created_at=float(data.get("created_at", 0.0)),
             expires_at=float(data.get("expires_at", 0.0)),
             status=str(data.get("status", "pending")),
-            channel_binding_key=binding_key,
             interaction_id=str(data.get("interaction_id", "")),
-        )
-
-    @staticmethod
-    def _decision_to_dict(decision: HitlDecision) -> dict[str, Any]:
-        return {
-            "hitl_request_id": decision.hitl_request_id,
-            "actor": _actor_to_dict(decision.actor),
-            "action": decision.action,
-            "native_response": dict(decision.native_response),
-            "decided_at": decision.decided_at,
-            "delivery_status": decision.delivery_status,
-        }
-
-    @staticmethod
-    def _decision_from_dict(data: dict[str, Any]) -> HitlDecision:
-        return HitlDecision(
-            hitl_request_id=str(data.get("hitl_request_id", "")),
-            actor=_actor_from_dict(data.get("actor")) or ActorRef("", ""),
-            action=str(data.get("action", "")),
-            native_response=dict(data.get("native_response", {})),
-            decided_at=float(data.get("decided_at", 0.0)),
-            delivery_status=str(data.get("delivery_status", "")),
+            decided_at=float(data.get("decided_at", 0.0) or 0.0),
         )
 
 
@@ -9797,6 +9661,26 @@ class StateSnapshot:
     authz: AuthorizationStore
     inbound_ledger: InboundLedger
     hitls: HitlStore = field(default_factory=HitlStore)
+
+
+def compact_sessions(state: StateSnapshot) -> dict[str, int]:
+    """Session retention pass; run after the other stores' compaction.
+
+    A session stays while anything still points at it: an undelivered outbox
+    item for one of its bindings, an undecided interaction, or a pending HITL
+    request. Its grants go with it.
+    """
+    referenced = state.interactions.undecided_session_ids() | state.hitls.pending_session_ids()
+    pending_keys = state.outbox.pending_binding_keys()
+    if pending_keys:
+        referenced |= {
+            session_id
+            for session_id, keys in state.sessions.binding_keys_by_session().items()
+            if keys & pending_keys
+        }
+    removed = state.sessions.prune_stopped_sessions(referenced=referenced)
+    state.authz.drop_sessions(removed)
+    return {"sessions": len(removed)}
 
 
 def _atomic_write_json(path: Path, payload: Any) -> None:
@@ -9819,25 +9703,60 @@ def _atomic_write_json(path: Path, payload: Any) -> None:
             Path(tmp_name).unlink(missing_ok=True)
 
 
+# A temp file older than this next to the state file cannot belong to a
+# writer still in progress (a full save takes milliseconds).
+STALE_STATE_TEMP_SECONDS = 60.0
+
+
 class JsonFileStateStore:
     def __init__(self, path: str | Path, *, now: Callable[[], float] = time.time):
         self.path = Path(path).expanduser()
         self._now = now
+        # True while the in-memory snapshot holds changes the last save
+        # attempt failed to persist. Callers that must not act on unsaved
+        # state (dropping a replayable queue file) check it.
+        self.last_save_failed = False
 
     def save(self, snapshot: StateSnapshot) -> None:
         # Whole snapshots only: saving from loose components let a caller
         # omit one (the debug repair commands dropped hitls) and silently
         # persist it as empty.
-        payload = {
-            "schema_version": 1,
-            "sessions": snapshot.sessions.to_dict(),
-            "interactions": snapshot.interactions.to_dict(),
-            "outbox": snapshot.outbox.to_dict(),
-            "authz": snapshot.authz.to_dict(),
-            "inbound_ledger": snapshot.inbound_ledger.to_dict(),
-            "hitls": snapshot.hitls.to_dict(),
-        }
-        _atomic_write_json(self.path, payload)
+        try:
+            payload = {
+                "schema_version": 1,
+                "sessions": snapshot.sessions.to_dict(),
+                "interactions": snapshot.interactions.to_dict(),
+                "outbox": snapshot.outbox.to_dict(),
+                "authz": snapshot.authz.to_dict(),
+                "inbound_ledger": snapshot.inbound_ledger.to_dict(),
+                "hitls": snapshot.hitls.to_dict(),
+            }
+            _atomic_write_json(self.path, payload)
+        except BaseException:
+            self.last_save_failed = True
+            raise
+        self.last_save_failed = False
+
+    def sweep_stale_temp_files(self, *, min_age: float = STALE_STATE_TEMP_SECONDS) -> int:
+        """Delete temp files a killed writer left next to the state file.
+
+        ``_atomic_write_json`` removes its temp file on any exception, but a
+        SIGKILL mid-write skips that cleanup. Only files older than
+        ``min_age`` (wall clock, like mtime) are removed, so another
+        process's in-flight save is never touched.
+        """
+        cutoff = time.time() - min_age
+        removed = 0
+        for path in self.path.parent.glob(f".{self.path.name}.*.tmp"):
+            try:
+                if path.stat().st_mtime < cutoff:
+                    path.unlink()
+                    removed += 1
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                _log_degrade("state_temp_sweep_failed", path=str(path), error=exc)
+        return removed
 
     def load(self) -> StateSnapshot:
         with self.path.open("r", encoding="utf-8") as f:
@@ -9846,7 +9765,7 @@ class JsonFileStateStore:
             sessions=SessionRegistry.from_dict(payload.get("sessions", {}), now=self._now),
             interactions=InteractionStore.from_dict(payload.get("interactions", {}), now=self._now),
             outbox=DurableOutbox.from_dict(payload.get("outbox", {}), now=self._now),
-            authz=AuthorizationStore.from_dict(payload.get("authz", {}), now=self._now),
+            authz=AuthorizationStore.from_dict(payload.get("authz", {})),
             inbound_ledger=InboundLedger.from_dict(payload.get("inbound_ledger", {}), now=self._now),
             hitls=HitlStore.from_dict(payload.get("hitls", {}), now=self._now),
         )
@@ -10290,7 +10209,6 @@ class Orchestrator:
                 session.last_progress_at = self._now()
                 session.last_progress_event = "turn.event_drain_failed"
                 session.lifecycle_state = "ERROR_RECOVERABLE"
-                session.writer_lease = None
                 await self._send_session_view(
                     session,
                     {
@@ -10681,7 +10599,6 @@ class Orchestrator:
         session.status = "stopped"
         session.lifecycle_state = "STOPPED"
         session.stop_reason = reason
-        session.writer_lease = None
         session.writer_owner = WriterOwner(kind="none")
         # The worker (and its subagents) die with the close; a stopped card
         # must not keep advertising background work.
@@ -11629,13 +11546,7 @@ class Orchestrator:
                 await self._notify_interaction_delivery_failure(inbound, session, ctx, exc)
                 return SubmitResult(False, BlockedReason.NOT_FOUND)
             if ctx.hitl_request_id:
-                self.hitls.mark_decided(
-                    ctx.hitl_request_id,
-                    actor=actor,
-                    action=str(approval_decision.get("action", "")),
-                    native_response=approval_decision,
-                    delivery_status=DeliveryStatus.SENT,
-                )
+                self.hitls.mark_decided(ctx.hitl_request_id)
             await self._flip_decided_card(
                 inbound,
                 kind="permission",
@@ -12455,13 +12366,7 @@ class Orchestrator:
                 answers,
             )
             if ctx.hitl_request_id:
-                self.hitls.mark_decided(
-                    ctx.hitl_request_id,
-                    actor=actor,
-                    action="answers",
-                    native_response=answers,
-                    delivery_status=DeliveryStatus.SENT,
-                )
+                self.hitls.mark_decided(ctx.hitl_request_id)
             return
         if action == "incomplete":
             # Submit arrived with unanswered questions: keep the card open and
@@ -12952,7 +12857,6 @@ class Orchestrator:
             session.last_progress_at = self._now()
             session.last_progress_event = "turn.event_stream_incomplete"
             session.lifecycle_state = "ERROR_RECOVERABLE"
-            session.writer_lease = None
 
     async def _upsert_tool_progress_view(
         self,
@@ -13101,7 +13005,6 @@ class Orchestrator:
         elif event.type == AgentEventType.TURN_COMPLETED:
             session.lifecycle_state = "IDLE"
             self._record_durable_resume_ref(session, event)
-            session.writer_lease = None
         elif event.type == AgentEventType.SESSION_ERROR:
             session.lifecycle_state = "ERROR_RECOVERABLE"
 
@@ -13180,17 +13083,13 @@ class Orchestrator:
                     or tool_input.get("native_method")
                     or "permission.requested"
                 )
-                native_params = dict(event.payload)
-                native_params["tool_input"] = dict(tool_input)
                 hitl_request = self.hitls.register_request(
                     session_id=session.session_id,
                     generation=session.generation,
                     transport_kind=session.transport_kind,
                     transport_request_id=transport_request_id,
                     native_method=native_method,
-                    native_params=native_params,
                     prompt_kind="permission",
-                    channel_binding_key=session.channel_binding.key() if session.channel_binding else None,
                 )
             ctx = self.interactions.register_permission(
                 session_id=session.session_id,
@@ -13218,17 +13117,13 @@ class Orchestrator:
             )
             hitl_request = None
             if transport_request_id:
-                native_params = dict(event.payload)
-                native_params["questions"] = [dict(question) for question in valid_questions]
                 hitl_request = self.hitls.register_request(
                     session_id=session.session_id,
                     generation=session.generation,
                     transport_kind=session.transport_kind,
                     transport_request_id=transport_request_id,
                     native_method=str(event.payload.get("native_method") or "ask_user.requested"),
-                    native_params=native_params,
                     prompt_kind="ask_user_question",
-                    channel_binding_key=session.channel_binding.key() if session.channel_binding else None,
                 )
             ctx = self.interactions.register_ask_user_question(
                 session_id=session.session_id,
@@ -13306,7 +13201,6 @@ __all__ = [
     "FakeChannelAdapter",
     "FakeExternalTuiController",
     "HANDOFF_CONTINUE_PROMPT",
-    "HitlDecision",
     "HitlRequest",
     "HitlStore",
     "InboundEvent",
@@ -13340,7 +13234,6 @@ __all__ = [
     "TransientDeliveryError",
     "TurnInput",
     "ViewModelFactory",
-    "WriterLease",
     "WriterOwner",
     "render_view_text",
 ]

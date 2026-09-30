@@ -129,7 +129,7 @@ class PersistenceTests(unittest.TestCase):
             view_model={"type": "text", "text": "pending"},
             idempotency_key="k1",
         )
-        authz = AuthorizationStore(now=clock)
+        authz = AuthorizationStore()
         authz.grant(structured.session_id, _actor("owner"), SessionRole.OWNER)
         ledger = InboundLedger(now=clock)
         self.assertTrue(ledger.record("evt-1"))
@@ -140,18 +140,10 @@ class PersistenceTests(unittest.TestCase):
             transport_kind=structured.transport_kind,
             transport_request_id="approval-1",
             native_method="item/commandExecution/requestApproval",
-            native_params={"command": "pwd"},
             prompt_kind="permission",
-            channel_binding_key=_binding().key(),
         )
         hitls.attach_interaction(hitl.hitl_request_id, ctx.interaction_id)
-        hitls.mark_decided(
-            hitl.hitl_request_id,
-            actor=_actor("owner"),
-            action="accept",
-            native_response={"decision": "accept"},
-            delivery_status=DeliveryStatus.SENT,
-        )
+        hitls.mark_decided(hitl.hitl_request_id)
 
         with tempfile.TemporaryDirectory() as tmp:
             store = JsonFileStateStore(Path(tmp) / "state.json", now=clock)
@@ -169,7 +161,7 @@ class PersistenceTests(unittest.TestCase):
 
         restored_structured = restored.sessions.get(structured.session_id)
         restored_observed = restored.sessions.get(observed.session_id)
-        self.assertEqual(restored_structured.writer_lease.lease_id, structured.writer_lease.lease_id)
+        self.assertEqual(restored_structured.writer_owner.kind, "orchestrator")
         self.assertEqual(
             restored_observed.blocked_inputs[blocked.blocked_input_id].text,
             "blocked",
@@ -187,10 +179,7 @@ class PersistenceTests(unittest.TestCase):
         restored_hitl = restored.hitls.get(hitl.hitl_request_id)
         self.assertEqual(restored_hitl.status, "decided")
         self.assertEqual(restored_hitl.interaction_id, ctx.interaction_id)
-        self.assertEqual(
-            restored.hitls.decision_for(hitl.hitl_request_id).native_response,
-            {"decision": "accept"},
-        )
+        self.assertEqual(restored_hitl.decided_at, clock())
 
     def test_state_snapshot_round_trips_retention_metadata(self):
         clock = _Clock()
@@ -223,7 +212,7 @@ class PersistenceTests(unittest.TestCase):
                     sessions=sessions,
                     interactions=interactions,
                     outbox=outbox,
-                    authz=AuthorizationStore(now=clock),
+                    authz=AuthorizationStore(),
                     inbound_ledger=InboundLedger(now=clock),
                 )
             )
@@ -606,3 +595,284 @@ class TelegramHttpTests(unittest.TestCase):
         self.assertLess(elapsed, 0.04)
         self.assertNotEqual(thread_ids[0], main_thread)
         self.assertEqual(result["result"]["message_id"], 1)
+
+
+_DAY = 86400.0
+_FIXTURE = Path(__file__).parent / "data" / "state_pre_v0_14_36.json"
+
+
+def _empty_state(clock, sessions, authz=None) -> StateSnapshot:
+    return StateSnapshot(
+        sessions=sessions,
+        interactions=InteractionStore(now=clock),
+        outbox=DurableOutbox(now=clock),
+        authz=authz or AuthorizationStore(),
+        inbound_ledger=InboundLedger(now=clock),
+        hitls=HitlStore(now=clock),
+    )
+
+
+class OldStateCompatibilityTests(unittest.TestCase):
+    """v0.14.36 dropped write-only keys; live files written before it still
+    carry them and must keep loading (the fixture copies their structure)."""
+
+    RETIRED_SESSION_KEYS = {"writer_lease", "interrupt_reason"}
+
+    def test_pre_v0_14_36_state_file_loads_and_rewrites_without_retired_keys(self):
+        head_id = "sess-" + "a" * 32
+        tui_id = "tui-claude-" + "b" * 12
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "state.json"
+            path.write_text(_FIXTURE.read_text(encoding="utf-8"), encoding="utf-8")
+            store = JsonFileStateStore(path, now=_Clock(1790000100.0))
+            loaded = store.load()
+
+            head = loaded.sessions.get(head_id)
+            tui = loaded.sessions.get(tui_id)
+            self.assertEqual(head.writer_owner.kind, "orchestrator")
+            self.assertEqual(tui.stop_reason, "external_tui_process_gone")
+            [blocked] = tui.blocked_inputs.values()
+            self.assertEqual(blocked.text, "synthetic blocked message")
+            self.assertEqual(loaded.sessions.resolve_binding(tui.channel_binding.key()), tui_id)
+            owner = ActorRef("lark", "ou_owner")
+            self.assertEqual(loaded.authz.role_for(tui_id, owner), SessionRole.OWNER)
+            [hitl] = loaded.hitls.to_dict()["requests"].values()
+            self.assertEqual(hitl["interaction_id"], "int-" + "f" * 32)
+            self.assertEqual(hitl["status"], "decided")
+            [interaction] = loaded.interactions.to_dict()["interactions"].values()
+            self.assertEqual(interaction["answers"], {"0": "yes"})
+
+            store.save(loaded)
+            rewritten = json.loads(path.read_text(encoding="utf-8"))
+            reloaded = store.load()
+
+        self.assertNotIn("audit", rewritten["authz"])
+        self.assertEqual(len(rewritten["authz"]["grants"]), 2)
+        self.assertNotIn("lease_ttl", rewritten["sessions"])
+        self.assertNotIn("pending", rewritten["sessions"])
+        for session in rewritten["sessions"]["sessions"].values():
+            self.assertFalse(self.RETIRED_SESSION_KEYS & set(session))
+            self.assertNotIn("subscribed", session["channel_binding"])
+            for blocked in session["blocked_inputs"].values():
+                self.assertNotIn("expires_at", blocked)
+        self.assertNotIn("decisions", rewritten["hitls"])
+        for request in rewritten["hitls"]["requests"].values():
+            self.assertNotIn("native_params", request)
+            self.assertNotIn("channel_binding_key", request)
+        for interaction in rewritten["interactions"]["interactions"].values():
+            self.assertNotIn("current_index", interaction)
+        # The rewrite is lossless for everything still modelled.
+        self.assertEqual(reloaded.sessions.to_dict(), loaded.sessions.to_dict())
+        self.assertEqual(reloaded.hitls.to_dict(), loaded.hitls.to_dict())
+        self.assertEqual(reloaded.authz.to_dict(), loaded.authz.to_dict())
+
+    def test_grants_no_longer_accumulate_an_audit_log(self):
+        authz = AuthorizationStore()
+        for _ in range(3):
+            authz.grant("s1", _actor("owner"), SessionRole.OWNER)
+        self.assertEqual(
+            authz.to_dict(),
+            {"grants": [{"session_id": "s1", "channel_kind": "telegram", "actor_id": "owner", "role": "owner"}]},
+        )
+
+    def test_decided_hitl_without_decided_at_is_retained_from_expiry(self):
+        clock = _Clock()
+        hitls = HitlStore(now=clock, request_ttl=100.0, decided_retention=50.0)
+        request = hitls.register_request(
+            session_id="s1",
+            generation=1,
+            transport_kind="claude_headless",
+            transport_request_id="rid",
+            native_method="can_use_tool",
+            prompt_kind="permission",
+        )
+        request.status = "decided"  # an old file's decided request: decided_at == 0
+        clock.now += 149.0
+        self.assertEqual(hitls.compact(), {"requests": 0})
+        clock.now += 1.0
+        self.assertEqual(hitls.compact(), {"requests": 1})
+
+
+class SessionRetentionTests(unittest.TestCase):
+    def setUp(self):
+        self.clock = _Clock(1_800_000_000.0)
+        self.sessions = SessionRegistry(now=self.clock)
+        self.authz = AuthorizationStore()
+        self.state = _empty_state(self.clock, self.sessions, self.authz)
+
+    @staticmethod
+    def _binding(name: str) -> ChannelBinding:
+        return ChannelBinding("lark", "bot", "chat", f"omt_{name}", f"om_{name}")
+
+    def _tui(self, name: str, *, resume: bool = True):
+        ref = {"source": "native_tui_hook"}
+        if resume:
+            ref["resume_ref"] = {"agent_session_id": f"agent-{name}", "transport_kind": "claude_headless"}
+        session = self.sessions.create_observed_session(
+            session_id=f"tui-{name}",
+            binding=self._binding(name),
+            cwd="/tmp",
+            external_ref=ref,
+            owner=_actor("owner"),
+        )
+        session.status = "stopped"
+        session.stop_reason = "external_tui_process_gone"
+        self.authz.grant(session.session_id, _actor("owner"), SessionRole.OWNER)
+        return session
+
+    def _headless(self, name: str, *, agent_id: str = "agent-x", stop_reason: str = "runtime_restart"):
+        ref = {"handle_id": f"h-{name}"}
+        if agent_id:
+            ref["agent_session_id"] = agent_id
+        session = self.sessions.create_structured_session(
+            session_id=f"sess-{name}",
+            binding=self._binding(name),
+            transport_kind="claude_headless",
+            transport_ref=ref,
+            cwd="/tmp",
+            owner=_actor("owner"),
+        )
+        if stop_reason:
+            session.status = "stopped"
+            session.stop_reason = stop_reason
+        self.authz.grant(session.session_id, _actor("owner"), SessionRole.OWNER)
+        return session
+
+    def _compact(self, days: float) -> set[str]:
+        from walkcode.channel_native import compact_sessions
+
+        self.clock.now += days * _DAY
+        before = {s.session_id for s in self.sessions.iter_sessions()}
+        removed = compact_sessions(self.state)["sessions"]
+        after = {s.session_id for s in self.sessions.iter_sessions()}
+        self.assertEqual(len(before - after), removed)
+        return before - after
+
+    def test_revivable_sessions_get_the_long_window(self):
+        # ADR 0054 revival candidate + TUI session resumable via takeover.
+        tui = self._tui("tui")
+        revivable = self._headless("revive")
+        self.assertEqual(self._compact(30), set())
+        self.assertEqual(self._compact(59.9), set())
+        self.assertEqual(self._compact(0.1), {tui.session_id, revivable.session_id})
+
+    def test_sessions_that_can_never_continue_get_the_short_window(self):
+        no_ref_tui = self._tui("noref", resume=False)
+        no_ref_headless = self._headless("noref-h", agent_id="")
+        archived = self._tui("archived")
+        archived.archived_at = self.clock.now
+        topicless = self._tui("topicless")
+        topicless.channel_binding = None
+        kept = self._tui("kept")
+        self.assertEqual(self._compact(6.9), set())
+        self.assertEqual(
+            self._compact(0.1),
+            {no_ref_tui.session_id, no_ref_headless.session_id, archived.session_id, topicless.session_id},
+        )
+        self.assertIn(kept.session_id, {s.session_id for s in self.sessions.iter_sessions()})
+
+    def test_running_sessions_are_never_pruned(self):
+        running = self._headless("running", stop_reason="")
+        self.assertEqual(self._compact(365), set())
+        self.assertEqual(self.sessions.get(running.session_id).status, "running")
+
+    def test_pruning_drops_bindings_takeovers_grants_and_blocked_inputs(self):
+        tui = self._tui("gone")
+        blocked = self.sessions.block_input(
+            tui.session_id, actor=_actor("owner"), turn=TurnInput(text="secret"), generation=tui.generation,
+        )
+        self.sessions.request_takeover(
+            tui.session_id, blocked.blocked_input_id, requested_by=_actor("owner"), generation=tui.generation,
+        )
+        other = self._tui("other")
+        other.last_progress_at = self.clock.now + 80 * _DAY
+
+        self.assertEqual(self._compact(91), {tui.session_id})
+
+        data = self.sessions.to_dict()
+        self.assertEqual(list(data["binding_to_session"].values()), [other.session_id])
+        self.assertEqual(data["takeovers"], {})
+        self.assertEqual({g["session_id"] for g in self.authz.to_dict()["grants"]}, {other.session_id})
+        self.assertNotIn("secret", json.dumps(data))
+
+    def test_a_recent_blocked_input_counts_as_activity(self):
+        tui = self._tui("replied")
+        self.clock.now += 89 * _DAY
+        self.sessions.block_input(
+            tui.session_id, actor=_actor("owner"), turn=TurnInput(text="hi"), generation=tui.generation,
+        )
+        self.assertEqual(self._compact(2), set())
+
+    def test_still_referenced_sessions_are_kept(self):
+        outbox_ref = self._tui("outbox", resume=False)
+        interaction_ref = self._tui("interaction", resume=False)
+        hitl_ref = self._tui("hitl", resume=False)
+        self.state.outbox.enqueue(
+            channel_binding_key=outbox_ref.channel_binding.key(),
+            view_model={"type": "text", "text": "undelivered"},
+            idempotency_key="k1",
+        )
+        self.state.interactions.register_permission(
+            session_id=interaction_ref.session_id,
+            generation=0,
+            tool_name="Bash",
+            tool_input={},
+            actions=["allow"],
+            ttl=30 * _DAY,
+        )
+        self.state.hitls.register_request(
+            session_id=hitl_ref.session_id,
+            generation=0,
+            transport_kind="claude_headless",
+            transport_request_id="rid",
+            native_method="can_use_tool",
+            prompt_kind="permission",
+        )
+        self.assertEqual(self._compact(8), set())
+        # Once nothing points at them any more they go like the rest.
+        self.state.outbox.record_result(
+            next(iter(self.state.outbox.to_dict()["pending"])), DeliveryStatus.PERMANENT_FAILURE
+        )
+        for ctx in self.state.interactions._interactions.values():
+            ctx.decision = {"action": "allow"}
+        for request in self.state.hitls._requests.values():
+            request.status = "stale"
+        self.assertEqual(
+            self._compact(0), {outbox_ref.session_id, interaction_ref.session_id, hitl_ref.session_id}
+        )
+
+
+class StateTempSweepTests(unittest.TestCase):
+    def test_sweep_removes_only_stale_temp_files_of_this_state_file(self):
+        import os
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = JsonFileStateStore(root / "work-claude-state.json")
+            stale = root / ".work-claude-state.json.39n1wzuy.tmp"
+            fresh = root / ".work-claude-state.json.fresh123.tmp"
+            other = root / ".work-codex-state.json.ck7_k9fu.tmp"
+            for path in (stale, fresh, other):
+                path.write_text("{partial", encoding="utf-8")
+            old = time.time() - 3600
+            os.utime(stale, (old, old))
+            os.utime(other, (old, old))
+
+            self.assertEqual(store.sweep_stale_temp_files(), 1)
+
+            self.assertFalse(stale.exists())
+            self.assertTrue(fresh.exists())
+            self.assertTrue(other.exists())
+
+
+class StateSaveFailureTrackingTests(unittest.TestCase):
+    def test_last_save_failed_tracks_the_latest_attempt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = JsonFileStateStore(Path(tmp) / "state.json")
+            state = _empty_state(_Clock(), SessionRegistry(now=_Clock()))
+            with patch("walkcode.channel_native._atomic_write_json", side_effect=OSError("disk full")):
+                with self.assertRaises(OSError):
+                    store.save(state)
+            self.assertTrue(store.last_save_failed)
+            store.save(state)
+            self.assertFalse(store.last_save_failed)

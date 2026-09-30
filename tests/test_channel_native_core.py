@@ -272,7 +272,6 @@ class ChannelNativeCoreContractTests(unittest.TestCase):
         updated = sessions.get(session.session_id)
         self.assertTrue(result.accepted)
         self.assertEqual(updated.lifecycle_state, "IDLE")
-        self.assertIsNone(updated.writer_lease)
         self.assertEqual(updated.transport_ref["agent_session_id"], "agent-session-1")
 
     def test_incomplete_event_stream_releases_lease_as_recoverable(self):
@@ -311,7 +310,6 @@ class ChannelNativeCoreContractTests(unittest.TestCase):
         self.assertTrue(result.accepted)
         self.assertEqual(updated.lifecycle_state, "ERROR_RECOVERABLE")
         self.assertEqual(updated.last_progress_event, "turn.event_stream_incomplete")
-        self.assertIsNone(updated.writer_lease)
 
     def test_completed_turn_does_not_send_duplicate_final_text_after_delta(self):
         clock = _Clock()
@@ -413,7 +411,7 @@ class ChannelNativeCoreContractTests(unittest.TestCase):
                 return self.event_batches.pop(0)
 
         clock = _Clock()
-        sessions = SessionRegistry(now=clock, lease_ttl=10.0)
+        sessions = SessionRegistry(now=clock)
         channel = FakeChannelAdapter("fake", _channel_caps())
         transport = BatchedTransport()
         orchestrator = Orchestrator(
@@ -453,11 +451,10 @@ class ChannelNativeCoreContractTests(unittest.TestCase):
         self.assertEqual(transport.call_log, ["submit_turn", "resume", "submit_turn"])
         self.assertEqual(transport.resume_specs[0].resume_ref["agent_session_id"], "agent-session-1")
         self.assertEqual(updated.lifecycle_state, "IDLE")
-        self.assertIsNone(updated.writer_lease)
 
     def test_error_recoverable_session_reacquires_writer_before_followup_submit(self):
         clock = _Clock()
-        sessions = SessionRegistry(now=clock, lease_ttl=10.0)
+        sessions = SessionRegistry(now=clock)
         channel = FakeChannelAdapter("fake", _channel_caps())
         transport = FakeAgentTransport(
             "claude_headless",
@@ -483,7 +480,6 @@ class ChannelNativeCoreContractTests(unittest.TestCase):
         session.transport_ref["agent_session_id"] = "agent-session-1"
         session.lifecycle_state = "ERROR_RECOVERABLE"
         session.last_progress_event = AgentEventType.SESSION_ERROR
-        session.writer_lease = None
         clock.now += 60.0
 
         result = asyncio.run(
@@ -552,28 +548,6 @@ class ChannelNativeCoreContractTests(unittest.TestCase):
         self.assertEqual(outbox.pending_count(), 0)
         self.assertEqual(outbox.dead_count(), 1)
 
-    def test_pending_binding_can_be_committed_to_session(self):
-        sessions = SessionRegistry(now=_Clock())
-        pending_key = sessions.add_pending_binding(
-            pending_key="launch-1",
-            binding=_binding(),
-            cwd="/tmp/project",
-        )
-
-        self.assertEqual(sessions.resolve_pending_by_binding(_binding().key()), pending_key)
-
-        session = sessions.commit_pending(
-            pending_key,
-            session_id="sess-1",
-            transport_kind="fake-transport",
-            transport_ref={"handle_id": "h1"},
-            owner=_actor(),
-        )
-
-        self.assertEqual(session.session_id, "sess-1")
-        self.assertEqual(sessions.resolve_binding(_binding().key()), "sess-1")
-        self.assertIsNone(sessions.resolve_pending_by_binding(_binding().key()))
-
     def test_unknown_event_falls_back_to_text_rendering(self):
         channel = FakeChannelAdapter("fake", _channel_caps())
         transport = FakeAgentTransport(
@@ -637,7 +611,7 @@ class ChannelNativeCoreContractTests(unittest.TestCase):
 
     def test_generation_gates_submits_but_lease_expiry_does_not(self):
         clock = _Clock()
-        sessions = SessionRegistry(now=clock, lease_ttl=10.0)
+        sessions = SessionRegistry(now=clock)
         channel = FakeChannelAdapter("fake", _channel_caps())
         transport = FakeAgentTransport("fake-transport", _transport_caps())
         orchestrator = Orchestrator(
@@ -688,7 +662,7 @@ class ChannelNativeCoreContractTests(unittest.TestCase):
         # structured reason (so the channel sends its rejection note), not
         # re-raise past the note branch into a silent serve-loop log line.
         clock = _Clock()
-        sessions = SessionRegistry(now=clock, lease_ttl=10.0)
+        sessions = SessionRegistry(now=clock)
         channel = FakeChannelAdapter("fake", _channel_caps())
 
         class DeadWorkerTransport(FakeAgentTransport):
@@ -734,7 +708,7 @@ class ChannelNativeCoreContractTests(unittest.TestCase):
         # turn never completed) cannot resume — the refusal must carry
         # "missing_resume_ref" so the sender learns the session is dead.
         clock = _Clock()
-        sessions = SessionRegistry(now=clock, lease_ttl=10.0)
+        sessions = SessionRegistry(now=clock)
         channel = FakeChannelAdapter("fake", _channel_caps())
 
         class DeadWorkerTransport(FakeAgentTransport):

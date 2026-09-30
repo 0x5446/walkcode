@@ -109,7 +109,7 @@ def _orchestrator(transport=None):
         outbox=DurableOutbox(now=clock),
         channels={"telegram": channel},
         transports={"claude_headless": transport},
-        authz=AuthorizationStore(now=clock),
+        authz=AuthorizationStore(),
         now=clock,
     )
     session = asyncio.run(
@@ -386,7 +386,6 @@ class TurnReplaySafetyTests(unittest.TestCase):
             )
             # Simulate the worker being gone so the replay must resume fresh.
             session.lifecycle_state = "ERROR_RECOVERABLE"
-            session.writer_lease = None
             await _drain_replay_tasks(orchestrator)
 
         asyncio.run(scenario())

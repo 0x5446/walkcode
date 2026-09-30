@@ -47,7 +47,7 @@ IM ChannelAdapter
 
 - `ChannelAdapter` owns IM-specific parsing, callbacks, attachments, and message
   rendering.
-- `Orchestrator` owns session routing, authorization, single-writer leases,
+- `Orchestrator` owns session routing, authorization, single-writer fencing,
   interaction state, idempotency, takeover state, and outbox enqueueing.
 - `AgentTransport` owns product-specific headless execution and resume.
 - `JsonFileStateStore` persists sessions, interaction tokens, auth state,
@@ -221,7 +221,7 @@ boundaries:
 - atomic JSON state persistence (private temporary file, flush/fsync, replace,
   cleanup on failure); persistence errors are logged and propagated, and the
   outbox cannot send a batch whose claim was not saved;
-- pending sessions and durable bindings;
+- durable bindings;
 - inbound dedupe;
 - durable outbox and retry/dead-letter state;
 - permission and AskUserQuestion interaction state;
@@ -252,7 +252,18 @@ existing empty-turn notice through the durable outbox.
 
 At startup and every five minutes the runtime invokes the existing outbox,
 interaction, and HITL retention policies and saves the compacted snapshot.
-Pending deliveries and unexpired prompts survive. Sessions are not pruned.
+Pending deliveries and unexpired prompts survive. The same pass prunes
+stopped sessions (`compact_sessions`): a session goes once it has been idle
+(no progress, user input, title refresh or blocked input) for its retention
+window and nothing references it — no undelivered outbox item for one of its
+bindings, no undecided interaction, no pending HITL request. Sessions a topic
+message can still continue (ADR 0054 revival candidates, and TUI-observed
+sessions with a durable resume ref, which continue through takeover) keep
+90 days; archived, topicless and unresumable ones keep 7. Pruning drops the
+session's binding index entries, takeovers, grants and blocked inputs; a later
+reply in a pruned topic is handled like any unbound topic message. At startup
+the maintenance task also removes `.<state>.*.tmp` files older than 60 s left
+by a writer killed mid-save.
 `native hook --defer` loads configuration and writes a private queue file
 directly; it does not load state or construct agent transports. Hook ordering,
 capture stamps, and `<state>.tui-hooks.d` filenames keep their existing contract.

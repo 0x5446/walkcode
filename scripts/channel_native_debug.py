@@ -52,6 +52,9 @@ from walkcode.channel_native import (  # noqa: E402
 )
 from walkcode.channel_native_runtime import ChannelNativeRuntime, _launchd_service_label, _load_native_env  # noqa: E402
 
+# --repair-stale-errors only touches ERROR_RECOVERABLE sessions that have made
+# no progress for this long (a session that just errored may still recover).
+STALE_ERROR_SESSION_SECONDS = 30.0
 
 TEST_GROUPS = {
     "config": ["tests/test_channel_native_config.py"],
@@ -238,12 +241,6 @@ def debug_state(
         snapshot, load_report = _load_state_snapshot(cfg)
     write_probe = _probe_state_write(Path(cfg.state_path))
     counts = _snapshot_counts(snapshot) if snapshot is not None else {}
-    # ADR 0059: an expired writer lease on a running session is normal — the
-    # lease is only stamped at writer (re)acquire and never renewed while a
-    # turn runs, and validate_submit no longer vetoes on expiry. The count
-    # stays informational in `counts`, but it neither fails the gate nor
-    # warns ("updates confirmed without submitting" can no longer happen for
-    # that reason).
     payload: dict[str, Any] = {
         "ok": bool(load_report["ok"] and write_probe["ok"]),
         "state_path": cfg.state_path,
@@ -267,19 +264,17 @@ def _repair_stale_error_sessions(
     now = time.time()
     repaired: list[str] = []
     for session in snapshot.sessions._sessions.values():
-        lease = session.writer_lease
         if session.status == "stopped":
             continue
         if session.lifecycle_state != "ERROR_RECOVERABLE":
             continue
-        if lease is None or not lease.expired(now):
+        if now - session.last_progress_at < STALE_ERROR_SESSION_SECONDS:
             continue
         if _debug_session_has_durable_resume_ref(session):
             continue
         session.status = "stopped"
         session.lifecycle_state = "STOPPED"
         session.stop_reason = "repaired_stale_unresumable_error"
-        session.writer_lease = None
         session.writer_owner = WriterOwner(kind="none")
         repaired.append(session.session_id)
     if not repaired:
@@ -314,7 +309,6 @@ def _repair_stale_external_tui_sessions(
             session.status = "stopped"
             session.lifecycle_state = "STOPPED"
             session.stop_reason = "repaired_external_tui_stop_hook"
-            session.writer_lease = None
             session.writer_owner = WriterOwner(kind="none")
             repaired.append(session.session_id)
             continue
@@ -328,7 +322,6 @@ def _repair_stale_external_tui_sessions(
         session.status = "stopped"
         session.lifecycle_state = "STOPPED"
         session.stop_reason = "repaired_stale_external_tui_process_gone"
-        session.writer_lease = None
         session.writer_owner = WriterOwner(kind="none")
         repaired.append(session.session_id)
     if not repaired:
@@ -688,34 +681,19 @@ def _snapshot_counts(snapshot: StateSnapshot) -> dict[str, Any]:
     session_data = snapshot.sessions.to_dict()
     authz_data = snapshot.authz.to_dict()
     ledger_data = snapshot.inbound_ledger.to_dict()
-    now = time.time()
-    active_sessions = 0
-    expired_writer_leases = 0
-    for session in session_data.get("sessions", {}).values():
-        if session.get("status") == "stopped":
-            continue
-        active_sessions += 1
-        lifecycle_state = str(session.get("lifecycle_state", ""))
-        if lifecycle_state in {"IDLE", "EXTERNAL_OBSERVED_READONLY"}:
-            continue
-        lease = session.get("writer_lease") or {}
-        try:
-            expires_at = float(lease.get("expires_at", 0.0) or 0.0)
-        except (TypeError, ValueError):
-            expires_at = 0.0
-        if not lease or expires_at <= now:
-            expired_writer_leases += 1
+    active_sessions = sum(
+        1
+        for session in session_data.get("sessions", {}).values()
+        if session.get("status") != "stopped"
+    )
     return {
         "sessions": len(session_data.get("sessions", {})),
         "active_sessions": active_sessions,
-        "expired_writer_leases": expired_writer_leases,
-        "pending_bindings": len(session_data.get("pending", {})),
         "interactions": snapshot.interactions.interaction_count(),
         "callback_tokens": snapshot.interactions.token_count(),
         "awaiting_other": snapshot.interactions.awaiting_other_count(),
         "outbox": _outbox_counts(snapshot.outbox),
         "auth_grants": len(authz_data.get("grants", [])),
-        "auth_audit_events": len(authz_data.get("audit", [])),
         "inbound_completed": len(ledger_data.get("completed", {})),
         "inbound_in_progress": len(ledger_data.get("in_progress", {})),
     }
@@ -1347,7 +1325,6 @@ def print_text(payload: dict[str, Any]) -> None:
         counts = payload["counts"]
         print(f"sessions.count: {counts.get('sessions')}")
         print(f"sessions.active_count: {counts.get('active_sessions')}")
-        print(f"sessions.expired_writer_leases: {counts.get('expired_writer_leases')}")
         outbox_counts = counts.get("outbox", {})
         print(f"outbox.pending_count: {outbox_counts.get('pending_count')}")
         print(f"outbox.dead_count: {outbox_counts.get('dead_count')}")

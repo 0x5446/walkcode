@@ -577,7 +577,7 @@ class _StubDaemonClient:
 def _orchestrator_with_observed_claude_session(*, daemon_client=None, resume_transport_kind="claude_headless"):
     clock = _Clock()
     sessions = SessionRegistry(now=clock)
-    authz = AuthorizationStore(now=clock)
+    authz = AuthorizationStore()
     channel = FakeChannelAdapter("telegram", _channel_caps())
     transports = {
         "fake-transport": FakeAgentTransport(

@@ -75,7 +75,7 @@ def _transport_caps() -> TransportCapabilities:
 
 def _orchestrator():
     clock = _Clock()
-    authz = AuthorizationStore(now=clock)
+    authz = AuthorizationStore()
     transport = FakeAgentTransport("fake-transport", _transport_caps())
     orchestrator = Orchestrator(
         sessions=SessionRegistry(now=clock),
