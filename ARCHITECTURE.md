@@ -65,7 +65,10 @@ modules earlier in that list. The Claude gate (`claude_gate`,
 `claude_gate_transport`) and Lark live/card modules (`lark_live`,
 `lark_cards`) sit beside them. `walkcode.channel_native_runtime` wires it all
 into the serving process. Tests patch a module-level name in the submodule
-that uses it, not on the package.
+that uses it, not on the package. Optional third-party SDKs (claude_agent_sdk,
+lark_oapi) stay imported lazily inside their loaders on purpose: a missing
+package must surface as "agent/channel unavailable", not as an import error of
+the whole runtime.
 
 ## Channels
 

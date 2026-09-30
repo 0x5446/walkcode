@@ -398,7 +398,7 @@ Telegram 实例 2026-07-04 退役，渠道代码 2026-09-30 删除（ADR 0069）
   **也别把磁盘队列理解成"一条都不会丢"**：工具进度卡按设计不走 outbox 重试，
   发送失败只记一条 `tool_progress_send_failed`（只有 `PermanentDeliveryError`
   才会顺带把绑定标成投递异常，网络抖动这类瞬时错误连标记都没有），hook 仍算
-  accepted、队列文件照删（`channel_native/__init__.py` 的 `send_view` 失败分支
+  accepted、队列文件照删（`channel_native/orchestrator.py` 里 `Orchestrator._upsert_tool_progress_view` 的 `send_view` 失败分支
   + `channel_native_runtime.py` 排水里的 `result.accepted → path.unlink()`）。
   队列保的是积压不丢，不是渠道故障不丢。
   盯两个数就够：队列目录 `<state 文件名>.tui-hooks.d`（含 `.json`，例如

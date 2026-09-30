@@ -10,7 +10,7 @@ Status: Accepted; implemented 2026-07-06.
 trace viewer）查看某个 profile 实际发给 Claude Code 上游的 system prompt、工具
 调用、token 用量。顾虑：WalkCode 本身通过 `claude-agent-sdk`
 (`ClaudeSDKClient`/`ClaudeAgentOptions`) 拉起 Claude Code headless 会话
-(`ClaudeHeadlessTransport`, `channel_native/__init__.py`)，真正的 `claude` 二进
+(`ClaudeHeadlessTransport`, `channel_native/claude_headless.py`)，真正的 `claude` 二进
 制 spawn 发生在 SDK 内部；claude-tap 默认也是"自己拉起 client 再代理"
 (`claude-tap`/`run_client()`)。两者若都想当 Claude 进程的发起者/env 提供者，会产
 生冲突。
@@ -38,7 +38,7 @@ trace viewer）查看某个 profile 实际发给 Claude Code 上游的 system pr
 ## Decision
 
 新增 `WALKCODE_CLAUDE_ANTHROPIC_BASE_URL`：`_configured_agent_options`
-(`channel_native/__init__.py`) 解析该 env（校验 `http://`/`https://` 前缀），经
+(`channel_native/config.py`) 解析该 env（校验 `http://`/`https://` 前缀），经
 `_build_transports` (`channel_native_runtime.py`) 传给 `ClaudeHeadlessTransport`
 新增的 `anthropic_base_url` 构造参数。
 
