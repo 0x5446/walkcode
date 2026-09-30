@@ -1998,6 +1998,9 @@ class LarkAttachmentAndMultiTabTests(_LarkRuntimeHarness):
         captured = []
 
         class _Client:
+            async def connect(self, prompt=None):
+                return None
+
             async def query(self, text, session_id="default"):
                 captured.append(text)
 

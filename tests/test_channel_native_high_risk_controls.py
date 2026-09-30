@@ -144,14 +144,11 @@ class HighRiskTransportControlTests(unittest.TestCase):
             def __init__(self):
                 self.calls = []
 
+            async def connect(self, prompt=None):
+                return None
+
             async def set_model(self, model: str):
                 self.calls.append(("set_model", model))
-
-            async def events(self):
-                return []
-
-            async def submit(self, _turn):
-                return None
 
         client = Client()
         transport = ClaudeHeadlessTransport(client_factory=lambda _spec: client)

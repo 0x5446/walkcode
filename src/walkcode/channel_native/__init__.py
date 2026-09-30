@@ -6347,9 +6347,6 @@ class ClaudeHeadlessTransport:
                 LaunchSpec(cwd=spec.cwd, session_id=spec.session_id),
                 resume_id=resume_id,
             )
-            resume = getattr(client, "resume", None)
-            if resume is not None:
-                await _maybe_await(resume(dict(spec.resume_ref)))
             await self._connect_client(client)
             resumed_session_id = resume_id or spec.session_id
             handle = TransportHandle(
@@ -6436,31 +6433,16 @@ class ClaudeHeadlessTransport:
         return client, bridge
 
     async def _disconnect_client(self, handle_id: str, client: Any) -> None:
-        closed = False
         if client is not None:
-            for method_name in ("disconnect", "stop", "close"):
-                method = getattr(client, method_name, None)
-                if method is None:
-                    continue
-                try:
-                    await _maybe_await(method())
-                    closed = True
-                    break
-                except Exception as exc:
-                    # Keep trying the remaining close methods; a swallowed failure
-                    # here would leave an invisible zombie process.
-                    _log_degrade(
-                        "headless_worker_close_failed",
-                        handle_id=handle_id,
-                        method=method_name,
-                        error=exc,
-                        fallback="try_next_close_method",
-                    )
-            if not closed:
+            try:
+                await client.disconnect()
+            except Exception as exc:
+                # Logged, not raised: the process verify below still runs and
+                # escalates if the CLI survived the failed close.
                 _log_degrade(
-                    "headless_worker_close_exhausted",
+                    "headless_worker_close_failed",
                     handle_id=handle_id,
-                    drop=True,
+                    error=exc,
                 )
         # A "successful" close only closed the SDK-side pipes — verify the CLI
         # process actually died, whether or not any close method worked. The
@@ -6629,23 +6611,12 @@ class ClaudeHeadlessTransport:
             self._inflight_submits.get(handle.handle_id, 0) + 1
         )
         try:
-            submit = getattr(client, "submit", None)
-            if submit is not None:
-                await _maybe_await(submit(turn))
-                return
-
-            query = getattr(client, "query", None)
-            if query is None:
-                raise CapabilityUnsupported("Claude headless turn submission is not available")
             # query(text) has no attachment channel, so downloaded files are
             # named by absolute path in the prompt for Claude to open with
             # Read. Without this an attachment-only message reaches Claude as
-            # empty text.
-            text = _compose_turn_text(turn)
-            try:
-                await _maybe_await(query(text, session_id="default"))
-            except TypeError:
-                await _maybe_await(query(text))
+            # empty text. Called exactly once: a retry on TypeError would send
+            # the user message twice when the TypeError came from inside it.
+            await client.query(_compose_turn_text(turn))
         except BaseException:
             # A failed submit must not leave a "turn in flight" marker behind:
             # the persistent listener would wait for a turn that never started
@@ -6676,12 +6647,10 @@ class ClaudeHeadlessTransport:
     def handle_supports_reuse(self, handle_id: str) -> bool:
         """True when the handle's worker can accept another turn in place.
 
-        Only session-level (receive_messages) clients qualify: a legacy
-        single-turn client left in the registry must go through resume, or its
-        second turn would be submitted into a worker nobody listens to.
+        Every live worker runs a session-level listener (receive_messages), so
+        a turn submitted into it is always observed.
         """
-        client = self._clients.get(handle_id) if handle_id else None
-        return client is not None and getattr(client, "receive_messages", None) is not None
+        return self.handle_is_live(handle_id)
 
     async def events(self, handle: TransportHandle):
         client = self._clients.get(handle.handle_id)
@@ -6690,35 +6659,14 @@ class ClaudeHeadlessTransport:
             # this drain starting; a typed error lets the caller treat it as
             # a benign race instead of crashing on KeyError.
             raise TransportUnavailable("claude headless worker is gone (settled or restarted)")
-        bridge = self._bridges.get(handle.handle_id)
-        if bridge is not None or getattr(client, "receive_messages", None) is not None:
-            # Session-level listener (gated on stream capability, not on the
-            # permission bridge — a bridge-less client with receive_messages
-            # must not fall into the collect-until-EOF path below, which would
-            # hang on a persistent stream). With a bridge, mid-turn permission
-            # / AskUserQuestion cards float before the turn ends. The stream
-            # does NOT stop at the first turn's result — background subagents
-            # keep opening new turns (task notifications), and their messages
-            # must reach the channel. It ends only when the session settles
-            # (no open turn, task ledger empty, no pending HITL, quiet grace
-            # elapsed), when the background-wait ceiling fires, or when the
-            # worker dies.
-            return self._bridged_event_stream(handle, client, bridge)
-
-        events = getattr(client, "events", None)
-        if events is not None:
-            raw_events = await self._collect_client_items(events())
-            return list(raw_events)
-
-        receiver = getattr(client, "receive_response", None)
-        if receiver is None:
-            raise CapabilityUnsupported("Claude headless event stream is not available")
-
-        sdk_messages = await self._collect_client_items(receiver())
-        converted: list[AgentEvent] = []
-        for message in sdk_messages:
-            converted.extend(self._convert_sdk_message_to_events(message))
-        return converted
+        # Session-level listener. With a bridge, mid-turn permission /
+        # AskUserQuestion cards float before the turn ends. The stream does
+        # NOT stop at the first turn's result — background subagents keep
+        # opening new turns (task notifications), and their messages must
+        # reach the channel. It ends only when the session settles (no open
+        # turn, task ledger empty, no pending HITL, quiet grace elapsed), when
+        # the background-wait ceiling fires, or when the worker dies.
+        return self._bridged_event_stream(handle, client, self._bridges.get(handle.handle_id))
 
     # A terminal task_notification predicts a CLI-injected follow-up turn; the
     # listener must not settle before the injection had a fair chance to land
@@ -6762,8 +6710,8 @@ class ClaudeHeadlessTransport:
         resolves the Future, the SDK resumes, and the message stream yields the
         tool result and the turn's completion within this same pass.
 
-        Session-level lifetime: with ``receive_messages`` available this stream
-        is persistent across turns. A ResultMessage only closes the *turn*;
+        Session-level lifetime: the ``receive_messages`` stream is persistent
+        across turns. A ResultMessage only closes the *turn*;
         background subagents launched with run_in_background keep working and
         the CLI auto-opens new turns when they notify. The stream tracks those
         subagents in a ledger (task_started adds, task_notification /
@@ -6778,17 +6726,9 @@ class ClaudeHeadlessTransport:
         - EOF: the worker process exited.
 
         On any of those the worker client is closed and unregistered, so the
-        next user message resumes a fresh process via ``--resume``. Legacy
-        clients that only expose ``receive_response`` keep the old single-turn
-        behavior (the stream ends when that generator ends).
+        next user message resumes a fresh process via ``--resume``.
         """
-        receiver = getattr(client, "receive_messages", None)
-        persistent = receiver is not None
-        if receiver is None:
-            receiver = getattr(client, "receive_response", None)
-        if receiver is None:
-            raise CapabilityUnsupported("Claude headless event stream is not available")
-        stream_iter = receiver().__aiter__()
+        stream_iter = client.receive_messages().__aiter__()
         msg_task: asyncio.Future | None = asyncio.ensure_future(stream_iter.__anext__())
         queue_task: asyncio.Future | None = (
             asyncio.ensure_future(bridge.next_event()) if bridge is not None else None
@@ -6885,18 +6825,15 @@ class ClaudeHeadlessTransport:
         try:
             while True:
                 if msg_task is None:
-                    # SDK stream is exhausted (worker exited, or a legacy
-                    # single-turn receiver finished). Flush any residual
-                    # floated permission events, then stop.
+                    # SDK stream is exhausted (worker exited). Flush any
+                    # residual floated permission events, then stop.
                     if bridge is not None:
                         for event in bridge.drain_ready_events():
                             yield event
-                    settled = persistent
+                    settled = True
                     # Capture BEFORE unregistering clears it: submits that
                     # never produced any stream traffic died with the worker
-                    # and must not vanish silently — on the legacy
-                    # (receive_response) path too, where a zero-traffic EOF
-                    # equally means the turn is gone.
+                    # and must not vanish silently.
                     pending_lost = self._pending_turns.get(handle.handle_id, 0)
                     # ADR 0059 R2: read BEFORE unregister pops the timestamp.
                     # Leftover pending may be a phantom from mid-turn submits
@@ -6935,50 +6872,49 @@ class ClaudeHeadlessTransport:
                         and last_accounted_result_at > eof_last_submit_ts
                         and eof_absorption_age >= self._ABSORBED_MIN_RESULT_AGE_SECONDS
                     )
-                    if persistent:
-                        closing = self._unregister_handle(handle.handle_id)
-                        if active_tasks:
-                            # The worker died with subagents still on the books:
-                            # say so visibly and clear the session ledger, or
-                            # the status card would show phantom background
-                            # work forever.
-                            abandoned = len(active_tasks)
-                            _log_degrade(
-                                "headless_worker_eof_with_background_tasks",
-                                handle_id=handle.handle_id,
-                                pending_tasks=abandoned,
-                            )
-                            yield AgentEvent(
-                                AgentEventType.TURN_DELTA,
-                                {
-                                    "text": (
-                                        f"⚠️ 代理进程已退出，仍有 {abandoned} 个后台任务未完成，"
-                                        "它们的结果不会自动送达。你可以直接回复继续对话。"
-                                    )
-                                },
-                            )
-                            # Close the synthetic warning turn (same rule as
-                            # the ceiling path) so the ended stream is not
-                            # misread as a mid-turn failure.
-                            yield AgentEvent(AgentEventType.TURN_COMPLETED, {"message": ""})
-                            yield AgentEvent(
-                                AgentEventType.BACKGROUND_TASKS,
-                                {"count": 0, "tasks": [], "abandoned": abandoned, "reason": "worker_eof"},
-                            )
-                        elif bridge is not None and bridge.has_any_pending():
-                            # The worker died while a question/permission card
-                            # was still waiting for the human: without a
-                            # visible signal the session parks in WAITING_*
-                            # with a card that can never be answered.
-                            yield AgentEvent(
-                                AgentEventType.SESSION_ERROR,
-                                {
-                                    "message": (
-                                        "代理进程在等待你回答时退出了，上面的卡片已失效；"
-                                        "直接回复即可继续。"
-                                    )
-                                },
-                            )
+                    closing = self._unregister_handle(handle.handle_id)
+                    if active_tasks:
+                        # The worker died with subagents still on the books:
+                        # say so visibly and clear the session ledger, or
+                        # the status card would show phantom background
+                        # work forever.
+                        abandoned = len(active_tasks)
+                        _log_degrade(
+                            "headless_worker_eof_with_background_tasks",
+                            handle_id=handle.handle_id,
+                            pending_tasks=abandoned,
+                        )
+                        yield AgentEvent(
+                            AgentEventType.TURN_DELTA,
+                            {
+                                "text": (
+                                    f"⚠️ 代理进程已退出，仍有 {abandoned} 个后台任务未完成，"
+                                    "它们的结果不会自动送达。你可以直接回复继续对话。"
+                                )
+                            },
+                        )
+                        # Close the synthetic warning turn (same rule as
+                        # the ceiling path) so the ended stream is not
+                        # misread as a mid-turn failure.
+                        yield AgentEvent(AgentEventType.TURN_COMPLETED, {"message": ""})
+                        yield AgentEvent(
+                            AgentEventType.BACKGROUND_TASKS,
+                            {"count": 0, "tasks": [], "abandoned": abandoned, "reason": "worker_eof"},
+                        )
+                    elif bridge is not None and bridge.has_any_pending():
+                        # The worker died while a question/permission card
+                        # was still waiting for the human: without a
+                        # visible signal the session parks in WAITING_*
+                        # with a card that can never be answered.
+                        yield AgentEvent(
+                            AgentEventType.SESSION_ERROR,
+                            {
+                                "message": (
+                                    "代理进程在等待你回答时退出了，上面的卡片已失效；"
+                                    "直接回复即可继续。"
+                                )
+                            },
+                        )
                     if pending_lost > 0 and pending_absorbed:
                         # Phantom leftover from absorbed mid-turn submits:
                         # observability only — no error, no replay.
@@ -7005,13 +6941,11 @@ class ClaudeHeadlessTransport:
                         # producing a single message for an accepted submit.
                         # Silence here = the session stuck on ACTIVE forever
                         # with the user's message gone (review round 3,
-                        # 6-dimension consensus; legacy path included per the
-                        # adversarial verify pass).
+                        # 6-dimension consensus).
                         _log_degrade(
                             "headless_worker_eof_with_pending_turns",
                             handle_id=handle.handle_id,
                             pending_turns=pending_lost,
-                            persistent=persistent,
                         )
                         yield AgentEvent(
                             AgentEventType.SESSION_ERROR,
@@ -7034,7 +6968,6 @@ class ClaudeHeadlessTransport:
                         )
                     break
                 timeout = self._stream_wait_timeout(
-                    persistent=persistent,
                     # Raw turn state on purpose: unaccounted submits must NOT
                     # map to an infinite wait — they get the bounded ceiling
                     # via pending_turns below.
@@ -7486,7 +7419,6 @@ class ClaudeHeadlessTransport:
     def _stream_wait_timeout(
         self,
         *,
-        persistent: bool,
         turn_open: bool,
         active_tasks: dict[str, dict[str, Any]],
         bridge: _ClaudePermissionBridge | None,
@@ -7504,8 +7436,6 @@ class ClaudeHeadlessTransport:
         answer and freeze the ceiling clock. Unaccounted submits wait up to
         the background ceiling, never forever.
         """
-        if not persistent:
-            return None
         if turn_open:
             return None
         if bridge is not None and bridge.has_any_pending():
@@ -7558,33 +7488,22 @@ class ClaudeHeadlessTransport:
         """
         subtype = ""
         data: Any = None
-        if isinstance(message, dict):
-            if str(message.get("type", "")) != "system":
-                return False, False, ""
-            subtype = str(message.get("subtype", "") or "")
-            # Dict-shaped system messages may nest their payload under "data"
-            # (raw stream shape); merge so _field sees both layouts.
-            nested = message.get("data")
-            data = {**message, **nested} if isinstance(nested, dict) else message
-        else:
-            class_name = message.__class__.__name__
-            if class_name == "TaskStartedMessage":
-                subtype = "task_started"
-            elif class_name == "TaskProgressMessage":
-                subtype = "task_progress"
-            elif class_name == "TaskNotificationMessage":
-                subtype = "task_notification"
-            elif class_name == "TaskUpdatedMessage":
-                subtype = "task_updated"
-            elif class_name == "SystemMessage":
-                subtype = str(getattr(message, "subtype", "") or "")
-                data = getattr(message, "data", None)
-            if subtype not in cls._TASK_SYSTEM_SUBTYPES:
-                return False, False, ""
-            if data is None:
-                data = message
+        class_name = message.__class__.__name__
+        if class_name == "TaskStartedMessage":
+            subtype = "task_started"
+        elif class_name == "TaskProgressMessage":
+            subtype = "task_progress"
+        elif class_name == "TaskNotificationMessage":
+            subtype = "task_notification"
+        elif class_name == "TaskUpdatedMessage":
+            subtype = "task_updated"
+        elif class_name == "SystemMessage":
+            subtype = str(getattr(message, "subtype", "") or "")
+            data = getattr(message, "data", None)
         if subtype not in cls._TASK_SYSTEM_SUBTYPES:
             return False, False, ""
+        if data is None:
+            data = message
 
         def _field(name: str) -> Any:
             if isinstance(data, dict):
@@ -7648,8 +7567,6 @@ class ClaudeHeadlessTransport:
         signal the CLI opened/continues a turn, even when they convert to no
         channel-visible events.
         """
-        if isinstance(message, dict):
-            return "content" in message and message.get("type") != "result"
         return message.__class__.__name__ in {"UserMessage", "AssistantMessage"}
 
     @classmethod
@@ -7673,17 +7590,15 @@ class ClaudeHeadlessTransport:
             # awaiting. Write-once is enforced inside the bridge.
             bridge.resolve(rid, dict(decision))
             return
-        client = self._clients.get(handle.handle_id)
-        if client is None:
+        if handle.handle_id not in self._clients:
             # The worker (and its in-flight can_use_tool Future) lived in a
             # previous runtime process; a card clicked after a restart lands
             # here. Raise instead of KeyError so the callback path can tell
             # the user the card is stale rather than dying silently.
             raise TransportUnavailable("claude headless worker is gone (runtime restarted)")
-        approve = getattr(client, "approve_permission", None)
-        if approve is None:
-            raise CapabilityUnsupported("Claude headless permission approval is not available")
-        await _maybe_await(approve(rid, decision))
+        # Live worker, but no pending can_use_tool call for this rid (the
+        # bridge already timed out / resolved it): nothing can take it.
+        raise CapabilityUnsupported("Claude headless permission approval is not available")
 
     async def answer_user_question(
         self,
@@ -7695,13 +7610,9 @@ class ClaudeHeadlessTransport:
         if bridge is not None and bridge.has_pending(rid):
             bridge.resolve(rid, {"action": "answers", "answers": dict(answers)})
             return
-        client = self._clients.get(handle.handle_id)
-        if client is None:
+        if handle.handle_id not in self._clients:
             raise TransportUnavailable("claude headless worker is gone (runtime restarted)")
-        answer = getattr(client, "answer_user_question", None)
-        if answer is None:
-            raise CapabilityUnsupported("Claude headless AskUserQuestion answers are not available")
-        await _maybe_await(answer(rid, answers))
+        raise CapabilityUnsupported("Claude headless AskUserQuestion answers are not available")
 
     async def interrupt(self, handle: TransportHandle, reason: str) -> ControlResult:
         bridge = self._bridges.get(handle.handle_id)
@@ -7928,40 +7839,12 @@ class ClaudeHeadlessTransport:
 
     @staticmethod
     async def _connect_client(client: Any) -> None:
-        connect = getattr(client, "connect", None)
-        if connect is not None:
-            try:
-                await _maybe_await(connect(prompt=None))
-            except TypeError:
-                await _maybe_await(connect())
-            return
-        start = getattr(client, "start", None)
-        if start is not None:
-            await _maybe_await(start())
-
-    @staticmethod
-    async def _collect_client_items(source: Any) -> list[Any]:
-        items = await _maybe_await(source)
-        if items is None:
-            return []
-        if hasattr(items, "__aiter__"):
-            collected = []
-            async for item in items:
-                collected.append(item)
-            return collected
-        if isinstance(items, list):
-            return items
-        if isinstance(items, tuple):
-            return list(items)
-        return [items]
+        # Called exactly once: a retry on TypeError would spawn a second CLI
+        # subprocess when the TypeError came from inside connect().
+        await client.connect(prompt=None)
 
     @classmethod
     def _convert_sdk_message(cls, message: Any) -> AgentEvent | list[AgentEvent] | None:
-        if isinstance(message, AgentEvent):
-            return message
-        if isinstance(message, dict):
-            return cls._convert_sdk_dict_message(message)
-
         error = getattr(message, "error", None)
         is_error = bool(getattr(message, "is_error", False))
         if is_error or error is not None:
@@ -8013,48 +7896,8 @@ class ClaudeHeadlessTransport:
 
         return events or None
 
-    @classmethod
-    def _convert_sdk_dict_message(cls, message: dict[str, Any]) -> AgentEvent | list[AgentEvent] | None:
-        if bool(message.get("is_error")) or message.get("error") is not None:
-            return AgentEvent(
-                AgentEventType.SESSION_ERROR,
-                {"message": str(message.get("error") or message.get("result") or "Claude SDK reported an error")},
-            )
-        events = cls._extract_sdk_tool_events(message)
-        tool_block_message = bool(events)
-        if "content" in message and not tool_block_message:
-            events = cls._extract_sdk_tool_events(message.get("content"))
-        text = "" if tool_block_message else cls._extract_sdk_text(message.get("content"))
-        if text and not cls._is_user_role_message(message):
-            if events:
-                # ADR 0055: same as the object path — narration precedes the
-                # tools it narrates and joins the burst card, never a bubble.
-                events.insert(0, AgentEvent(AgentEventType.TURN_NARRATION, {"text": text}))
-            else:
-                events.append(AgentEvent(AgentEventType.TURN_DELTA, {"text": text}))
-        if "result" in message or message.get("type") == "result":
-            payload: dict[str, Any] = {"message": str(message.get("result", ""))}
-            if message.get("session_id"):
-                payload["session_id"] = str(message["session_id"])
-            if "usage" in message:
-                payload["usage"] = message["usage"]
-            events.append(AgentEvent(AgentEventType.TURN_COMPLETED, payload))
-        model = str(message.get("model", "") or "")
-        if model:
-            for event in events:
-                event.payload.setdefault("model", model)
-        return events or None
-
     @staticmethod
     def _is_user_role_message(message: Any) -> bool:
-        if isinstance(message, dict):
-            # Dict-shaped stream messages mark the role as "role" or "type";
-            # both must be filtered or injected <task-notification> turns leak
-            # to the channel as agent text.
-            return "user" in {
-                str(message.get("role", "") or ""),
-                str(message.get("type", "") or ""),
-            }
         if message.__class__.__name__ == "UserMessage":
             return True
         return str(getattr(message, "role", "") or "") == "user"
@@ -10529,7 +10372,6 @@ class Orchestrator:
         # same agent session and orphan the listener. Only IDLE qualifies:
         # ERROR_RECOVERABLE means the previous submit or stream broke, and
         # recovery must go through a fresh worker, not the suspect one.
-        # Legacy single-turn clients never qualify (handle_supports_reuse).
         handle_id = str(session.transport_ref.get("handle_id", ""))
         supports_reuse = getattr(transport, "handle_supports_reuse", None)
         if session.lifecycle_state == "IDLE" and handle_id and callable(supports_reuse):

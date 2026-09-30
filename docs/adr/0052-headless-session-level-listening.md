@@ -47,6 +47,8 @@ Status: Accepted; implemented
    ResultMessage 只标记回合边界（session 翻 IDLE、状态卡照常），流本身跨
    回合存活；后台子 agent 开启的新回合照常转 outbox / 注册 HITL。仅支持
    `receive_response` 的旧式（测试）client 保持单回合行为。
+   （2026-09-30 更新：生产里 client 只会是真 `ClaudeSDKClient`，旧式单回合
+   分支连同测试替身已删除，监听一律走 `receive_messages`。）
 2. **后台任务账本**：`task_started` 记账；`task_notification` **或**
    `task_updated` 带终结状态销账；running/pending 的 task_updated 重新记账
    （唤醒场景）；`background_tasks_changed` 作为权威全量清单校准账本。账本

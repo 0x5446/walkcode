@@ -233,19 +233,16 @@ class ResumeBoundaryTests(unittest.TestCase):
         self.assertEqual(handle.ref["thread_id"], "thread-2")
         self.assertEqual(client.requests, [("thread/resume", {"threadId": "thread-2", "cwd": "/tmp/project"})])
 
-    def test_claude_generic_resume_delegates_to_injected_client(self):
+    def test_claude_resume_connects_worker_and_reports_agent_session(self):
+        # The agent session id reaches the SDK as options.resume (see
+        # test_real_sdk_shape_resume_uses_options_resume); the client itself
+        # is only connected.
         class Client:
             def __init__(self):
-                self.resumed = []
+                self.connected = False
 
-            async def resume(self, resume_ref):
-                self.resumed.append(dict(resume_ref))
-
-            async def submit(self, turn):
-                pass
-
-            async def events(self):
-                return []
+            async def connect(self, prompt=None):
+                self.connected = True
 
         client = Client()
         transport = ClaudeHeadlessTransport(client_factory=lambda _spec: client)
@@ -260,8 +257,10 @@ class ResumeBoundaryTests(unittest.TestCase):
             )
         )
 
-        self.assertEqual(client.resumed, [{"session_id": "claude-1"}])
+        self.assertTrue(client.connected)
         self.assertEqual(handle.ref["session_id"], "claude-1")
+        self.assertEqual(handle.ref["agent_session_id"], "claude-1")
+        self.assertEqual(handle.ref["walkcode_session_id"], "s1")
 
 
 if __name__ == "__main__":
