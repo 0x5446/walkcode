@@ -63,9 +63,13 @@ re-exports. `models` (contracts), `config`, `stores` (everything
 clients), `orchestrator` and `fakes` hold the code; imports only point to
 modules earlier in that list. The Claude gate (`claude_gate`,
 `claude_gate_transport`) and Lark live/card modules (`lark_live`,
-`lark_cards`) sit beside them. `walkcode.channel_native_runtime` wires it all
-into the serving process. Tests patch a module-level name in the submodule
-that uses it, not on the package. Optional third-party SDKs (claude_agent_sdk,
+`lark_cards`) sit beside them.
+`tui_hooks` holds the runtime's module-level Claude/Codex TUI hook helpers
+(hook/transcript/rollout parsing, resume/terminate refs, process-tree
+capture, hook spool); it imports only the core submodules, never the runtime.
+`walkcode.channel_native_runtime` wires it all into the serving process.
+Tests patch a module-level name in the submodule that uses it, not on the
+package. Optional third-party SDKs (claude_agent_sdk,
 lark_oapi) stay imported lazily inside their loaders on purpose: a missing
 package must surface as "agent/channel unavailable", not as an import error of
 the whole runtime.
