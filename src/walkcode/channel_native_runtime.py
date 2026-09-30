@@ -3985,7 +3985,11 @@ class ChannelNativeRuntime:
             binding.capabilities.pop("topic_closed", None)
             changed = True
         if session.writer_owner and session.writer_owner.kind == "external_tui":
-            if session.lifecycle_state != "EXTERNAL_OBSERVED_READONLY":
+            # WAITING_PERMISSION is a sub-state of the read-only observation
+            # (set by permission-request, cleared by the next tool event).
+            # Resetting it on every hook lost it before Claude's follow-up
+            # Notification arrived, so that duplicate was not suppressed.
+            if session.lifecycle_state not in {"EXTERNAL_OBSERVED_READONLY", "WAITING_PERMISSION"}:
                 session.lifecycle_state = "EXTERNAL_OBSERVED_READONLY"
                 changed = True
         return changed

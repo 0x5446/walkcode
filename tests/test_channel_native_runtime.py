@@ -3055,15 +3055,6 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
             )
             self.assertEqual(session.lifecycle_state, "EXTERNAL_OBSERVED_READONLY")
 
-    # Known Lark bug surfaced by the channel retirement (ADR 0069): every hook
-    # on an observed session runs _ensure_tui_observed_binding_capabilities,
-    # which resets lifecycle_state to EXTERNAL_OBSERVED_READONLY whenever the
-    # binding has a thread (always true on Lark). So WAITING_PERMISSION is
-    # lost before Claude's follow-up Notification arrives and the duplicate
-    # "needs your permission" bubble is not suppressed. The retired channel's
-    # private chats had no thread id and never hit the reset. Remove this decorator with the
-    # src fix (an "unexpected success" fails the suite on purpose).
-    @unittest.expectedFailure
     def test_notification_after_permission_request_is_suppressed(self):
         with tempfile.TemporaryDirectory() as tmp:
             state_path = str(Path(tmp) / "state.json")
