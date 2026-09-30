@@ -40,6 +40,7 @@ would cycle).
 from __future__ import annotations
 
 import contextlib
+import fcntl
 import json
 import os
 import re
@@ -311,6 +312,28 @@ def wait_for_decision(
             return {"action": "pass", "reason": "walkcode_offline"}
         time.sleep(poll_interval)
     return None
+
+
+@contextlib.contextmanager
+def gate_lock(state_path: Path | str):
+    """Cross-process lock for "is the hook still waiting?" decisions.
+
+    The hook's timeout close (last decision read, then pending removal) and a
+    card click's delivery (pending check, then decision write) must not
+    interleave: a click landing between the hook's last read and its cleanup
+    was written, reported as approved on the card, and then deleted while the
+    terminal fell back. One lock file for the whole spool, never unlinked
+    (unlinking a lock file races with its holders); critical sections are a
+    few file operations.
+    """
+    root = gate_root(state_path)
+    _ensure_private_dir(root)
+    fd = os.open(root / "gate.lock", os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
 
 
 def cleanup_gate_files(state_path: Path | str, rid: str) -> None:
