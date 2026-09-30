@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Any
 
 from .channel_native import (
+    agent_session_id,
     PermanentDeliveryError,
     ActorRef,
     AgentEvent,
@@ -141,6 +142,8 @@ TUI_HOOK_DRAIN_TIMEOUT_SECONDS = 30.0
 TUI_HOOK_DRAIN_BATCH_SIZE = 25
 TUI_HOOK_RECENT_PRIORITY_WINDOW_SECONDS = 300.0
 TUI_HOOK_DRAIN_INTERVAL_SECONDS = 1.0
+CODEX_MIRROR_RETRY_MIN_SECONDS = 5.0
+CODEX_MIRROR_RETRY_MAX_SECONDS = 300.0
 # A queued hook that raises this many times in a row is archived: the drain
 # stops at the first failure to keep order, so one hook failing the same way
 # every tick would otherwise block every hook behind it forever.
@@ -1110,9 +1113,6 @@ class _UnavailableTransport:
     ) -> None:
         raise CapabilityUnsupported(self.reason)
 
-    async def interrupt(self, handle: TransportHandle, reason: str) -> ControlResult:
-        return ControlResult(False, self.reason)
-
     async def shutdown(self, handle: TransportHandle, mode: str) -> ControlResult:
         return ControlResult(False, self.reason)
 
@@ -1607,6 +1607,10 @@ class ChannelNativeRuntime:
         # thread each mirrored session is subscribed to.
         self._codex_mirror: CodexForeignTurnMirror | None = None
         self._codex_mirror_threads: dict[str, str] = {}
+        # session id -> (retry at [monotonic], current delay, last error). A failing
+        # subscribe (e.g. the daemon executable is missing) used to be retried on
+        # every 5 s pass forever, spawning a codex process and a log line each time.
+        self._codex_mirror_backoff: dict[str, tuple[float, float, str]] = {}
         self._gate_always_allow: set[tuple[str, str]] = set()
         # ADR 0066: since when the Claude daemon socket file has been missing
         # (0 = present / not yet seen missing).
@@ -1900,13 +1904,7 @@ class ChannelNativeRuntime:
         selector = _agent_selector_command(inbound)
         if selector:
             await channel.send_view(
-                ChannelBinding(
-                    channel_kind=inbound.channel_kind,
-                    account_id=inbound.account_id,
-                    chat_id=inbound.chat_id,
-                    thread_id=inbound.thread_id,
-                    root_message_id=inbound.root_message_id or inbound.message_id,
-                ),
+                _inbound_reply_binding(inbound),
                 {
                     "type": "agent_selector_rejected",
                     "message": _agent_selector_rejected_message(
@@ -1920,13 +1918,7 @@ class ChannelNativeRuntime:
         unknown_slash = _telegram_unknown_slash_command(inbound)
         if unknown_slash and self._resolve_telegram_command_session(inbound) is None:
             await channel.send_view(
-                ChannelBinding(
-                    channel_kind=inbound.channel_kind,
-                    account_id=inbound.account_id,
-                    chat_id=inbound.chat_id,
-                    thread_id=inbound.thread_id,
-                    root_message_id=inbound.root_message_id or inbound.message_id,
-                ),
+                _inbound_reply_binding(inbound),
                 {
                     "type": "text",
                     "text": (
@@ -2093,13 +2085,7 @@ class ChannelNativeRuntime:
     def _telegram_command_reply_binding(self, inbound, session=None) -> ChannelBinding:
         if session is not None and session.channel_binding is not None:
             return session.channel_binding
-        return ChannelBinding(
-            channel_kind=inbound.channel_kind,
-            account_id=inbound.account_id,
-            chat_id=inbound.chat_id,
-            thread_id=inbound.thread_id,
-            root_message_id=inbound.root_message_id or inbound.message_id,
-        )
+        return _inbound_reply_binding(inbound)
 
     def _telegram_runtime_status_view(self) -> dict[str, Any]:
         active = [
@@ -2272,13 +2258,7 @@ class ChannelNativeRuntime:
             return
         try:
             await send_action(
-                ChannelBinding(
-                    channel_kind=inbound.channel_kind,
-                    account_id=inbound.account_id,
-                    chat_id=inbound.chat_id,
-                    thread_id=inbound.thread_id,
-                    root_message_id=inbound.root_message_id or inbound.message_id,
-                ),
+                _inbound_reply_binding(inbound),
                 "typing",
             )
         except Exception:
@@ -2290,13 +2270,7 @@ class ChannelNativeRuntime:
             return
         try:
             await react_to_message(
-                ChannelBinding(
-                    channel_kind=inbound.channel_kind,
-                    account_id=inbound.account_id,
-                    chat_id=inbound.chat_id,
-                    thread_id=inbound.thread_id,
-                    root_message_id=inbound.root_message_id or inbound.message_id,
-                ),
+                _inbound_reply_binding(inbound),
                 inbound.message_id,
                 "✅",
             )
@@ -2424,8 +2398,6 @@ class ChannelNativeRuntime:
             and inbound.event_id != "lark:"
             and ledger.seen(inbound.event_id)
         ):
-            from .channel_native import _log_degrade
-
             # Dropped silently toward the user (a duplicate needs no reply),
             # but never silently toward the operator: redeliveries are the
             # symptom of the WS drop/ack loss this dedup exists for.
@@ -2443,13 +2415,7 @@ class ChannelNativeRuntime:
             # After the authz gates on purpose: expanding costs an API call,
             # and an unauthorized sender must not be able to spend it.
             inbound = await self._expand_lark_merge_forward(channel, inbound)
-            reply_binding = ChannelBinding(
-                channel_kind=inbound.channel_kind,
-                account_id=inbound.account_id,
-                chat_id=inbound.chat_id,
-                thread_id=inbound.thread_id,
-                root_message_id=inbound.root_message_id or inbound.message_id,
-            )
+            reply_binding = _inbound_reply_binding(inbound)
             if str(inbound.text or "").lstrip().startswith("//"):
                 # Escape hatch for agent-native commands shadowed by WalkCode
                 # ones: //model reaches the agent as /model. Claude executes
@@ -2531,18 +2497,10 @@ class ChannelNativeRuntime:
             if note:
                 try:
                     await channel.send_view(
-                        ChannelBinding(
-                            channel_kind=inbound.channel_kind,
-                            account_id=inbound.account_id,
-                            chat_id=inbound.chat_id,
-                            thread_id=inbound.thread_id,
-                            root_message_id=inbound.root_message_id or inbound.message_id,
-                        ),
+                        _inbound_reply_binding(inbound),
                         {"type": "text", "text": note},
                     )
                 except Exception as exc:
-                    from .channel_native import _log_degrade
-
                     _log_degrade(
                         "lark_rejection_note_send_failed",
                         reason=str(result.reason or ""),
@@ -3229,19 +3187,37 @@ class ChannelNativeRuntime:
                 transport.unsubscribe_foreign_mirror(thread_id)
                 self._codex_mirror_threads.pop(session_id, None)
                 await mirror.close(session_id)
+        for session_id in list(self._codex_mirror_backoff):
+            if session_id not in candidates:
+                self._codex_mirror_backoff.pop(session_id, None)
         subscribed = 0
         for session_id, (thread_id, cwd) in candidates.items():
             if self._codex_mirror_threads.get(session_id) == thread_id and transport.foreign_sink_current(thread_id):
+                continue
+            retry_at, delay, last_error = self._codex_mirror_backoff.get(session_id, (0.0, 0.0, ""))
+            if time.monotonic() < retry_at:
                 continue
             if mirror.is_active(session_id):
                 mirror.interrupt(session_id)
             try:
                 await transport.subscribe_foreign_mirror(thread_id, cwd=cwd, sink=mirror.sink(session_id))
-            except Exception as exc:  # noqa: BLE001 - retried on the next pass
-                _log_degrade("codex_mirror_subscribe_failed", session_id=session_id, error=exc)
+            except Exception as exc:  # noqa: BLE001 - retried with backoff
+                error = f"{type(exc).__name__}: {exc}"
+                delay = min(max(delay * 2, CODEX_MIRROR_RETRY_MIN_SECONDS), CODEX_MIRROR_RETRY_MAX_SECONDS)
+                if error != last_error:
+                    _log_degrade(
+                        "codex_mirror_subscribe_failed",
+                        session_id=session_id,
+                        error=error,
+                        retry_in=int(delay),
+                    )
+                # Measured from the failure: a 30 s request timeout must not
+                # eat the delay it is meant to start.
+                self._codex_mirror_backoff[session_id] = (time.monotonic() + delay, delay, error)
                 self._codex_mirror_threads.pop(session_id, None)
                 await mirror.close(session_id)
                 continue
+            self._codex_mirror_backoff.pop(session_id, None)
             self._codex_mirror_threads[session_id] = thread_id
             subscribed += 1
         return subscribed
@@ -3363,10 +3339,8 @@ class ChannelNativeRuntime:
             _stamp_transcript_size(payload)
         hook_type = _normalize_tui_hook_type(hook_type or _payload_hook_event_name(payload))
         if not hook_type:
-            self.save_state()
             return SubmitResult(True, "missing_hook_type")
         if not _tui_hook_observes_session(hook_type):
-            self.save_state()
             return SubmitResult(True, "non_observation_hook")
         agent_name = _normalize_tui_agent(agent or str(payload.get("agent", "") or ""))
         if not agent_name:
@@ -3374,28 +3348,24 @@ class ChannelNativeRuntime:
         transport_kind = _agent_to_transport_kind(agent_name)
         resume_ref = _tui_resume_ref(transport_kind, payload)
         if not resume_ref:
-            self.save_state()
             return SubmitResult(True, "missing_resume_ref")
         if _tui_hook_is_walkcode_headless_transport(transport_kind, payload) or self._tui_hook_is_walkcode_codex_turn(
             transport_kind, payload
         ):
-            self.save_state()
             return SubmitResult(True, "internal_headless_hook_ignored")
         if transport_kind == "codex_app_server" and _codex_transcript_is_exec(payload):
-            self.save_state()
             return SubmitResult(True, "codex_exec_hook_ignored")
         if (
             _tui_hook_can_claim_existing_session(hook_type)
             and self._tui_hook_is_unverified_walkcode_owned_session_hook(transport_kind, resume_ref, payload)
         ):
-            self.save_state()
             return SubmitResult(True, "internal_headless_hook_ignored")
 
         event_id = _tui_event_id(hook_type, transport_kind, resume_ref, payload)
-        ledger_started = False
-        if self.state.inbound_ledger is not None and not self.state.inbound_ledger.start(event_id):
+        # Nothing above changed state: ignored hooks return without a save
+        # (a full fsync'd rewrite of a multi-MB state file per tool call).
+        if not self.state.inbound_ledger.start(event_id):
             return SubmitResult(True, BlockedReason.DUPLICATE_INBOUND)
-        ledger_started = self.state.inbound_ledger is not None
         try:
             session = await self._claim_or_create_tui_observed_session(
                 hook_type=hook_type,
@@ -3405,8 +3375,7 @@ class ChannelNativeRuntime:
                 payload=payload,
             )
             if session is None:
-                if ledger_started:
-                    self.state.inbound_ledger.complete(event_id)
+                self.state.inbound_ledger.complete(event_id)
                 self.save_state()
                 return SubmitResult(True, "unobserved_tui_hook")
             if session.status != "stopped":
@@ -3443,11 +3412,9 @@ class ChannelNativeRuntime:
             # (asyncio.CancelledError) must also release the ledger entry —
             # an event stuck in_progress makes the replay look like a
             # duplicate and the queued hook is then dropped as "processed".
-            if ledger_started:
-                self.state.inbound_ledger.fail(event_id)
+            self.state.inbound_ledger.fail(event_id)
             raise
-        if ledger_started:
-            self.state.inbound_ledger.complete(event_id)
+        self.state.inbound_ledger.complete(event_id)
         self.save_state()
         return SubmitResult(True)
 
@@ -3693,8 +3660,6 @@ class ChannelNativeRuntime:
         transport = self._claude_daemon_transport()
         if transport is None:
             return None
-        from .channel_native import _log_degrade
-
         headless = self.transports.get("claude_headless")
         settings = ""
         cli_path = ""
@@ -3829,8 +3794,6 @@ class ChannelNativeRuntime:
         """
         if not short:
             return
-        from .channel_native import _log_degrade
-
         transport.stop_observer(short)
         try:
             await transport.client.kill(short)
@@ -3940,7 +3903,7 @@ class ChannelNativeRuntime:
     def _tui_observed_session_id(
         self, agent_name: str, transport_kind: str, resume_ref: dict[str, Any]
     ) -> str:
-        identity = _resume_ref_identity(transport_kind, resume_ref)
+        identity = agent_session_id(transport_kind, resume_ref)
         session_id = f"tui-{agent_name}-{hashlib.sha1(identity.encode()).hexdigest()[:12]}"
         base_session_id = session_id
         suffix = 1
@@ -4683,7 +4646,7 @@ class ChannelNativeRuntime:
             external_ref["terminate_ref"] = terminate_ref
         actor = ActorRef(
             channel_kind=self.config.channel.kind,
-            actor_id=f"local_tui:{transport_kind}:{_resume_ref_identity(transport_kind, resume_ref)}",
+            actor_id=f"local_tui:{transport_kind}:{agent_session_id(transport_kind, resume_ref)}",
             display_name=f"{agent_name} TUI",
         )
         existing_id = self.state.sessions.find_by_resume_ref(
@@ -4845,7 +4808,7 @@ class ChannelNativeRuntime:
             if not session.cached_title:
                 session.cached_title = _telegram_session_topic_name(
                     agent_name,
-                    f"TUI {_resume_ref_identity(transport_kind, resume_ref)}",
+                    f"TUI {agent_session_id(transport_kind, resume_ref)}",
                 )
                 session.title_source = "tui_hook"
             await self.orchestrator.refresh_session_status_card(session)
@@ -4860,7 +4823,7 @@ class ChannelNativeRuntime:
         if not title:
             title = _telegram_session_topic_name(
                 agent_name,
-                f"TUI {_resume_ref_identity(transport_kind, resume_ref)}",
+                f"TUI {agent_session_id(transport_kind, resume_ref)}",
             )
             title_source = "tui_hook"
         binding = await self._create_tui_observed_binding(
@@ -5135,7 +5098,7 @@ class ChannelNativeRuntime:
         agent = _normalize_tui_agent(str(transport_ref.get("agent", "") or "")) or self.config.agent
         resume_ref = transport_ref.get("resume_ref")
         identity = (
-            _resume_ref_identity(_agent_to_transport_kind(agent), resume_ref)
+            agent_session_id(_agent_to_transport_kind(agent), resume_ref)
             if isinstance(resume_ref, dict)
             else ""
         )
@@ -5323,7 +5286,7 @@ class ChannelNativeRuntime:
     ) -> ChannelBinding:
         title = title or _telegram_session_topic_name(
             agent_name,
-            f"TUI {_resume_ref_identity(transport_kind, resume_ref)}",
+            f"TUI {agent_session_id(transport_kind, resume_ref)}",
         )
         channel_kind = self.config.channel.kind
         if channel_kind == "lark":
@@ -5924,7 +5887,7 @@ class ChannelNativeRuntime:
                 "submit_blocked_reason": "",
             }
         resolution = self.state.sessions.resolve_active_binding(
-            inbound.binding_key(), revival_eligible=self._revival_transport_ready
+            inbound.binding_key(), revival_eligible=self.orchestrator._revival_transport_ready
         )
         if resolution.reason:
             if resolution.reason == BlockedReason.AMBIGUOUS_SESSION:
@@ -5954,7 +5917,7 @@ class ChannelNativeRuntime:
                     "submit_would_accept": False,
                     "submit_blocked_reason": authz.reason,
                 }
-        if _session_is_channel_revival_candidate(session) and self._revival_transport_ready(session):
+        if _session_is_channel_revival_candidate(session) and self.orchestrator._revival_transport_ready(session):
             # ADR 0054: the real submit path revives this session instead of
             # dead-ending at SESSION_STOPPED — report it as submittable.
             return {
@@ -6052,16 +6015,6 @@ class ChannelNativeRuntime:
             "submit_would_accept": True,
             "submit_blocked_reason": "",
         }
-
-    def _revival_transport_ready(self, session) -> bool:
-        """Mirror of Orchestrator._revival_transport_ready for the doctor path."""
-        transport = self.transports.get(session.transport_kind)
-        if transport is None:
-            return False
-        try:
-            return bool(transport.capabilities().resume_after_complete)
-        except Exception:
-            return False
 
     def _summarize_new_session_gate(self, transport_kind: str | None = None) -> dict[str, Any]:
         selected_transport = transport_kind or self.config.agent_transport_kind
@@ -6355,13 +6308,25 @@ def _codex_home_path(codex_home: str = "") -> Path:
     return Path.home() / ".codex"
 
 
+def _inbound_reply_binding(inbound) -> ChannelBinding:
+    """Where a direct reply to this inbound goes: its thread, rooted on the
+    thread root (or on the message itself when it starts one)."""
+    return ChannelBinding(
+        channel_kind=inbound.channel_kind,
+        account_id=inbound.account_id,
+        chat_id=inbound.chat_id,
+        thread_id=inbound.thread_id,
+        root_message_id=inbound.root_message_id or inbound.message_id,
+    )
+
+
 def _build_codex_app_server_client(config: ChannelNativeConfig) -> Any:
     options = config.agent_options.get("codex", {})
     mode = str(options.get("app_server_mode", "") or "auto").strip().lower()
     socket_path = str(options.get("app_server_socket", "") or "")
     codex_home = str(options.get("codex_home", "") or "")
     if mode == "auto":
-        if _codex_standalone_daemon_available(codex_home):
+        if _codex_managed_daemon_available(codex_home):
             return CodexManagedAppServerClient(socket_path=socket_path, codex_home=codex_home)
         return CodexStdioAppServerClient(codex_home=codex_home)
     if mode in {"daemon", "managed", "shared"}:
@@ -6373,8 +6338,13 @@ def _build_codex_app_server_client(config: ChannelNativeConfig) -> Any:
     )
 
 
-def _codex_standalone_daemon_available(codex_home: str = "") -> bool:
-    return (_codex_home_path(codex_home) / "packages" / "standalone" / "current" / "codex").exists()
+def _codex_managed_daemon_available(codex_home: str = "") -> bool:
+    # The executable `codex app-server daemon start` runs. exists() follows
+    # the `current` symlink, so a dangling one (its release dir was deleted —
+    # 2026-09-29 bfjdfhnf-codex outage) falls back to stdio instead of
+    # failing every request. The standalone CLI package says nothing about it.
+    daemon = _codex_home_path(codex_home) / "packages" / "app-server-daemon" / "current" / "bin" / "codex"
+    return daemon.exists()
 
 
 def _build_external_tui_controllers() -> dict[str, Any]:
@@ -6882,8 +6852,6 @@ def _ignore_empty_inbound(inbound: Any) -> SubmitResult:
     without a trace the visible symptom is "the bot ignored me" with no
     evidence in the ledger, the outbox, or the agent transcript.
     """
-    from .channel_native import _log_degrade
-
     _log_degrade(
         "empty_inbound_ignored",
         channel=getattr(inbound, "channel_kind", ""),
@@ -7135,24 +7103,14 @@ def _tui_resume_ref(transport_kind: str, payload: dict[str, Any]) -> dict[str, A
         if normalized:
             return normalized
 
+    value = agent_session_id(transport_kind, payload)
+    if not value:
+        return {}
     if transport_kind == "claude_headless":
-        value = (
-            payload.get("agent_session_id")
-            or payload.get("claude_session_id")
-            or payload.get("session_id")
-            or payload.get("resume")
-        )
-        return {"agent_session_id": str(value)} if value else {}
+        return {"agent_session_id": value}
     if transport_kind == "codex_app_server":
-        value = (
-            payload.get("thread_id")
-            or payload.get("codex_thread_id")
-            or payload.get("conversation_id")
-            or payload.get("session_id")
-        )
-        return {"thread_id": str(value)} if value else {}
-    value = payload.get("session_id") or payload.get("handle_id")
-    return {"session_id": str(value)} if value else {}
+        return {"thread_id": value}
+    return {"session_id": value}
 
 
 def _tui_terminate_ref(payload: dict[str, Any]) -> dict[str, Any] | None:
@@ -7620,7 +7578,7 @@ def _tui_event_id(
     resume_ref: dict[str, Any],
     payload: dict[str, Any],
 ) -> str:
-    identity = _resume_ref_identity(transport_kind, resume_ref)
+    identity = agent_session_id(transport_kind, resume_ref)
     # Tool lifecycle hooks (PreToolUse/PostToolUse/...) carry a per-call
     # tool_use_id that is unique within the task. Using turn_id here — which
     # codex 0.144+ keeps CONSTANT across every tool in one turn — made the
@@ -7665,26 +7623,6 @@ def _tui_event_id(
         }
         suffix = hashlib.sha1(json.dumps(stable, sort_keys=True).encode("utf-8")).hexdigest()
     return f"external_tui:{hook_type}:{transport_kind}:{identity}:{suffix}"
-
-
-def _resume_ref_identity(transport_kind: str, resume_ref: dict[str, Any]) -> str:
-    if transport_kind == "claude_headless":
-        return str(
-            resume_ref.get("agent_session_id")
-            or resume_ref.get("claude_session_id")
-            or resume_ref.get("session_id")
-            or resume_ref.get("resume")
-            or ""
-        )
-    if transport_kind == "codex_app_server":
-        return str(
-            resume_ref.get("thread_id")
-            or resume_ref.get("codex_thread_id")
-            or resume_ref.get("conversation_id")
-            or resume_ref.get("session_id")
-            or ""
-        )
-    return str(resume_ref.get("session_id") or resume_ref.get("handle_id") or "")
 
 
 def _tui_telegram_chat_id(endpoint: ChannelEndpointConfig) -> str:
@@ -8114,10 +8052,8 @@ def _session_has_durable_resume_ref(session: Any) -> bool:
 
 
 def _resume_ref_is_durable(transport_kind: str, ref: dict[str, Any]) -> bool:
-    if transport_kind == "claude_headless":
-        return bool(ref.get("agent_session_id") or ref.get("claude_session_id") or ref.get("session_id"))
-    if transport_kind == "codex_app_server":
-        return bool(ref.get("thread_id"))
+    if transport_kind in {"claude_headless", "codex_app_server"}:
+        return bool(agent_session_id(transport_kind, ref))
     return bool(ref)
 
 

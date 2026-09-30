@@ -2159,14 +2159,14 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
             }
         )
         original = runtime_module.shutil.which
-        original_daemon_available = runtime_module._codex_standalone_daemon_available
+        original_daemon_available = runtime_module._codex_managed_daemon_available
         runtime_module.shutil.which = lambda name: "/usr/bin/codex" if name == "codex" else original(name)
-        runtime_module._codex_standalone_daemon_available = lambda codex_home="": True
+        runtime_module._codex_managed_daemon_available = lambda codex_home="": True
         try:
             transports = runtime_module._build_transports(cfg)
         finally:
             runtime_module.shutil.which = original
-            runtime_module._codex_standalone_daemon_available = original_daemon_available
+            runtime_module._codex_managed_daemon_available = original_daemon_available
 
         self.assertIsInstance(transports["codex_app_server"], runtime_module.CodexAppServerTransport)
         self.assertIsInstance(
@@ -2175,7 +2175,7 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
         )
         self.assertTrue(transports["codex_app_server"].capabilities().structured_input)
 
-    def test_build_transports_auto_falls_back_to_codex_stdio_without_standalone_daemon(self):
+    def test_build_transports_auto_falls_back_to_codex_stdio_without_managed_daemon(self):
         cfg = ChannelNativeConfig.from_env(
             {
                 "WALKCODE_CHANNEL": "telegram",
@@ -2184,14 +2184,14 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
             }
         )
         original = runtime_module.shutil.which
-        original_daemon_available = runtime_module._codex_standalone_daemon_available
+        original_daemon_available = runtime_module._codex_managed_daemon_available
         runtime_module.shutil.which = lambda name: "/usr/bin/codex" if name == "codex" else original(name)
-        runtime_module._codex_standalone_daemon_available = lambda codex_home="": False
+        runtime_module._codex_managed_daemon_available = lambda codex_home="": False
         try:
             transports = runtime_module._build_transports(cfg)
         finally:
             runtime_module.shutil.which = original
-            runtime_module._codex_standalone_daemon_available = original_daemon_available
+            runtime_module._codex_managed_daemon_available = original_daemon_available
 
         self.assertIsInstance(
             transports["codex_app_server"].client,
@@ -3319,6 +3319,88 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
 
             asyncio.run(run())
 
+    def test_failing_mirror_subscribe_backs_off_and_logs_once(self):
+        # Regression (2026-09-29 bfjdfhnf-codex): a missing daemon executable
+        # failed every 5 s pass forever — a codex spawn and a log line each.
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime, fake, taken_over = self._reconcile_setup(tmp)
+            fake.fail = True
+            attempts = []
+            original = fake.subscribe_foreign_mirror
+
+            async def counting(thread_id, *, cwd, sink):
+                attempts.append(thread_id)
+                return await original(thread_id, cwd=cwd, sink=sink)
+
+            fake.subscribe_foreign_mirror = counting
+            clock = [1000.0]
+
+            async def run():
+                with patch.object(runtime_module.time, "monotonic", lambda: clock[0]), \
+                        patch.object(runtime_module, "_log_degrade") as log:
+                    for _ in range(3):  # same pass window: only the first tries
+                        await runtime.reconcile_codex_mirrors()
+                    self.assertEqual(len(attempts), 1)
+                    clock[0] += runtime_module.CODEX_MIRROR_RETRY_MIN_SECONDS
+                    await runtime.reconcile_codex_mirrors()  # retried after the delay
+                    self.assertEqual(len(attempts), 2)
+                    clock[0] += runtime_module.CODEX_MIRROR_RETRY_MIN_SECONDS
+                    await runtime.reconcile_codex_mirrors()  # delay doubled: not yet
+                    self.assertEqual(len(attempts), 2)
+                    self.assertEqual(log.call_count, 1)  # same error logged once
+                    fake.fail = False
+                    clock[0] += runtime_module.CODEX_MIRROR_RETRY_MAX_SECONDS
+                    self.assertEqual(await runtime.reconcile_codex_mirrors(), 1)
+                self.assertEqual(runtime._codex_mirror_backoff, {})
+
+            asyncio.run(run())
+
+    def test_mirror_backoff_starts_when_the_slow_request_fails(self):
+        # A subscribe that times out after 30 s must not have spent the delay
+        # that should start at the failure.
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime, fake, taken_over = self._reconcile_setup(tmp)
+            clock = [1000.0]
+            attempts = []
+
+            async def slow_failure(thread_id, *, cwd, sink):
+                attempts.append(clock[0])
+                clock[0] += 30.0  # the request itself took 30 s
+                raise RuntimeError("timed out")
+
+            fake.subscribe_foreign_mirror = slow_failure
+
+            async def run():
+                with patch.object(runtime_module.time, "monotonic", lambda: clock[0]), \
+                        patch.object(runtime_module, "_log_degrade"):
+                    await runtime.reconcile_codex_mirrors()
+                    clock[0] += runtime_module.CODEX_MIRROR_RETRY_MIN_SECONDS - 1
+                    await runtime.reconcile_codex_mirrors()
+                    self.assertEqual(len(attempts), 1)  # full delay not yet over
+                    clock[0] += 1
+                    await runtime.reconcile_codex_mirrors()
+                    self.assertEqual(len(attempts), 2)
+
+            asyncio.run(run())
+
+    def test_auto_mode_needs_the_managed_daemon_executable(self):
+        # The standalone CLI package does not make `app-server daemon start`
+        # work; a dangling daemon `current` link must fall back to stdio.
+        with tempfile.TemporaryDirectory() as home:
+            packages = Path(home) / "packages"
+            (packages / "standalone" / "current").mkdir(parents=True)
+            (packages / "standalone" / "current" / "codex").write_text("")
+            self.assertFalse(runtime_module._codex_managed_daemon_available(home))
+            daemon_dir = packages / "app-server-daemon"
+            daemon_dir.mkdir()
+            (daemon_dir / "current").symlink_to(Path(home) / "gone" / "release")
+            self.assertFalse(runtime_module._codex_managed_daemon_available(home))
+            (daemon_dir / "current").unlink()
+            (daemon_dir / "releases" / "v1" / "bin").mkdir(parents=True)
+            (daemon_dir / "releases" / "v1" / "bin" / "codex").write_text("")
+            (daemon_dir / "current").symlink_to(daemon_dir / "releases" / "v1")
+            self.assertTrue(runtime_module._codex_managed_daemon_available(home))
+
     def test_codex_mirror_switch_rejects_unknown_values(self):
         with tempfile.TemporaryDirectory() as tmp:
             env = {
@@ -3397,6 +3479,7 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
                 fake.fail = True
                 self.assertEqual(await runtime.reconcile_codex_mirrors(), 0)
                 fake.fail = False
+                runtime._codex_mirror_backoff.clear()  # retry window elapsed
                 self.assertEqual(await runtime.reconcile_codex_mirrors(), 1)
                 await runtime._codex_mirror.close(taken_over.session_id)
 

@@ -22,6 +22,8 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+from claude_agent_sdk import AssistantMessage, TextBlock, ToolResultBlock, ToolUseBlock, UserMessage
+
 from walkcode.channel_native import (
     ActorRef,
     AgentEventType,
@@ -104,14 +106,14 @@ def _orchestrator():
 
 class SdkNarrationConversionTests(unittest.TestCase):
     def test_text_sharing_message_with_tool_use_becomes_narration(self):
-        message = {
-            "role": "assistant",
-            "content": [
-                {"type": "text", "text": "先看下配置文件"},
-                {"type": "tool_use", "id": "tu-1", "name": "Read", "input": {"file_path": "/tmp/x"}},
+        message = AssistantMessage(
+            content=[
+                TextBlock(text="先看下配置文件"),
+                ToolUseBlock(id="tu-1", name="Read", input={"file_path": "/tmp/x"}),
             ],
-        }
-        events = ClaudeHeadlessTransport._convert_sdk_dict_message(message)
+            model="claude-test",
+        )
+        events = ClaudeHeadlessTransport._convert_sdk_message(message)
         self.assertIsInstance(events, list)
         self.assertEqual(events[0].type, AgentEventType.TURN_NARRATION)
         self.assertEqual(events[0].payload["text"], "先看下配置文件")
@@ -121,21 +123,20 @@ class SdkNarrationConversionTests(unittest.TestCase):
         self.assertNotIn(AgentEventType.TURN_DELTA, [e.type for e in events])
 
     def test_text_only_message_stays_turn_delta(self):
-        message = {"role": "assistant", "content": [{"type": "text", "text": "最终回复"}]}
-        events = ClaudeHeadlessTransport._convert_sdk_dict_message(message)
+        message = AssistantMessage(content=[TextBlock(text="最终回复")], model="claude-test")
+        events = ClaudeHeadlessTransport._convert_sdk_message(message)
         self.assertEqual([e.type for e in events], [AgentEventType.TURN_DELTA])
 
     def test_user_role_tool_message_emits_no_narration(self):
         # Tool results ride user-role messages; their text is machine input,
         # not agent narration.
-        message = {
-            "role": "user",
-            "content": [
-                {"type": "text", "text": "<task-notification>done</task-notification>"},
-                {"type": "tool_result", "tool_use_id": "tu-1", "content": "ok"},
-            ],
-        }
-        events = ClaudeHeadlessTransport._convert_sdk_dict_message(message)
+        message = UserMessage(
+            content=[
+                TextBlock(text="<task-notification>done</task-notification>"),
+                ToolResultBlock(tool_use_id="tu-1", content="ok"),
+            ]
+        )
+        events = ClaudeHeadlessTransport._convert_sdk_message(message)
         types = [e.type for e in (events or [])]
         self.assertNotIn(AgentEventType.TURN_NARRATION, types)
         self.assertNotIn(AgentEventType.TURN_DELTA, types)

@@ -163,7 +163,6 @@ class HealthWatchdogTests(unittest.TestCase):
         self.assertEqual(health.reason, "progress_timeout")
         self.assertEqual(health.view_model["type"], "health")
         self.assertEqual(health.view_model["status"], "stale")
-        self.assertEqual(transport.interrupt_calls, [])
         self.assertEqual(transport.shutdown_calls, [])
         self.assertEqual(orchestrator.sessions.get(session.session_id).status, "running")
 
@@ -352,7 +351,7 @@ class AgentSessionIdentityTests(unittest.TestCase):
         self.assertEqual(_agent_session_identity(session), "c5b03e87-9ca0-48af")
 
     def test_walkcode_key_parked_in_the_generic_slot_is_not_an_agent_id(self):
-        session = self._session("claude_headless", {"session_id": "sess-abc"})
+        session = self._session("claude_headless", {"session_id": "sess-" + "0123456789abcdef" * 2})
 
         self.assertEqual(_agent_session_identity(session), "")
 

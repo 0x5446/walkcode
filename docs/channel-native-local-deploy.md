@@ -590,10 +590,12 @@ WALKCODE_E2E_CWD=/Users/you/.walkcode/e2e/channel-native-smoke
 ```
 
 Codex defaults to `WALKCODE_CODEX_APP_SERVER_MODE=auto`. In `auto` mode,
-WalkCode starts/uses the managed Codex app-server daemon when the local Codex
-standalone daemon install is present, then connects directly to the daemon's
-Unix control socket with a WebSocket JSON-RPC client. If the standalone daemon
-install is missing, it falls back to an isolated `codex app-server --stdio`
+WalkCode starts/uses the managed Codex app-server daemon when
+`$CODEX_HOME/packages/app-server-daemon/current/bin/codex` resolves to a real
+file (the standalone CLI package alone is not enough; a dangling `current`
+link counts as missing), then connects directly to the daemon's Unix control
+socket with a WebSocket JSON-RPC client. Otherwise it falls back to an
+isolated `codex app-server --stdio`
 client.
 
 The shared-daemon path is the target architecture because it can also be used

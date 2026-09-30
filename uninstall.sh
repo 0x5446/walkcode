@@ -1,24 +1,43 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# WalkCode one-click uninstaller
-# Usage: bash uninstall.sh
-#   or:  curl -fsSL https://raw.githubusercontent.com/0x5446/walkcode/main/uninstall.sh | bash
+# WalkCode V3 uninstaller.
+#
+# Removes, in order:
+#   1. loaded/installed com.walkcode.* LaunchAgents (bootout + plist) —
+#      com.walkcode.tap-* debug proxies are never touched: they carry live
+#      Claude API traffic;
+#   2. the `walkcode` uv tool;
+#   3. WalkCode hook entries (`walkcode native hook`, legacy `walkcode hook`)
+#      from Claude settings.json and codex hooks.json files — other hooks in
+#      the same files stay, and every modified file is backed up first.
+#
+# It never deletes ~/.walkcode wholesale: env files, backups and the default
+# workspace (WALKCODE_CWD=~/.walkcode/workspace — user code) are always kept.
+# State/log files are only removed after an interactive "y" (default No;
+# skipped when there is no terminal).
+#
+# Usage:
+#   ./uninstall.sh [--dry-run] [--yes]
+#     --dry-run  print what would be done, change nothing
+#     --yes      skip the initial confirmation (the state/log prompt still
+#                needs a terminal and still defaults to No)
+
+DRY_RUN=false
+ASSUME_YES=false
+for arg in "$@"; do
+  case "$arg" in
+    --dry-run) DRY_RUN=true ;;
+    --yes|-y) ASSUME_YES=true ;;
+    *) echo "usage: $0 [--dry-run] [--yes]" >&2; exit 2 ;;
+  esac
+done
 
 INSTALL_DIR="${WALKCODE_DIR:-$HOME/.walkcode}"
+LAUNCH_AGENTS="$HOME/Library/LaunchAgents"
+UID_NUM="$(id -u)"
+STAMP="$(date +%Y%m%d-%H%M%S)"
 
-# All candidate shell rc files (same strategy as rustup/nvm/uv)
-RC_CANDIDATES=(
-  "$HOME/.zshrc"
-  "$HOME/.zshenv"
-  "$HOME/.zprofile"
-  "$HOME/.bashrc"
-  "$HOME/.bash_profile"
-  "$HOME/.bash_login"
-  "$HOME/.profile"
-)
-
-# --- Colors ---
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -27,190 +46,249 @@ NC='\033[0m'
 info()  { echo -e "${GREEN}[walkcode]${NC} $*"; }
 warn()  { echo -e "${YELLOW}[walkcode]${NC} $*"; }
 error() { echo -e "${RED}[walkcode]${NC} $*" >&2; }
+is_zh() { case "${LANG:-}${LANGUAGE:-}" in zh*) return 0 ;; esac; return 1; }
+msg()   { if is_zh; then echo "$2"; else echo "$1"; fi; }
+run()   { if $DRY_RUN; then printf '  [dry-run] %s\n' "$*"; else "$@"; fi; }
 
-# --- i18n ---
-is_zh() {
-  case "${LANG:-}${LANGUAGE:-}" in zh*) return 0 ;; esac
-  return 1
-}
-msg() { if is_zh; then echo "$2"; else echo "$1"; fi; }
+# Succeeds only with a controlling terminal (curl | bash keeps one; launchd,
+# CI and test subprocesses started in a new session do not).
+has_tty() { { : </dev/tty; } 2>/dev/null; }
 
-# --- Stop daemon if running ---
-stop_daemon() {
-  local pid_file="$INSTALL_DIR/walkcode.pid"
-  if [ -f "$pid_file" ]; then
-    local pid
-    pid=$(cat "$pid_file" 2>/dev/null || true)
-    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-      info "$(msg "Stopping WalkCode daemon (pid $pid)..." "正在停止 WalkCode 守护进程 (pid $pid)...")"
-      kill "$pid" 2>/dev/null || true
-      sleep 1
-      kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null || true
-      info "$(msg "Daemon stopped" "守护进程已停止")"
-    fi
-    rm -f "$pid_file"
-  fi
+ask_yes() {
+  # $1 = prompt. Default No; no terminal → No.
+  local answer=""
+  has_tty || return 1
+  printf '%s' "$1" >/dev/tty
+  read -r answer </dev/tty || return 1
+  [ "$answer" = "y" ] || [ "$answer" = "Y" ]
 }
 
-# --- Remove shell wrapper from ALL candidate rc files ---
-remove_shell_wrapper() {
-  local marker_start="# >>> walkcode claude wrapper >>>"
-  local marker_end="# <<< walkcode claude wrapper <<<"
-  local found=0
+# --- 1. LaunchAgents ---------------------------------------------------------
 
-  for rc in "${RC_CANDIDATES[@]}"; do
-    [ -f "$rc" ] || continue
-    if grep -q "$marker_start" "$rc" 2>/dev/null; then
-      info "$(msg "Removing shell wrapper from $rc..." "正在从 $rc 移除 shell wrapper...")"
-      sed -i.walkcode-bak "/$marker_start/,/$marker_end/d" "$rc"
-      rm -f "${rc}.walkcode-bak"
-      found=1
+walkcode_labels() {
+  # Loaded labels plus installed-but-unloaded plists (they would load again
+  # at next login). tap-* excluded — same rule as upgrade.sh.
+  {
+    LC_ALL=C launchctl list 2>/dev/null | LC_ALL=C awk '{print $NF}' || true
+    for plist in "$LAUNCH_AGENTS"/com.walkcode.*.plist; do
+      [ -e "$plist" ] || continue
+      basename "$plist" .plist
+    done
+  } | LC_ALL=C grep -E '^com\.walkcode\.' | LC_ALL=C grep -v '^com\.walkcode\.tap-' | LC_ALL=C sort -u || true
+}
+
+# Set when this script runs inside a session a WalkCode runtime drives
+# (exported by `walkcode native serve`); booting that runtime out kills us,
+# so it goes last (ADR 0058).
+SELF_LABEL="${WALKCODE_DRIVER_LABEL:-}"
+DEFERRED_SELF_LABEL=""
+
+remove_launch_agents() {
+  local label found=0
+  while IFS= read -r label; do
+    [ -n "$label" ] || continue
+    found=1
+    if [ -f "$LAUNCH_AGENTS/${label}.plist" ]; then
+      run rm -f "$LAUNCH_AGENTS/${label}.plist"
     fi
-  done
-
+    if [ "$label" = "$SELF_LABEL" ]; then
+      DEFERRED_SELF_LABEL="$label"
+      continue
+    fi
+    info "$(msg "Stopping LaunchAgent ${label}" "停止 LaunchAgent ${label}")"
+    run launchctl bootout "gui/${UID_NUM}/${label}" 2>/dev/null || true
+  done < <(walkcode_labels)
   if [ "$found" -eq 0 ]; then
-    info "$(msg "No shell wrapper found in any shell rc file, skipping" "未在任何 shell rc 文件中找到 wrapper，跳过")"
+    info "$(msg "No com.walkcode.* LaunchAgent found" "未发现 com.walkcode.* LaunchAgent")"
   fi
 }
 
-# --- Remove tmux config ---
-remove_tmux_config() {
-  local tmux_conf="$HOME/.tmux.conf"
-  local marker_start="# >>> walkcode tmux config >>>"
-  local marker_end="# <<< walkcode tmux config <<<"
+# --- 2. uv tool ---------------------------------------------------------------
 
-  if [ -f "$tmux_conf" ] && grep -q "$marker_start" "$tmux_conf" 2>/dev/null; then
-    info "$(msg "Removing tmux config from $tmux_conf..." "正在从 $tmux_conf 移除 tmux 配置...")"
-    sed -i.walkcode-bak "/$marker_start/,/$marker_end/d" "$tmux_conf"
-    rm -f "${tmux_conf}.walkcode-bak"
-    # Remove file if empty (only whitespace left)
-    if [ ! -s "$tmux_conf" ] || ! grep -q '[^[:space:]]' "$tmux_conf" 2>/dev/null; then
-      rm -f "$tmux_conf"
-      info "$(msg "Removed empty $tmux_conf" "已删除空文件 $tmux_conf")"
-    fi
-    tmux source-file "$tmux_conf" 2>/dev/null || true
-  else
-    info "$(msg "No WalkCode tmux config found, skipping" "未找到 WalkCode tmux 配置，跳过")"
+remove_cli() {
+  if ! command -v uv >/dev/null 2>&1; then
+    warn "$(msg "uv not found; skipping 'uv tool uninstall walkcode'" "找不到 uv；跳过 uv tool uninstall walkcode")"
+    return
   fi
+  info "$(msg "Removing the walkcode uv tool" "移除 walkcode uv tool")"
+  run uv tool uninstall walkcode || warn "$(msg \
+    "uv tool uninstall walkcode failed (not installed?)" \
+    "uv tool uninstall walkcode 失败（可能未安装）")"
 }
 
-# --- Remove Claude Code hooks ---
-remove_hooks() {
-  local settings="$HOME/.claude/settings.json"
-  if [ ! -f "$settings" ]; then
-    info "$(msg "No Claude Code settings found, skipping hooks removal" "未找到 Claude Code 配置文件，跳过 hooks 移除")"
-    return
-  fi
+# --- 3. hooks -----------------------------------------------------------------
 
-  if ! command -v python3 &>/dev/null; then
-    warn "$(msg \
-      "python3 not found, cannot auto-remove hooks from $settings" \
-      "未找到 python3，无法自动移除 $settings 中的 hooks")"
-    warn "$(msg \
-      "Please manually remove the \"hooks\" section from $settings" \
-      "请手动移除 $settings 中的 \"hooks\" 部分")"
-    return
-  fi
+hook_files() {
+  local f
+  for f in "$HOME/.claude/settings.json" \
+           "$HOME"/.claude-profiles/*/settings.json \
+           "$HOME"/.codex*/hooks.json \
+           "$HOME"/.codex-profiles/*/hooks.json; do
+    [ -f "$f" ] && printf '%s\n' "$f"
+  done
+  return 0
+}
 
-  # Only remove hooks that contain "walkcode" commands
-  if grep -q "walkcode" "$settings" 2>/dev/null; then
-    info "$(msg "Removing WalkCode hooks from $settings..." "正在从 $settings 移除 WalkCode hooks...")"
-    python3 -c "
-import json, sys
-path = '$settings'
-with open(path) as f:
-    data = json.load(f)
-hooks = data.get('hooks', {})
-changed = False
-for event in list(hooks.keys()):
-    entries = hooks[event]
-    filtered = []
-    for entry in entries:
-        cmds = entry.get('hooks', [])
-        cmds = [c for c in cmds if 'walkcode' not in c.get('command', '')]
-        if cmds:
-            entry['hooks'] = cmds
-            filtered.append(entry)
-    if filtered:
-        hooks[event] = filtered
-    else:
-        del hooks[event]
-        changed = True
-if not hooks and 'hooks' in data:
-    del data['hooks']
-    changed = True
-if changed or hooks != data.get('hooks'):
-    with open(path, 'w') as f:
+# Prints one status line per file: "changed <n>", "clean", or "error <why>".
+# Only hook commands matching `walkcode native hook` / `walkcode hook` are
+# dropped; an entry is dropped only when that left it empty, an event only
+# when all its entries went. The file is backed up before it is rewritten.
+HOOK_FILTER_PY='
+import json, re, shutil, sys
+path, mode, backup = sys.argv[1:4]
+pat = re.compile(r"\bwalkcode\s+(native\s+)?hook\b")
+try:
+    with open(path) as f:
+        data = json.load(f)
+except Exception as exc:
+    print("error", type(exc).__name__)
+    sys.exit(0)
+hooks = data.get("hooks") if isinstance(data, dict) else None
+removed = 0
+if isinstance(hooks, dict):
+    for event in list(hooks):
+        entries = hooks[event]
+        if not isinstance(entries, list):
+            continue
+        kept_entries = []
+        event_removed = 0
+        for entry in entries:
+            cmds = entry.get("hooks") if isinstance(entry, dict) else None
+            if not isinstance(cmds, list):
+                kept_entries.append(entry)
+                continue
+            kept = [c for c in cmds
+                    if not (isinstance(c, dict) and pat.search(str(c.get("command", ""))))]
+            event_removed += len(cmds) - len(kept)
+            if kept or not cmds:
+                entry["hooks"] = kept
+                kept_entries.append(entry)
+        if event_removed:
+            removed += event_removed
+            if kept_entries:
+                hooks[event] = kept_entries
+            else:
+                del hooks[event]
+    if removed and not hooks:
+        del data["hooks"]
+if not removed:
+    print("clean")
+    sys.exit(0)
+if mode == "apply":
+    shutil.copy2(path, backup)
+    with open(path, "w") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
-        f.write('\n')
-    print('Hooks removed')
-else:
-    print('No WalkCode hooks found')
-"
-  else
-    info "$(msg "No WalkCode hooks found in $settings, skipping" "未在 $settings 中找到 WalkCode hooks，跳过")"
+        f.write("\n")
+print("changed", removed)
+'
+
+remove_hooks() {
+  local file result mode backup any=0
+  if ! command -v python3 >/dev/null 2>&1; then
+    warn "$(msg \
+      "python3 not found; remove 'walkcode native hook' entries from Claude settings.json / codex hooks.json by hand" \
+      "找不到 python3；请手动删除 Claude settings.json / codex hooks.json 里的 walkcode native hook 条目")"
+    return
+  fi
+  mode=apply
+  $DRY_RUN && mode=dry
+  while IFS= read -r file; do
+    grep -q 'walkcode' "$file" 2>/dev/null || continue
+    backup="${file}.walkcode-uninstall-${STAMP}.bak"
+    result="$(python3 -c "$HOOK_FILTER_PY" "$file" "$mode" "$backup")"
+    case "$result" in
+      changed*)
+        any=1
+        if $DRY_RUN; then
+          printf '  [dry-run] remove %s WalkCode hook(s) from %s (backup %s)\n' "${result#changed }" "$file" "$backup"
+        else
+          info "$(msg \
+            "Removed ${result#changed } WalkCode hook(s) from ${file} (backup: ${backup})" \
+            "已从 ${file} 移除 ${result#changed } 个 WalkCode hook（备份: ${backup}）")"
+        fi
+        ;;
+      error*)
+        warn "$(msg "Could not parse ${file} (${result#error }); left untouched" "无法解析 ${file}（${result#error }）；未改动")"
+        ;;
+    esac
+  done < <(hook_files)
+  if [ "$any" -eq 0 ]; then
+    info "$(msg "No WalkCode hooks found" "未发现 WalkCode hook")"
   fi
 }
 
-# --- Remove install directory ---
-remove_install_dir() {
-  if [ -d "$INSTALL_DIR" ]; then
-    info "$(msg "Removing install directory $INSTALL_DIR..." "正在移除安装目录 $INSTALL_DIR...")"
-    rm -rf "$INSTALL_DIR"
-    info "$(msg "Install directory removed" "安装目录已移除")"
-  else
-    info "$(msg "Install directory $INSTALL_DIR not found, skipping" "安装目录 $INSTALL_DIR 不存在，跳过")"
-  fi
+# --- 4. data (opt-in, state/logs only) ------------------------------------------
+
+state_paths() {
+  local p
+  for p in "$INSTALL_DIR"/*-state.json "$INSTALL_DIR"/*-state.json.*.d \
+           "$INSTALL_DIR"/.*-state.json.*.tmp "$INSTALL_DIR/logs"; do
+    [ -e "$p" ] && printf '%s\n' "$p"
+  done
+  return 0
 }
 
-# --- Main ---
+handle_data() {
+  local -a paths=()
+  local p
+  [ -d "$INSTALL_DIR" ] || return 0
+  while IFS= read -r p; do
+    [ -n "$p" ] && paths+=("$p")
+  done < <(state_paths)
+
+  if [ "${#paths[@]}" -gt 0 ]; then
+    if $DRY_RUN; then
+      printf '  [dry-run] would ask before deleting state/log files:\n'
+      printf '    %s\n' "${paths[@]}"
+    elif ask_yes "$(msg \
+        "Delete WalkCode state/log files (${#paths[@]} paths under ${INSTALL_DIR})? [y/N] " \
+        "删除 WalkCode 状态/日志文件（${INSTALL_DIR} 下 ${#paths[@]} 项）？[y/N] ")"; then
+      for p in "${paths[@]}"; do
+        rm -rf -- "$p"
+      done
+      info "$(msg "State/log files deleted" "状态/日志文件已删除")"
+    else
+      info "$(msg "State/log files kept" "状态/日志文件已保留")"
+    fi
+  fi
+
+  info "$(msg \
+    "Kept ${INSTALL_DIR}: env files (bot secrets), backups and the workspace directory are never deleted by this script. Remove them by hand if you are sure." \
+    "已保留 ${INSTALL_DIR}：env 文件（含机器人密钥）、备份和 workspace 目录本脚本一律不删；确认不要再手动删除。")"
+}
+
 main() {
-  echo ""
-  echo "  ╦ ╦╔═╗╦  ╦╔═╔═╗╔═╗╔╦╗╔═╗"
-  echo "  ║║║╠═╣║  ╠╩╗║  ║ ║ ║║║╣ "
-  echo "  ╚╩╝╩ ╩╩═╝╩ ╩╚═╝╚═╝═╩╝╚═╝"
   if is_zh; then
-    echo "  卸载程序"
+    echo "WalkCode V3 卸载：停止并移除 com.walkcode.* LaunchAgent（tap-* 除外）、"
+    echo "卸载 walkcode uv tool、从 Claude/codex 配置中移除 WalkCode hook（先备份）。"
+    echo "不会删除 ${INSTALL_DIR} 下的 env 文件和 workspace。"
   else
-    echo "  Uninstaller"
+    echo "WalkCode V3 uninstall: stop and remove com.walkcode.* LaunchAgents (except tap-*),"
+    echo "uninstall the walkcode uv tool, remove WalkCode hooks from Claude/codex config (backed up first)."
+    echo "Env files and the workspace under ${INSTALL_DIR} are kept."
   fi
-  echo ""
-
-  if is_zh; then
-    echo "即将移除:"
-    echo "  1. WalkCode 守护进程（如正在运行）"
-    echo "  2. 所有 rc 文件中的 Shell wrapper (.zshrc, .bashrc, .profile 等)"
-    echo "  3. ~/.tmux.conf 中的 tmux 配置"
-    echo "  4. ~/.claude/settings.json 中的 Claude Code hooks"
-    echo "  5. 安装目录 ($INSTALL_DIR)"
-  else
-    echo "This will remove:"
-    echo "  1. WalkCode daemon (if running)"
-    echo "  2. Shell wrapper from all rc files (.zshrc, .bashrc, .profile, etc.)"
-    echo "  3. tmux config from ~/.tmux.conf"
-    echo "  4. Claude Code hooks from ~/.claude/settings.json"
-    echo "  5. Install directory ($INSTALL_DIR)"
-  fi
-  echo ""
-  printf "$(msg "Continue? [y/N] " "继续？[y/N] ")"
-  read -r answer </dev/tty
-  if [ "$answer" != "y" ] && [ "$answer" != "Y" ]; then
-    echo "$(msg "Aborted." "已取消。")"
-    exit 0
+  if $DRY_RUN; then
+    info "$(msg "Dry run: nothing will be changed" "dry-run：不做任何改动")"
+  elif ! $ASSUME_YES; then
+    if ! ask_yes "$(msg "Continue? [y/N] " "继续？[y/N] ")"; then
+      echo "$(msg "Aborted (use --yes when there is no terminal)." "已取消（无终端时用 --yes）。")"
+      exit 1
+    fi
   fi
 
-  echo ""
-  stop_daemon
-  remove_shell_wrapper
-  remove_tmux_config
+  remove_launch_agents
+  remove_cli
   remove_hooks
-  remove_install_dir
+  handle_data
 
-  echo ""
-  info "$(msg "WalkCode has been completely removed." "WalkCode 已完全卸载。")"
-  echo ""
-  echo "  $(msg "Restart your shell or run 'exec \$SHELL' to apply changes." "重启终端或执行 'exec \$SHELL' 以应用更改。")"
-  echo ""
+  info "$(msg "WalkCode uninstall finished." "WalkCode 卸载完成。")"
+
+  if [ -n "$DEFERRED_SELF_LABEL" ]; then
+    info "$(msg \
+      "Stopping ${DEFERRED_SELF_LABEL} last — it drives this session, which ends now." \
+      "最后停止 ${DEFERRED_SELF_LABEL}——它驱动着当前会话，会话将随之结束。")"
+    run launchctl bootout "gui/${UID_NUM}/${DEFERRED_SELF_LABEL}" 2>/dev/null || true
+  fi
 }
 
-main "$@"
+main

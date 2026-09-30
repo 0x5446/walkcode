@@ -1301,9 +1301,6 @@ class ClaudeDaemonTransport:
         with contextlib.suppress(Exception):
             self.on_gate_decision(rid, dict(decision))
 
-    async def interrupt(self, handle: TransportHandle, reason: str) -> ControlResult:
-        return ControlResult(False, "unsupported_by_claude_daemon")
-
     async def shutdown(self, handle: TransportHandle, mode: str) -> ControlResult:
         short = str(handle.ref.get("short", ""))
         if not short:

@@ -9,6 +9,17 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from claude_agent_sdk import (
+    AssistantMessage,
+    ResultMessage,
+    ServerToolResultBlock,
+    ServerToolUseBlock,
+    TextBlock,
+    ToolResultBlock,
+    ToolUseBlock,
+    UserMessage,
+)
+
 from walkcode.channel_native import (
     ActorRef,
     AgentEvent,
@@ -29,6 +40,55 @@ from walkcode.channel_native import (
     TransportUnavailable,
     TurnInput,
 )
+
+
+def _sdk_result(message="done", session_id="claude-sdk-session"):
+    return ResultMessage(
+        subtype="success",
+        duration_ms=1,
+        duration_api_ms=1,
+        is_error=False,
+        num_turns=1,
+        session_id=session_id,
+        result=message,
+    )
+
+
+def _sdk_stream_client_class(messages):
+    """ClaudeSDKClient stand-in with the real client surface: receive_messages
+    yields the given typed SDK messages, then ends (worker EOF)."""
+
+    class Client:
+        instances: list = []
+
+        def __init__(self, options=None):
+            self.options = options
+            self.connected = False
+            self.connect_prompt = "unset"
+            self.disconnected = False
+            self.queries = []
+            type(self).instances.append(self)
+
+        async def connect(self, prompt=None):
+            self.connected = True
+            self.connect_prompt = prompt
+
+        async def query(self, prompt, session_id="default"):
+            self.queries.append((prompt, session_id))
+
+        async def receive_messages(self):
+            for message in messages:
+                yield message
+
+        async def disconnect(self):
+            self.disconnected = True
+
+    return Client
+
+
+async def _drain_events(transport, handle):
+    stream = await transport.events(handle)
+    return [event async for event in stream]
 
 
 class _Clock:
@@ -545,24 +605,14 @@ class ClaudeHeadlessTransportTests(unittest.TestCase):
             asyncio.run(transport.launch_session(cwd="/tmp/project", session_id="s1"))
 
     def test_fake_client_factory_launch_submit_events(self):
-        class Client:
-            def __init__(self):
-                self.submitted = []
-
-            async def submit(self, turn: TurnInput):
-                self.submitted.append(turn)
-
-            async def events(self):
-                return [AgentEvent(AgentEventType.TURN_COMPLETED, {"message": "done"})]
-
-        client = Client()
+        client = _sdk_stream_client_class([_sdk_result("done")])()
         transport = ClaudeHeadlessTransport(client_factory=lambda spec: client)
 
         handle = asyncio.run(transport.launch_session(cwd="/tmp/project", session_id="s1"))
         asyncio.run(transport.submit_turn(handle, TurnInput(text="hello"), "k1"))
-        events = asyncio.run(transport.events(handle))
+        events = asyncio.run(_drain_events(transport, handle))
 
-        self.assertEqual(client.submitted[0].text, "hello")
+        self.assertEqual(client.queries, [("hello", "default")])
         self.assertEqual(events[0].payload["message"], "done")
         self.assertTrue(transport.capabilities().permission_callback)
 
@@ -739,122 +789,84 @@ class ClaudeHeadlessTransportTests(unittest.TestCase):
 
     def test_real_sdk_shape_connects_queries_and_converts_messages(self):
         created_options = []
-        clients = []
-
-        class TextBlock:
-            def __init__(self, text):
-                self.text = text
-
-        class AssistantMessage:
-            def __init__(self):
-                self.content = [TextBlock("working")]
-                self.error = None
-
-        class ResultMessage:
-            def __init__(self):
-                self.is_error = False
-                self.result = "done"
-                self.session_id = "claude-sdk-session"
 
         class Options:
             def __init__(self, **kwargs):
                 self.kwargs = dict(kwargs)
                 created_options.append(self)
 
-        class Client:
-            def __init__(self, options=None, transport=None):
-                self.options = options
-                self.transport = transport
-                self.connected = False
-                self.queries = []
-                clients.append(self)
-
-            async def connect(self, prompt=None):
-                self.connected = True
-                self.connect_prompt = prompt
-
-            async def query(self, prompt, session_id="default"):
-                self.queries.append((prompt, session_id))
-
-            async def receive_response(self):
-                yield AssistantMessage()
-                yield ResultMessage()
+        client_cls = _sdk_stream_client_class(
+            [
+                AssistantMessage(content=[TextBlock(text="working")], model="claude-test"),
+                _sdk_result("done", session_id="claude-sdk-session"),
+            ]
+        )
 
         class SDK:
             ClaudeAgentOptions = Options
-            ClaudeSDKClient = Client
+            ClaudeSDKClient = client_cls
 
         transport = ClaudeHeadlessTransport(sdk_loader=lambda: SDK)
 
         handle = asyncio.run(transport.launch_session(cwd="/tmp/project", session_id="s1"))
         asyncio.run(transport.submit_turn(handle, TurnInput(text="hello"), "k1"))
-        events = asyncio.run(transport.events(handle))
+        events = asyncio.run(_drain_events(transport, handle))
 
+        client = client_cls.instances[0]
         self.assertEqual(created_options[0].kwargs["cwd"], "/tmp/project")
-        self.assertTrue(clients[0].connected)
-        self.assertEqual(clients[0].queries, [("hello", "default")])
+        self.assertTrue(client.connected)
+        self.assertIsNone(client.connect_prompt)
+        self.assertEqual(client.queries, [("hello", "default")])
         self.assertEqual(events[0].type, AgentEventType.TURN_DELTA)
         self.assertEqual(events[0].payload["text"], "working")
         self.assertEqual(events[1].type, AgentEventType.TURN_COMPLETED)
         self.assertEqual(events[1].payload["message"], "done")
         self.assertEqual(handle.ref["session_id"], "s1")
+        # Worker EOF ends the session-level listener and closes the client.
+        self.assertTrue(client.disconnected)
 
     def test_sdk_messages_carry_model_and_usage(self):
-        class TextBlock:
-            def __init__(self, text):
-                self.text = text
+        assistant = AssistantMessage(content=[TextBlock(text="working")], model="claude-opus-4-8-20260610")
+        result = ResultMessage(
+            subtype="success",
+            duration_ms=1,
+            duration_api_ms=1,
+            is_error=False,
+            num_turns=1,
+            session_id="sid",
+            result="done",
+            usage={"input_tokens": 10, "output_tokens": 3},
+        )
 
-        class AssistantMessage:
-            def __init__(self):
-                self.content = [TextBlock("working")]
-                self.error = None
-                self.model = "claude-opus-4-8-20260610"
-
-        class ResultMessage:
-            def __init__(self):
-                self.is_error = False
-                self.result = "done"
-                self.session_id = "sid"
-                self.usage = {"input_tokens": 10, "output_tokens": 3}
-
-        deltas = ClaudeHeadlessTransport._convert_sdk_message(AssistantMessage())
+        deltas = ClaudeHeadlessTransport._convert_sdk_message(assistant)
         self.assertEqual(deltas[0].type, AgentEventType.TURN_DELTA)
         self.assertEqual(deltas[0].payload["model"], "claude-opus-4-8-20260610")
 
-        completed = ClaudeHeadlessTransport._convert_sdk_message(ResultMessage())
+        completed = ClaudeHeadlessTransport._convert_sdk_message(result)
         self.assertEqual(completed[0].type, AgentEventType.TURN_COMPLETED)
         self.assertEqual(completed[0].payload["usage"], {"input_tokens": 10, "output_tokens": 3})
         self.assertNotIn("model", completed[0].payload)
 
     def test_real_sdk_shape_converts_tool_use_and_tool_result_messages(self):
-        class Client:
-            async def connect(self, prompt=None):
-                return None
-
-            async def query(self, prompt, session_id="default"):
-                return None
-
-            async def receive_response(self):
-                yield {
-                    "content": [
-                        {"type": "tool_use", "id": "tool-1", "name": "Bash", "input": {"command": "ls"}},
-                    ]
-                }
-                yield {
-                    "content": [
-                        {"type": "tool_result", "tool_use_id": "tool-1", "content": "large output"},
-                    ]
-                }
-                yield {"type": "result", "result": "done", "session_id": "claude-sdk-session"}
+        client_cls = _sdk_stream_client_class(
+            [
+                AssistantMessage(
+                    content=[ToolUseBlock(id="tool-1", name="Bash", input={"command": "ls"})],
+                    model="claude-test",
+                ),
+                UserMessage(content=[ToolResultBlock(tool_use_id="tool-1", content="large output")]),
+                _sdk_result("done", session_id="claude-sdk-session"),
+            ]
+        )
 
         class SDK:
-            ClaudeSDKClient = Client
+            ClaudeSDKClient = client_cls
 
         transport = ClaudeHeadlessTransport(sdk_loader=lambda: SDK)
 
         handle = asyncio.run(transport.launch_session(cwd="/tmp/project", session_id="s1"))
         asyncio.run(transport.submit_turn(handle, TurnInput(text="hello"), "k1"))
-        events = asyncio.run(transport.events(handle))
+        events = asyncio.run(_drain_events(transport, handle))
 
         self.assertEqual(events[0].type, AgentEventType.TOOL_STARTED)
         self.assertEqual(events[0].payload["tool_name"], "Bash")
@@ -862,32 +874,34 @@ class ClaudeHeadlessTransportTests(unittest.TestCase):
         self.assertNotIn("large output", events[1].payload.get("summary", ""))
         self.assertEqual(events[2].type, AgentEventType.TURN_COMPLETED)
 
-    def test_direct_sdk_tool_blocks_convert_to_tool_lifecycle_events(self):
-        class Client:
-            async def connect(self, prompt=None):
-                return None
-
-            async def query(self, prompt, session_id="default"):
-                return None
-
-            async def receive_response(self):
-                yield {"type": "server_tool_use", "id": "tool-1", "name": "WebSearch", "input": {"query": "x"}}
-                yield {"type": "tool_result", "tool_use_id": "tool-1", "content": "large output"}
-                yield {"type": "result", "result": "done"}
+    def test_server_tool_blocks_convert_to_tool_lifecycle_events(self):
+        client_cls = _sdk_stream_client_class(
+            [
+                AssistantMessage(
+                    content=[ServerToolUseBlock(id="tool-1", name="web_search", input={"query": "x"})],
+                    model="claude-test",
+                ),
+                AssistantMessage(
+                    content=[ServerToolResultBlock(tool_use_id="tool-1", content={"type": "web_search_tool_result"})],
+                    model="claude-test",
+                ),
+                _sdk_result("done"),
+            ]
+        )
 
         class SDK:
-            ClaudeSDKClient = Client
+            ClaudeSDKClient = client_cls
 
         transport = ClaudeHeadlessTransport(sdk_loader=lambda: SDK)
 
         handle = asyncio.run(transport.launch_session(cwd="/tmp/project", session_id="s1"))
         asyncio.run(transport.submit_turn(handle, TurnInput(text="hello"), "k1"))
-        events = asyncio.run(transport.events(handle))
+        events = asyncio.run(_drain_events(transport, handle))
 
         self.assertEqual(events[0].type, AgentEventType.TOOL_STARTED)
-        self.assertEqual(events[0].payload["tool_name"], "WebSearch")
+        self.assertEqual(events[0].payload["tool_name"], "web_search")
         self.assertEqual(events[1].type, AgentEventType.TOOL_COMPLETED)
-        self.assertNotIn("large output", events[1].payload.get("summary", ""))
+        self.assertNotIn("web_search_tool_result", events[1].payload.get("summary", ""))
 
     def test_real_sdk_shape_receives_settings_and_cli_path(self):
         created_options = []
