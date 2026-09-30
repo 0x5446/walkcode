@@ -56,17 +56,9 @@ def _binding() -> ChannelBinding:
 
 def _channel_caps() -> ChannelCapabilities:
     return ChannelCapabilities(
-        thread_context=True,
         editable_message=True,
-        interactive_message=True,
-        interactive_update=True,
         private_callback_ack=True,
-        toast_or_ephemeral_notice=True,
-        force_reply=True,
         attachment_download=True,
-        forum_or_topic=True,
-        max_text_chars=4096,
-        max_callback_payload_bytes=64,
     )
 
 
@@ -441,6 +433,24 @@ class RetentionPolicyTests(unittest.TestCase):
         self.assertEqual(restored.sent_message_id("s1:0:gate:toolu_1"), "om_card")
         self.assertEqual(restored.sent_message_id("missing"), "")
 
+    def test_sent_items_keep_only_the_view_type(self):
+        # Delivered items stay a day for dedupe and the message id; their card
+        # bodies were ~1 MB of dead weight in a busy state file.
+        outbox = DurableOutbox(now=lambda: 1000.0)
+        item = outbox.enqueue(
+            channel_binding_key=("lark", "bot", "chat", "", "root"),
+            view_model={"type": "turn_completed", "message": "x" * 10000},
+            idempotency_key="k-body",
+        )
+        outbox.record_result(item.delivery_id, DeliveryStatus.SENT, message_id="om_1")
+        self.assertEqual(outbox.get(item.delivery_id).view_model, {"type": "turn_completed"})
+
+        legacy = outbox.to_dict()
+        legacy["sent"][item.delivery_id]["view_model"] = {"type": "text", "text": "y" * 10000}
+        restored = DurableOutbox.from_dict(legacy, now=lambda: 1000.0)
+        self.assertEqual(restored.get(item.delivery_id).view_model, {"type": "text"})
+        self.assertEqual(restored.sent_message_id("k-body"), "om_1")
+
     def test_outbox_compaction_prunes_sent_and_dead_after_retention(self):
         clock = _Clock()
         outbox = DurableOutbox(
@@ -512,14 +522,8 @@ class InboundLedgerReliabilityTests(unittest.TestCase):
                     structured_output=True,
                     permission_callback=False,
                     ask_user_question=False,
-                    interrupt=False,
                     set_model=False,
-                    set_permission_mode=False,
-                    checkpoint_rewind=False,
                     resume_after_complete=False,
-                    resume_active_turn=False,
-                    multi_client_observe=False,
-                    multi_client_write=False,
                     external_tui_takeover=False,
                 )
 

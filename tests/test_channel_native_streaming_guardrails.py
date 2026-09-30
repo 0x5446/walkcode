@@ -41,17 +41,9 @@ def _binding(kind: str = "lark") -> ChannelBinding:
 
 def _channel_caps() -> ChannelCapabilities:
     return ChannelCapabilities(
-        thread_context=True,
         editable_message=True,
-        interactive_message=True,
-        interactive_update=True,
         private_callback_ack=True,
-        toast_or_ephemeral_notice=True,
-        force_reply=True,
         attachment_download=True,
-        forum_or_topic=True,
-        max_text_chars=4096,
-        max_callback_payload_bytes=64,
     )
 
 
@@ -61,14 +53,8 @@ def _transport_caps() -> TransportCapabilities:
         structured_output=True,
         permission_callback=False,
         ask_user_question=False,
-        interrupt=False,
         set_model=False,
-        set_permission_mode=False,
-        checkpoint_rewind=False,
         resume_after_complete=True,
-        resume_active_turn=False,
-        multi_client_observe=False,
-        multi_client_write=False,
         external_tui_takeover=False,
     )
 

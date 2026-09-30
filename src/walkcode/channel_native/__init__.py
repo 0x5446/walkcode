@@ -243,18 +243,9 @@ class ChannelBinding:
 
 @dataclass(frozen=True)
 class ChannelCapabilities:
-    thread_context: bool
     editable_message: bool
-    interactive_message: bool
-    interactive_update: bool
     private_callback_ack: bool
-    toast_or_ephemeral_notice: bool
-    force_reply: bool
     attachment_download: bool
-    forum_or_topic: bool
-    max_text_chars: int
-    max_callback_payload_bytes: int
-    edit_rate_limit_hint: str = ""
 
 
 @dataclass(frozen=True)
@@ -732,16 +723,9 @@ class TransportCapabilities:
     structured_output: bool
     permission_callback: bool
     ask_user_question: bool
-    interrupt: bool
     set_model: bool
-    set_permission_mode: bool
-    checkpoint_rewind: bool
     resume_after_complete: bool
-    resume_active_turn: bool
-    multi_client_observe: bool
-    multi_client_write: bool
     external_tui_takeover: bool
-    requires_single_writer: bool = True
 
 
 @dataclass
@@ -3343,6 +3327,16 @@ class DeliveryItem:
     message_id: str = ""
 
 
+def _sent_view_stub(view_model: dict[str, Any]) -> dict[str, Any]:
+    """What a delivered item keeps of its view: only the type.
+
+    Sent items stay for a day to dedupe by idempotency key and to remember the
+    platform message id; the full card body was dead weight (about 1 MB of a
+    busy instance's state file, rewritten with fsync on every save).
+    """
+    return {"type": str(view_model.get("type", "") or "")}
+
+
 class DurableOutbox:
     def __init__(
         self,
@@ -3472,6 +3466,7 @@ class DurableOutbox:
         if status == DeliveryStatus.SENT:
             item.finished_at = self._now()
             item.message_id = message_id
+            item.view_model = _sent_view_stub(item.view_model)
             self._sent[delivery_id] = self._pending.pop(delivery_id)
             return True
         elif status == DeliveryStatus.PERMANENT_FAILURE:
@@ -3542,6 +3537,8 @@ class DurableOutbox:
         }
         outbox._dead = {str(key): _delivery_from_dict(value) for key, value in data.get("dead", {}).items()}
         outbox._sent = {str(key): _delivery_from_dict(value) for key, value in data.get("sent", {}).items()}
+        for item in outbox._sent.values():
+            item.view_model = _sent_view_stub(item.view_model)
         return outbox
 
 
@@ -4685,18 +4682,9 @@ class LarkChannelAdapter:
         self.kind = "lark"
         self.api = api
         self._capabilities = ChannelCapabilities(
-            thread_context=True,
             editable_message=True,
-            interactive_message=True,
-            interactive_update=True,
             private_callback_ack=True,
-            toast_or_ephemeral_notice=True,
-            force_reply=False,
             attachment_download=True,
-            forum_or_topic=True,
-            max_text_chars=30000,
-            max_callback_payload_bytes=2048,
-            edit_rate_limit_hint="patch cards asynchronously",
         )
 
     def capabilities(self) -> ChannelCapabilities:
@@ -5606,14 +5594,8 @@ class ClaudeHeadlessTransport:
             structured_output=available,
             permission_callback=available,
             ask_user_question=available,
-            interrupt=available,
             set_model=available,
-            set_permission_mode=available,
-            checkpoint_rewind=available,
             resume_after_complete=available,
-            resume_active_turn=False,
-            multi_client_observe=False,
-            multi_client_write=False,
             external_tui_takeover=available,
         )
 
@@ -7589,14 +7571,8 @@ class CodexAppServerTransport:
             structured_output=True,
             permission_callback=True,
             ask_user_question=True,
-            interrupt=False,
             set_model=False,
-            set_permission_mode=False,
-            checkpoint_rewind=False,
             resume_after_complete=True,
-            resume_active_turn=False,
-            multi_client_observe=False,
-            multi_client_write=False,
             external_tui_takeover=True,
         )
 

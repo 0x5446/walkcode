@@ -1197,17 +1197,9 @@ class _DebugChannel:
 
     def capabilities(self) -> ChannelCapabilities:
         return ChannelCapabilities(
-            thread_context=True,
             editable_message=True,
-            interactive_message=True,
-            interactive_update=True,
             private_callback_ack=True,
-            toast_or_ephemeral_notice=False,
-            force_reply=True,
             attachment_download=True,
-            forum_or_topic=True,
-            max_text_chars=4096,
-            max_callback_payload_bytes=64,
         )
 
     async def send_view(self, _binding: ChannelBinding, _view_model: dict[str, Any]) -> str:

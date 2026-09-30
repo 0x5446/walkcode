@@ -1037,14 +1037,8 @@ class _UnavailableTransport:
             structured_output=False,
             permission_callback=False,
             ask_user_question=False,
-            interrupt=False,
             set_model=False,
-            set_permission_mode=False,
-            checkpoint_rewind=False,
             resume_after_complete=False,
-            resume_active_turn=False,
-            multi_client_observe=False,
-            multi_client_write=False,
             external_tui_takeover=False,
         )
 
@@ -4318,13 +4312,6 @@ class ChannelNativeRuntime:
             idempotency_key=f"external_tui:{hook_type}:{session.last_event_seq}",
         )
 
-    @staticmethod
-    def _mark_tui_session_stopped(session, *, hook_type: str) -> None:
-        session.status = "stopped"
-        session.lifecycle_state = "STOPPED"
-        session.stop_reason = f"external_tui_{hook_type}"
-        session.writer_owner = WriterOwner(kind="none")
-
     def save_state(self) -> None:
         self.state_store.save(self.state)
 
@@ -6270,14 +6257,6 @@ def _process_ref_state_now(process_ref: dict[str, Any]) -> str:
 
 def _session_is_external_tui_writer(session: Any) -> bool:
     return session.writer_owner is not None and session.writer_owner.kind == "external_tui"
-
-
-def _safe_error_message(exc: Exception, *secrets: str) -> str:
-    message = str(exc)
-    for secret in secrets:
-        if secret:
-            message = message.replace(str(secret), "<redacted>")
-    return message
 
 
 def _defer_tui_hook(
