@@ -56,6 +56,20 @@ IM ChannelAdapter
 The old tmux pane, Feishu thread id, and hook callback shapes are not core V3
 identities.
 
+Code map: `walkcode.channel_native` is a package whose `__init__.py` only
+re-exports. `models` (contracts), `config`, `stores` (everything
+`JsonFileStateStore` persists), `views`, `process_control`, `lark_adapter`,
+`claude_headless`, `codex_transport`, `codex_app_server` (codex JSON-RPC
+clients), `orchestrator` and `fakes` hold the code; imports only point to
+modules earlier in that list. The Claude gate (`claude_gate`,
+`claude_gate_transport`) and Lark live/card modules (`lark_live`,
+`lark_cards`) sit beside them. `walkcode.channel_native_runtime` wires it all
+into the serving process. Tests patch a module-level name in the submodule
+that uses it, not on the package. Optional third-party SDKs (claude_agent_sdk,
+lark_oapi) stay imported lazily inside their loaders on purpose: a missing
+package must surface as "agent/channel unavailable", not as an import error of
+the whole runtime.
+
 ## Channels
 
 Lark/Feishu is the only channel (ADR 0044; Telegram was removed in ADR 0069

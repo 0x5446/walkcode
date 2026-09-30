@@ -72,7 +72,7 @@ class PersistenceTests(unittest.TestCase):
             original = store.path.read_bytes()
             for target in ("json.dump", "os.fsync", "os.replace"):
                 with self.subTest(target=target), patch(
-                    f"walkcode.channel_native.{target}", side_effect=OSError("disk failure")
+                    f"walkcode.channel_native.stores.{target}", side_effect=OSError("disk failure")
                 ):
                     with self.assertRaises(OSError):
                         store.save(snapshot)
@@ -917,7 +917,7 @@ class StateSaveFailureTrackingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             store = JsonFileStateStore(Path(tmp) / "state.json")
             state = _empty_state(_Clock(), SessionRegistry(now=_Clock()))
-            with patch("walkcode.channel_native._atomic_write_json", side_effect=OSError("disk full")):
+            with patch("walkcode.channel_native.stores._atomic_write_json", side_effect=OSError("disk full")):
                 with self.assertRaises(OSError):
                     store.save(state)
             self.assertTrue(store.last_save_failed)

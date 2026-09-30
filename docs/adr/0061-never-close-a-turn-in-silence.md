@@ -34,7 +34,7 @@
 
 ### 1. 提交给 agent 的文本永不为空
 
-`_compose_turn_text()`（`channel_native/__init__.py` 模块级，三条 transport 共用）
+`_compose_turn_text()`（`channel_native/claude_headless.py` 模块级，三条 transport 共用）
 是唯一入口：附件的本地绝对路径拼进 prompt；文本与附件都为空时退化为
 `EMPTY_TURN_PLACEHOLDER`。`CodexAppServerTransport.submit_turn` 在拼完环境上下文后
 再兜一次底。

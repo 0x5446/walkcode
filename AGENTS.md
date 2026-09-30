@@ -59,7 +59,7 @@ scripts; orchestration and gates live in the skill.
 - **Runtime contract (ADR 0061)**: never submit empty text to an agent — an
   empty message persists in the thread history and permanently 400s it — and
   never let a turn close without the channel seeing something. Both are
-  enforced in `channel_native/__init__.py` (`_compose_turn_text` /
+  enforced in `channel_native/claude_headless.py` (`_compose_turn_text` /
   `EMPTY_TURN_NOTICE`); don't "simplify" either away.
 - **Agent diagnostics (ADR 0062)**: codex's app-server `error` notification is
   surfaced (retrying → progress-card note, gave up → bubble), and any codex
@@ -74,7 +74,8 @@ scripts; orchestration and gates live in the skill.
   launchd can recover retained files. Never send an outbox claim that could
   not be persisted. These guarantees do not provide exactly-once delivery.
 - **Item-type mapping (ADR 0063)**: `item.type` is classified by an exhaustive
-  table, `_CODEX_TOOL_ITEM_SPECS` — every `ThreadItem` variant is either in it or
+  table, `_CODEX_TOOL_ITEM_SPECS` (`channel_native/codex_transport.py`) — every
+  `ThreadItem` variant is either in it or
   in the test's not-tool-activity list. The guard has two halves and needs both:
   `tests/data/codex_thread_item_variants.json` is *generated* from
   `codex app-server generate-json-schema` (regenerate it after a codex upgrade),

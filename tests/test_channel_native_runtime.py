@@ -27,6 +27,7 @@ from walkcode.channel_native import (
     BlockedReason,
 )
 from walkcode import channel_native as channel_native_module
+from walkcode.channel_native import orchestrator as channel_native_orchestrator
 from walkcode import channel_native_runtime as runtime_module
 from walkcode.channel_native_runtime import ChannelNativeRuntime
 
@@ -6110,7 +6111,7 @@ class ClaudeTuiSessionSwitchTests(unittest.TestCase):
             running = {201: "another", 202: "current"}
             probes = {pid: channel_native_module._ProcProbe("ok", self.LSTART) for pid in running}
             with patch.object(runtime_module, "_probe_processes", return_value=probes), patch.object(
-                channel_native_module, "claude_tui_current_session", side_effect=lambda pid, lstart: running[pid]
+                channel_native_orchestrator, "claude_tui_current_session", side_effect=lambda pid, lstart: running[pid]
             ):
                 self.assertEqual(asyncio.run(runtime.sweep_exited_tui_sessions()), 1)
             gone = runtime.state.sessions.get(left.session_id)
@@ -6126,6 +6127,6 @@ class ClaudeTuiSessionSwitchTests(unittest.TestCase):
             needs_stop = channel_native_module.Orchestrator._takeover_requires_external_tui_termination
             for running, expected in (("another", False), ("left", True), ("", True)):
                 with self.subTest(running=running), patch.object(
-                    channel_native_module, "claude_tui_current_session", return_value=running
+                    channel_native_orchestrator, "claude_tui_current_session", return_value=running
                 ):
                     self.assertIs(needs_stop(session), expected)

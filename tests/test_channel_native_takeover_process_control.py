@@ -5,6 +5,7 @@ import unittest
 import unittest.mock
 
 from walkcode import channel_native as channel_native_module
+from walkcode.channel_native import process_control
 from walkcode.channel_native import (
     ActorRef,
     AuthorizationStore,
@@ -184,7 +185,7 @@ class TakeoverProcessControlTests(unittest.TestCase):
                     return cn._ProcProbe("ok", "Sun Jul 19 10:00:01 2026", f"claude --session-id {session_id}")
                 return real
 
-            with unittest.mock.patch.object(cn, "_probe_process", side_effect=fake_probe):
+            with unittest.mock.patch.object(process_control, "_probe_process", side_effect=fake_probe):
                 result = asyncio.run(
                     controller.terminate(
                         {
@@ -460,8 +461,8 @@ class KillOneSwitchedSessionTests(unittest.TestCase):
         controller = LocalProcessController(kill_after_timeout=True)
         probe = channel_native_module._ProcProbe("ok", self.LSTART, "claude")
         signals = []
-        with unittest.mock.patch.object(channel_native_module, "_probe_process", return_value=probe), unittest.mock.patch.object(
-            channel_native_module, "claude_tui_current_session", side_effect=sessions
+        with unittest.mock.patch.object(process_control, "_probe_process", return_value=probe), unittest.mock.patch.object(
+            process_control, "claude_tui_current_session", side_effect=sessions
         ), unittest.mock.patch.object(channel_native_module.os, "kill", side_effect=lambda pid, sig: signals.append(sig)), unittest.mock.patch.object(
             controller, "_wait_exited", return_value=exits_after_term
         ):
@@ -490,8 +491,8 @@ class KillOneSwitchedSessionTests(unittest.TestCase):
         controller = LocalProcessController(kill_after_timeout=True)
         probe = channel_native_module._ProcProbe("ok", self.LSTART, "claude")
         ref = {"pid": 123, "allow_terminate": True, "lstart": self.LSTART, "command": "claude", "expected_claude_session": "claude-old"}
-        with unittest.mock.patch.object(channel_native_module, "_probe_process", return_value=probe), unittest.mock.patch.object(
-            channel_native_module, "claude_tui_current_session", return_value="claude-new"
+        with unittest.mock.patch.object(process_control, "_probe_process", return_value=probe), unittest.mock.patch.object(
+            process_control, "claude_tui_current_session", return_value="claude-new"
         ), unittest.mock.patch.object(channel_native_module.os, "kill", side_effect=AssertionError("signalled")):
             result = controller._terminate_sync(ref, "takeover:t1")
         self.assertEqual((result.accepted, result.state), (True, "switched_away"))
