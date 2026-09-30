@@ -36,7 +36,7 @@ from walkcode.channel_native import (
     Orchestrator,
     PermanentDeliveryError,
     SessionRegistry,
-    TelegramBotApi,
+    LarkBotApi,
     TransportCapabilities,
     TurnInput,
     compose_session_title,
@@ -102,51 +102,29 @@ def _actor() -> ActorRef:
     return ActorRef(channel_kind="fake", actor_id="user-1", display_name="User One")
 
 
-class _TitleTelegramApi(TelegramBotApi):
-    """Minimal stub covering only the calls a TUI hook turn makes."""
+class _TitleLarkApi(LarkBotApi):
+    """Recording stub covering the calls a TUI hook turn makes."""
 
     def __init__(self):
         self.calls = []
-        super().__init__(token="fake", caller=self._call)
+        super().__init__(caller=self._call)
 
     async def _call(self, method, payload):
         self.calls.append((method, dict(payload)))
-        if method == "getMe":
-            return {
-                "ok": True,
-                "result": {
-                    "id": 123456,
-                    "username": "walkcode_title_bot",
-                    "first_name": "WalkCode",
-                    "can_join_groups": True,
-                    "can_read_all_group_messages": False,
-                    "has_topics_enabled": False,
-                    "allows_users_to_create_topics": False,
-                },
-            }
-        if method == "getChat":
-            return {"ok": True, "result": {"id": payload.get("chat_id"), "type": "private", "is_forum": False}}
-        if method == "sendMessage":
-            return {"ok": True, "result": {"message_id": len(self.calls)}}
-        if method in {
-            "editMessageText",
-            "sendChatAction",
-            "setMessageReaction",
-            "setMyCommands",
-            "pinChatMessage",
-            "deleteMessage",
-        }:
-            return {"ok": True, "result": True}
-        raise AssertionError(f"unexpected Telegram method: {method}")
+        return {"ok": True, "data": {"message_id": f"lark-msg-{len(self.calls)}"}}
 
 
-def _tui_runtime(tmp: str, agent: str, api: _TitleTelegramApi) -> ChannelNativeRuntime:
+_SEND_METHODS = {"sendMessage", "sendCard"}
+
+
+def _tui_runtime(tmp: str, agent: str, api: _TitleLarkApi) -> ChannelNativeRuntime:
     cfg = ChannelNativeConfig.from_env(
         {
-            "WALKCODE_CHANNEL": "telegram",
-            "TELEGRAM_BOT_TOKEN": "fake",
+            "WALKCODE_CHANNEL": "lark",
+            "LARK_APP_ID": "cli_x",
+            "LARK_APP_SECRET": "s",
             "WALKCODE_AGENT": agent,
-            "TELEGRAM_ALLOWED_CHAT_IDS": "123",
+            "LARK_ALLOWED_CHAT_IDS": "oc_123",
             "WALKCODE_STATE_PATH": str(Path(tmp) / "state.json"),
             "WALKCODE_CWD": tmp,
         }
@@ -154,13 +132,13 @@ def _tui_runtime(tmp: str, agent: str, api: _TitleTelegramApi) -> ChannelNativeR
     transport_kind = "codex_app_server" if agent == "codex" else "claude_headless"
     return ChannelNativeRuntime.from_config(
         cfg,
-        telegram_api=api,
+        lark_api=api,
         transports={transport_kind: FakeAgentTransport(transport_kind, _transport_caps())},
     )
 
 
 def _only_session(runtime: ChannelNativeRuntime):
-    summaries = runtime.state.sessions.list_sessions(channel_kind="telegram")
+    summaries = runtime.state.sessions.list_sessions(channel_kind="lark")
     assert len(summaries) == 1, summaries
     return runtime.state.sessions.get(summaries[0].session_id)
 
@@ -258,7 +236,7 @@ class TuiHookTitlePathTests(unittest.TestCase):
         # ADR 0066: SessionStart opens nothing; the first prompt opens the
         # topic, and its very first status card already carries the prompt.
         with tempfile.TemporaryDirectory() as tmp:
-            api = _TitleTelegramApi()
+            api = _TitleLarkApi()
             runtime = _tui_runtime(tmp, "claude", api)
 
             asyncio.run(
@@ -268,8 +246,8 @@ class TuiHookTitlePathTests(unittest.TestCase):
                     payload={"session_id": "claude-title-1", "cwd": tmp},
                 )
             )
-            self.assertEqual(runtime.state.sessions.list_sessions(channel_kind="telegram"), [])
-            self.assertEqual([m for m, _ in api.calls if m == "sendMessage"], [])
+            self.assertEqual(runtime.state.sessions.list_sessions(channel_kind="lark"), [])
+            self.assertEqual([m for m, _ in api.calls if m in _SEND_METHODS], [])
 
             asyncio.run(
                 runtime.process_tui_hook(
@@ -286,7 +264,7 @@ class TuiHookTitlePathTests(unittest.TestCase):
             session = _only_session(runtime)
             self.assertEqual(session.cached_title, "把话题根标题改成有意义的")
             self.assertEqual(session.title_source, "initial_user_input")
-            sent = [p["text"] for m, p in api.calls if m == "sendMessage"]
+            sent = [p["text"] for m, p in api.calls if m in _SEND_METHODS]
             self.assertIn("把话题根标题改成有意义的", sent[0])
             self.assertFalse(any("claude-title-1" in text.split("\n")[0] for text in sent))
 
@@ -294,7 +272,7 @@ class TuiHookTitlePathTests(unittest.TestCase):
         # The first prompt opened the topic but carried no text (e.g. only an
         # attachment), so the stop bubble is the only title material.
         with tempfile.TemporaryDirectory() as tmp:
-            api = _TitleTelegramApi()
+            api = _TitleLarkApi()
             runtime = _tui_runtime(tmp, "codex", api)
 
             asyncio.run(
@@ -323,7 +301,7 @@ class TuiHookTitlePathTests(unittest.TestCase):
 
     def test_later_prompt_does_not_repaint_the_first_one(self):
         with tempfile.TemporaryDirectory() as tmp:
-            api = _TitleTelegramApi()
+            api = _TitleLarkApi()
             runtime = _tui_runtime(tmp, "claude", api)
 
             for prompt in ("第一个问题", "换个话题问第二个"):
@@ -899,7 +877,7 @@ class RootCardEditFailureTests(unittest.TestCase):
 class TitlePersistenceTests(unittest.TestCase):
     def test_title_watermark_survives_a_state_roundtrip(self):
         with tempfile.TemporaryDirectory() as tmp:
-            api = _TitleTelegramApi()
+            api = _TitleLarkApi()
             runtime = _tui_runtime(tmp, "claude", api)
             asyncio.run(
                 runtime.process_tui_hook(

@@ -19,12 +19,12 @@ class _Clock:
 
 
 def _actor() -> ActorRef:
-    return ActorRef(channel_kind="telegram", actor_id="u1", display_name="User")
+    return ActorRef(channel_kind="lark", actor_id="u1", display_name="User")
 
 
 def _binding() -> ChannelBinding:
     return ChannelBinding(
-        channel_kind="telegram",
+        channel_kind="lark",
         account_id="bot",
         chat_id="chat",
         thread_id="topic",

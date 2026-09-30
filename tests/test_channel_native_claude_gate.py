@@ -31,37 +31,38 @@ AGENT_SESSION_ID = "5ca3e37c-1111-2222-3333-444455556666"
 
 
 def _actor(actor_id: str = "owner") -> ActorRef:
-    return ActorRef(channel_kind="telegram", actor_id=actor_id, display_name=actor_id.title())
+    return ActorRef(channel_kind="lark", actor_id=actor_id, display_name=actor_id.title())
 
 
-class _FakeTelegramApi:
+_SEND_METHODS = {"sendMessage", "sendCard"}
+
+
+class _FakeLarkApi:
     def __init__(self):
-        self.token = "fake"
         self.calls = []
 
     async def call(self, method, payload):
         self.calls.append((method, payload))
-        if method == "sendMessage":
-            return {"ok": True, "result": {"message_id": len(self.calls)}}
-        return {"ok": True, "result": {}}
+        return {"ok": True, "data": {"message_id": f"lark-msg-{len(self.calls)}"}}
 
 
 def _runtime_with_observed_session(tmp: str, *, extra_env: dict | None = None):
     cfg = ChannelNativeConfig.from_env(
         {
-            "WALKCODE_CHANNEL": "telegram",
-            "TELEGRAM_BOT_TOKEN": "fake",
+            "WALKCODE_CHANNEL": "lark",
+            "LARK_APP_ID": "cli_x",
+            "LARK_APP_SECRET": "s",
             "WALKCODE_AGENT": "claude",
             "WALKCODE_STATE_PATH": str(Path(tmp) / "state.json"),
             "WALKCODE_CWD": tmp,
             **(extra_env or {}),
         }
     )
-    api = _FakeTelegramApi()
-    runtime = ChannelNativeRuntime.from_config(cfg, telegram_api=api)
+    api = _FakeLarkApi()
+    runtime = ChannelNativeRuntime.from_config(cfg, lark_api=api)
     session = runtime.state.sessions.create_observed_session(
         session_id="observed-1",
-        binding=ChannelBinding("telegram", "bot", "chat", "topic", "root"),
+        binding=ChannelBinding("lark", "bot", "chat", "topic", "root"),
         cwd=tmp,
         external_ref={
             "source": "native_tui_hook",
@@ -522,7 +523,7 @@ class GateDrainTests(unittest.TestCase):
             sent = [
                 payload
                 for method, payload in api.calls
-                if method == "sendMessage" and "Edit" in str(payload.get("text", ""))
+                if method in _SEND_METHODS and "Edit" in str(payload.get("text", ""))
             ]
             self.assertTrue(sent)
             # No decision yet: that comes from the card callback.
@@ -545,7 +546,7 @@ class GateDrainTests(unittest.TestCase):
                 [
                     payload
                     for method, payload in api.calls
-                    if method == "sendMessage" and "Edit" in str(payload.get("text", ""))
+                    if method in _SEND_METHODS and "Edit" in str(payload.get("text", ""))
                 ]
             )
 
@@ -596,9 +597,9 @@ class GateDrainTests(unittest.TestCase):
             asyncio.run(runtime.drain_claude_gate_requests())
             card_call = next(
                 i for i, (method, payload) in enumerate(api.calls)
-                if method == "sendMessage" and "Edit" in str(payload.get("text", ""))
+                if method in _SEND_METHODS and "Edit" in str(payload.get("text", ""))
             )
-            card_id = str(card_call + 1)  # the fake API numbers messages by call index
+            card_id = f"lark-msg-{card_call + 1}"  # the fake API numbers messages by call index
             [hitl] = runtime.orchestrator.hitls.pending_for_session("observed-1")
             ctx = runtime.orchestrator.interactions.get(hitl.interaction_id)
 
@@ -625,7 +626,7 @@ class GateDrainTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             runtime, _session, api = _runtime_with_observed_session(tmp)
             state = runtime.state_store.path
-            channel = runtime.channels["telegram"]
+            channel = runtime.channels["lark"]
             real_send = channel.send_view
             failures = {"left": 1}
 
@@ -662,7 +663,7 @@ class GateDrainTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             runtime, _session, api = _runtime_with_observed_session(tmp)
             state = runtime.state_store.path
-            channel = runtime.channels["telegram"]
+            channel = runtime.channels["lark"]
             real_edit = channel.edit_view
             refusals = {"left": 1}
 
@@ -776,7 +777,7 @@ class StatusCardTests(unittest.TestCase):
                 return sum(
                     1
                     for method, _payload in api.calls
-                    if method in {"sendMessage", "editMessageText", "sendRichMessage"}
+                    if method in {"sendMessage", "sendCard", "editCard"}
                 )
 
             session.last_progress_event = "external_tui.pre-tool"
@@ -830,8 +831,9 @@ class GateWithoutDaemonTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             cfg = ChannelNativeConfig.from_env(
                 {
-                    "WALKCODE_CHANNEL": "telegram",
-                    "TELEGRAM_BOT_TOKEN": "fake",
+                    "WALKCODE_CHANNEL": "lark",
+                    "LARK_APP_ID": "cli_x",
+                    "LARK_APP_SECRET": "s",
                     "WALKCODE_AGENT": "codex",
                     "WALKCODE_STATE_PATH": str(Path(tmp) / "state.json"),
                 }
@@ -843,11 +845,11 @@ class GateWithoutDaemonTests(unittest.TestCase):
             runtime, _session, _api = _runtime_with_observed_session(tmp)
 
             async def names():
-                tasks = runtime._start_telegram_maintenance_tasks()
+                tasks = runtime._start_maintenance_tasks()
                 try:
                     return {task.get_name() for task in tasks}
                 finally:
-                    await runtime._stop_telegram_maintenance_tasks(tasks)
+                    await runtime._stop_maintenance_tasks(tasks)
 
             started = asyncio.run(names())
             self.assertIn("walkcode-claude-gate-drain", started)
@@ -878,7 +880,7 @@ class GateWithoutDaemonTests(unittest.TestCase):
             self.assertIsNotNone(claude_gate.read_pending(state, rid))
             self.assertEqual(asyncio.run(runtime.drain_claude_gate_requests()), 1)
             self.assertTrue(
-                [p for m, p in api.calls if m == "sendMessage" and "Edit" in str(p.get("text", ""))]
+                [p for m, p in api.calls if m in _SEND_METHODS and "Edit" in str(p.get("text", ""))]
             )
             transport = runtime.orchestrator._interaction_transport(session)
             asyncio.run(
@@ -929,7 +931,7 @@ class GateWithoutDaemonTests(unittest.TestCase):
             self.assertEqual(asyncio.run(runtime.drain_claude_gate_requests()), 0)
             self.assertIsNone(claude_gate.read_pending(state, "toolu_old"))
             self.assertIsNone(claude_gate.read_decision(state, "toolu_old"))
-            self.assertFalse([m for m, _ in api.calls if m == "sendMessage"])
+            self.assertFalse([m for m, _ in api.calls if m in _SEND_METHODS])
 
 
 class RetiredEnvKeysTests(unittest.TestCase):
@@ -944,8 +946,9 @@ class RetiredEnvKeysTests(unittest.TestCase):
     def _config(self, extra: dict):
         return ChannelNativeConfig.from_env(
             {
-                "WALKCODE_CHANNEL": "telegram",
-                "TELEGRAM_BOT_TOKEN": "fake",
+                "WALKCODE_CHANNEL": "lark",
+                "LARK_APP_ID": "cli_x",
+                "LARK_APP_SECRET": "s",
                 "WALKCODE_AGENT": "claude",
                 **extra,
             }
@@ -996,7 +999,7 @@ class LegacyDaemonStateTests(unittest.TestCase):
             spawned = runtime.state.sessions.create_observed_session(
                 session_id="tui-claude-daemonspawn",
                 binding=ChannelBinding(
-                    "telegram", "bot", "chat", "topic-2", "root-2", capabilities={"origin": "daemon_spawn"}
+                    "lark", "bot", "chat", "topic-2", "root-2", capabilities={"origin": "daemon_spawn"}
                 ),
                 cwd=tmp,
                 external_ref={
@@ -1010,7 +1013,7 @@ class LegacyDaemonStateTests(unittest.TestCase):
             spawned.transport_kind = "claude_daemon"
             runtime.save_state()
 
-            reloaded = ChannelNativeRuntime.from_config(runtime.config, telegram_api=_FakeTelegramApi())
+            reloaded = ChannelNativeRuntime.from_config(runtime.config, lark_api=_FakeLarkApi())
             old = reloaded.state.sessions.get("tui-claude-daemonspawn")
             self.assertEqual(old.transport_kind, "external_tui")
             self.assertIsInstance(
@@ -1044,7 +1047,7 @@ class LegacyDaemonStateTests(unittest.TestCase):
                 "claude_daemon_reply_failed", [call.args[0] for call in log.call_args_list]
             )
             self.assertTrue(
-                [p for m, p in api.calls if m == "sendMessage" and "Take over" in str(p)]
+                [p for m, p in api.calls if m in _SEND_METHODS and "Take over" in str(p)]
             )
 
 

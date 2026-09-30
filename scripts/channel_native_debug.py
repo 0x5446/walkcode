@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """Module-level debug runner for channel-native V3.
 
-The script avoids printing secrets. Telegram ingress diagnostics call
-getUpdates without an offset, so they do not confirm or consume pending updates.
+The script avoids printing secrets.
 """
 
 from __future__ import annotations
@@ -58,11 +57,10 @@ STALE_ERROR_SESSION_SECONDS = 30.0
 
 TEST_GROUPS = {
     "config": ["tests/test_channel_native_config.py"],
-    "telegram": ["tests/test_channel_native_runtime.py", "tests/test_channel_native_telegram_claude.py"],
     "agent": ["tests/test_channel_native_runtime.py", "tests/test_channel_native_codex.py"],
     "state": ["tests/test_channel_native_persistence_reliability.py", "tests/test_channel_native_debug_script.py"],
     "outbox": ["tests/test_channel_native_views_auth_outbox.py", "tests/test_channel_native_persistence_reliability.py"],
-    "agent-smoke": ["tests/test_channel_native_runtime.py", "tests/test_channel_native_telegram_claude.py", "tests/test_channel_native_codex.py"],
+    "agent-smoke": ["tests/test_channel_native_runtime.py", "tests/test_channel_native_codex.py"],
     "runtime": ["tests/test_channel_native_runtime.py", "tests/test_channel_native_core.py", "tests/test_channel_native_debug_script.py"],
     "lark": [
         "tests/test_channel_native_lark.py",
@@ -123,10 +121,6 @@ def main() -> None:
     )
     smoke.add_argument("--timeout", type=float, default=60.0, help="Per-step timeout for --live smoke")
 
-    telegram = sub.add_parser("telegram", help="Inspect Telegram ingress without consuming updates")
-    telegram.add_argument("--json", action="store_true")
-    telegram.add_argument("--limit", type=int, default=5)
-
     lark = sub.add_parser("lark", help="Check Lark credentials/domain; --live sends and patches a card")
     lark.add_argument("--json", action="store_true")
     lark.add_argument(
@@ -174,10 +168,6 @@ def main() -> None:
                     timeout=args.timeout,
                 )
             )
-            print_payload(payload, as_json=args.json)
-            raise SystemExit(0 if payload["ok"] else 1)
-        if args.command == "telegram":
-            payload = asyncio.run(debug_telegram(limit=args.limit))
             print_payload(payload, as_json=args.json)
             raise SystemExit(0 if payload["ok"] else 1)
         if args.command == "lark":
@@ -575,38 +565,6 @@ async def debug_lark(*, live: bool) -> dict[str, Any]:
     return payload
 
 
-async def debug_telegram(*, limit: int) -> dict[str, Any]:
-    runtime = ChannelNativeRuntime.from_env()
-    report = await runtime.diagnose_telegram_ingress(limit=limit)
-    process_report = debug_runtime_processes(allow_channel_native=True)
-    warnings = list(report.get("warnings", []))
-    running_service_owns_polling = (
-        _telegram_pending_updates_conflict(report)
-        and bool(process_report.get("ok"))
-        and int(process_report.get("native_consumer_count") or 0) > 0
-    )
-    if running_service_owns_polling:
-        report["polling_owned_by_running_service"] = True
-        warnings = [item for item in warnings if item != "could not inspect Telegram pending updates"]
-        warnings.append(
-            "running walkcode native serve owns Telegram polling; getUpdates diagnostics are expected to return 409"
-        )
-    if not process_report["ok"]:
-        report["safe_to_run_serve_once"] = False
-        warnings.append("competing walkcode serve process(es) can consume Telegram updates before this run")
-    return {
-        "ok": (
-            bool(report.get("bot", {}).get("ok"))
-            and bool(report.get("webhook", {}).get("ok"))
-            and (bool(report.get("safe_to_run_serve_once")) or running_service_owns_polling)
-            and bool(process_report["ok"])
-        ),
-        **report,
-        "runtime_processes": process_report,
-        "warnings": warnings,
-    }
-
-
 def run_tests(module: str) -> int:
     paths = TEST_GROUPS[module]
     cmd = ["uv", "run", "--with", "pytest", "python", "-m", "pytest", *paths]
@@ -614,15 +572,6 @@ def run_tests(module: str) -> int:
     env = os.environ.copy()
     env.pop("VIRTUAL_ENV", None)
     return subprocess.run(cmd, cwd=ROOT, env=env, check=False).returncode
-
-
-def _telegram_pending_updates_conflict(report: dict[str, Any]) -> bool:
-    pending = report.get("pending_updates", {})
-    if not isinstance(pending, dict):
-        return False
-    message = str(pending.get("message", "") or "")
-    error = str(pending.get("error", "") or "")
-    return "409" in message or "Conflict" in message or error == "Conflict"
 
 
 def _load_state_snapshot(cfg: ChannelNativeConfig) -> tuple[StateSnapshot | None, dict[str, Any]]:
@@ -807,15 +756,15 @@ def _agent_smoke_error_payload(events: Any) -> dict[str, Any]:
 
 
 async def _probe_outbox_dispatch() -> dict[str, Any]:
-    binding = ChannelBinding(channel_kind="telegram", account_id="bot", chat_id="debug")
+    binding = ChannelBinding(channel_kind="lark", account_id="bot", chat_id="debug")
     sent_outbox = DurableOutbox()
     sent_outbox.enqueue(
         channel_binding_key=binding.key(),
         view_model={"type": "text", "text": "debug"},
         idempotency_key="debug:sent",
     )
-    sent_channel = _DebugChannel("telegram", mode="sent")
-    await OutboxDispatcher(sent_outbox, {"telegram": sent_channel}).flush_once()
+    sent_channel = _DebugChannel("lark", mode="sent")
+    await OutboxDispatcher(sent_outbox, {"lark": sent_channel}).flush_once()
 
     permanent_outbox = DurableOutbox()
     permanent_outbox.enqueue(
@@ -825,7 +774,7 @@ async def _probe_outbox_dispatch() -> dict[str, Any]:
     )
     await OutboxDispatcher(
         permanent_outbox,
-        {"telegram": _DebugChannel("telegram", mode="permanent")},
+        {"lark": _DebugChannel("lark", mode="permanent")},
     ).flush_once()
 
     transient_outbox = DurableOutbox(max_attempts=1)
@@ -836,7 +785,7 @@ async def _probe_outbox_dispatch() -> dict[str, Any]:
     )
     await OutboxDispatcher(
         transient_outbox,
-        {"telegram": _DebugChannel("telegram", mode="transient")},
+        {"lark": _DebugChannel("lark", mode="transient")},
     ).flush_once()
 
     result = {
@@ -918,7 +867,7 @@ def debug_runtime_processes(*, allow_channel_native: bool = False) -> dict[str, 
         payload["warnings"].append("stop competing walkcode serve process(es) before consuming IM updates")
     elif payload["native_consumer_count"]:
         payload["warnings"].append(
-            "walkcode native serve process(es) are running; Telegram 409/pending diagnostics are authoritative for same-bot conflicts"
+            "walkcode native serve process(es) are running; a second consumer of the same bot would compete for its events"
         )
     if legacy_remnants:
         payload["warnings"].append("legacy walkcode launchers/hooks/wrappers detected; clean or migrate before V3 release validation")
@@ -1210,7 +1159,7 @@ def _detect_process_env_remnants(*, root: Path, environ: dict[str, str]) -> list
                 {
                     "kind": "legacy_env_file_selected",
                     "path": _home_relative(root, env_path),
-                    "action": "point WALKCODE_ENV_FILE at a V3 Telegram/Lark env file instead of a FEISHU_* env",
+                    "action": "point WALKCODE_ENV_FILE at a V3 Lark env file instead of a FEISHU_* env",
                 }
             )
         if env_text and "WALKCODE_AGENT" not in env_text and not str(environ.get("WALKCODE_AGENT", "") or "").strip():

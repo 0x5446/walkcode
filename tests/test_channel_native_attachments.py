@@ -17,8 +17,6 @@ from walkcode.channel_native import (
     LarkChannelAdapter,
     Orchestrator,
     SessionRegistry,
-    TelegramBotApi,
-    TelegramChannelAdapter,
     TransportCapabilities,
 )
 
@@ -32,10 +30,10 @@ class _Clock:
 
 
 def _actor() -> ActorRef:
-    return ActorRef(channel_kind="telegram", actor_id="owner", display_name="Owner")
+    return ActorRef(channel_kind="lark", actor_id="owner", display_name="Owner")
 
 
-def _binding(kind: str = "telegram") -> ChannelBinding:
+def _binding(kind: str = "lark") -> ChannelBinding:
     return ChannelBinding(kind, "bot", "chat", "topic", "root")
 
 
@@ -77,7 +75,7 @@ def _transport_caps() -> TransportCapabilities:
 
 class _DownloadingChannel(FakeChannelAdapter):
     def __init__(self, capabilities: ChannelCapabilities):
-        super().__init__("telegram", capabilities)
+        super().__init__("lark", capabilities)
         self.downloaded: list[str] = []
 
     async def download_attachment(self, attachment: AttachmentRef) -> AttachmentRef:
@@ -111,14 +109,14 @@ class AttachmentIntakeTests(unittest.TestCase):
             sessions=SessionRegistry(now=clock),
             interactions=InteractionStore(now=clock),
             outbox=DurableOutbox(now=clock),
-            channels={"telegram": channel},
+            channels={"lark": channel},
             transports={"fake-transport": transport},
             now=clock,
         )
         asyncio.run(orchestrator.start_session(_binding(), "fake-transport", "/tmp/project", _actor()))
         inbound = InboundEvent(
             event_id="evt-file",
-            channel_kind="telegram",
+            channel_kind="lark",
             account_id="bot",
             chat_id="chat",
             thread_id="topic",
@@ -152,14 +150,14 @@ class AttachmentIntakeTests(unittest.TestCase):
             sessions=SessionRegistry(now=clock),
             interactions=InteractionStore(now=clock),
             outbox=DurableOutbox(now=clock),
-            channels={"telegram": channel},
+            channels={"lark": channel},
             transports={"fake-transport": transport},
             now=clock,
         )
         asyncio.run(orchestrator.start_session(_binding(), "fake-transport", "/tmp/project", _actor()))
         inbound = InboundEvent(
             event_id="evt-file",
-            channel_kind="telegram",
+            channel_kind="lark",
             account_id="bot",
             chat_id="chat",
             thread_id="topic",
@@ -183,45 +181,6 @@ class AttachmentIntakeTests(unittest.TestCase):
         self.assertEqual(result.reason, BlockedReason.CAPABILITY_DISABLED)
         self.assertEqual(channel.downloaded, [])
         self.assertEqual(transport.submitted_turns, [])
-
-    def test_telegram_photo_and_document_updates_create_attachment_refs(self):
-        adapter = TelegramChannelAdapter(TelegramBotApi("token", caller=lambda _method, _payload: {}))
-
-        photo = adapter.parse_update(
-            {
-                "update_id": 1,
-                "message": {
-                    "message_id": 10,
-                    "chat": {"id": "chat"},
-                    "from": {"id": "owner"},
-                    "caption": "look",
-                    "photo": [
-                        {"file_id": "small", "file_size": 1},
-                        {"file_id": "large", "file_size": 99},
-                    ],
-                },
-            }
-        )
-        document = adapter.parse_update(
-            {
-                "update_id": 2,
-                "message": {
-                    "message_id": 11,
-                    "chat": {"id": "chat"},
-                    "from": {"id": "owner"},
-                    "document": {
-                        "file_id": "doc-1",
-                        "mime_type": "application/pdf",
-                        "file_name": "spec.pdf",
-                    },
-                },
-            }
-        )
-
-        self.assertEqual(photo.attachments[0].source_id, "large")
-        self.assertEqual(photo.attachments[0].mime, "image/jpeg")
-        self.assertEqual(document.attachments[0].source_id, "doc-1")
-        self.assertEqual(document.attachments[0].mime, "application/pdf")
 
     def test_lark_image_and_file_events_create_attachment_refs(self):
         adapter = LarkChannelAdapter(LarkBotApi(caller=lambda *_: {}))

@@ -1,7 +1,6 @@
 import asyncio
 import json
 import tempfile
-import threading
 import time
 import unittest
 from pathlib import Path
@@ -27,7 +26,6 @@ from walkcode.channel_native import (
     PermanentDeliveryError,
     SessionRegistry,
     SessionRole,
-    TelegramBotApi,
     TransientDeliveryError,
     TransportCapabilities,
     TurnInput,
@@ -43,12 +41,12 @@ class _Clock:
 
 
 def _actor(actor_id: str = "u1") -> ActorRef:
-    return ActorRef(channel_kind="telegram", actor_id=actor_id, display_name=f"User {actor_id}")
+    return ActorRef(channel_kind="lark", actor_id=actor_id, display_name=f"User {actor_id}")
 
 
 def _binding() -> ChannelBinding:
     return ChannelBinding(
-        channel_kind="telegram",
+        channel_kind="lark",
         account_id="bot",
         chat_id="chat",
         thread_id="topic",
@@ -103,7 +101,7 @@ class PersistenceTests(unittest.TestCase):
         )
         observed = sessions.create_observed_session(
             session_id="observed-1",
-            binding=ChannelBinding("telegram", "bot", "chat", "topic", "observed-root"),
+            binding=ChannelBinding("lark", "bot", "chat", "topic", "observed-root"),
             cwd="/tmp/project",
             external_ref={"pid": 123},
             owner=_actor("owner"),
@@ -236,12 +234,12 @@ class OutboxReliabilityTests(unittest.TestCase):
         outbox = DurableOutbox(now=clock)
         outbox.enqueue(channel_binding_key=_binding().key(),
                        view_model={"type": "text", "text": "durable"}, idempotency_key="k")
-        channel = FakeChannelAdapter("telegram", _channel_caps())
+        channel = FakeChannelAdapter("lark", _channel_caps())
 
         def fail_save():
             raise OSError("disk full")
 
-        dispatcher = OutboxDispatcher(outbox, {"telegram": channel}, on_state_changed=fail_save)
+        dispatcher = OutboxDispatcher(outbox, {"lark": channel}, on_state_changed=fail_save)
         with self.assertRaises(OSError):
             asyncio.run(dispatcher.flush_once())
         self.assertEqual(channel.sent_views, [])
@@ -255,10 +253,10 @@ class OutboxReliabilityTests(unittest.TestCase):
         outbox = DurableOutbox()
         outbox.enqueue(channel_binding_key=_binding().key(),
                        view_model={"type": "text", "text": "durable"}, idempotency_key="k")
-        channel = FakeChannelAdapter("telegram", _channel_caps())
+        channel = FakeChannelAdapter("lark", _channel_caps())
         from unittest.mock import Mock
         save = Mock(side_effect=[None, OSError("disk full")])
-        dispatcher = OutboxDispatcher(outbox, {"telegram": channel}, on_state_changed=save)
+        dispatcher = OutboxDispatcher(outbox, {"lark": channel}, on_state_changed=save)
         with self.assertRaises(OSError):
             asyncio.run(dispatcher.flush_once())
         dispatcher.on_state_changed = lambda: None
@@ -270,7 +268,7 @@ class OutboxReliabilityTests(unittest.TestCase):
 
         clock = _Clock()
         outbox = DurableOutbox(now=clock, max_attempts=2, base_retry_delay=10.0)
-        channel = FakeChannelAdapter("telegram", _channel_caps())
+        channel = FakeChannelAdapter("lark", _channel_caps())
         attempts = {"count": 0}
 
         async def always_transient(_binding, _view):
@@ -283,7 +281,7 @@ class OutboxReliabilityTests(unittest.TestCase):
             view_model={"type": "text", "text": "retry"},
             idempotency_key="k1",
         )
-        dispatcher = OutboxDispatcher(outbox, {"telegram": channel})
+        dispatcher = OutboxDispatcher(outbox, {"lark": channel})
 
         asyncio.run(dispatcher.flush_once())
         asyncio.run(dispatcher.flush_once())
@@ -302,7 +300,7 @@ class OutboxReliabilityTests(unittest.TestCase):
 
         clock = _Clock()
         outbox = DurableOutbox(now=clock, max_attempts=3, base_retry_delay=1.0)
-        channel = FakeChannelAdapter("telegram", _channel_caps())
+        channel = FakeChannelAdapter("lark", _channel_caps())
 
         async def rate_limited(_binding, _view):
             raise TransientDeliveryError("rate limited", retry_after=30.0)
@@ -314,7 +312,7 @@ class OutboxReliabilityTests(unittest.TestCase):
             idempotency_key="k1",
         )
 
-        asyncio.run(OutboxDispatcher(outbox, {"telegram": channel}).flush_once())
+        asyncio.run(OutboxDispatcher(outbox, {"lark": channel}).flush_once())
 
         self.assertEqual(outbox.pending_count(), 1)
         self.assertEqual(outbox.get(item.delivery_id).next_attempt_at, clock.now + 30.0)
@@ -324,7 +322,7 @@ class OutboxReliabilityTests(unittest.TestCase):
 
         clock = _Clock()
         outbox = DurableOutbox(now=clock)
-        channel = FakeChannelAdapter("telegram", _channel_caps())
+        channel = FakeChannelAdapter("lark", _channel_caps())
         sends = {"count": 0}
         release = asyncio.Event()
 
@@ -339,8 +337,8 @@ class OutboxReliabilityTests(unittest.TestCase):
             view_model={"type": "text", "text": "once"},
             idempotency_key="k1",
         )
-        first = OutboxDispatcher(outbox, {"telegram": channel}, owner="first")
-        second = OutboxDispatcher(outbox, {"telegram": channel}, owner="second")
+        first = OutboxDispatcher(outbox, {"lark": channel}, owner="first")
+        second = OutboxDispatcher(outbox, {"lark": channel}, owner="second")
 
         async def run():
             task1 = asyncio.create_task(first.flush_once())
@@ -483,7 +481,7 @@ class RetentionPolicyTests(unittest.TestCase):
         from walkcode.channel_native import OutboxDispatcher
 
         outbox = DurableOutbox(now=_Clock())
-        channel = FakeChannelAdapter("telegram", _channel_caps())
+        channel = FakeChannelAdapter("lark", _channel_caps())
 
         async def permanent(_binding, _view):
             raise PermanentDeliveryError("bad chat")
@@ -494,7 +492,7 @@ class RetentionPolicyTests(unittest.TestCase):
             view_model={"type": "text", "text": "dead"},
             idempotency_key="k1",
         )
-        asyncio.run(OutboxDispatcher(outbox, {"telegram": channel}).flush_once())
+        asyncio.run(OutboxDispatcher(outbox, {"lark": channel}).flush_once())
 
         self.assertEqual(outbox.pending_count(), 0)
         self.assertEqual(outbox.dead_count(), 1)
@@ -534,14 +532,14 @@ class InboundLedgerReliabilityTests(unittest.TestCase):
             sessions=SessionRegistry(now=_Clock()),
             interactions=InteractionStore(now=_Clock()),
             outbox=DurableOutbox(now=_Clock()),
-            channels={"telegram": FakeChannelAdapter("telegram", _channel_caps())},
+            channels={"lark": FakeChannelAdapter("lark", _channel_caps())},
             transports={"failing": transport},
             inbound_ledger=InboundLedger(now=_Clock()),
             now=_Clock(),
         )
         inbound = InboundEvent(
             event_id="evt-retry",
-            channel_kind="telegram",
+            channel_kind="lark",
             account_id="bot",
             chat_id="chat",
             thread_id="topic",
@@ -558,43 +556,6 @@ class InboundLedgerReliabilityTests(unittest.TestCase):
             asyncio.run(orchestrator.handle_inbound_event(inbound, agent_transport_kind="failing", cwd="/tmp/project"))
 
         self.assertEqual(transport.launch_count, 2)
-
-
-class TelegramHttpTests(unittest.TestCase):
-    def test_real_http_branch_runs_off_event_loop(self):
-        class _Response:
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *_args):
-                return False
-
-            def read(self):
-                return json.dumps({"ok": True, "result": {"message_id": 1}}).encode()
-
-        thread_ids = []
-
-        def fake_urlopen(_request, timeout):
-            thread_ids.append(threading.get_ident())
-            time.sleep(0.05)
-            return _Response()
-
-        async def run_call():
-            api = TelegramBotApi("token")
-            main_thread = threading.get_ident()
-            started = time.perf_counter()
-            task = asyncio.create_task(api.call("sendMessage", {"chat_id": "c", "text": "hi"}))
-            await asyncio.sleep(0.01)
-            elapsed = time.perf_counter() - started
-            result = await task
-            return main_thread, elapsed, result
-
-        with patch("urllib.request.urlopen", fake_urlopen):
-            main_thread, elapsed, result = asyncio.run(run_call())
-
-        self.assertLess(elapsed, 0.04)
-        self.assertNotEqual(thread_ids[0], main_thread)
-        self.assertEqual(result["result"]["message_id"], 1)
 
 
 _DAY = 86400.0
@@ -666,13 +627,44 @@ class OldStateCompatibilityTests(unittest.TestCase):
         self.assertEqual(reloaded.hitls.to_dict(), loaded.hitls.to_dict())
         self.assertEqual(reloaded.authz.to_dict(), loaded.authz.to_dict())
 
+    def test_state_with_retired_telegram_binding_still_loads(self):
+        # ADR 0069 retired the Telegram channel. State files from before it may
+        # still hold channel_kind="telegram" sessions/grants; they must load
+        # and round-trip untouched rather than crash the Lark runtime.
+        clock = _Clock()
+        sessions = SessionRegistry(now=clock)
+        binding = ChannelBinding("telegram", "bot", "123", "77", "110")
+        session = sessions.create_structured_session(
+            session_id="legacy-telegram",
+            binding=binding,
+            transport_kind="claude_headless",
+            transport_ref={"handle_id": "h1", "agent_session_id": "claude-1"},
+            cwd="/tmp/project",
+            owner=ActorRef("telegram", "456", "Ada"),
+        )
+        authz = AuthorizationStore()
+        authz.grant(session.session_id, ActorRef("telegram", "456", "Ada"), SessionRole.OWNER)
+        with tempfile.TemporaryDirectory() as tmp:
+            store = JsonFileStateStore(Path(tmp) / "state.json", now=clock)
+            store.save(_empty_state(clock, sessions, authz))
+            loaded = store.load()
+
+        reloaded = loaded.sessions.get(session.session_id)
+        self.assertEqual(reloaded.channel_binding.channel_kind, "telegram")
+        self.assertEqual(loaded.sessions.resolve_binding(binding.key()), session.session_id)
+        self.assertEqual(loaded.sessions.list_sessions(channel_kind="lark"), [])
+        self.assertEqual(
+            loaded.authz.role_for(session.session_id, ActorRef("telegram", "456")),
+            SessionRole.OWNER,
+        )
+
     def test_grants_no_longer_accumulate_an_audit_log(self):
         authz = AuthorizationStore()
         for _ in range(3):
             authz.grant("s1", _actor("owner"), SessionRole.OWNER)
         self.assertEqual(
             authz.to_dict(),
-            {"grants": [{"session_id": "s1", "channel_kind": "telegram", "actor_id": "owner", "role": "owner"}]},
+            {"grants": [{"session_id": "s1", "channel_kind": "lark", "actor_id": "owner", "role": "owner"}]},
         )
 
     def test_decided_hitl_without_decided_at_is_retained_from_expiry(self):

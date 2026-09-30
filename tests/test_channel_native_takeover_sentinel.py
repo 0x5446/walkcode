@@ -51,7 +51,8 @@ from walkcode.channel_native_runtime import (
     _tui_hook_captured_age,
 )
 
-from tests.test_channel_native_runtime import _FakeTelegramApi, _transport_caps
+from tests.test_channel_native_lark import _FakeLarkApi
+from tests.test_channel_native_runtime import _transport_caps
 
 
 SESSION_UUID = "98951f59-ef79-475e-a938-6bae92f14b28"
@@ -86,20 +87,21 @@ class _FakeSentinelController:
 
 def _make_runtime(tmp: str, env_extra: dict | None = None):
     env = {
-        "WALKCODE_CHANNEL": "telegram",
-        "TELEGRAM_BOT_TOKEN": "fake",
+        "WALKCODE_CHANNEL": "lark",
+        "LARK_APP_ID": "cli_x",
+        "LARK_APP_SECRET": "s",
         "WALKCODE_AGENT": "claude",
-        "TELEGRAM_ALLOWED_CHAT_IDS": "123",
+        "LARK_ALLOWED_CHAT_IDS": "123",
         "WALKCODE_STATE_PATH": str(Path(tmp) / "state.json"),
         "WALKCODE_CWD": tmp,
     }
     if env_extra:
         env.update(env_extra)
     cfg = ChannelNativeConfig.from_env(env)
-    api = _FakeTelegramApi()
+    api = _FakeLarkApi()
     runtime = ChannelNativeRuntime.from_config(
         cfg,
-        telegram_api=api,
+        lark_api=api,
         transports={"claude_headless": FakeAgentTransport("claude_headless", _transport_caps())},
     )
     return runtime, api
@@ -108,7 +110,7 @@ def _make_runtime(tmp: str, env_extra: dict | None = None):
 def _orchestrator_owned_session(runtime, tmp: str):
     return runtime.state.sessions.create_structured_session(
         binding=ChannelBinding(
-            channel_kind="telegram",
+            channel_kind="lark",
             account_id="bot",
             chat_id="123",
             root_message_id="3",
@@ -116,7 +118,7 @@ def _orchestrator_owned_session(runtime, tmp: str):
         transport_kind="claude_headless",
         transport_ref={"handle_id": "h1", "agent_session_id": "claude-session-1"},
         cwd=tmp,
-        owner=ActorRef("telegram", "456", "Ada"),
+        owner=ActorRef("lark", "456", "Ada"),
     )
 
 
@@ -132,7 +134,7 @@ def _activity_hook_payload(*, pid: int, command: str, lstart: str = "", age_seco
 
 
 def _sent_texts(api) -> list[str]:
-    return [str(payload.get("text", "")) for method, payload in api.calls if method == "sendMessage"]
+    return [str(payload.get("text", "")) for method, payload in api.calls if method in {"sendMessage", "sendCard"}]
 
 
 class ProbeTests(unittest.TestCase):
@@ -822,10 +824,11 @@ class ConfigValidationTests(unittest.TestCase):
     def _cfg(self, value):
         return ChannelNativeConfig.from_env(
             {
-                "WALKCODE_CHANNEL": "telegram",
-                "TELEGRAM_BOT_TOKEN": "fake",
+                "WALKCODE_CHANNEL": "lark",
+                "LARK_APP_ID": "cli_x",
+                "LARK_APP_SECRET": "s",
                 "WALKCODE_AGENT": "claude",
-                "TELEGRAM_ALLOWED_CHAT_IDS": "123",
+                "LARK_ALLOWED_CHAT_IDS": "123",
                 "WALKCODE_STATE_PATH": "/tmp/x.json",
                 "WALKCODE_CWD": "/tmp",
                 "WALKCODE_TUI_HOOK_FRESH_SECONDS": value,

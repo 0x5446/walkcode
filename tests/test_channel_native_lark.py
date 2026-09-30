@@ -556,12 +556,6 @@ class InboundMessageTypeTests(unittest.TestCase):
         inbound = SimpleNamespace(raw={"event": {"message": {"msg_type": "post"}}})
         self.assertEqual(runtime_module._inbound_message_type(inbound), "post")
 
-    def test_telegram_shape_reports_payload_key(self):
-        inbound = SimpleNamespace(
-            raw={"update_id": 7, "message": {"message_id": 1, "sticker": {"file_id": "s1"}}}
-        )
-        self.assertEqual(runtime_module._inbound_message_type(inbound), "sticker")
-
     def test_unknown_shape_reports_empty(self):
         self.assertEqual(runtime_module._inbound_message_type(SimpleNamespace(raw=None)), "")
 
@@ -684,7 +678,7 @@ class LarkInboxReliabilityTests(_LarkRuntimeHarness):
         bridge = mock.Mock()
         with mock.patch.object(runtime, "process_lark_event", side_effect=RuntimeError("unknown outcome")), \
              mock.patch.object(runtime, "save_state", side_effect=TypeError("not serializable")), \
-             mock.patch.object(runtime, "_start_telegram_maintenance_tasks", return_value=[]):
+             mock.patch.object(runtime, "_start_maintenance_tasks", return_value=[]):
             with self.assertRaisesRegex(TypeError, "not serializable"):
                 asyncio.run(runtime.serve_lark_ws(max_events=1, bridge_factory=lambda **_: bridge))
         bridge.stop.assert_called_once()
@@ -2112,3 +2106,56 @@ class LarkAttachmentAndMultiTabTests(_LarkRuntimeHarness):
         self.assertIn("周末计划: 出门浪", detail)
         self.assertIn("吃啥: 碳水快乐, 辣", detail)
         self.assertNotIn("[", detail)
+
+
+class RetiredTelegramStateTests(_LarkRuntimeHarness):
+    """ADR 0069: state written while the Telegram channel existed must load."""
+
+    def test_telegram_bindings_in_state_load_and_maintenance_ignores_them(self):
+        from walkcode.channel_native import ActorRef, ChannelBinding
+
+        runtime, _api, _transport = self._runtime()
+        binding = ChannelBinding(
+            "telegram",
+            "bot",
+            "123",
+            "77",
+            "500",
+            capabilities={
+                "status_card": True,
+                "native_topic": True,
+                "pin_status_card": True,
+                "static_status_card": True,
+                "origin": "telegram",
+            },
+        )
+        session = asyncio.run(
+            runtime.orchestrator.start_session(
+                binding, "claude_headless", self._tmp.name, ActorRef("telegram", "456", "Ada")
+            )
+        )
+        session.status = "stopped"
+        session.lifecycle_state = "STOPPED"
+        runtime.state.outbox.enqueue(
+            channel_binding_key=binding.key(),
+            view_model={"type": "text", "text": "queued before the upgrade"},
+            idempotency_key="legacy-telegram",
+        )
+        runtime.save_state()
+
+        reloaded, api, _transport = self._runtime()
+        summaries = reloaded.state.sessions.list_sessions(channel_kind="telegram")
+        self.assertEqual([item.session_id for item in summaries], [session.session_id])
+        self.assertNotIn("telegram", reloaded.channels)
+
+        asyncio.run(reloaded._refresh_loaded_tui_observed_bindings())
+        asyncio.run(reloaded.outbox_dispatcher.flush_once())
+        asyncio.run(
+            reloaded.orchestrator.refresh_session_status_card(
+                reloaded.state.sessions.get(session.session_id)
+            )
+        )
+        reloaded.compact_state()
+
+        # Nothing is delivered to the Lark bot on behalf of the old binding.
+        self.assertEqual(api.calls, [])

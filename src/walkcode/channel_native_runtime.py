@@ -11,7 +11,6 @@ import itertools
 import json
 import os
 import stat
-import random
 import re
 import shutil
 import secrets
@@ -77,8 +76,6 @@ from .channel_native import (
     SessionRole,
     StateSnapshot,
     SubmitResult,
-    TelegramBotApi,
-    TelegramChannelAdapter,
     TransportCapabilities,
     TransportHandle,
     TransportUnavailable,
@@ -88,7 +85,6 @@ from .channel_native import (
     WriterOwner,
     _agent_to_transport_kind,
     _session_has_durable_resume_ref,
-    _session_is_channel_revival_candidate,
     _session_is_external_tui_takeover_candidate,
     compact_sessions,
 )
@@ -97,7 +93,6 @@ from .channel_native.claude_gate_transport import CLAUDE_GATE_TRANSPORT_KEY, Cla
 from .channel_native.lark_live import AckRegistry, LarkIngressBridge, build_lark_live_api
 
 
-TELEGRAM_FORUM_TOPIC_ICON_COLORS = (0x6FB9F0, 0xFFD67E, 0xCB86DB, 0x8EEE98, 0xFF93B2, 0xFB6F5F)
 CLAUDE_GATE_DRAIN_INTERVAL_SECONDS = 1.0
 # Failed edits of a settled gate card (about one pass a second) before giving
 # up on it. Waiting for the card's delivery does not count.
@@ -1540,11 +1535,7 @@ class ChannelNativeRuntime:
         self.outbox_dispatcher = outbox_dispatcher
         self.e2e_gates = e2e_gates or {}
         self._now = now
-        self._telegram_offset: int | None = None
-        self.last_telegram_offset_confirm_error = ""
-        self.last_telegram_poll_error = ""
         self.last_lark_event_error = ""
-        self._telegram_commands_installed = False
         self._tui_hook_queue_dir = _tui_hook_queue_dir(self.state_store.path)
         self._tui_hook_failures: dict[str, int] = {}
         # Sessions whose rootless heal failed permanently; skipped until
@@ -1591,7 +1582,6 @@ class ChannelNativeRuntime:
         cls,
         env: dict[str, str] | None = None,
         *,
-        telegram_api: TelegramBotApi | None = None,
         lark_api: LarkBotApi | None = None,
         transports: dict[str, AgentTransport] | None = None,
         now=time.time,
@@ -1599,7 +1589,6 @@ class ChannelNativeRuntime:
         source = _load_native_env(env)
         return cls.from_config(
             ChannelNativeConfig.from_env(source),
-            telegram_api=telegram_api,
             lark_api=lark_api,
             transports=transports,
             e2e_gates=_describe_e2e_gates(ChannelNativeE2EGates.from_env(source)),
@@ -1611,7 +1600,6 @@ class ChannelNativeRuntime:
         cls,
         config: ChannelNativeConfig,
         *,
-        telegram_api: TelegramBotApi | None = None,
         lark_api: LarkBotApi | None = None,
         transports: dict[str, AgentTransport] | None = None,
         external_tui_controllers: dict[str, Any] | None = None,
@@ -1620,7 +1608,7 @@ class ChannelNativeRuntime:
     ) -> "ChannelNativeRuntime":
         state_store = JsonFileStateStore(config.state_path, now=now)
         state = _load_or_create_state(state_store, now=now)
-        channels = _build_channels(config, telegram_api=telegram_api, lark_api=lark_api)
+        channels = _build_channels(config, lark_api=lark_api)
         transport_map = transports or _build_transports(config)
         save_state = lambda: state_store.save(state)
         outbox_dispatcher = OutboxDispatcher(
@@ -1742,154 +1730,15 @@ class ChannelNativeRuntime:
             }
         return report
 
-    async def diagnose_telegram_ingress(self, *, limit: int = 5) -> dict[str, Any]:
-        channel = self.channels.get("telegram")
-        if not isinstance(channel, TelegramChannelAdapter):
-            raise ChannelConfigError("Telegram channel is not configured for channel-native runtime")
-        endpoint = self.config.channel
-        allowed = tuple(str(item) for item in endpoint.options.get("allowed_chat_ids", ()) if item)
-        known_chats = {
-            summary.chat_id
-            for summary in self.state.sessions.list_sessions(channel_kind="telegram")
-            if summary.chat_id
-        }
-        report: dict[str, Any] = {
-            "channel": {
-                "kind": "telegram",
-                "polling_enabled": bool(endpoint.options.get("polling", True)),
-                "allowlist_configured": bool(allowed),
-                "allowlist_count": len(allowed),
-                "allowlist_matches_existing_session": bool(set(allowed) & known_chats),
-            },
-            "state": {
-                "existing_session_chats": len(known_chats),
-            },
-            "safe_to_run_serve_once": True,
-            "warnings": [],
-            "note": "diagnostic getUpdates does not advance Telegram offset",
-        }
-        report["bot"] = await self._diagnose_telegram_bot(channel)
-        report["target_chat"] = await self._diagnose_telegram_target_chat(
-            channel,
-            allowed=allowed,
-            bot=report["bot"],
-        )
-        report["webhook"] = await self._diagnose_telegram_webhook(channel)
-        try:
-            updates = await self._peek_telegram_updates(channel, limit=limit)
-        except Exception as exc:
-            report["safe_to_run_serve_once"] = False
-            report["pending_updates"] = {
-                "count": 0,
-                "limit": limit,
-                "error": type(exc).__name__,
-                "message": _safe_error_message(exc, channel.api.token),
-                "items": [],
-            }
-            report["warnings"].append("could not inspect Telegram pending updates")
-            return report
-
-        disallowed = 0
-        blocked = 0
-        items = []
-        for index, update in enumerate(updates):
-            item = self._summarize_telegram_update(
-                channel,
-                update,
-                index=index,
-                known_chats=known_chats,
-            )
-            if item.get("chat_id_present") and not item.get("chat_allowed"):
-                disallowed += 1
-            if item.get("submit_would_accept") is False:
-                blocked += 1
-            items.append(item)
-        report["pending_updates"] = {
-            "count": len(updates),
-            "limit": limit,
-            "items": items,
-        }
-        if disallowed:
-            report["safe_to_run_serve_once"] = False
-            report["warnings"].append(
-                "pending update(s) are outside Telegram allowlist; serve --once would confirm their offsets without starting an agent turn"
-            )
-        if blocked:
-            report["safe_to_run_serve_once"] = False
-            report["warnings"].append(
-                "pending update(s) target a session that is not currently submittable; serve --once would confirm their offsets without submitting to an agent"
-            )
-        return report
-
-    async def process_telegram_update(self, update: dict[str, Any]) -> SubmitResult:
-        channel = self.channels.get("telegram")
-        if not isinstance(channel, TelegramChannelAdapter):
-            raise ChannelConfigError("Telegram channel is not configured for channel-native runtime")
-        inbound = channel.parse_update(update)
-        if not self._telegram_chat_allowed(inbound.chat_id):
-            return SubmitResult(False, BlockedReason.UNAUTHORIZED)
-        service_kind = _telegram_service_message_kind(inbound)
-        if service_kind:
-            return SubmitResult(True, f"telegram_service_message:{service_kind}")
-        if not inbound.callback and not _telegram_message_is_empty(inbound):
-            await self._ack_telegram_received(channel, inbound)
-        command = _telegram_bot_command(inbound)
-        if command:
-            result = await self._handle_telegram_bot_command(channel, inbound, command)
-            self.save_state()
-            return result
-        selector = _agent_selector_command(inbound)
-        if selector:
-            await channel.send_view(
-                _inbound_reply_binding(inbound),
-                {
-                    "type": "agent_selector_rejected",
-                    "message": _agent_selector_rejected_message(
-                        configured_agent=self.config.agent,
-                        requested_agent=selector[0],
-                    ),
-                },
-            )
-            self.save_state()
-            return SubmitResult(True, "agent_selector_rejected")
-        unknown_slash = _telegram_unknown_slash_command(inbound)
-        if unknown_slash and self._resolve_telegram_command_session(inbound) is None:
-            await channel.send_view(
-                _inbound_reply_binding(inbound),
-                {
-                    "type": "text",
-                    "text": (
-                        "Unknown slash command. Use agent-native slash commands inside an existing "
-                        "session topic or reply chain."
-                    ),
-                },
-            )
-            self.save_state()
-            return SubmitResult(True, "telegram_unknown_slash_command")
-        if unknown_slash:
-            inbound = replace(inbound, text=_telegram_agent_command_text(self.config.agent, inbound.text))
-        if _telegram_message_is_empty(inbound):
-            return _ignore_empty_inbound(inbound)
-        transport_kind = self.config.agent_transport_kind
-        inbound = await self._place_telegram_new_session(channel, inbound)
-        await self._send_telegram_processing_action(channel, inbound)
-        result = await self.orchestrator.handle_inbound_event(
-            inbound,
-            agent_transport_kind=transport_kind,
-            cwd=self.config.cwd,
-        )
-        self.save_state()
-        return result
-
-    async def _handle_telegram_bot_command(
+    async def _handle_bot_command(
         self,
-        channel: TelegramChannelAdapter,
+        channel: ChannelAdapter,
         inbound,
         command: tuple[str, str],
     ) -> SubmitResult:
         name, argument = command
         actor = ActorRef(inbound.channel_kind, inbound.sender_id, inbound.sender_display)
-        session = self._resolve_telegram_command_session(inbound)
+        session = self._resolve_command_session(inbound)
         if name == "takeover":
             return await self.orchestrator.handle_inbound_event(
                 inbound,
@@ -1904,9 +1753,9 @@ class ChannelNativeRuntime:
                 ).view_model
                 view["actions"] = self.orchestrator._status_card_actions(session)
             else:
-                view = self._telegram_runtime_status_view()
-            await channel.send_view(self._telegram_command_reply_binding(inbound, session), view)
-            return SubmitResult(True, "telegram_bot_command")
+                view = self._runtime_status_view()
+            await channel.send_view(self._command_reply_binding(inbound, session), view)
+            return SubmitResult(True, "bot_command")
         if name == "sessions":
             sessions = self.state.sessions.list_sessions(
                 channel_kind=inbound.channel_kind,
@@ -1917,11 +1766,11 @@ class ChannelNativeRuntime:
                 reason="active_sessions",
                 sessions=[item for item in sessions if item.status != "stopped"],
             )
-            await channel.send_view(self._telegram_command_reply_binding(inbound, session), view)
-            return SubmitResult(True, "telegram_bot_command")
+            await channel.send_view(self._command_reply_binding(inbound, session), view)
+            return SubmitResult(True, "bot_command")
         if name == "skills":
             await channel.send_view(
-                self._telegram_command_reply_binding(inbound, session),
+                self._command_reply_binding(inbound, session),
                 {
                     "type": "text",
                     "text": (
@@ -1931,28 +1780,28 @@ class ChannelNativeRuntime:
                     ),
                 },
             )
-            return SubmitResult(True, "telegram_bot_command")
+            return SubmitResult(True, "bot_command")
         if name == "commands":
             await channel.send_view(
-                self._telegram_command_reply_binding(inbound, session),
+                self._command_reply_binding(inbound, session),
                 {
                     "type": "text",
-                    "text": _telegram_commands_help_text(self.config.agent),
+                    "text": _commands_help_text(self.config.agent),
                 },
             )
-            return SubmitResult(True, "telegram_bot_command")
+            return SubmitResult(True, "bot_command")
         if name == "reload":
             await self._handle_reload_command(channel, inbound, session, actor)
-            return SubmitResult(True, "telegram_bot_command")
+            return SubmitResult(True, "bot_command")
         if name == "model":
-            await self._handle_telegram_model_command(channel, inbound, session, actor, argument)
-            return SubmitResult(True, "telegram_bot_command")
+            await self._handle_model_command(channel, inbound, session, actor, argument)
+            return SubmitResult(True, "bot_command")
         if name == "repo":
             return await self._handle_repo_command(channel, inbound, session, argument)
         return SubmitResult(False, BlockedReason.NOT_FOUND)
 
     async def _handle_repo_command(self, channel, inbound, session, argument: str) -> SubmitResult:
-        binding = self._telegram_command_reply_binding(inbound, session)
+        binding = self._command_reply_binding(inbound, session)
         roots = self.config.workspace_roots
         if session is not None:
             await channel.send_view(
@@ -2013,18 +1862,18 @@ class ChannelNativeRuntime:
         self.save_state()
         return result
 
-    def _resolve_telegram_command_session(self, inbound):
+    def _resolve_command_session(self, inbound):
         resolution = self.state.sessions.resolve_active_binding(inbound.binding_key())
         if resolution.session_id and not resolution.reason:
             return self.state.sessions.get(resolution.session_id)
         return None
 
-    def _telegram_command_reply_binding(self, inbound, session=None) -> ChannelBinding:
+    def _command_reply_binding(self, inbound, session=None) -> ChannelBinding:
         if session is not None and session.channel_binding is not None:
             return session.channel_binding
         return _inbound_reply_binding(inbound)
 
-    def _telegram_runtime_status_view(self) -> dict[str, Any]:
+    def _runtime_status_view(self) -> dict[str, Any]:
         active = [
             item
             for item in self.state.sessions.list_sessions(channel_kind=self.config.channel_kind)
@@ -2057,7 +1906,7 @@ class ChannelNativeRuntime:
         conversation.
         """
         zh = str(getattr(inbound, "channel_kind", "")) == "lark"
-        binding = self._telegram_command_reply_binding(inbound, session)
+        binding = self._command_reply_binding(inbound, session)
 
         async def _reply(text: str) -> None:
             await channel.send_view(binding, {"type": "text", "text": text})
@@ -2125,15 +1974,15 @@ class ChannelNativeRuntime:
                 )
         await _reply(text)
 
-    async def _handle_telegram_model_command(
+    async def _handle_model_command(
         self,
-        channel: TelegramChannelAdapter,
+        channel: ChannelAdapter,
         inbound,
         session,
         actor: ActorRef,
         argument: str,
     ) -> None:
-        binding = self._telegram_command_reply_binding(inbound, session)
+        binding = self._command_reply_binding(inbound, session)
         if session is None:
             await channel.send_view(
                 binding,
@@ -2162,7 +2011,7 @@ class ChannelNativeRuntime:
                 binding,
                 {
                     "type": "text",
-                    "text": _telegram_model_status_text(
+                    "text": _model_status_text(
                         transport_kind=session.transport_kind,
                         switching_available=available,
                         inventory=inventory,
@@ -2188,31 +2037,6 @@ class ChannelNativeRuntime:
             binding,
             {"type": "text", "text": f"Model switch failed: {result.reason}"},
         )
-
-    async def _send_telegram_processing_action(self, channel: TelegramChannelAdapter, inbound) -> None:
-        send_action = getattr(channel, "send_action", None)
-        if send_action is None:
-            return
-        try:
-            await send_action(
-                _inbound_reply_binding(inbound),
-                "typing",
-            )
-        except Exception:
-            return
-
-    async def _ack_telegram_received(self, channel: TelegramChannelAdapter, inbound) -> None:
-        react_to_message = getattr(channel, "react_to_message", None)
-        if react_to_message is None:
-            return
-        try:
-            await react_to_message(
-                _inbound_reply_binding(inbound),
-                inbound.message_id,
-                "✅",
-            )
-        except Exception:
-            return
 
     def _lark_chat_allowed(self, chat_id: str, *, is_callback: bool = False) -> bool:
         endpoint = self.config.channel
@@ -2365,9 +2189,9 @@ class ChannelNativeRuntime:
                     text=raw_text[: len(raw_text) - len(stripped)] + stripped[1:],
                 )
             else:
-                command = _telegram_bot_command(inbound)
+                command = _parse_bot_command(inbound)
                 if command:
-                    result = await self._handle_telegram_bot_command(channel, inbound, command)
+                    result = await self._handle_bot_command(channel, inbound, command)
                     if (
                         not result.accepted
                         and str(getattr(result, "reason", "") or "") == "stale_inbound"
@@ -2399,8 +2223,8 @@ class ChannelNativeRuntime:
                     self._complete_lark_local_inbound(inbound)
                     self.save_state()
                     return SubmitResult(True, "agent_selector_rejected")
-                unknown_slash = _telegram_unknown_slash_command(inbound)
-                if unknown_slash and self._resolve_telegram_command_session(inbound) is None:
+                unknown_slash = _unknown_slash_command(inbound)
+                if unknown_slash and self._resolve_command_session(inbound) is None:
                     await channel.send_view(
                         reply_binding,
                         {
@@ -2415,9 +2239,9 @@ class ChannelNativeRuntime:
                     return SubmitResult(True, "lark_unknown_slash_command")
                 if unknown_slash:
                     inbound = replace(
-                        inbound, text=_telegram_agent_command_text(self.config.agent, inbound.text)
+                        inbound, text=_agent_command_text(self.config.agent, inbound.text)
                     )
-            if _telegram_message_is_empty(inbound):
+            if _inbound_is_empty(inbound):
                 return _ignore_empty_inbound(inbound)
             inbound = await self._place_lark_new_session(channel, inbound)
         result = await self.orchestrator.handle_inbound_event(
@@ -2567,7 +2391,7 @@ class ChannelNativeRuntime:
         bridge.start()
         previous_defer_event_drain = self.orchestrator.defer_event_drain
         self.orchestrator.defer_event_drain = True
-        maintenance_tasks = self._start_telegram_maintenance_tasks()
+        maintenance_tasks = self._start_maintenance_tasks()
         processed = 0
         try:
             while max_events is None or processed < max_events:
@@ -2587,7 +2411,7 @@ class ChannelNativeRuntime:
         finally:
             if hasattr(bridge, "stop"):
                 bridge.stop()
-            await self._stop_telegram_maintenance_tasks(maintenance_tasks)
+            await self._stop_maintenance_tasks(maintenance_tasks)
             self.orchestrator.defer_event_drain = previous_defer_event_drain
 
     def _persist_lark_event(self, payload: dict[str, Any]) -> Path:
@@ -2653,253 +2477,7 @@ class ChannelNativeRuntime:
         self.save_state()
         await self._best_effort_flush_outbox()
 
-    async def _place_telegram_new_session(
-        self,
-        channel: TelegramChannelAdapter,
-        inbound,
-    ):
-        if inbound.callback or inbound.thread_id or inbound.root_message_id:
-            return inbound
-        resolution = self.state.sessions.resolve_active_binding(inbound.binding_key())
-        if resolution.session_id or resolution.reason:
-            return inbound
-        topic_id = await self._create_telegram_session_topic_if_possible(channel, inbound)
-        if not topic_id:
-            return inbound
-        await self._send_telegram_general_topic_created_notice(channel, inbound, topic_id=topic_id)
-        return replace(inbound, thread_id=topic_id)
-
-    async def _create_telegram_session_topic_if_possible(
-        self,
-        channel: TelegramChannelAdapter,
-        inbound,
-    ) -> str:
-        message = inbound.raw.get("message", {}) if isinstance(inbound.raw, dict) else {}
-        chat = message.get("chat", {}) if isinstance(message, dict) else {}
-        chat_type = str(chat.get("type", "") or "")
-        return await self._create_telegram_topic_for_chat_if_possible(
-            channel,
-            chat_id=inbound.chat_id,
-            chat_type=chat_type,
-            topic_name=_telegram_session_topic_name(self.config.agent, inbound.text),
-        )
-
-    async def _create_telegram_topic_for_chat_if_possible(
-        self,
-        channel: TelegramChannelAdapter,
-        *,
-        chat_id: str,
-        chat_type: str = "",
-        topic_name: str,
-    ) -> str:
-        if chat_type == "supergroup":
-            try:
-                chat_result = await channel.api.call("getChat", {"chat_id": chat_id})
-            except Exception:
-                return ""
-            chat_info = chat_result.get("result", {}) if isinstance(chat_result, dict) else {}
-            if not bool(chat_info.get("is_forum")):
-                return ""
-            if not await self._telegram_bot_can_manage_topics(channel, chat_id):
-                return ""
-            return await self._create_telegram_forum_topic(
-                channel,
-                chat_id=chat_id,
-                topic_name=topic_name,
-            )
-        if not chat_type:
-            try:
-                chat_result = await channel.api.call("getChat", {"chat_id": chat_id})
-            except Exception:
-                return ""
-            chat_info = chat_result.get("result", {}) if isinstance(chat_result, dict) else {}
-            return await self._create_telegram_topic_for_chat_if_possible(
-                channel,
-                chat_id=chat_id,
-                chat_type=str(chat_info.get("type", "") or ""),
-                topic_name=topic_name,
-            )
-        if chat_type == "private":
-            try:
-                bot_result = await channel.api.call("getMe", {})
-            except Exception:
-                return ""
-            bot = bot_result.get("result", {}) if isinstance(bot_result, dict) else {}
-            if not bool(bot.get("has_topics_enabled")):
-                return ""
-            return await self._create_telegram_forum_topic(
-                channel,
-                chat_id=chat_id,
-                topic_name=topic_name,
-            )
-        return ""
-
-    async def _telegram_bot_can_manage_topics(
-        self,
-        channel: TelegramChannelAdapter,
-        chat_id: str,
-    ) -> bool:
-        try:
-            bot_result = await channel.api.call("getMe", {})
-        except Exception:
-            return False
-        bot = bot_result.get("result", {}) if isinstance(bot_result, dict) else {}
-        bot_id = bot.get("id")
-        if not bot_id:
-            return False
-        try:
-            member_result = await channel.api.call("getChatMember", {"chat_id": chat_id, "user_id": bot_id})
-        except Exception:
-            return False
-        member = member_result.get("result", {}) if isinstance(member_result, dict) else {}
-        if member.get("status") == "creator":
-            return True
-        return member.get("status") == "administrator" and bool(member.get("can_manage_topics"))
-
-    async def _create_telegram_forum_topic(
-        self,
-        channel: TelegramChannelAdapter,
-        *,
-        chat_id: str,
-        topic_name: str,
-    ) -> str:
-        try:
-            payload: dict[str, Any] = {
-                "chat_id": chat_id,
-                "name": topic_name,
-            }
-            payload.update(await self._random_telegram_topic_icon(channel))
-            result = await channel.api.call(
-                "createForumTopic",
-                payload,
-            )
-        except Exception:
-            return ""
-        topic = result.get("result", {}) if isinstance(result, dict) else {}
-        return str(topic.get("message_thread_id", "") or "")
-
-    async def _random_telegram_topic_icon(self, channel: TelegramChannelAdapter) -> dict[str, Any]:
-        try:
-            result = await channel.api.call("getForumTopicIconStickers", {})
-        except Exception:
-            result = {}
-        stickers = result.get("result", []) if isinstance(result, dict) else []
-        custom_emoji_ids = [
-            str(item.get("custom_emoji_id", "") or "")
-            for item in stickers
-            if isinstance(item, dict) and item.get("custom_emoji_id")
-        ]
-        if custom_emoji_ids:
-            return {"icon_custom_emoji_id": random.SystemRandom().choice(custom_emoji_ids)}
-        return {"icon_color": random.SystemRandom().choice(TELEGRAM_FORUM_TOPIC_ICON_COLORS)}
-
-    async def _send_telegram_general_topic_created_notice(
-        self,
-        channel: TelegramChannelAdapter,
-        inbound,
-        *,
-        topic_id: str,
-    ) -> None:
-        message = inbound.raw.get("message", {}) if isinstance(inbound.raw, dict) else {}
-        chat = message.get("chat", {}) if isinstance(message, dict) else {}
-        if str(chat.get("type", "") or "") != "supergroup":
-            return
-        topic_name = _telegram_session_topic_name(self.config.agent, inbound.text)
-        text = (
-            f"已创建 session topic：{topic_name}\n"
-            "请在新 topic 内继续这个任务；General 会保留原始启动消息作为记录。"
-        )
-        payload: dict[str, Any] = {
-            "chat_id": inbound.chat_id,
-            "text": text,
-            "disable_notification": True,
-        }
-        if inbound.message_id:
-            try:
-                payload["reply_parameters"] = {"message_id": int(inbound.message_id)}
-            except (TypeError, ValueError):
-                pass
-        topic_url = _telegram_topic_url(inbound.chat_id, topic_id)
-        if topic_url:
-            payload["reply_markup"] = {
-                "inline_keyboard": [[{"text": "Open topic", "url": topic_url}]]
-            }
-        try:
-            await channel.api.call("sendMessage", payload)
-        except Exception:
-            return
-
-    async def poll_telegram_once(self, *, timeout: int = 30, limit: int = 25) -> int:
-        channel = self.channels.get("telegram")
-        if not isinstance(channel, TelegramChannelAdapter):
-            raise ChannelConfigError("Telegram channel is not configured for channel-native runtime")
-        # Startup barrier for the --once path too (idempotent per process).
-        await self._settle_orphan_headless_sessions_once()
-        if not self.config.channel.options.get("polling", True):
-            raise ChannelConfigError("Telegram polling is disabled; webhook ingress is not wired yet")
-        payload: dict[str, Any] = {
-            "timeout": timeout,
-            "limit": limit,
-            "allowed_updates": ["message", "callback_query"],
-        }
-        if self._telegram_offset is not None:
-            payload["offset"] = self._telegram_offset
-        result = await channel.api.call("getUpdates", payload)
-        updates = result.get("result", []) if isinstance(result, dict) else []
-        processed = 0
-        for update in updates:
-            if not isinstance(update, dict):
-                continue
-            async with self._ingress_lock:
-                result = await self.process_telegram_update(update)
-            update_id = _telegram_update_id(update)
-            if update_id is not None and _telegram_result_confirms_offset(result):
-                next_offset = update_id + 1
-                self._telegram_offset = max(self._telegram_offset or next_offset, next_offset)
-            elif update_id is not None:
-                break
-            if result.accepted:
-                processed += 1
-        if self._telegram_offset is not None and updates:
-            await self._confirm_telegram_offset(channel)
-        return processed
-
-    async def serve_telegram_polling(
-        self,
-        *,
-        timeout: int = 30,
-        limit: int = 25,
-        retry_delay: float = 2.0,
-        max_iterations: int | None = None,
-    ) -> None:
-        iterations = 0
-        # Same startup barrier as serve_lark_ws: settle previous-process
-        # zombies before any polling can route messages into dead handles.
-        await self._settle_orphan_headless_sessions_once()
-        previous_defer_event_drain = self.orchestrator.defer_event_drain
-        self.orchestrator.defer_event_drain = True
-        maintenance_tasks = self._start_telegram_maintenance_tasks()
-        try:
-            await asyncio.sleep(0)
-            while max_iterations is None or iterations < max_iterations:
-                iterations += 1
-                try:
-                    await self.poll_telegram_once(timeout=timeout, limit=limit)
-                    await self._ensure_telegram_bot_commands()
-                except ChannelConfigError:
-                    raise
-                except Exception as exc:
-                    self.last_telegram_poll_error = f"{type(exc).__name__}: {exc}"
-                    print(f"telegram polling transient error: {self.last_telegram_poll_error}", file=sys.stderr)
-                    if retry_delay > 0:
-                        await asyncio.sleep(retry_delay)
-                else:
-                    self.last_telegram_poll_error = ""
-        finally:
-            await self._stop_telegram_maintenance_tasks(maintenance_tasks)
-            self.orchestrator.defer_event_drain = previous_defer_event_drain
-
-    def _start_telegram_maintenance_tasks(self) -> list[asyncio.Task[None]]:
+    def _start_maintenance_tasks(self) -> list[asyncio.Task[None]]:
         return [
             asyncio.create_task(self._compact_state_forever(), name="walkcode-state-compact"),
             asyncio.create_task(
@@ -2937,7 +2515,7 @@ class ChannelNativeRuntime:
         ]
 
     @staticmethod
-    async def _stop_telegram_maintenance_tasks(tasks: list[asyncio.Task[None]]) -> None:
+    async def _stop_maintenance_tasks(tasks: list[asyncio.Task[None]]) -> None:
         for task in tasks:
             task.cancel()
         if tasks:
@@ -2951,7 +2529,7 @@ class ChannelNativeRuntime:
         # reach a worker. Settle them so the topic shows the truth and stale
         # cards get retired by the callback-failure path instead of hanging.
         # Guarded to one run per process so every ingress entry point (lark
-        # ws, telegram polling, --once) can call it without re-sweeping
+        # ws and its tests) can call it without re-sweeping
         # sessions this process created.
         if getattr(self, "_orphan_sweep_done", False):
             return
@@ -3232,22 +2810,6 @@ class ChannelNativeRuntime:
         while True:
             await self._best_effort_refresh_loaded_tui_observed_bindings()
             await asyncio.sleep(interval)
-
-    async def _ensure_telegram_bot_commands(self) -> None:
-        if self._telegram_commands_installed:
-            return
-        channel = self.channels.get("telegram")
-        if not isinstance(channel, TelegramChannelAdapter):
-            return
-        set_bot_commands = getattr(channel, "set_bot_commands", None)
-        if set_bot_commands is None:
-            return
-        commands = _telegram_native_command_menu(self.config.agent)
-        try:
-            await set_bot_commands(commands)
-        except Exception:
-            return
-        self._telegram_commands_installed = True
 
     async def process_tui_hook(
         self,
@@ -3971,7 +3533,7 @@ class ChannelNativeRuntime:
                     session.writer_owner.external_ref.update(external_ref)
             self._ensure_tui_observed_binding_capabilities(session)
             if not session.cached_title:
-                session.cached_title = _telegram_session_topic_name(
+                session.cached_title = _session_topic_name(
                     agent_name,
                     f"TUI {agent_session_id(transport_kind, resume_ref)}",
                 )
@@ -3986,7 +3548,7 @@ class ChannelNativeRuntime:
         # never shows the session uuid first.
         title, title_source = compose_session_title(user_text=_tui_hook_text(hook_type, payload))
         if not title:
-            title = _telegram_session_topic_name(
+            title = _session_topic_name(
                 agent_name,
                 f"TUI {agent_session_id(transport_kind, resume_ref)}",
             )
@@ -4189,8 +3751,7 @@ class ChannelNativeRuntime:
         heal_retry_needed = False
         summaries = [
             summary
-            for kind in ("telegram", "lark")
-            for summary in self.state.sessions.list_sessions(channel_kind=kind)
+            for summary in self.state.sessions.list_sessions(channel_kind="lark")
         ]
         for summary in summaries:
             session = self.state.sessions.get(summary.session_id)
@@ -4283,7 +3844,7 @@ class ChannelNativeRuntime:
                     status="running",
                     title=(
                         session.cached_title
-                        or _telegram_session_topic_name(agent, f"TUI {identity}")
+                        or _session_topic_name(agent, f"TUI {identity}")
                     ),
                     session_id=session.session_id,
                     transport=session.transport_kind,
@@ -4397,16 +3958,12 @@ class ChannelNativeRuntime:
     @staticmethod
     def _ensure_tui_observed_binding_capabilities(session) -> bool:
         binding = session.channel_binding
-        if binding is None or binding.channel_kind not in {"telegram", "lark"}:
+        if binding is None or binding.channel_kind != "lark":
             return False
         if not binding.thread_id:
             return False
         changed = False
-        if binding.channel_kind == "telegram":
-            keys = ("status_card", "native_topic", "readonly_topic", "pin_status_card", "static_status_card")
-        else:
-            keys = ("status_card", "readonly_topic")
-        for key in keys:
+        for key in ("status_card", "readonly_topic"):
             if key not in binding.capabilities:
                 binding.capabilities[key] = True
                 changed = True
@@ -4431,48 +3988,16 @@ class ChannelNativeRuntime:
         *,
         title: str = "",
     ) -> ChannelBinding:
-        title = title or _telegram_session_topic_name(
+        title = title or _session_topic_name(
             agent_name,
             f"TUI {agent_session_id(transport_kind, resume_ref)}",
         )
         channel_kind = self.config.channel.kind
-        if channel_kind == "lark":
-            return await self._create_lark_tui_observed_binding(title)
-        if channel_kind != "telegram":
+        if channel_kind != "lark":
             raise ChannelConfigError(
                 f"TUI observed session ingress is not supported for channel: {channel_kind}"
             )
-        chat_id = _tui_telegram_chat_id(self.config.channel)
-        if not chat_id:
-            raise ChannelConfigError(
-                "missing Telegram chat for TUI observation; set WALKCODE_TELEGRAM_TUI_CHAT_ID or exactly one TELEGRAM_ALLOWED_CHAT_IDS"
-            )
-        thread_id = str(
-            payload.get("telegram_thread_id")
-            or self.config.channel.options.get("tui_thread_id", "")
-            or ""
-        )
-        channel = self.channels["telegram"]
-        if not thread_id:
-            thread_id = await self._create_telegram_topic_for_chat_if_possible(
-                channel,
-                chat_id=chat_id,
-                topic_name=title,
-            )
-        return ChannelBinding(
-            channel_kind="telegram",
-            account_id="bot",
-            chat_id=chat_id,
-            thread_id=thread_id,
-            capabilities={
-                "status_card": True,
-                "native_topic": True,
-                "readonly_topic": True,
-                "pin_status_card": True,
-                "static_status_card": True,
-                "origin": "external_tui",
-            },
-        )
+        return await self._create_lark_tui_observed_binding(title)
 
     async def _create_lark_tui_observed_binding(self, title: str) -> ChannelBinding:
         chat_id = _tui_lark_chat_id(self.config.channel)
@@ -4546,14 +4071,12 @@ class ChannelNativeRuntime:
     def _grant_tui_channel_owners(self, session_id: str, binding: ChannelBinding) -> None:
         if self.state.authz is None:
             return
-        actor_ids = list(self.config.channel.options.get("allowed_actor_ids", ()) or ())
-        if binding.channel_kind == "lark":
-            # Lark actors are open_ids (ou_...), never the chat id (oc_...);
-            # without this grant an observed session silently rejects every
-            # takeover request from the chat.
-            actor_ids.extend(self.config.channel.options.get("allowed_open_ids", ()) or ())
-        if binding.channel_kind == "telegram" and binding.chat_id and not binding.chat_id.startswith("-"):
-            actor_ids.append(binding.chat_id)
+        if binding.channel_kind != "lark":
+            return
+        # Lark actors are open_ids (ou_...), never the chat id (oc_...);
+        # without this grant an observed session silently rejects every
+        # takeover request from the chat.
+        actor_ids = list(self.config.channel.options.get("allowed_open_ids", ()) or ())
         for actor_id in dict.fromkeys(str(item) for item in actor_ids if item):
             self.state.authz.grant(
                 session_id,
@@ -4801,386 +4324,9 @@ class ChannelNativeRuntime:
 
     @staticmethod
     def _channel_live_ingress(kind: str, endpoint: ChannelEndpointConfig) -> str:
-        if kind == "telegram":
-            return "polling" if endpoint.options.get("polling", True) else "webhook_not_wired"
         if kind == "lark":
             return "websocket"
         return "not_wired"
-
-    def _telegram_chat_allowed(self, chat_id: str) -> bool:
-        endpoint = self.config.channel
-        if endpoint.kind != "telegram":
-            return False
-        allowed = tuple(str(item) for item in endpoint.options.get("allowed_chat_ids", ()) if item)
-        if not allowed:
-            return True
-        return str(chat_id) in allowed
-
-    async def _diagnose_telegram_bot(self, channel: TelegramChannelAdapter) -> dict[str, Any]:
-        try:
-            result = await channel.api.call("getMe", {})
-        except Exception as exc:
-            return {
-                "ok": False,
-                "error": type(exc).__name__,
-                "message": _safe_error_message(exc, channel.api.token),
-            }
-        bot = result.get("result", {}) if isinstance(result, dict) else {}
-        return {
-            "ok": bool(result.get("ok")) if isinstance(result, dict) else False,
-            "bot_id_present": bool(bot.get("id")),
-            "username": bot.get("username", ""),
-            "first_name": bot.get("first_name", ""),
-            "can_join_groups": bot.get("can_join_groups"),
-            "can_read_all_group_messages": bot.get("can_read_all_group_messages"),
-            "has_private_topics_enabled": bool(bot.get("has_topics_enabled")),
-            "allows_users_to_create_topics": bool(bot.get("allows_users_to_create_topics")),
-        }
-
-    async def _diagnose_telegram_target_chat(
-        self,
-        channel: TelegramChannelAdapter,
-        *,
-        allowed: tuple[str, ...],
-        bot: dict[str, Any],
-    ) -> dict[str, Any]:
-        if len(allowed) != 1:
-            return {
-                "ok": False,
-                "reason": "exactly_one_allowed_chat_required",
-                "allowed_chat_count": len(allowed),
-                "topic_per_session_available": False,
-            }
-        try:
-            result = await channel.api.call("getChat", {"chat_id": allowed[0]})
-        except Exception as exc:
-            return {
-                "ok": False,
-                "error": type(exc).__name__,
-                "message": _safe_error_message(exc, channel.api.token),
-                "topic_per_session_available": False,
-            }
-        chat = result.get("result", {}) if isinstance(result, dict) else {}
-        chat_type = str(chat.get("type", "") or "")
-        is_forum = bool(chat.get("is_forum"))
-        private_topics = chat_type == "private" and bool(bot.get("has_private_topics_enabled"))
-        bot_admin = await self._diagnose_telegram_topic_admin(channel, chat_id=allowed[0]) if is_forum else {}
-        can_manage_topics = bool(bot_admin.get("can_manage_topics"))
-        topic_available = bool(private_topics or (is_forum and can_manage_topics))
-        return {
-            "ok": bool(result.get("ok")) if isinstance(result, dict) else False,
-            "chat_id_present": bool(chat.get("id")),
-            "type": chat_type,
-            "is_forum": is_forum,
-            "bot_admin": bot_admin,
-            "native_topic_surface": (
-                "forum_supergroup"
-                if is_forum
-                else "private_bot_topics"
-                if private_topics
-                else ""
-            ),
-            "topic_per_session_available": topic_available,
-            "recommended_placement": "topic_per_session"
-            if topic_available
-            else "root_reply_chain",
-            "topic_unavailable_reason": "bot_missing_manage_topics"
-            if is_forum and not can_manage_topics
-            else "",
-        }
-
-    async def _diagnose_telegram_topic_admin(
-        self,
-        channel: TelegramChannelAdapter,
-        *,
-        chat_id: str,
-    ) -> dict[str, Any]:
-        try:
-            bot_result = await channel.api.call("getMe", {})
-            bot = bot_result.get("result", {}) if isinstance(bot_result, dict) else {}
-            bot_id = bot.get("id")
-            if not bot_id:
-                return {"checked": False, "reason": "bot_id_missing"}
-            member_result = await channel.api.call("getChatMember", {"chat_id": chat_id, "user_id": bot_id})
-        except Exception as exc:
-            return {
-                "checked": False,
-                "error": type(exc).__name__,
-                "message": _safe_error_message(exc, channel.api.token),
-            }
-        member = member_result.get("result", {}) if isinstance(member_result, dict) else {}
-        return {
-            "checked": True,
-            "status": str(member.get("status", "") or ""),
-            "can_manage_topics": bool(
-                member.get("status") == "creator"
-                or member.get("can_manage_topics")
-            ),
-            "can_delete_messages": bool(member.get("can_delete_messages")),
-            "can_invite_users": bool(member.get("can_invite_users")),
-            "can_pin_messages": bool(member.get("can_pin_messages")),
-        }
-
-    async def _diagnose_telegram_webhook(self, channel: TelegramChannelAdapter) -> dict[str, Any]:
-        try:
-            result = await channel.api.call("getWebhookInfo", {})
-        except Exception as exc:
-            return {
-                "ok": False,
-                "error": type(exc).__name__,
-                "message": _safe_error_message(exc, channel.api.token),
-            }
-        webhook = result.get("result", {}) if isinstance(result, dict) else {}
-        return {
-            "ok": bool(result.get("ok")) if isinstance(result, dict) else False,
-            "has_url": bool(webhook.get("url")),
-            "pending_update_count": webhook.get("pending_update_count", 0),
-            "last_error_present": bool(webhook.get("last_error_date") or webhook.get("last_error_message")),
-            "allowed_updates": list(webhook.get("allowed_updates") or []),
-        }
-
-    async def _peek_telegram_updates(self, channel: TelegramChannelAdapter, *, limit: int) -> list[dict[str, Any]]:
-        result = await channel.api.call(
-            "getUpdates",
-            {
-                "timeout": 0,
-                "limit": limit,
-                "allowed_updates": ["message", "callback_query"],
-            },
-        )
-        updates = result.get("result", []) if isinstance(result, dict) else []
-        return [update for update in updates if isinstance(update, dict)]
-
-    def _summarize_telegram_update(
-        self,
-        channel: TelegramChannelAdapter,
-        update: dict[str, Any],
-        *,
-        index: int,
-        known_chats: set[str],
-    ) -> dict[str, Any]:
-        try:
-            inbound = channel.parse_update(update)
-        except Exception as exc:
-            return {
-                "index": index,
-                "parse_ok": False,
-                "error": type(exc).__name__,
-                "message": _safe_error_message(exc, channel.api.token),
-            }
-        text = inbound.text or ""
-        item = {
-            "index": index,
-            "parse_ok": True,
-            "event_kind": "callback_query" if inbound.callback else "message",
-            "update_id_present": _telegram_update_id(update) is not None,
-            "message_id_present": bool(inbound.message_id),
-            "chat_id_present": bool(inbound.chat_id),
-            "chat_allowed": self._telegram_chat_allowed(inbound.chat_id),
-            "chat_matches_existing_session": inbound.chat_id in known_chats,
-            "thread_id_present": bool(inbound.thread_id),
-            "sender_id_present": bool(inbound.sender_id),
-            "text_present": bool(text),
-            "text_length": len(text),
-            "attachment_count": len(inbound.attachments),
-        }
-        if not inbound.callback and item["chat_allowed"]:
-            item.update(self._summarize_submit_gate(inbound))
-        return item
-
-    def _summarize_submit_gate(self, inbound) -> dict[str, Any]:
-        transport_kind = self.config.agent_transport_kind
-        selector = _agent_selector_command(inbound)
-        if selector:
-            return {
-                "active_session_present": False,
-                "submit_would_accept": True,
-                "submit_action": "agent_selector_rejected",
-                "submit_blocked_reason": "",
-                "agent_selector_command": selector[0],
-                "configured_agent": self.config.agent,
-            }
-        if _telegram_message_is_empty(inbound):
-            return {
-                "active_session_present": False,
-                "submit_would_accept": True,
-                "submit_action": "empty_message_ignored",
-                "submit_blocked_reason": "",
-            }
-        resolution = self.state.sessions.resolve_active_binding(
-            inbound.binding_key(), revival_eligible=self.orchestrator._revival_transport_ready
-        )
-        if resolution.reason:
-            if resolution.reason == BlockedReason.AMBIGUOUS_SESSION:
-                return {
-                    "active_session_present": False,
-                    "submit_would_accept": True,
-                    "submit_action": "session_chooser",
-                    "submit_blocked_reason": resolution.reason,
-                }
-            return {
-                "active_session_present": False,
-                "submit_would_accept": False,
-                "submit_blocked_reason": resolution.reason,
-            }
-        if not resolution.session_id:
-            return self._summarize_new_session_gate(transport_kind)
-
-        session = self.state.sessions.get(resolution.session_id)
-        actor = ActorRef(inbound.channel_kind, inbound.sender_id, inbound.sender_display)
-        if self.state.authz is not None:
-            authz = self.state.authz.can_submit(session.session_id, actor)
-            if not authz.allowed:
-                return {
-                    "active_session_present": True,
-                    "active_session_status": session.status,
-                    "active_session_lifecycle": session.lifecycle_state,
-                    "submit_would_accept": False,
-                    "submit_blocked_reason": authz.reason,
-                }
-        if _session_is_channel_revival_candidate(session) and self.orchestrator._revival_transport_ready(session):
-            # ADR 0054: the real submit path revives this session instead of
-            # dead-ending at SESSION_STOPPED — report it as submittable.
-            return {
-                "active_session_present": True,
-                "active_session_status": session.status,
-                "active_session_lifecycle": session.lifecycle_state,
-                "submit_would_accept": True,
-                "submit_action": "revive_stopped_session",
-                "submit_blocked_reason": "",
-                "submit_requires_resume": True,
-            }
-        transport = self.transports.get(session.transport_kind)
-        if session.lifecycle_state == "IDLE":
-            if transport is None:
-                return {
-                    "active_session_present": True,
-                    "active_session_status": session.status,
-                    "active_session_lifecycle": session.lifecycle_state,
-                    "submit_would_accept": False,
-                    "submit_blocked_reason": "transport_not_wired",
-                }
-            try:
-                caps = transport.capabilities()
-            except Exception as exc:
-                return {
-                    "active_session_present": True,
-                    "active_session_status": session.status,
-                    "active_session_lifecycle": session.lifecycle_state,
-                    "submit_would_accept": False,
-                    "submit_blocked_reason": type(exc).__name__,
-                }
-            if not caps.resume_after_complete:
-                return {
-                    "active_session_present": True,
-                    "active_session_status": session.status,
-                    "active_session_lifecycle": session.lifecycle_state,
-                    "submit_would_accept": False,
-                    "submit_blocked_reason": BlockedReason.CAPABILITY_DISABLED,
-                }
-            if not _session_has_durable_resume_ref(session):
-                return {
-                    "active_session_present": True,
-                    "active_session_status": session.status,
-                    "active_session_lifecycle": session.lifecycle_state,
-                    "submit_would_accept": False,
-                    "submit_blocked_reason": "missing_resume_ref",
-                }
-            return {
-                "active_session_present": True,
-                "active_session_status": session.status,
-                "active_session_lifecycle": session.lifecycle_state,
-                "submit_would_accept": True,
-                "submit_blocked_reason": "",
-                "submit_requires_resume": True,
-            }
-        validation = self.state.sessions.validate_submit(session.session_id, session.generation)
-        if not validation.accepted:
-            return {
-                "active_session_present": True,
-                "active_session_status": session.status,
-                "active_session_lifecycle": session.lifecycle_state,
-                "submit_would_accept": False,
-                "submit_blocked_reason": validation.reason,
-            }
-        if transport is None:
-            return {
-                "active_session_present": True,
-                "active_session_status": session.status,
-                "active_session_lifecycle": session.lifecycle_state,
-                "submit_would_accept": False,
-                "submit_blocked_reason": "transport_not_wired",
-            }
-        try:
-            caps = transport.capabilities()
-        except Exception as exc:
-            return {
-                "active_session_present": True,
-                "active_session_status": session.status,
-                "active_session_lifecycle": session.lifecycle_state,
-                "submit_would_accept": False,
-                "submit_blocked_reason": type(exc).__name__,
-            }
-        if not caps.structured_input:
-            return {
-                "active_session_present": True,
-                "active_session_status": session.status,
-                "active_session_lifecycle": session.lifecycle_state,
-                "submit_would_accept": False,
-                "submit_blocked_reason": BlockedReason.CAPABILITY_DISABLED,
-            }
-        return {
-            "active_session_present": True,
-            "active_session_status": session.status,
-            "active_session_lifecycle": session.lifecycle_state,
-            "submit_would_accept": True,
-            "submit_blocked_reason": "",
-        }
-
-    def _summarize_new_session_gate(self, transport_kind: str | None = None) -> dict[str, Any]:
-        selected_transport = transport_kind or self.config.agent_transport_kind
-        transport = self.transports.get(selected_transport)
-        if transport is None:
-            return {
-                "active_session_present": False,
-                "submit_would_accept": False,
-                "submit_blocked_reason": "transport_not_wired",
-            }
-        try:
-            caps = transport.capabilities()
-        except Exception as exc:
-            return {
-                "active_session_present": False,
-                "submit_would_accept": False,
-                "submit_blocked_reason": type(exc).__name__,
-            }
-        if not (caps.structured_input and caps.structured_output):
-            return {
-                "active_session_present": False,
-                "submit_would_accept": False,
-                "submit_blocked_reason": BlockedReason.CAPABILITY_DISABLED,
-            }
-        return {
-            "active_session_present": False,
-            "submit_would_accept": True,
-            "submit_blocked_reason": "",
-        }
-
-    async def _confirm_telegram_offset(self, channel: TelegramChannelAdapter) -> None:
-        try:
-            await channel.api.call(
-                "getUpdates",
-                {
-                    "offset": self._telegram_offset,
-                    "timeout": 0,
-                    "limit": 1,
-                    "allowed_updates": ["message", "callback_query"],
-                },
-            )
-        except Exception as exc:
-            self.last_telegram_offset_confirm_error = str(exc)
-        else:
-            self.last_telegram_offset_confirm_error = ""
 
     @staticmethod
     def _describe_transport(_kind: str, transport: AgentTransport) -> dict[str, Any]:
@@ -5217,13 +4363,6 @@ def run_native_cli(args) -> None:
         return
     if args.native_command == "debug":
         module = getattr(args, "debug_module", "")
-        if module == "telegram":
-            report = asyncio.run(runtime.diagnose_telegram_ingress(limit=args.limit))
-            if getattr(args, "json", False):
-                print(json.dumps(report, indent=2, sort_keys=True))
-            else:
-                print(_format_telegram_diagnosis(report))
-            return
         if module == "lark":
             report = asyncio.run(runtime.diagnose_lark_ingress())
             if getattr(args, "json", False):
@@ -5293,25 +4432,9 @@ def run_native_cli(args) -> None:
     if args.native_command == "serve":
         # 只有 serve 会派生 worker，也只有它需要向会话内暴露驱动者身份。
         _export_driver_label(runtime.config)
-        if runtime.config.channel_kind == "lark":
-            if getattr(args, "once", False):
-                raise ChannelConfigError(
-                    "serve --once is not supported for the lark channel (WebSocket push has "
-                    "no pull semantics); use doctor and debug lark instead"
-                )
-            print(_format_status(runtime.describe()))
-            print("channel-native V3 runtime listening via Lark WebSocket")
-            asyncio.run(runtime.serve_lark_ws())
-            return
-        if getattr(args, "once", False):
-            processed = asyncio.run(
-                runtime.poll_telegram_once(timeout=args.poll_timeout, limit=args.limit)
-            )
-            print(f"processed {processed} update(s)")
-            return
         print(_format_status(runtime.describe()))
-        print("channel-native V3 runtime listening via Telegram polling")
-        asyncio.run(runtime.serve_telegram_polling(timeout=args.poll_timeout, limit=args.limit))
+        print("channel-native V3 runtime listening via Lark WebSocket")
+        asyncio.run(runtime.serve_lark_ws())
         return
     raise ChannelConfigError(f"unknown native command: {args.native_command}")
 
@@ -5337,18 +4460,11 @@ def _new_interaction_store(*, now=time.time):
 def _build_channels(
     config: ChannelNativeConfig,
     *,
-    telegram_api: TelegramBotApi | None = None,
     lark_api: LarkBotApi | None = None,
 ) -> dict[str, ChannelAdapter]:
     channels: dict[str, ChannelAdapter] = {}
     endpoint = config.channel
-    if endpoint.kind == "telegram":
-        api = telegram_api or TelegramBotApi(endpoint.credentials["bot_token"])
-        channels[endpoint.kind] = TelegramChannelAdapter(
-            api,
-            use_rich_messages=bool(endpoint.options.get("rich_messages")),
-        )
-    elif endpoint.kind == "lark":
+    if endpoint.kind == "lark":
         if lark_api is None:
             ack_registry = AckRegistry()
             lark_api = build_lark_live_api(
@@ -5526,13 +4642,6 @@ def _repo_usage_text(roots: tuple[str, ...]) -> str:
     return "\n".join(lines)
 
 
-def _telegram_update_id(update: dict[str, Any]) -> int | None:
-    try:
-        return int(update.get("update_id"))
-    except (TypeError, ValueError):
-        return None
-
-
 # Reply text for silently-rejected Lark messages from authorized senders.
 # Reasons with their own feedback card (external_tui_readonly → takeover
 # prompt, ambiguous_session → session chooser) are intentionally absent.
@@ -5554,22 +4663,6 @@ _LARK_REJECTION_NOTES = {
 }
 
 
-def _telegram_result_confirms_offset(result: SubmitResult) -> bool:
-    if result.accepted:
-        return True
-    return result.reason in {
-        BlockedReason.UNAUTHORIZED,
-        BlockedReason.DUPLICATE_INBOUND,
-        BlockedReason.INVALID_TOKEN,
-        BlockedReason.ALREADY_DECIDED,
-        BlockedReason.STALE_GENERATION,
-        BlockedReason.NOT_FOUND,
-        BlockedReason.SESSION_STOPPED,
-        BlockedReason.EXTERNAL_TUI_READONLY,
-        "keep_readonly",
-    }
-
-
 def _agent_selector_command(inbound: Any) -> tuple[str, str] | None:
     text = str(getattr(inbound, "text", "") or "").strip()
     if not text.startswith("/"):
@@ -5588,7 +4681,7 @@ def _agent_selector_command(inbound: Any) -> tuple[str, str] | None:
     return agent, prompt.strip()
 
 
-def _telegram_bot_command(inbound: Any) -> tuple[str, str] | None:
+def _parse_bot_command(inbound: Any) -> tuple[str, str] | None:
     text = str(getattr(inbound, "text", "") or "").strip()
     if not text.startswith("/"):
         return None
@@ -5613,25 +4706,7 @@ def _telegram_bot_command(inbound: Any) -> tuple[str, str] | None:
     return resolved, argument.strip()
 
 
-def _telegram_service_message_kind(inbound: Any) -> str:
-    raw = getattr(inbound, "raw", {})
-    message = raw.get("message", {}) if isinstance(raw, dict) else {}
-    if not isinstance(message, dict):
-        return ""
-    for key in (
-        "forum_topic_created",
-        "forum_topic_closed",
-        "forum_topic_reopened",
-        "forum_topic_edited",
-        "general_forum_topic_hidden",
-        "general_forum_topic_unhidden",
-    ):
-        if key in message:
-            return key
-    return ""
-
-
-_WALKCODE_TELEGRAM_COMMANDS = [
+_WALKCODE_COMMANDS = [
     {"command": "status", "description": "Show current session or runtime status"},
     {"command": "sessions", "description": "List active sessions in this chat"},
     {"command": "model", "description": "Show or switch the current session model"},
@@ -5687,11 +4762,11 @@ _CODEX_NATIVE_COMMANDS = [
 ]
 
 
-def _telegram_native_command_menu(agent: str) -> list[dict[str, str]]:
+def _command_menu(agent: str) -> list[dict[str, str]]:
     native = _CLAUDE_NATIVE_COMMANDS if agent == "claude" else _CODEX_NATIVE_COMMANDS if agent == "codex" else []
     commands: list[dict[str, str]] = []
     seen: set[str] = set()
-    for command in [*_WALKCODE_TELEGRAM_COMMANDS, *native]:
+    for command in [*_WALKCODE_COMMANDS, *native]:
         name = str(command.get("command", "")).lstrip("/").lower()
         if not name or name in seen:
             continue
@@ -5700,7 +4775,7 @@ def _telegram_native_command_menu(agent: str) -> list[dict[str, str]]:
     return commands[:100]
 
 
-def _telegram_agent_command_aliases(agent: str) -> dict[str, str]:
+def _agent_command_aliases(agent: str) -> dict[str, str]:
     if agent == "claude":
         return {
             "add_dir": "add-dir",
@@ -5710,7 +4785,7 @@ def _telegram_agent_command_aliases(agent: str) -> dict[str, str]:
     return {}
 
 
-def _telegram_agent_command_text(agent: str, text: str) -> str:
+def _agent_command_text(agent: str, text: str) -> str:
     stripped = str(text or "")
     if not stripped.strip().startswith("/"):
         return stripped
@@ -5720,15 +4795,15 @@ def _telegram_agent_command_text(agent: str, text: str) -> str:
     name, suffix = command[1:].split("@", 1)[0], ""
     if "@" in command:
         suffix = "@" + command[1:].split("@", 1)[1]
-    mapped = _telegram_agent_command_aliases(agent).get(name.lower())
+    mapped = _agent_command_aliases(agent).get(name.lower())
     if not mapped:
         return stripped
     return f"{leading}/{mapped}{suffix}{sep}{argument}"
 
 
-def _telegram_commands_help_text(agent: str) -> str:
-    commands = _telegram_native_command_menu(agent)
-    aliases = _telegram_agent_command_aliases(agent)
+def _commands_help_text(agent: str) -> str:
+    commands = _command_menu(agent)
+    aliases = _agent_command_aliases(agent)
     lines = [f"Commands for {agent} bot:"]
     for item in commands:
         alias = aliases.get(item["command"])
@@ -5738,12 +4813,12 @@ def _telegram_commands_help_text(agent: str) -> str:
     return "\n".join(lines)
 
 
-def _telegram_unknown_slash_command(inbound: Any) -> bool:
+def _unknown_slash_command(inbound: Any) -> bool:
     text = str(getattr(inbound, "text", "") or "").strip()
-    return bool(text.startswith("/") and not _telegram_bot_command(inbound) and not _agent_selector_command(inbound))
+    return bool(text.startswith("/") and not _parse_bot_command(inbound) and not _agent_selector_command(inbound))
 
 
-def _telegram_model_status_text(
+def _model_status_text(
     *,
     transport_kind: str,
     switching_available: bool,
@@ -5780,7 +4855,7 @@ def _telegram_model_status_text(
                 label = f"{label} ({marker})"
             lines.append(f"- {label}")
         if len(models) > 20:
-            lines.append(f"... {len(models) - 20} more hidden by Telegram summary")
+            lines.append(f"... {len(models) - 20} more not shown")
     notes = [str(item).strip() for item in inventory.get("notes", []) if str(item).strip()]
     if notes:
         lines.append("")
@@ -5918,30 +4993,10 @@ def _codex_local_model_inventory(config: ChannelNativeConfig) -> dict[str, Any]:
     }
 
 
-def _telegram_message_is_empty(inbound: Any) -> bool:
+def _inbound_is_empty(inbound: Any) -> bool:
     return not str(getattr(inbound, "text", "") or "").strip() and not list(
         getattr(inbound, "attachments", []) or []
     )
-
-
-# One content key per kind in a Telegram message payload; used to name what
-# the parser failed to understand when a message is dropped as empty.
-_TELEGRAM_PAYLOAD_KEYS = (
-    "text",
-    "photo",
-    "document",
-    "sticker",
-    "voice",
-    "audio",
-    "video",
-    "video_note",
-    "animation",
-    "contact",
-    "location",
-    "venue",
-    "poll",
-    "dice",
-)
 
 
 def _inbound_message_type(inbound: Any) -> str:
@@ -5950,14 +5005,7 @@ def _inbound_message_type(inbound: Any) -> str:
         return ""
     event = raw.get("event") if isinstance(raw.get("event"), dict) else {}
     message = event.get("message") if isinstance(event.get("message"), dict) else {}
-    lark_type = str(message.get("message_type", "") or message.get("msg_type", "") or "")
-    if lark_type:
-        return lark_type
-    tg_message = raw.get("message") if isinstance(raw.get("message"), dict) else {}
-    for key in _TELEGRAM_PAYLOAD_KEYS:
-        if key in tg_message:
-            return key
-    return ""
+    return str(message.get("message_type", "") or message.get("msg_type", "") or "")
 
 
 def _ignore_empty_inbound(inbound: Any) -> SubmitResult:
@@ -5991,20 +5039,12 @@ def _agent_selector_rejected_message(*, configured_agent: str, requested_agent: 
     )
 
 
-def _telegram_session_topic_name(agent: str, text: str) -> str:
+def _session_topic_name(agent: str, text: str) -> str:
     words = " ".join(str(text or "").strip().split())
     if not words:
         words = "new session"
     name = f"{agent}: {words}"
     return name[:128].strip() or f"{agent}: new session"
-
-
-def _telegram_topic_url(chat_id: str, topic_id: str) -> str:
-    chat = str(chat_id or "").strip()
-    topic = str(topic_id or "").strip()
-    if not (chat.startswith("-100") and topic.isdigit()):
-        return ""
-    return f"https://t.me/c/{chat[4:]}/{topic}"
 
 
 def _normalize_tui_agent(value: str) -> str:
@@ -6741,7 +5781,9 @@ def _tui_event_id(
     return f"external_tui:{hook_type}:{transport_kind}:{identity}:{suffix}"
 
 
-def _tui_telegram_chat_id(endpoint: ChannelEndpointConfig) -> str:
+def _tui_lark_chat_id(endpoint: ChannelEndpointConfig) -> str:
+    # Explicit TUI chat wins, otherwise a single-entry allowlist unambiguously
+    # names the observation chat.
     configured = str(endpoint.options.get("tui_chat_id", "") or "").strip()
     if configured:
         return configured
@@ -6749,12 +5791,6 @@ def _tui_telegram_chat_id(endpoint: ChannelEndpointConfig) -> str:
     if len(allowed) == 1:
         return allowed[0]
     return ""
-
-
-def _tui_lark_chat_id(endpoint: ChannelEndpointConfig) -> str:
-    # Same resolution rule as Telegram: explicit TUI chat wins, otherwise a
-    # single-entry allowlist unambiguously names the observation chat.
-    return _tui_telegram_chat_id(endpoint)
 
 
 _TRANSCRIPT_READ_MAX_BYTES = 2 * 1024 * 1024
@@ -7452,9 +6488,7 @@ def _launchd_service_label(channel_kind: str, agent: str, profile: str = "") -> 
         return ""
     if profile:
         return f"com.walkcode.{profile}-{value}"
-    if channel_kind != "telegram":
-        return ""
-    return f"com.walkcode.telegram-{value}"
+    return ""
 
 
 def _lark_tenant_token_self_check(app_id: str, app_secret: str, domain: str) -> dict[str, Any]:
@@ -7504,48 +6538,6 @@ def _format_lark_diagnosis(report: dict[str, Any]) -> str:
     hint = sdk.get("hint", "")
     if hint:
         lines.append(f"hint: {hint}")
-    return "\n".join(lines)
-
-
-def _format_telegram_diagnosis(report: dict[str, Any]) -> str:
-    channel = report.get("channel", {})
-    bot = report.get("bot", {})
-    webhook = report.get("webhook", {})
-    pending = report.get("pending_updates", {})
-    lines = [
-        "telegram ingress diagnosis",
-        f"bot: ok={bot.get('ok')} username={bot.get('username', '')}",
-        (
-            "channel: "
-            f"polling_enabled={channel.get('polling_enabled')} "
-            f"allowlist_configured={channel.get('allowlist_configured')} "
-            f"allowlist_count={channel.get('allowlist_count')} "
-            f"allowlist_matches_existing_session={channel.get('allowlist_matches_existing_session')}"
-        ),
-        (
-            "webhook: "
-            f"has_url={webhook.get('has_url')} "
-            f"pending_update_count={webhook.get('pending_update_count')} "
-            f"last_error_present={webhook.get('last_error_present')}"
-        ),
-        f"pending_updates: count={pending.get('count')} limit={pending.get('limit')}",
-        f"safe_to_run_serve_once: {report.get('safe_to_run_serve_once')}",
-    ]
-    for item in pending.get("items", []):
-        lines.append(
-            "  - "
-            f"index={item.get('index')} "
-            f"kind={item.get('event_kind')} "
-            f"chat_allowed={item.get('chat_allowed')} "
-            f"known_chat={item.get('chat_matches_existing_session')} "
-            f"text_present={item.get('text_present')} "
-            f"attachments={item.get('attachment_count')}"
-        )
-    for warning in report.get("warnings", []):
-        lines.append(f"warning: {warning}")
-    note = report.get("note")
-    if note:
-        lines.append(f"note: {note}")
     return "\n".join(lines)
 
 

@@ -33,11 +33,11 @@ class _Clock:
 
 
 def _actor(actor_id: str = "owner") -> ActorRef:
-    return ActorRef(channel_kind="telegram", actor_id=actor_id, display_name=actor_id.title())
+    return ActorRef(channel_kind="lark", actor_id=actor_id, display_name=actor_id.title())
 
 
 def _binding() -> ChannelBinding:
-    return ChannelBinding("telegram", "bot", "chat", "topic", "root")
+    return ChannelBinding("lark", "bot", "chat", "topic", "root")
 
 
 def _channel_caps() -> ChannelCapabilities:
@@ -79,7 +79,7 @@ def _transport_caps(**overrides) -> TransportCapabilities:
 def _callback(token: str) -> InboundEvent:
     return InboundEvent(
         event_id="cb-1",
-        channel_kind="telegram",
+        channel_kind="lark",
         account_id="bot",
         chat_id="chat",
         thread_id="topic",
@@ -97,12 +97,12 @@ def _setup(transport):
     sessions = SessionRegistry(now=clock)
     interactions = InteractionStore(now=clock)
     authz = AuthorizationStore()
-    channel = FakeChannelAdapter("telegram", _channel_caps())
+    channel = FakeChannelAdapter("lark", _channel_caps())
     orchestrator = Orchestrator(
         sessions=sessions,
         interactions=interactions,
         outbox=DurableOutbox(now=clock),
-        channels={"telegram": channel},
+        channels={"lark": channel},
         transports={"fake-transport": transport},
         external_tui_controllers={"fake-process": FakeExternalTuiController("fake-process")},
         authz=authz,
