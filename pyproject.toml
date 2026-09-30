@@ -1,6 +1,6 @@
 [project]
 name = "walkcode"
-version = "0.14.36"
+version = "0.14.37"
 description = "Channel-native Lark/Feishu runtime for Claude Code and Codex"
 readme = "README.md"
 requires-python = ">=3.13"

@@ -786,7 +786,7 @@ wheels = [
 
 [[package]]
 name = "walkcode"
-version = "0.14.36"
+version = "0.14.37"
 source = { editable = "." }
 dependencies = [
     { name = "claude-agent-sdk" },
