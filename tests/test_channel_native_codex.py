@@ -2533,11 +2533,15 @@ class CodexStdioStderrTests(unittest.TestCase):
                 stderr = client._process.stderr
                 await client.restart()
                 # The child keeps writing: a pipe left open would keep
-                # filling a buffer that nobody reads any more.
+                # filling a buffer that nobody reads any more. (One chunk
+                # read between the cancel and the close may stay; it must
+                # not grow.)
+                await asyncio.sleep(0.05)
+                settled = len(stderr._buffer)
                 await asyncio.sleep(0.3)
                 # Checked inside the loop: asyncio.run cancels leftovers on
                 # exit, which would make any drain look finished.
-                return drain.done(), len(stderr._buffer)
+                return drain.done(), len(stderr._buffer) - settled
 
             try:
                 reclaimed, unread = asyncio.run(asyncio.wait_for(scenario(), timeout=15))
@@ -2546,7 +2550,7 @@ class CodexStdioStderrTests(unittest.TestCase):
                     os.kill(int(pid_file.read_text()), 9)
 
             self.assertTrue(reclaimed)
-            self.assertEqual(unread, 0)
+            self.assertEqual(unread, 0)  # no growth after the restart
 
 
 class CodexEventRoutingTests(unittest.TestCase):

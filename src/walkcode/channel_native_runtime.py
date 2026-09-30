@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Any
 
 from .channel_native import (
+    agent_session_id,
     PermanentDeliveryError,
     ActorRef,
     AgentEvent,
@@ -3901,7 +3902,7 @@ class ChannelNativeRuntime:
     def _tui_observed_session_id(
         self, agent_name: str, transport_kind: str, resume_ref: dict[str, Any]
     ) -> str:
-        identity = _resume_ref_identity(transport_kind, resume_ref)
+        identity = agent_session_id(transport_kind, resume_ref)
         session_id = f"tui-{agent_name}-{hashlib.sha1(identity.encode()).hexdigest()[:12]}"
         base_session_id = session_id
         suffix = 1
@@ -4644,7 +4645,7 @@ class ChannelNativeRuntime:
             external_ref["terminate_ref"] = terminate_ref
         actor = ActorRef(
             channel_kind=self.config.channel.kind,
-            actor_id=f"local_tui:{transport_kind}:{_resume_ref_identity(transport_kind, resume_ref)}",
+            actor_id=f"local_tui:{transport_kind}:{agent_session_id(transport_kind, resume_ref)}",
             display_name=f"{agent_name} TUI",
         )
         existing_id = self.state.sessions.find_by_resume_ref(
@@ -4806,7 +4807,7 @@ class ChannelNativeRuntime:
             if not session.cached_title:
                 session.cached_title = _telegram_session_topic_name(
                     agent_name,
-                    f"TUI {_resume_ref_identity(transport_kind, resume_ref)}",
+                    f"TUI {agent_session_id(transport_kind, resume_ref)}",
                 )
                 session.title_source = "tui_hook"
             await self.orchestrator.refresh_session_status_card(session)
@@ -4821,7 +4822,7 @@ class ChannelNativeRuntime:
         if not title:
             title = _telegram_session_topic_name(
                 agent_name,
-                f"TUI {_resume_ref_identity(transport_kind, resume_ref)}",
+                f"TUI {agent_session_id(transport_kind, resume_ref)}",
             )
             title_source = "tui_hook"
         binding = await self._create_tui_observed_binding(
@@ -5096,7 +5097,7 @@ class ChannelNativeRuntime:
         agent = _normalize_tui_agent(str(transport_ref.get("agent", "") or "")) or self.config.agent
         resume_ref = transport_ref.get("resume_ref")
         identity = (
-            _resume_ref_identity(_agent_to_transport_kind(agent), resume_ref)
+            agent_session_id(_agent_to_transport_kind(agent), resume_ref)
             if isinstance(resume_ref, dict)
             else ""
         )
@@ -5284,7 +5285,7 @@ class ChannelNativeRuntime:
     ) -> ChannelBinding:
         title = title or _telegram_session_topic_name(
             agent_name,
-            f"TUI {_resume_ref_identity(transport_kind, resume_ref)}",
+            f"TUI {agent_session_id(transport_kind, resume_ref)}",
         )
         channel_kind = self.config.channel.kind
         if channel_kind == "lark":
@@ -7101,24 +7102,14 @@ def _tui_resume_ref(transport_kind: str, payload: dict[str, Any]) -> dict[str, A
         if normalized:
             return normalized
 
+    value = agent_session_id(transport_kind, payload)
+    if not value:
+        return {}
     if transport_kind == "claude_headless":
-        value = (
-            payload.get("agent_session_id")
-            or payload.get("claude_session_id")
-            or payload.get("session_id")
-            or payload.get("resume")
-        )
-        return {"agent_session_id": str(value)} if value else {}
+        return {"agent_session_id": value}
     if transport_kind == "codex_app_server":
-        value = (
-            payload.get("thread_id")
-            or payload.get("codex_thread_id")
-            or payload.get("conversation_id")
-            or payload.get("session_id")
-        )
-        return {"thread_id": str(value)} if value else {}
-    value = payload.get("session_id") or payload.get("handle_id")
-    return {"session_id": str(value)} if value else {}
+        return {"thread_id": value}
+    return {"session_id": value}
 
 
 def _tui_terminate_ref(payload: dict[str, Any]) -> dict[str, Any] | None:
@@ -7586,7 +7577,7 @@ def _tui_event_id(
     resume_ref: dict[str, Any],
     payload: dict[str, Any],
 ) -> str:
-    identity = _resume_ref_identity(transport_kind, resume_ref)
+    identity = agent_session_id(transport_kind, resume_ref)
     # Tool lifecycle hooks (PreToolUse/PostToolUse/...) carry a per-call
     # tool_use_id that is unique within the task. Using turn_id here — which
     # codex 0.144+ keeps CONSTANT across every tool in one turn — made the
@@ -7631,26 +7622,6 @@ def _tui_event_id(
         }
         suffix = hashlib.sha1(json.dumps(stable, sort_keys=True).encode("utf-8")).hexdigest()
     return f"external_tui:{hook_type}:{transport_kind}:{identity}:{suffix}"
-
-
-def _resume_ref_identity(transport_kind: str, resume_ref: dict[str, Any]) -> str:
-    if transport_kind == "claude_headless":
-        return str(
-            resume_ref.get("agent_session_id")
-            or resume_ref.get("claude_session_id")
-            or resume_ref.get("session_id")
-            or resume_ref.get("resume")
-            or ""
-        )
-    if transport_kind == "codex_app_server":
-        return str(
-            resume_ref.get("thread_id")
-            or resume_ref.get("codex_thread_id")
-            or resume_ref.get("conversation_id")
-            or resume_ref.get("session_id")
-            or ""
-        )
-    return str(resume_ref.get("session_id") or resume_ref.get("handle_id") or "")
 
 
 def _tui_telegram_chat_id(endpoint: ChannelEndpointConfig) -> str:
@@ -8080,10 +8051,8 @@ def _session_has_durable_resume_ref(session: Any) -> bool:
 
 
 def _resume_ref_is_durable(transport_kind: str, ref: dict[str, Any]) -> bool:
-    if transport_kind == "claude_headless":
-        return bool(ref.get("agent_session_id") or ref.get("claude_session_id") or ref.get("session_id"))
-    if transport_kind == "codex_app_server":
-        return bool(ref.get("thread_id"))
+    if transport_kind in {"claude_headless", "codex_app_server"}:
+        return bool(agent_session_id(transport_kind, ref))
     return bool(ref)
 
 

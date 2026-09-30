@@ -513,5 +513,5 @@ class KillOneSwitchedSessionTests(unittest.TestCase):
     def test_every_session_id_alias_counts(self):
         for key in ("agent_session_id", "claude_session_id", "resume", "session_id"):
             with self.subTest(key=key):
-                self.assertEqual(channel_native_module._claude_resume_session_id({key: " s1 "}), "s1")
-        self.assertEqual(channel_native_module._claude_resume_session_id({"session_id": 5}), "")
+                self.assertEqual(channel_native_module.agent_session_id("claude_headless", {key: " s1 "}), "s1")
+        self.assertEqual(channel_native_module.agent_session_id("claude_headless", {"session_id": 5}), "")

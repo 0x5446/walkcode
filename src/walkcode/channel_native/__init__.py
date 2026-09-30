@@ -1081,21 +1081,52 @@ def compose_session_title(*, user_text: str = "", assistant_text: str = "") -> t
     return "", ""
 
 
+# Where each agent's own session id may sit in a transport / resume ref, most
+# specific first. One table for every reader: they used to disagree (one copy
+# accepted `session_id`, another did not), so a ref could be "resumable" to one
+# path and "not durable" to the next.
+_AGENT_SESSION_ID_KEYS = {
+    "claude_headless": ("agent_session_id", "claude_session_id", "resume", "session_id"),
+    "codex_app_server": ("thread_id", "codex_thread_id", "conversation_id", "session_id"),
+}
+# WalkCode's own ledger ids (Orchestrator `sess-<uuid4 hex>`, TUI-observed
+# `tui-<agent>-<12 hex>`). Claude refs carry `session_id: sess-...` next to the
+# agent id; no agent has ever heard of it.
+_WALKCODE_SESSION_ID_RE = re.compile(r"sess-[0-9a-f]{32}|tui-(?:claude|codex)-[0-9a-f]{12}")
+
+
+def agent_session_id(transport_kind: str, ref: dict[str, Any]) -> str:
+    """The agent's own session id in ``ref`` ("" when absent).
+
+    For transports without an agent id (fakes, external refs) this is the
+    generic ``session_id`` / ``handle_id``.
+    """
+    keys = _AGENT_SESSION_ID_KEYS.get(transport_kind)
+    if keys is None:
+        return str(ref.get("session_id") or ref.get("handle_id") or "")
+    for key in keys:
+        value = ref.get(key)
+        if not isinstance(value, str) or not value.strip():
+            continue
+        value = value.strip()
+        if key == "session_id" and _WALKCODE_SESSION_ID_RE.fullmatch(value):
+            continue
+        return value
+    return ""
+
+
 def _durable_resume_ref(session: Session) -> dict[str, Any]:
-    """The transport ref if it carries enough identity to resume, else {}."""
+    """The transport ref if it carries enough identity to resume, else {}.
+
+    The id is copied to the key the transport's resume reads.
+    """
     ref = dict(session.transport_ref)
-    if session.transport_kind == "claude_headless":
-        agent_session_id = str(
-            ref.get("agent_session_id")
-            or ref.get("claude_session_id")
-            or ""
-        )
-        if not agent_session_id:
-            return {}
-        ref["agent_session_id"] = agent_session_id
+    if session.transport_kind not in _AGENT_SESSION_ID_KEYS:
         return ref
-    if session.transport_kind == "codex_app_server" and not ref.get("thread_id"):
+    identity = agent_session_id(session.transport_kind, ref)
+    if not identity:
         return {}
+    ref["agent_session_id" if session.transport_kind == "claude_headless" else "thread_id"] = identity
     return ref
 
 
@@ -1116,24 +1147,7 @@ def _agent_session_identity(session: Session) -> str:
         # agent-native ref nested, tagged with its own discriminator.
         kind = str(nested.get("transport_kind", "") or kind)
         ref = nested
-    if kind == "claude_headless":
-        value = ref.get("agent_session_id") or ref.get("claude_session_id") or ""
-    elif kind == "codex_app_server":
-        value = (
-            ref.get("thread_id")
-            or ref.get("codex_thread_id")
-            or ref.get("conversation_id")
-            or ""
-        )
-    else:
-        value = ""
-    identity = str(value or "").strip()
-    if identity:
-        return identity
-    # Older claude records parked the agent id under the generic key. A
-    # WalkCode ledger id sitting there is NOT an agent id.
-    fallback = str(ref.get("session_id", "") or "").strip()
-    return "" if fallback.startswith("sess-") else fallback
+    return agent_session_id(kind, ref) if kind in _AGENT_SESSION_ID_KEYS else ""
 
 
 def _session_is_channel_revival_candidate(session: Session) -> bool:
@@ -1786,7 +1800,7 @@ class SessionRegistry:
         self._binding_to_session[binding.key()] = session_id
 
     def find_by_resume_ref(self, *, transport_kind: str, resume_ref: dict[str, Any]) -> str | None:
-        target = self._resume_identity(transport_kind, resume_ref)
+        target = agent_session_id(transport_kind, resume_ref)
         if not target:
             return None
         for session_id, session in self._sessions.items():
@@ -1798,28 +1812,11 @@ class SessionRegistry:
                     continue
                 nested = ref.get("resume_ref")
                 if isinstance(nested, dict):
-                    if self._resume_identity(transport_kind, nested) == target:
+                    if agent_session_id(transport_kind, nested) == target:
                         return session_id
-                if self._resume_identity(transport_kind, ref) == target:
+                if agent_session_id(transport_kind, ref) == target:
                     return session_id
         return None
-
-    @staticmethod
-    def _resume_identity(transport_kind: str, resume_ref: dict[str, Any]) -> str:
-        if transport_kind == "claude_headless":
-            return str(
-                resume_ref.get("agent_session_id")
-                or resume_ref.get("claude_session_id")
-                or resume_ref.get("session_id")
-                or ""
-            )
-        if transport_kind == "codex_app_server":
-            return str(
-                resume_ref.get("thread_id")
-                or resume_ref.get("codex_thread_id")
-                or ""
-            )
-        return str(resume_ref.get("session_id") or resume_ref.get("handle_id") or "")
 
     def list_sessions(
         self,
@@ -4168,15 +4165,6 @@ def _utc_lstart_epoch(text: str) -> float | None:
         return None
 
 
-def _claude_resume_session_id(resume_ref: dict[str, Any]) -> str:
-    """The Claude session id in a resume ref, under any alias ClaudeHeadlessTransport.resume accepts."""
-    for key in ("agent_session_id", "claude_session_id", "resume", "session_id"):
-        value = resume_ref.get(key)
-        if isinstance(value, str) and value.strip():
-            return value.strip()
-    return ""
-
-
 def _claude_process_moved_to_another_session(pid: int, lstart: str, expected_session: str) -> bool:
     """Right before a signal: does this Claude process now run a session other than ``expected``?"""
     if not expected_session:
@@ -6303,12 +6291,7 @@ class ClaudeHeadlessTransport:
     async def resume(self, spec: ResumeSpec) -> TransportHandle:
         if not self._available():
             raise TransportUnavailable("claude_agent_sdk is not installed or no client factory is configured")
-        resume_id = str(
-            spec.resume_ref.get("agent_session_id")
-            or spec.resume_ref.get("resume")
-            or spec.resume_ref.get("session_id")
-            or ""
-        )
+        resume_id = agent_session_id("claude_headless", spec.resume_ref)
         if not resume_id:
             raise CapabilityUnsupported("Claude headless resume requires an agent session id")
         # Close-old → verify-dead → create-new → register → capture must be
@@ -12187,7 +12170,7 @@ class Orchestrator:
                     ),
                     idempotency_key=f"takeover_terminating:{takeover_id}",
                 )
-                own_session = _claude_resume_session_id(resume_ref or {})
+                own_session = agent_session_id("claude_headless", resume_ref or {})
                 termination = await controller.terminate(
                     # ADR 0067: the controller re-checks, right before every
                     # signal, that the process still runs this session — the
@@ -12534,7 +12517,7 @@ class Orchestrator:
     @staticmethod
     def _claude_tui_switched_away(session: Session) -> bool:
         """Is the Claude TUI recorded for this session now running a different session?"""
-        own = _claude_resume_session_id(Orchestrator._takeover_resume_ref(session) or {})
+        own = agent_session_id("claude_headless", Orchestrator._takeover_resume_ref(session) or {})
         controller_kind, process_ref = Orchestrator._normalize_takeover_terminate_ref(
             Orchestrator._takeover_terminate_ref(session) or {}
         )
