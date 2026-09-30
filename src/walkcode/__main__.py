@@ -122,16 +122,10 @@ def main() -> None:
 
     dbg = nsub.add_parser("debug", help="Run channel-native module-level diagnostics")
     dbgsub = dbg.add_subparsers(dest="debug_module", required=True)
-    dtg = dbgsub.add_parser("telegram", help="Inspect Telegram ingress without consuming updates")
-    dtg.add_argument("--json", action="store_true", help="Print machine-readable JSON")
-    dtg.add_argument("--limit", type=int, default=5, help="Maximum pending updates to inspect")
     dlk = dbgsub.add_parser("lark", help="Check Lark credentials, domain, and SDK availability")
     dlk.add_argument("--json", action="store_true", help="Print machine-readable JSON")
 
-    ns = nsub.add_parser("serve", help="Run channel-native V3 runtime")
-    ns.add_argument("--once", action="store_true", help="Process one polling cycle and exit")
-    ns.add_argument("--poll-timeout", type=int, default=30, help="Telegram getUpdates timeout in seconds")
-    ns.add_argument("--limit", type=int, default=25, help="Telegram getUpdates limit")
+    nsub.add_parser("serve", help="Run channel-native V3 runtime")
 
     nh = nsub.add_parser("hook", help="Handle a channel-native TUI hook event (reads JSON from stdin)")
     nh.add_argument(
@@ -142,7 +136,7 @@ def main() -> None:
     nh.add_argument(
         "--defer",
         action="store_true",
-        help="Persist the hook locally and let the running native service process Telegram side effects",
+        help="Persist the hook locally and let the running native service process channel side effects",
     )
     nh.add_argument(
         "--gate",

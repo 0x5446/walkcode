@@ -38,7 +38,7 @@ class _Clock:
 
 
 def _actor() -> ActorRef:
-    return ActorRef(channel_kind="telegram", actor_id="owner", display_name="Owner")
+    return ActorRef(channel_kind="lark", actor_id="owner", display_name="Owner")
 
 
 def _caps() -> ChannelCapabilities:
@@ -78,17 +78,17 @@ def _tcaps() -> TransportCapabilities:
 def _setup():
     clock = _Clock()
     transport = FakeAgentTransport("claude_headless", _tcaps())
-    channel = FakeChannelAdapter("telegram", _caps())
+    channel = FakeChannelAdapter("lark", _caps())
     orchestrator = Orchestrator(
         sessions=SessionRegistry(now=clock),
         interactions=InteractionStore(now=clock),
         outbox=DurableOutbox(now=clock),
-        channels={"telegram": channel},
+        channels={"lark": channel},
         transports={"claude_headless": transport},
         authz=AuthorizationStore(),
         now=clock,
     )
-    binding = ChannelBinding("telegram", "bot", "chat", "topic", "root")
+    binding = ChannelBinding("lark", "bot", "chat", "topic", "root")
     session = asyncio.run(
         orchestrator.start_session(binding, "claude_headless", "/tmp/project", _actor())
     )
@@ -98,7 +98,7 @@ def _setup():
 def _inbound(text: str, created_at: float, message_id: str = "m-1") -> InboundEvent:
     return InboundEvent(
         event_id=f"evt-{message_id}",
-        channel_kind="telegram",
+        channel_kind="lark",
         account_id="bot",
         chat_id="chat",
         thread_id="topic",

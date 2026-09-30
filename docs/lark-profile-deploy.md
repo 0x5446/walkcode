@@ -123,7 +123,8 @@ open_id/chat_id 回填白名单后再改回（2026-09-27 建 bfjdfhnf-codex 实�
 
 历史 wrapper `cc`/`ccv`/`ccp` shell 函数（`~/.agent-control-plane/agent-wrappers.sh`）
 已于 2026-07-03 移除；`ccs`/`codex-api` 归档在 `~/.walkcode-attic/20260703-wrappers/`。
-telegram 双实例已于 2026-07-04 退役（plist 在 `~/.walkcode-attic/20260704-telegram/`）。
+telegram 双实例已于 2026-07-04 退役（plist 在 `~/.walkcode-attic/20260704-telegram/`）；
+Telegram 渠道代码于 2026-09-30 整体删除（ADR 0069），飞书/Lark 是唯一渠道。
 
 首次登录（每 profile 一次）：
 
@@ -234,8 +235,7 @@ walkcode 会把回显值记在 `CodexAppServerTransport.effective_sandbox`；显
 `sandbox_mode` 时 app-server 回落 `read-only`（fail-closed，不是 workspace-write）。
 
 **白名单闸**：最终生效沙箱是 `danger-full-access` 而 `LARK_ALLOWED_CHAT_IDS` /
-`LARK_ALLOWED_OPEN_IDS`（Telegram 对应 `TELEGRAM_ALLOWED_CHAT_IDS` /
-`TELEGRAM_ALLOWED_ACTOR_IDS`）全为空时，walkcode 拒绝起线程并报错。这两个白名单留空
+`LARK_ALLOWED_OPEN_IDS` 全为空时，walkcode 拒绝起线程并报错。这两个白名单留空
 等于放行所有人，叠上无沙箱、`approval_policy=never` 就是任何人都能远程在这台机器上执行
 任意命令。确实要这么跑就显式设
 `WALKCODE_CODEX_ALLOW_UNRESTRICTED_WITHOUT_ALLOWLIST=1`。
@@ -352,17 +352,14 @@ TUI 会话的 gate 另验（ADR 0046 v2 / ADR 0068，claude 实例）：
 部署顺序：work-claude → work-codex（验证 CODEX_HOME 双 daemon 隔离）→
 personal-claude / personal-codex（验证个人飞书身份隔离）。
 
-## 6. Telegram 实例退役
+## 6. Telegram 渠道已删除
 
-4 个 Lark 实例稳定运行约一周后：
-
-```bash
-launchctl bootout gui/$(id -u)/com.walkcode.telegram-claude
-launchctl bootout gui/$(id -u)/com.walkcode.telegram-codex
-```
-
-env/state 文件归档不删；Telegram 渠道代码与测试保留（架构验证通道，见
-ADR 0044）。
+Telegram 实例 2026-07-04 退役，渠道代码 2026-09-30 删除（ADR 0069）。
+`WALKCODE_CHANNEL=telegram` 现在启动即报配置错误；旧状态文件里 `channel_kind`
+为 `telegram` 的会话照常加载、不会让启动失败，只是没有渠道能投递到它们
+（运行时本来就只建配置的那一个渠道）。
+运行时参考（命令、`/reload`、TUI hook 观测、调试门禁）见
+[channel-native-local-deploy.md](channel-native-local-deploy.md)。
 
 ## 7. 已知边界
 
@@ -370,7 +367,7 @@ ADR 0044）。
   建议演练一次断网；
 - 卡片回调 3 秒窗口偶发超时：内联降级为"正在处理…" toast，终态由 outbox 的
   editCard patch 兜底；
-- `serve --once` 不支持 lark（WS 推送无拉取语义），预检用 doctor + debug lark。
+- 没有 `serve --once`（WS 推送无拉取语义，ADR 0069 连同 Telegram 轮询一起删掉），预检用 doctor + debug lark。
 - ~~两个 Codex bot 的入站事件投递自 2026-07-02 起失效~~ → **已定位并修复
   （2026-07-05）**：根因是 §2 已记载的老坑再犯——两个 codex env 的
   `LARK_ALLOWED_OPEN_IDS` 复用了同 profile claude bot 的 open_id（open_id

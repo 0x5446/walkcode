@@ -33,11 +33,11 @@ class _Clock:
 
 
 def _actor(actor_id: str = "owner") -> ActorRef:
-    return ActorRef(channel_kind="telegram", actor_id=actor_id, display_name=actor_id.title())
+    return ActorRef(channel_kind="lark", actor_id=actor_id, display_name=actor_id.title())
 
 
 def _binding() -> ChannelBinding:
-    return ChannelBinding("telegram", "bot", "chat", "topic", "root")
+    return ChannelBinding("lark", "bot", "chat", "topic", "root")
 
 
 def _channel_caps() -> ChannelCapabilities:
@@ -82,13 +82,13 @@ def _setup(*, resume_ref=None, caps=None, transport=None, handoff_continue="off"
     interactions = InteractionStore(now=clock)
     outbox = DurableOutbox(now=clock)
     authz = AuthorizationStore()
-    channel = FakeChannelAdapter("telegram", _channel_caps())
+    channel = FakeChannelAdapter("lark", _channel_caps())
     transport = transport or FakeAgentTransport("fake-transport", caps or _transport_caps())
     orchestrator = Orchestrator(
         sessions=sessions,
         interactions=interactions,
         outbox=outbox,
-        channels={"telegram": channel},
+        channels={"lark": channel},
         transports={"fake-transport": transport},
         external_tui_controllers={"fake-process": FakeExternalTuiController("fake-process")},
         authz=authz,
@@ -129,7 +129,7 @@ def _confirmation_token(channel: FakeChannelAdapter) -> str:
 def _callback(token: str, *, sender_id: str = "owner", event_id: str = "cb-1") -> InboundEvent:
     return InboundEvent(
         event_id=event_id,
-        channel_kind="telegram",
+        channel_kind="lark",
         account_id="bot",
         chat_id="chat",
         thread_id="topic",
@@ -182,7 +182,7 @@ class TakeoverOrchestratorTests(unittest.TestCase):
         session.channel_binding.capabilities["readonly_topic"] = True
         event = InboundEvent(
             event_id="msg-1",
-            channel_kind="telegram",
+            channel_kind="lark",
             account_id="bot",
             chat_id="chat",
             thread_id="topic",
@@ -221,7 +221,7 @@ class TakeoverOrchestratorTests(unittest.TestCase):
         session.transport_ref.pop("terminate_ref", None)
         event = InboundEvent(
             event_id="msg-stopped",
-            channel_kind="telegram",
+            channel_kind="lark",
             account_id="bot",
             chat_id="chat",
             thread_id="topic",
@@ -229,7 +229,7 @@ class TakeoverOrchestratorTests(unittest.TestCase):
             root_message_id="",
             sender_id="owner",
             sender_display="Owner",
-            text="continue from telegram",
+            text="continue from lark",
         )
 
         blocked = asyncio.run(
@@ -251,7 +251,7 @@ class TakeoverOrchestratorTests(unittest.TestCase):
         self.assertFalse(blocked.accepted)
         self.assertEqual(blocked.reason, BlockedReason.EXTERNAL_TUI_READONLY)
         self.assertTrue(confirmed.accepted)
-        self.assertEqual([turn.text for turn in transport.submitted_turns], ["continue from telegram"])
+        self.assertEqual([turn.text for turn in transport.submitted_turns], ["continue from lark"])
         self.assertEqual(orchestrator.external_tui_controllers["fake-process"].terminate_calls, [])
         updated = orchestrator.sessions.get(session.session_id)
         self.assertEqual(updated.status, "running")
@@ -274,7 +274,7 @@ class TakeoverOrchestratorTests(unittest.TestCase):
             orchestrator.handle_inbound_event(
                 InboundEvent(
                     event_id="cb-status",
-                    channel_kind="telegram",
+                    channel_kind="lark",
                     account_id="bot",
                     chat_id="chat",
                     thread_id="topic",
@@ -314,7 +314,7 @@ class TakeoverOrchestratorTests(unittest.TestCase):
         asyncio.run(orchestrator.refresh_session_status_card(session))
         callback = InboundEvent(
             event_id="cb-status-1",
-            channel_kind="telegram",
+            channel_kind="lark",
             account_id="bot",
             chat_id="chat",
             thread_id="topic",
@@ -350,7 +350,7 @@ class TakeoverOrchestratorTests(unittest.TestCase):
             orchestrator.handle_inbound_event(
                 InboundEvent(
                     event_id="cb-status-2",
-                    channel_kind="telegram",
+                    channel_kind="lark",
                     account_id="bot",
                     chat_id="chat",
                     thread_id="topic",
@@ -399,7 +399,7 @@ class TakeoverOrchestratorTests(unittest.TestCase):
             orchestrator.handle_inbound_event(
                 InboundEvent(
                     event_id="cb-status",
-                    channel_kind="telegram",
+                    channel_kind="lark",
                     account_id="bot",
                     chat_id="chat",
                     thread_id="topic",
@@ -718,7 +718,7 @@ class TakeoverOrchestratorTests(unittest.TestCase):
             orchestrator.handle_inbound_event(
                 InboundEvent(
                     event_id="cb-status",
-                    channel_kind="telegram",
+                    channel_kind="lark",
                     account_id="bot",
                     chat_id="chat",
                     thread_id="topic",

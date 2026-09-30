@@ -1,10 +1,7 @@
 import asyncio
-import io
 import json
 import os
 import tempfile
-import urllib.error
-import urllib.request
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -33,9 +30,8 @@ from walkcode.channel_native import (
     Orchestrator,
     ResumeSpec,
     SessionRegistry,
-    TelegramBotApi,
-    TelegramChannelAdapter,
-    TransientDeliveryError,
+    LarkBotApi,
+    LarkChannelAdapter,
     TransportCapabilities,
     TransportUnavailable,
     TurnInput,
@@ -99,14 +95,21 @@ class _Clock:
         return self.now
 
 
-class _FakeTelegramApi(TelegramBotApi):
+class _FakeLarkApi(LarkBotApi):
     def __init__(self):
         self.calls = []
-        super().__init__(token="fake", caller=self._call)
+        super().__init__(caller=self._call)
 
     async def _call(self, method, payload):
         self.calls.append((method, payload))
-        return {"ok": True, "result": {"message_id": len(self.calls)}}
+        return {"ok": True, "data": {"message_id": f"lark-msg-{len(self.calls)}"}}
+
+
+_SEND_METHODS = {"sendMessage", "sendCard"}
+
+
+def _texts(api, methods) -> list[str]:
+    return [payload["text"] for method, payload in api.calls if method in methods]
 
 
 def _transport_caps() -> TransportCapabilities:
@@ -127,284 +130,11 @@ def _transport_caps() -> TransportCapabilities:
     )
 
 
-class TelegramAdapterTests(unittest.TestCase):
-    def test_parse_private_text_message(self):
-        adapter = TelegramChannelAdapter(TelegramBotApi(token="fake", caller=lambda *_: {}))
-        event = adapter.parse_update(
-            {
-                "update_id": 1,
-                "message": {
-                    "message_id": 10,
-                    "chat": {"id": 100, "type": "private"},
-                    "from": {"id": 200, "first_name": "Ada"},
-                    "text": "hello",
-                },
-            }
-        )
-
-        self.assertEqual(event.event_id, "telegram:1")
-        self.assertEqual(event.chat_id, "100")
-        self.assertEqual(event.message_id, "10")
-        self.assertEqual(event.root_message_id, "")
-        self.assertEqual(event.sender_id, "200")
-        self.assertEqual(event.text, "hello")
-
-    def test_parse_callback_query_with_short_token(self):
-        adapter = TelegramChannelAdapter(TelegramBotApi(token="fake", caller=lambda *_: {}))
-        event = adapter.parse_update(
-            {
-                "update_id": 2,
-                "callback_query": {
-                    "id": "cb-1",
-                    "from": {"id": 200, "first_name": "Ada"},
-                    "data": "cb:short-token",
-                    "message": {
-                        "message_id": 11,
-                        "chat": {"id": 100, "type": "private"},
-                    },
-                },
-            }
-        )
-
-        self.assertEqual(event.callback["token"], "short-token")
-        self.assertEqual(event.callback["callback_query_id"], "cb-1")
-        self.assertEqual(event.message_id, "11")
-
-    def test_send_view_splits_long_text(self):
-        api = _FakeTelegramApi()
-        adapter = TelegramChannelAdapter(api, max_text_chars=10)
-        binding = ChannelBinding(
-            channel_kind="telegram",
-            account_id="bot",
-            chat_id="100",
-            thread_id="",
-            root_message_id="10",
-        )
-
-        message_id = asyncio.run(
-            adapter.send_view(binding, {"type": "turn_delta", "text": "abcdefghijklmno"})
-        )
-
-        self.assertEqual(message_id, "2")
-        self.assertEqual([call[0] for call in api.calls], ["sendMessage", "sendMessage"])
-        self.assertEqual(api.calls[0][1]["text"], "abcdefghij")
-        self.assertEqual(api.calls[1][1]["text"], "klmno")
-
-    def test_agent_markdown_is_sent_as_telegram_html_by_default(self):
-        api = _FakeTelegramApi()
-        adapter = TelegramChannelAdapter(api)
-        binding = ChannelBinding("telegram", "bot", "100")
-
-        message_id = asyncio.run(
-            adapter.send_view(
-                binding,
-                {
-                    "type": "turn_completed",
-                    "message": "## Result\n\n**Bold** and `code`\n\n| A | B |\n| - | - |",
-                },
-            )
-        )
-
-        payload = api.calls[0][1]
-        self.assertEqual(message_id, "1")
-        self.assertEqual(api.calls[0][0], "sendMessage")
-        self.assertEqual(payload["parse_mode"], "HTML")
-        self.assertIn("<b>Result</b>", payload["text"])
-        self.assertIn("<b>Bold</b>", payload["text"])
-        self.assertIn("<code>code</code>", payload["text"])
-        self.assertIn("<pre>| A | B |", payload["text"])
-
-    def test_agent_markdown_can_opt_into_telegram_rich_message(self):
-        api = _FakeTelegramApi()
-        adapter = TelegramChannelAdapter(api, use_rich_messages=True)
-        binding = ChannelBinding("telegram", "bot", "100")
-
-        message_id = asyncio.run(
-            adapter.send_view(
-                binding,
-                {
-                    "type": "turn_completed",
-                    "message": "## Result\n\n**Bold** and `code`",
-                },
-            )
-        )
-
-        payload = api.calls[0][1]
-        self.assertEqual(message_id, "1")
-        self.assertEqual(api.calls[0][0], "sendRichMessage")
-        self.assertEqual(payload["rich_message"]["markdown"], "## Result\n\n**Bold** and `code`")
-
-    def test_agent_markdown_html_parse_failure_falls_back_to_plain_text(self):
-        calls = []
-
-        async def caller(method, payload):
-            calls.append((method, dict(payload)))
-            if payload.get("parse_mode") == "HTML":
-                raise RuntimeError("Bad Request: can't parse entities")
-            return {"ok": True, "result": {"message_id": len(calls)}}
-
-        adapter = TelegramChannelAdapter(TelegramBotApi(token="fake", caller=caller))
-
-        message_id = asyncio.run(
-            adapter.send_view(
-                ChannelBinding("telegram", "bot", "100"),
-                {"type": "turn_completed", "message": "## Result\n\n**Bold**"},
-            )
-        )
-
-        self.assertEqual(message_id, "2")
-        self.assertEqual(calls[0][0], "sendMessage")
-        self.assertEqual(calls[0][1]["parse_mode"], "HTML")
-        self.assertNotIn("parse_mode", calls[1][1])
-        self.assertEqual(calls[1][1]["text"], "## Result\n\n**Bold**")
-
-    def test_agent_markdown_transient_html_failure_does_not_fallback_duplicate(self):
-        calls = []
-
-        async def caller(method, payload):
-            calls.append((method, dict(payload)))
-            raise TransientDeliveryError("rate limited", retry_after=12.0)
-
-        adapter = TelegramChannelAdapter(TelegramBotApi(token="fake", caller=caller))
-
-        with self.assertRaises(TransientDeliveryError) as raised:
-            asyncio.run(
-                adapter.send_view(
-                    ChannelBinding("telegram", "bot", "100"),
-                    {"type": "turn_completed", "message": "## Result\n\n**Bold**"},
-                )
-            )
-
-        self.assertEqual(raised.exception.retry_after, 12.0)
-        self.assertEqual(len(calls), 1)
-        self.assertEqual(calls[0][0], "sendMessage")
-        self.assertEqual(calls[0][1]["parse_mode"], "HTML")
-
-    def test_agent_markdown_rich_failure_falls_back_to_html(self):
-        calls = []
-
-        async def caller(method, payload):
-            calls.append((method, dict(payload)))
-            if method == "sendRichMessage":
-                raise RuntimeError("Bad Request: rich message unsupported")
-            return {"ok": True, "result": {"message_id": len(calls)}}
-
-        adapter = TelegramChannelAdapter(
-            TelegramBotApi(token="fake", caller=caller),
-            use_rich_messages=True,
-        )
-
-        message_id = asyncio.run(
-            adapter.send_view(
-                ChannelBinding("telegram", "bot", "100"),
-                {"type": "turn_completed", "message": "## Result\n\n**Bold**"},
-            )
-        )
-
-        self.assertEqual(message_id, "2")
-        self.assertEqual(calls[0][0], "sendRichMessage")
-        self.assertEqual(calls[1][0], "sendMessage")
-        self.assertEqual(calls[1][1]["parse_mode"], "HTML")
-
-    def test_get_updates_http_timeout_exceeds_long_poll_timeout(self):
-        observed = {}
-        original = urllib.request.urlopen
-
-        class Response:
-            def __enter__(self):
-                return self
-
-            def __exit__(self, exc_type, exc, tb):
-                return False
-
-            def read(self):
-                return b'{"ok": true, "result": []}'
-
-        def fake_urlopen(request, timeout):
-            observed["timeout"] = timeout
-            return Response()
-
-        urllib.request.urlopen = fake_urlopen
-        try:
-            TelegramBotApi("fake")._call_sync("getUpdates", {"timeout": 60})
-        finally:
-            urllib.request.urlopen = original
-
-        self.assertGreaterEqual(observed["timeout"], 70)
-
-    def test_telegram_http_429_exposes_retry_after_as_transient_delivery(self):
-        original = urllib.request.urlopen
-        body = b'{"ok":false,"description":"Too Many Requests","parameters":{"retry_after":17}}'
-
-        def fake_urlopen(_request, timeout):
-            raise urllib.error.HTTPError(
-                url="https://api.telegram.org/botfake/sendMessage",
-                code=429,
-                msg="Too Many Requests",
-                hdrs={},
-                fp=io.BytesIO(body),
-            )
-
-        urllib.request.urlopen = fake_urlopen
-        try:
-            with self.assertRaises(TransientDeliveryError) as raised:
-                TelegramBotApi("fake")._call_sync("sendMessage", {"chat_id": "1", "text": "hello"})
-        finally:
-            urllib.request.urlopen = original
-
-        self.assertEqual(raised.exception.retry_after, 17.0)
-        self.assertIn("Too Many Requests", str(raised.exception))
-
-    def test_send_chat_action_targets_topic(self):
-        api = _FakeTelegramApi()
-        adapter = TelegramChannelAdapter(api)
-
-        asyncio.run(adapter.send_action(ChannelBinding("telegram", "bot", "100", "77"), "typing"))
-
-        self.assertEqual(api.calls[0][0], "sendChatAction")
-        self.assertEqual(
-            api.calls[0][1],
-            {"chat_id": "100", "action": "typing", "message_thread_id": "77"},
-        )
-
-    def test_react_to_message_uses_telegram_reaction_api(self):
-        api = _FakeTelegramApi()
-        adapter = TelegramChannelAdapter(api)
-
-        asyncio.run(adapter.react_to_message(ChannelBinding("telegram", "bot", "100", "77"), "42", "✅"))
-
-        self.assertEqual(api.calls[0][0], "setMessageReaction")
-        self.assertEqual(
-            api.calls[0][1],
-            {
-                "chat_id": "100",
-                "message_id": 42,
-                "reaction": [{"type": "emoji", "emoji": "✅"}],
-            },
-        )
-
-    def test_install_bot_commands_uses_telegram_native_command_menu(self):
-        api = _FakeTelegramApi()
-        adapter = TelegramChannelAdapter(api)
-
-        asyncio.run(
-            adapter.set_bot_commands(
-                [
-                    {"command": "status", "description": "Show WalkCode session status"},
-                    {"command": "model", "description": "Show or switch model"},
-                ]
-            )
-        )
-
-        self.assertEqual(api.calls[0][0], "setMyCommands")
-        self.assertEqual(api.calls[0][1]["commands"][0]["command"], "status")
-
-
-class TelegramOrchestratorTests(unittest.TestCase):
-    def test_private_text_creates_session_and_submits_to_agent_transport(self):
+class LarkOrchestratorTests(unittest.TestCase):
+    def test_root_text_creates_session_and_submits_to_agent_transport(self):
         clock = _Clock()
-        api = _FakeTelegramApi()
-        channel = TelegramChannelAdapter(api)
+        api = _FakeLarkApi()
+        channel = LarkChannelAdapter(api)
         transport = FakeAgentTransport(
             "fake-transport",
             _transport_caps(),
@@ -414,18 +144,21 @@ class TelegramOrchestratorTests(unittest.TestCase):
             sessions=SessionRegistry(now=clock),
             interactions=InteractionStore(now=clock),
             outbox=DurableOutbox(now=clock),
-            channels={"telegram": channel},
+            channels={"lark": channel},
             transports={"fake-transport": transport},
             now=clock,
         )
-        event = channel.parse_update(
+        event = channel.parse_event(
             {
-                "update_id": 1,
-                "message": {
-                    "message_id": 10,
-                    "chat": {"id": 100, "type": "private"},
-                    "from": {"id": 200, "first_name": "Ada"},
-                    "text": "ship it",
+                "event_id": "evt-1",
+                "event": {
+                    "message": {
+                        "message_id": "om_10",
+                        "chat_id": "oc_100",
+                        "message_type": "text",
+                        "content": json.dumps({"text": "ship it"}),
+                    },
+                    "sender": {"sender_id": {"open_id": "ou_200"}},
                 },
             }
         )
@@ -440,12 +173,12 @@ class TelegramOrchestratorTests(unittest.TestCase):
 
         self.assertTrue(result.accepted)
         self.assertEqual([turn.text for turn in transport.submitted_turns], ["ship it"])
-        self.assertIn("ok", channel.rendered_text())
+        self.assertIn("ok", "\n".join(_texts(api, _SEND_METHODS)))
 
     def test_status_card_updates_immediately_after_turn_submit(self):
         clock = _Clock()
-        api = _FakeTelegramApi()
-        channel = TelegramChannelAdapter(api)
+        api = _FakeLarkApi()
+        channel = LarkChannelAdapter(api)
         transport = FakeAgentTransport(
             "fake-transport",
             _transport_caps(),
@@ -455,22 +188,22 @@ class TelegramOrchestratorTests(unittest.TestCase):
             sessions=SessionRegistry(now=clock),
             interactions=InteractionStore(now=clock),
             outbox=DurableOutbox(now=clock),
-            channels={"telegram": channel},
+            channels={"lark": channel},
             transports={"fake-transport": transport},
             now=clock,
         )
         session = asyncio.run(
             orchestrator.start_session(
                 ChannelBinding(
-                    "telegram",
+                    "lark",
                     "bot",
-                    "100",
-                    "77",
+                    "oc_100",
+                    "om_77",
                     capabilities={"status_card": True},
                 ),
                 "fake-transport",
                 "/tmp/project",
-                ActorRef("telegram", "200", "Ada"),
+                ActorRef("lark", "ou_200", "Ada"),
             )
         )
 
@@ -478,21 +211,21 @@ class TelegramOrchestratorTests(unittest.TestCase):
             orchestrator.submit_user_input(
                 session.session_id,
                 TurnInput(text="ship it"),
-                actor=ActorRef("telegram", "200", "Ada"),
+                actor=ActorRef("lark", "ou_200", "Ada"),
                 generation=session.generation,
             )
         )
 
         self.assertTrue(result.accepted)
-        sent_texts = [payload["text"] for method, payload in api.calls if method == "sendMessage"]
-        edit_texts = [payload["text"] for method, payload in api.calls if method == "editMessageText"]
+        sent_texts = _texts(api, _SEND_METHODS)
+        edit_texts = _texts(api, {"editCard"})
         self.assertTrue(any("Progress: turn.submitted" in text for text in sent_texts + edit_texts))
         self.assertTrue(any("Progress: turn.completed" in text for text in edit_texts))
 
     def test_tool_events_update_single_progress_message_without_output_spam(self):
         clock = _Clock()
-        api = _FakeTelegramApi()
-        channel = TelegramChannelAdapter(api)
+        api = _FakeLarkApi()
+        channel = LarkChannelAdapter(api)
         transport = FakeAgentTransport(
             "fake-transport",
             _transport_caps(),
@@ -506,16 +239,16 @@ class TelegramOrchestratorTests(unittest.TestCase):
             sessions=SessionRegistry(now=clock),
             interactions=InteractionStore(now=clock),
             outbox=DurableOutbox(now=clock),
-            channels={"telegram": channel},
+            channels={"lark": channel},
             transports={"fake-transport": transport},
             now=clock,
         )
         session = asyncio.run(
             orchestrator.start_session(
-                ChannelBinding("telegram", "bot", "100", "77"),
+                ChannelBinding("lark", "bot", "oc_100", "om_77"),
                 "fake-transport",
                 "/tmp/project",
-                ActorRef("telegram", "200", "Ada"),
+                ActorRef("lark", "ou_200", "Ada"),
             )
         )
 
@@ -523,7 +256,7 @@ class TelegramOrchestratorTests(unittest.TestCase):
             orchestrator.submit_user_input(
                 session.session_id,
                 TurnInput(text="ship it"),
-                actor=ActorRef("telegram", "200", "Ada"),
+                actor=ActorRef("lark", "ou_200", "Ada"),
                 generation=session.generation,
             )
         )
@@ -532,12 +265,12 @@ class TelegramOrchestratorTests(unittest.TestCase):
         sent_tool_cards = [
             payload["text"]
             for method, payload in api.calls
-            if method == "sendMessage" and "Agent activity" in payload["text"]
+            if method in _SEND_METHODS and "Agent activity" in payload["text"]
         ]
         edited_tool_cards = [
             payload["text"]
             for method, payload in api.calls
-            if method == "editMessageText" and "Agent activity" in payload["text"]
+            if method == "editCard" and "Agent activity" in payload["text"]
         ]
         self.assertEqual(len(sent_tool_cards), 1)
         self.assertTrue(any("Status: COMPLETED" in text for text in edited_tool_cards))
@@ -552,8 +285,8 @@ class TelegramOrchestratorTests(unittest.TestCase):
 
     def test_empty_turn_completion_still_seals_tool_progress(self):
         clock = _Clock()
-        api = _FakeTelegramApi()
-        channel = TelegramChannelAdapter(api)
+        api = _FakeLarkApi()
+        channel = LarkChannelAdapter(api)
         transport = FakeAgentTransport(
             "fake-transport",
             _transport_caps(),
@@ -569,16 +302,16 @@ class TelegramOrchestratorTests(unittest.TestCase):
             sessions=SessionRegistry(now=clock),
             interactions=InteractionStore(now=clock),
             outbox=DurableOutbox(now=clock),
-            channels={"telegram": channel},
+            channels={"lark": channel},
             transports={"fake-transport": transport},
             now=clock,
         )
         session = asyncio.run(
             orchestrator.start_session(
-                ChannelBinding("telegram", "bot", "100", "77"),
+                ChannelBinding("lark", "bot", "oc_100", "om_77"),
                 "fake-transport",
                 "/tmp/project",
-                ActorRef("telegram", "200", "Ada"),
+                ActorRef("lark", "ou_200", "Ada"),
             )
         )
 
@@ -586,7 +319,7 @@ class TelegramOrchestratorTests(unittest.TestCase):
             orchestrator.submit_user_input(
                 session.session_id,
                 TurnInput(text="go"),
-                actor=ActorRef("telegram", "200", "Ada"),
+                actor=ActorRef("lark", "ou_200", "Ada"),
                 generation=session.generation,
             )
         )

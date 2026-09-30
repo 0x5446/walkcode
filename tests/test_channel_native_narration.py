@@ -45,11 +45,11 @@ from walkcode.channel_native_runtime import _read_transcript_narration
 
 
 def _actor() -> ActorRef:
-    return ActorRef(channel_kind="telegram", actor_id="owner", display_name="Owner")
+    return ActorRef(channel_kind="lark", actor_id="owner", display_name="Owner")
 
 
 def _binding() -> ChannelBinding:
-    return ChannelBinding("telegram", "bot", "chat", "topic", "root")
+    return ChannelBinding("lark", "bot", "chat", "topic", "root")
 
 
 def _channel_caps() -> ChannelCapabilities:
@@ -88,12 +88,12 @@ def _transport_caps() -> TransportCapabilities:
 
 def _orchestrator():
     transport = FakeAgentTransport("claude_headless", _transport_caps())
-    channel = FakeChannelAdapter("telegram", _channel_caps())
+    channel = FakeChannelAdapter("lark", _channel_caps())
     orchestrator = Orchestrator(
         sessions=SessionRegistry(),
         interactions=InteractionStore(),
         outbox=DurableOutbox(),
-        channels={"telegram": channel},
+        channels={"lark": channel},
         transports={"claude_headless": transport},
         authz=AuthorizationStore(),
     )
@@ -233,7 +233,7 @@ class TuiHookNarrationDeliveryTests(unittest.TestCase):
 
         host = _HookHost()
         host.orchestrator = orchestrator
-        host.channels = {"telegram": channel}
+        host.channels = {"lark": channel}
         host._tui_transcript_cursors = {}
         host._now = _time.time
         self.host = host
@@ -781,7 +781,7 @@ class CodexStopDrainTests(unittest.TestCase):
 
         host = _HookHost()
         host.orchestrator = orchestrator
-        host.channels = {"telegram": channel}
+        host.channels = {"lark": channel}
         host._tui_transcript_cursors = {}
         host._now = _time.time
         self.host = host

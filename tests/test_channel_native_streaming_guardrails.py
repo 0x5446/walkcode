@@ -16,7 +16,6 @@ from walkcode.channel_native import (
     LaunchSpec,
     Orchestrator,
     SessionRegistry,
-    TelegramChannelAdapter,
     TransportCapabilities,
     TransportHandle,
     TurnInput,
@@ -33,10 +32,10 @@ class _Clock:
 
 
 def _actor() -> ActorRef:
-    return ActorRef(channel_kind="telegram", actor_id="owner", display_name="Owner")
+    return ActorRef(channel_kind="lark", actor_id="owner", display_name="Owner")
 
 
-def _binding(kind: str = "telegram") -> ChannelBinding:
+def _binding(kind: str = "lark") -> ChannelBinding:
     return ChannelBinding(kind, "bot", "chat", "topic", "root")
 
 
@@ -98,18 +97,18 @@ class StreamingEventBoundaryTests(unittest.TestCase):
 
                 return stream()
 
-        channel = FakeChannelAdapter("telegram", _channel_caps())
+        channel = FakeChannelAdapter("lark", _channel_caps())
         transport = _StreamingTransport()
         orchestrator = Orchestrator(
             sessions=SessionRegistry(now=_Clock()),
             interactions=InteractionStore(now=_Clock()),
             outbox=DurableOutbox(now=_Clock()),
-            channels={"telegram": channel},
+            channels={"lark": channel},
             transports={"streaming": transport},
             now=_Clock(),
         )
 
-        session = asyncio.run(orchestrator.start_session(_binding("telegram"), "streaming", "/tmp/project", _actor()))
+        session = asyncio.run(orchestrator.start_session(_binding("lark"), "streaming", "/tmp/project", _actor()))
         result = asyncio.run(
             orchestrator.submit_user_input(
                 session.session_id,
@@ -129,7 +128,7 @@ class RegistryGuardrailTests(unittest.TestCase):
         sessions = SessionRegistry(now=_Clock())
         session = sessions.create_structured_session(
             session_id="s1",
-            binding=_binding("telegram"),
+            binding=_binding("lark"),
             transport_kind="claude_headless",
             transport_ref={"session_id": "claude-1"},
             cwd="/tmp/project",
@@ -149,23 +148,16 @@ class RegistryGuardrailTests(unittest.TestCase):
 
 
 class NeutralViewTextTests(unittest.TestCase):
-    def test_lark_does_not_depend_on_telegram_text_helper(self):
+    def test_lark_send_view_uses_neutral_view_text(self):
         calls = []
 
         async def lark_caller(method, payload):
             calls.append((method, payload))
             return {"data": {"message_id": "om_1"}}
 
-        original = TelegramChannelAdapter._text_from_view
-        TelegramChannelAdapter._text_from_view = staticmethod(
-            lambda _view: (_ for _ in ()).throw(AssertionError("telegram helper used"))
-        )
-        try:
-            lark = LarkChannelAdapter(LarkBotApi(caller=lark_caller))
-            view = {"type": "error", "code": "bad", "message": "failed"}
-            msg_id = asyncio.run(lark.send_view(_binding("lark"), view))
-        finally:
-            TelegramChannelAdapter._text_from_view = staticmethod(original)
+        lark = LarkChannelAdapter(LarkBotApi(caller=lark_caller))
+        view = {"type": "error", "code": "bad", "message": "failed"}
+        msg_id = asyncio.run(lark.send_view(_binding("lark"), view))
 
         self.assertEqual(msg_id, "om_1")
         self.assertEqual(calls[0][1]["text"], render_view_text({"type": "error", "code": "bad", "message": "failed"}))

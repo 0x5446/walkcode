@@ -2,8 +2,9 @@
 
 Date: 2026-06-29
 
-Status: Superseded by ADR 0040 for Telegram topic close/reopen and live status
-card behavior.
+Status: Superseded by ADR 0069 (Telegram channel removed, 2026-09-30); earlier
+superseded by ADR 0040 for Telegram topic close/reopen and live status card
+behavior.
 
 Amended: 2026-06-29
 Superseded: 2026-06-30

@@ -1,4 +1,5 @@
 import asyncio
+import json
 import unittest
 
 from walkcode.channel_native import (
@@ -10,8 +11,10 @@ from walkcode.channel_native import (
     InteractionStore,
     Orchestrator,
     SessionRegistry,
-    TelegramBotApi,
-    TelegramChannelAdapter,
+    FakeChannelAdapter,
+    InboundEvent,
+    LarkBotApi,
+    LarkChannelAdapter,
     TransportCapabilities,
 )
 
@@ -25,7 +28,7 @@ class _Clock:
 
 
 def _actor(actor_id: str = "owner") -> ActorRef:
-    return ActorRef(channel_kind="telegram", actor_id=actor_id, display_name="Owner")
+    return ActorRef(channel_kind="lark", actor_id=actor_id, display_name="Owner")
 
 
 def _transport_caps() -> TransportCapabilities:
@@ -46,102 +49,99 @@ def _transport_caps() -> TransportCapabilities:
     )
 
 
-def _binding(root: str, *, chat: str = "100", thread: str = "") -> ChannelBinding:
+def _binding(root: str, *, chat: str = "oc_chat") -> ChannelBinding:
+    # A Lark thread is identified by its root message: thread_id == root.
     return ChannelBinding(
-        channel_kind="telegram",
+        channel_kind="lark",
         account_id="bot",
         chat_id=chat,
-        thread_id=thread,
+        thread_id=root,
         root_message_id=root,
     )
 
 
-class ChannelRoutingTests(unittest.TestCase):
-    def test_telegram_private_followup_continues_single_active_session(self):
-        channel = TelegramChannelAdapter(TelegramBotApi(token="fake", caller=lambda *_: {}))
-        transport = FakeAgentTransport("fake-transport", _transport_caps())
-        orchestrator = Orchestrator(
-            sessions=SessionRegistry(now=_Clock()),
-            interactions=InteractionStore(now=_Clock()),
-            outbox=DurableOutbox(now=_Clock()),
-            channels={"telegram": channel},
-            transports={"fake-transport": transport},
-            now=_Clock(),
-        )
+def _lark_channel() -> LarkChannelAdapter:
+    return LarkChannelAdapter(LarkBotApi(caller=lambda *_: {}))
 
-        first = channel.parse_update(
-            {
-                "update_id": 1,
-                "message": {
-                    "message_id": 10,
-                    "chat": {"id": 100, "type": "private"},
-                    "from": {"id": "owner", "first_name": "Ada"},
-                    "text": "first",
-                },
-            }
-        )
-        second = channel.parse_update(
-            {
-                "update_id": 2,
-                "message": {
-                    "message_id": 11,
-                    "chat": {"id": 100, "type": "private"},
-                    "from": {"id": "owner", "first_name": "Ada"},
-                    "text": "second",
-                },
-            }
-        )
+
+def _lark_message(message_id: str, text: str, *, root_id: str = "", parent_id: str = "") -> dict:
+    message = {
+        "message_id": message_id,
+        "chat_id": "oc_chat",
+        "message_type": "text",
+        "content": json.dumps({"text": text}),
+    }
+    if root_id:
+        message["root_id"] = root_id
+    if parent_id:
+        message["parent_id"] = parent_id
+    return {
+        "event_id": f"evt-{message_id}",
+        "event": {"message": message, "sender": {"sender_id": {"open_id": "ou_owner"}}},
+    }
+
+
+def _rootless_inbound(message_id: str, text: str) -> InboundEvent:
+    # Rootless (thread="") bindings still exist on Lark: a TUI-observed
+    # session starts rootless when its root card cannot be sent.
+    return InboundEvent(
+        event_id=f"lark:evt-{message_id}",
+        channel_kind="lark",
+        account_id="bot",
+        chat_id="oc_chat",
+        thread_id="",
+        message_id=message_id,
+        root_message_id="",
+        sender_id="owner",
+        sender_display="Ada",
+        text=text,
+    )
+
+
+def _orchestrator(channel, transports, sessions=None) -> Orchestrator:
+    return Orchestrator(
+        sessions=sessions or SessionRegistry(now=_Clock()),
+        interactions=InteractionStore(now=_Clock()),
+        outbox=DurableOutbox(now=_Clock()),
+        channels={"lark": channel},
+        transports=transports,
+        now=_Clock(),
+    )
+
+
+class ChannelRoutingTests(unittest.TestCase):
+    def test_rootless_followup_continues_single_active_rootless_session(self):
+        # Core rule, independent of how a channel places sessions: a rootless
+        # message continues the single active rootless session in the chat.
+        channel = FakeChannelAdapter("lark", _lark_channel().capabilities())
+        transport = FakeAgentTransport("fake-transport", _transport_caps())
+        orchestrator = _orchestrator(channel, {"fake-transport": transport})
 
         self.assertTrue(
             asyncio.run(
-                orchestrator.handle_inbound_event(first, agent_transport_kind="fake-transport", cwd="/tmp/p")
+                orchestrator.handle_inbound_event(
+                    _rootless_inbound("om_1", "first"), agent_transport_kind="fake-transport", cwd="/tmp/p"
+                )
             ).accepted
         )
         self.assertTrue(
             asyncio.run(
-                orchestrator.handle_inbound_event(second, agent_transport_kind="fake-transport", cwd="/tmp/p")
+                orchestrator.handle_inbound_event(
+                    _rootless_inbound("om_2", "second"), agent_transport_kind="fake-transport", cwd="/tmp/p"
+                )
             ).accepted
         )
 
         self.assertEqual(len(transport.handles), 1)
         self.assertEqual([turn.text for turn in transport.submitted_turns], ["first", "second"])
 
-    def test_telegram_forum_topic_followup_continues_single_active_topic_session(self):
-        channel = TelegramChannelAdapter(TelegramBotApi(token="fake", caller=lambda *_: {}))
+    def test_lark_thread_followup_continues_single_active_thread_session(self):
+        channel = _lark_channel()
         transport = FakeAgentTransport("fake-transport", _transport_caps())
-        orchestrator = Orchestrator(
-            sessions=SessionRegistry(now=_Clock()),
-            interactions=InteractionStore(now=_Clock()),
-            outbox=DurableOutbox(now=_Clock()),
-            channels={"telegram": channel},
-            transports={"fake-transport": transport},
-            now=_Clock(),
-        )
+        orchestrator = _orchestrator(channel, {"fake-transport": transport})
 
-        first = channel.parse_update(
-            {
-                "update_id": 1,
-                "message": {
-                    "message_id": 10,
-                    "message_thread_id": 77,
-                    "chat": {"id": -100, "type": "supergroup"},
-                    "from": {"id": "owner", "first_name": "Ada"},
-                    "text": "topic first",
-                },
-            }
-        )
-        second = channel.parse_update(
-            {
-                "update_id": 2,
-                "message": {
-                    "message_id": 11,
-                    "message_thread_id": 77,
-                    "chat": {"id": -100, "type": "supergroup"},
-                    "from": {"id": "owner", "first_name": "Ada"},
-                    "text": "topic second",
-                },
-            }
-        )
+        first = channel.parse_event(_lark_message("om_1", "topic first"))
+        second = channel.parse_event(_lark_message("om_2", "topic second", root_id="om_1", parent_id="om_1"))
 
         asyncio.run(orchestrator.handle_inbound_event(first, agent_transport_kind="fake-transport", cwd="/tmp/p"))
         result = asyncio.run(
@@ -152,42 +152,14 @@ class ChannelRoutingTests(unittest.TestCase):
         self.assertEqual(len(transport.handles), 1)
         self.assertEqual([turn.text for turn in transport.submitted_turns], ["topic first", "topic second"])
 
-    def test_telegram_forum_topic_reply_to_non_root_still_routes_by_topic(self):
-        channel = TelegramChannelAdapter(TelegramBotApi(token="fake", caller=lambda *_: {}))
+    def test_lark_reply_to_non_root_still_routes_by_thread(self):
+        channel = _lark_channel()
         transport = FakeAgentTransport("fake-transport", _transport_caps())
-        orchestrator = Orchestrator(
-            sessions=SessionRegistry(now=_Clock()),
-            interactions=InteractionStore(now=_Clock()),
-            outbox=DurableOutbox(now=_Clock()),
-            channels={"telegram": channel},
-            transports={"fake-transport": transport},
-            now=_Clock(),
-        )
+        orchestrator = _orchestrator(channel, {"fake-transport": transport})
 
-        first = channel.parse_update(
-            {
-                "update_id": 1,
-                "message": {
-                    "message_id": 10,
-                    "message_thread_id": 77,
-                    "chat": {"id": -100, "type": "supergroup"},
-                    "from": {"id": "owner", "first_name": "Ada"},
-                    "text": "topic first",
-                },
-            }
-        )
-        reply_to_later_message = channel.parse_update(
-            {
-                "update_id": 2,
-                "message": {
-                    "message_id": 12,
-                    "message_thread_id": 77,
-                    "chat": {"id": -100, "type": "supergroup"},
-                    "reply_to_message": {"message_id": 11},
-                    "from": {"id": "owner", "first_name": "Ada"},
-                    "text": "reply inside same topic",
-                },
-            }
+        first = channel.parse_event(_lark_message("om_1", "topic first"))
+        reply_to_later_message = channel.parse_event(
+            _lark_message("om_3", "reply inside same topic", root_id="om_1", parent_id="om_2")
         )
 
         asyncio.run(orchestrator.handle_inbound_event(first, agent_transport_kind="fake-transport", cwd="/tmp/p"))
@@ -204,31 +176,15 @@ class ChannelRoutingTests(unittest.TestCase):
         self.assertEqual([turn.text for turn in transport.submitted_turns], ["topic first", "reply inside same topic"])
 
     def test_reply_to_root_keeps_exact_binding_priority(self):
-        channel = TelegramChannelAdapter(TelegramBotApi(token="fake", caller=lambda *_: {}))
+        channel = _lark_channel()
         first_transport = FakeAgentTransport("first-transport", _transport_caps())
         second_transport = FakeAgentTransport("second-transport", _transport_caps())
-        orchestrator = Orchestrator(
-            sessions=SessionRegistry(now=_Clock()),
-            interactions=InteractionStore(now=_Clock()),
-            outbox=DurableOutbox(now=_Clock()),
-            channels={"telegram": channel},
-            transports={"first-transport": first_transport, "second-transport": second_transport},
-            now=_Clock(),
+        orchestrator = _orchestrator(
+            channel, {"first-transport": first_transport, "second-transport": second_transport}
         )
-        asyncio.run(orchestrator.start_session(_binding("10"), "first-transport", "/tmp/p", _actor()))
-        asyncio.run(orchestrator.start_session(_binding("20"), "second-transport", "/tmp/p", _actor()))
-        reply = channel.parse_update(
-            {
-                "update_id": 3,
-                "message": {
-                    "message_id": 30,
-                    "chat": {"id": 100, "type": "supergroup"},
-                    "reply_to_message": {"message_id": 10},
-                    "from": {"id": "owner", "first_name": "Ada"},
-                    "text": "reply to first",
-                },
-            }
-        )
+        asyncio.run(orchestrator.start_session(_binding("om_10"), "first-transport", "/tmp/p", _actor()))
+        asyncio.run(orchestrator.start_session(_binding("om_20"), "second-transport", "/tmp/p", _actor()))
+        reply = channel.parse_event(_lark_message("om_30", "reply to first", root_id="om_10"))
 
         result = asyncio.run(
             orchestrator.handle_inbound_event(reply, agent_transport_kind="first-transport", cwd="/tmp/p")
@@ -239,23 +195,18 @@ class ChannelRoutingTests(unittest.TestCase):
         self.assertEqual(second_transport.submitted_turns, [])
 
     def test_rootless_stopped_session_does_not_capture_new_general_message(self):
-        channel = TelegramChannelAdapter(TelegramBotApi(token="fake", caller=lambda *_: {}))
+        channel = FakeChannelAdapter("lark", _lark_channel().capabilities())
         old_transport = FakeAgentTransport("old-transport", _transport_caps())
         new_transport = FakeAgentTransport("new-transport", _transport_caps())
         sessions = SessionRegistry(now=_Clock())
-        orchestrator = Orchestrator(
-            sessions=sessions,
-            interactions=InteractionStore(now=_Clock()),
-            outbox=DurableOutbox(now=_Clock()),
-            channels={"telegram": channel},
-            transports={"old-transport": old_transport, "new-transport": new_transport},
-            now=_Clock(),
+        orchestrator = _orchestrator(
+            channel, {"old-transport": old_transport, "new-transport": new_transport}, sessions
         )
         old = sessions.create_structured_session(
             binding=ChannelBinding(
-                channel_kind="telegram",
+                channel_kind="lark",
                 account_id="bot",
-                chat_id="100",
+                chat_id="oc_chat",
                 thread_id="",
                 root_message_id="",
             ),
@@ -267,20 +218,11 @@ class ChannelRoutingTests(unittest.TestCase):
         old.status = "stopped"
         old.lifecycle_state = "STOPPED"
         old.writer_owner = None
-        general_message = channel.parse_update(
-            {
-                "update_id": 3,
-                "message": {
-                    "message_id": 30,
-                    "chat": {"id": 100, "type": "supergroup"},
-                    "from": {"id": "owner", "first_name": "Ada"},
-                    "text": "new task",
-                },
-            }
-        )
 
         result = asyncio.run(
-            orchestrator.handle_inbound_event(general_message, agent_transport_kind="new-transport", cwd="/tmp/p")
+            orchestrator.handle_inbound_event(
+                _rootless_inbound("om_30", "new task"), agent_transport_kind="new-transport", cwd="/tmp/p"
+            )
         )
 
         self.assertTrue(result.accepted)
@@ -288,33 +230,27 @@ class ChannelRoutingTests(unittest.TestCase):
         self.assertEqual([turn.text for turn in new_transport.submitted_turns], ["new task"])
 
     def test_rootless_message_with_multiple_active_candidates_renders_session_chooser(self):
-        channel = TelegramChannelAdapter(TelegramBotApi(token="fake", caller=lambda *_: {}))
+        channel = FakeChannelAdapter("lark", _lark_channel().capabilities())
         first_transport = FakeAgentTransport("first-transport", _transport_caps())
         second_transport = FakeAgentTransport("second-transport", _transport_caps())
-        orchestrator = Orchestrator(
-            sessions=SessionRegistry(now=_Clock()),
-            interactions=InteractionStore(now=_Clock()),
-            outbox=DurableOutbox(now=_Clock()),
-            channels={"telegram": channel},
-            transports={"first-transport": first_transport, "second-transport": second_transport},
-            now=_Clock(),
+        orchestrator = _orchestrator(
+            channel, {"first-transport": first_transport, "second-transport": second_transport}
         )
-        asyncio.run(orchestrator.start_session(_binding("10"), "first-transport", "/tmp/p", _actor()))
-        asyncio.run(orchestrator.start_session(_binding("20"), "second-transport", "/tmp/p", _actor()))
-        rootless = channel.parse_update(
-            {
-                "update_id": 4,
-                "message": {
-                    "message_id": 40,
-                    "chat": {"id": 100, "type": "supergroup"},
-                    "from": {"id": "owner", "first_name": "Ada"},
-                    "text": "where should this go",
-                },
-            }
-        )
+        # Two rootless-thread sessions in the same chat (distinct roots, no
+        # thread), so a rootless message cannot pick one.
+        for root, kind in (("om_10", "first-transport"), ("om_20", "second-transport")):
+            asyncio.run(
+                orchestrator.start_session(
+                    ChannelBinding("lark", "bot", "oc_chat", "", root), kind, "/tmp/p", _actor()
+                )
+            )
 
         result = asyncio.run(
-            orchestrator.handle_inbound_event(rootless, agent_transport_kind="first-transport", cwd="/tmp/p")
+            orchestrator.handle_inbound_event(
+                _rootless_inbound("om_40", "where should this go"),
+                agent_transport_kind="first-transport",
+                cwd="/tmp/p",
+            )
         )
 
         self.assertTrue(result.accepted)

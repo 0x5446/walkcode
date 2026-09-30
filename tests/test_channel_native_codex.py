@@ -290,11 +290,11 @@ async def _managed_websocket_smoke():
 
 
 def _actor(actor_id="owner"):
-    return ActorRef(channel_kind="telegram", actor_id=actor_id, display_name=actor_id.title())
+    return ActorRef(channel_kind="lark", actor_id=actor_id, display_name=actor_id.title())
 
 
 def _binding():
-    return ChannelBinding("telegram", "bot", "chat", "topic", "root")
+    return ChannelBinding("lark", "bot", "chat", "topic", "root")
 
 
 def _channel_caps():
@@ -316,7 +316,7 @@ def _channel_caps():
 def _callback(token: str, *, actor_id: str = "owner") -> InboundEvent:
     return InboundEvent(
         event_id=f"cb-{actor_id}-{token[:4]}",
-        channel_kind="telegram",
+        channel_kind="lark",
         account_id="bot",
         chat_id="chat",
         thread_id="topic",
@@ -2013,12 +2013,12 @@ class CodexAppServerTransportTests(unittest.TestCase):
             }
         ]
         transport = CodexAppServerTransport(client=client, event_silence_ceiling=0)
-        channel = FakeChannelAdapter("telegram", _channel_caps())
+        channel = FakeChannelAdapter("lark", _channel_caps())
         orchestrator = Orchestrator(
             sessions=SessionRegistry(),
             interactions=InteractionStore(),
             outbox=DurableOutbox(),
-            channels={"telegram": channel},
+            channels={"lark": channel},
             transports={"codex_app_server": transport},
             authz=AuthorizationStore(),
         )

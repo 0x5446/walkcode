@@ -96,6 +96,14 @@ scripts; orchestration and gates live in the skill.
   unrelated switch is how `WALKCODE_CLAUDE_DAEMON_MODE=off` used to kill every TUI
   card silently. The Claude daemon mode is gone; its env keys are ignored, not
   rejected, because deployed env files still set them.
+- **Lark/Feishu is the only channel (ADR 0069)**: the Telegram channel is gone —
+  adapter, polling, config, CLI flags (`native debug telegram`, `serve --once /
+  --poll-timeout / --limit`), E2E gate and deploy recipe. `WALKCODE_CHANNEL=telegram`
+  must keep failing with a config error that names ADR 0069, and state files that
+  still hold `channel_kind: "telegram"` bindings must keep loading. The command and
+  maintenance helpers the Lark path shares were renamed to neutral names
+  (`_handle_bot_command`, `_parse_bot_command`, `_start_maintenance_tasks`, …);
+  keep new shared code channel-neutral and put Lark specifics behind `lark` names.
 - Legacy remnants are blockers for upgrade and real E2E: old LaunchAgents,
   `walkcode hook` configs, shell wrapper source lines, and `FEISHU_*` env must be
   cleaned first.

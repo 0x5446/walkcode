@@ -428,14 +428,14 @@ class UpgradeGateTests(_ScriptGateBase):
     def test_v3_launchd_labels_are_restarted_when_configured(self):
         log = self.tmp / "launchctl.log"
         r = self._run("upgrade.sh", extra_env=self._upgrade_env(
-            WALKCODE_V3_LAUNCHD_LABELS="com.walkcode.telegram-claude,com.walkcode.telegram-codex",
+            WALKCODE_V3_LAUNCHD_LABELS="com.walkcode.work-claude,com.walkcode.work-codex",
             FAKE_LAUNCHCTL_LOG=str(log),
         ))
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         content = log.read_text()
         self.assertIn("gui/", content)
-        self.assertIn("com.walkcode.telegram-claude", content)
-        self.assertIn("com.walkcode.telegram-codex", content)
+        self.assertIn("com.walkcode.work-claude", content)
+        self.assertIn("com.walkcode.work-codex", content)
 
     def test_empty_labels_auto_discovers_loaded_runtimes_excluding_taps(self):
         # 2026-07-14 v0.13.1 upgrade: empty WALKCODE_V3_LAUNCHD_LABELS left

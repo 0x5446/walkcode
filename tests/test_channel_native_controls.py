@@ -28,11 +28,11 @@ class _Clock:
 
 
 def _actor(actor_id: str = "owner") -> ActorRef:
-    return ActorRef(channel_kind="telegram", actor_id=actor_id, display_name=actor_id.title())
+    return ActorRef(channel_kind="lark", actor_id=actor_id, display_name=actor_id.title())
 
 
 def _binding() -> ChannelBinding:
-    return ChannelBinding("telegram", "bot", "chat", "topic", "root")
+    return ChannelBinding("lark", "bot", "chat", "topic", "root")
 
 
 def _channel_caps() -> ChannelCapabilities:
@@ -79,7 +79,7 @@ def _orchestrator(*, caps=None):
         sessions=SessionRegistry(now=clock),
         interactions=InteractionStore(now=clock),
         outbox=DurableOutbox(now=clock),
-        channels={"telegram": FakeChannelAdapter("telegram", _channel_caps())},
+        channels={"lark": FakeChannelAdapter("lark", _channel_caps())},
         transports={"fake-transport": transport},
         authz=authz,
         now=clock,

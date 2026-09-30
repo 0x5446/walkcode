@@ -2,7 +2,9 @@
 
 ## Status
 
-Accepted.
+Accepted. Telegram-specific parts (topic creation, getUpdates starvation)
+superseded by ADR 0069; the deferred spool and independent drain stay and
+now serve the Lark channel.
 
 ## Context
 

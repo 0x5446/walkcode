@@ -11,8 +11,8 @@ from walkcode.channel_native import (
     InteractionStore,
     Orchestrator,
     SessionRegistry,
-    TelegramBotApi,
-    TelegramChannelAdapter,
+    LarkBotApi,
+    LarkChannelAdapter,
     TransportCapabilities,
 )
 
@@ -25,14 +25,14 @@ class _Clock:
         return self.now
 
 
-class _FakeTelegramApi(TelegramBotApi):
+class _FakeLarkApi(LarkBotApi):
     def __init__(self):
         self.calls = []
-        super().__init__(token="fake", caller=self._call)
+        super().__init__(caller=self._call)
 
     async def _call(self, method, payload):
         self.calls.append((method, payload))
-        return {"ok": True, "result": {"message_id": len(self.calls)}}
+        return {"ok": True, "data": {"message_id": f"lark-msg-{len(self.calls)}"}}
 
 
 def _channel_caps(**overrides) -> ChannelCapabilities:
@@ -84,20 +84,17 @@ def _orchestrator(channel) -> Orchestrator:
 
 
 class CallbackAckTests(unittest.TestCase):
-    def test_telegram_callback_is_acknowledged_before_invalid_token_result(self):
-        api = _FakeTelegramApi()
-        channel = TelegramChannelAdapter(api)
-        event = channel.parse_update(
+    def test_lark_callback_is_acknowledged_before_invalid_token_result(self):
+        api = _FakeLarkApi()
+        channel = LarkChannelAdapter(api)
+        event = channel.parse_event(
             {
-                "update_id": 1,
-                "callback_query": {
-                    "id": "cb-1",
-                    "from": {"id": "owner", "first_name": "Ada"},
-                    "data": "cb:missing-token",
-                    "message": {
-                        "message_id": 10,
-                        "chat": {"id": 100, "type": "private"},
-                    },
+                "event_id": "evt-cb-1",
+                "event": {
+                    "open_id": "ou_owner",
+                    "chat_id": "oc_chat",
+                    "message_id": "om_card",
+                    "action": {"value": {"token": "missing-token"}},
                 },
             }
         )
@@ -112,14 +109,15 @@ class CallbackAckTests(unittest.TestCase):
 
         self.assertFalse(result.accepted)
         self.assertEqual(result.reason, BlockedReason.INVALID_TOKEN)
-        self.assertEqual(api.calls[0][0], "answerCallbackQuery")
-        self.assertEqual(api.calls[0][1]["callback_query_id"], "cb-1")
+        self.assertEqual(api.calls[0][0], "ackCallback")
+        self.assertEqual(api.calls[0][1]["event_id"], "lark:evt-cb-1")
+        self.assertEqual(api.calls[0][1]["token"], "missing-token")
 
     def test_fake_channel_records_callback_ack_when_capability_enabled(self):
-        channel = FakeChannelAdapter("telegram", _channel_caps(private_callback_ack=True))
+        channel = FakeChannelAdapter("lark", _channel_caps(private_callback_ack=True))
         event = InboundEvent(
             event_id="evt-callback",
-            channel_kind="telegram",
+            channel_kind="lark",
             account_id="bot",
             chat_id="chat",
             thread_id="",
@@ -143,10 +141,10 @@ class CallbackAckTests(unittest.TestCase):
         self.assertEqual(channel.acknowledged_callbacks, ["evt-callback"])
 
     def test_callback_ack_capability_disabled_does_not_block_decision(self):
-        channel = FakeChannelAdapter("telegram", _channel_caps(private_callback_ack=False))
+        channel = FakeChannelAdapter("lark", _channel_caps(private_callback_ack=False))
         event = InboundEvent(
             event_id="evt-callback",
-            channel_kind="telegram",
+            channel_kind="lark",
             account_id="bot",
             chat_id="chat",
             thread_id="",

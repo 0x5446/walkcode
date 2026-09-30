@@ -1,6 +1,6 @@
 """Channel environment context injection (2026-07-25 user request).
 
-The user talks through Feishu/Telegram and cannot see the machine walkcode
+The user talks through Feishu and cannot see the machine walkcode
 runs on; agents kept asking them to "scan the QR code on the screen". Every
 agent conversation a channel drives must therefore carry an environment
 preamble. Per-transport mechanism:
@@ -32,7 +32,8 @@ class EnvironmentContextTemplateTests(unittest.TestCase):
         self.assertIn("Feishu (Lark)", lark)
         self.assertIn("<environment_context>", lark)
         self.assertIn("</environment_context>", lark)
-        self.assertIn("Telegram", _channel_environment_context("telegram"))
+        # Retired channel kinds (ADR 0069) fall back to the generic wording.
+        self.assertIn("the remote chat", _channel_environment_context("telegram"))
         self.assertIn("the remote chat", _channel_environment_context("unknown-channel"))
 
     def test_core_behavior_rules_are_present(self):
@@ -123,7 +124,7 @@ class ClaudeEnvironmentContextOptionTests(unittest.TestCase):
         )
 
     def test_legacy_sdk_gets_append_system_prompt(self):
-        context = _channel_environment_context("telegram")
+        context = _channel_environment_context("lark")
         options = self._client_options(_OptionsLegacySdk, context)
         self.assertEqual(options.append_system_prompt, context)
 
@@ -253,14 +254,15 @@ class RuntimeWiringTests(unittest.TestCase):
 
         cfg = ChannelNativeConfig.from_env(
             {
-                "WALKCODE_CHANNEL": "telegram",
-                "TELEGRAM_BOT_TOKEN": "fake",
+                "WALKCODE_CHANNEL": "lark",
+                "LARK_APP_ID": "cli_x",
+                "LARK_APP_SECRET": "s",
                 "WALKCODE_AGENT": "claude",
                 "WALKCODE_CWD": "/tmp",
             }
         )
         transports = _build_transports(cfg)
-        self.assertIn("Telegram", transports["claude_headless"].environment_context)
+        self.assertIn("Feishu (Lark)", transports["claude_headless"].environment_context)
 
     def test_codex_transport_receives_channel_context(self):
         from unittest.mock import patch
@@ -270,15 +272,16 @@ class RuntimeWiringTests(unittest.TestCase):
 
         cfg = ChannelNativeConfig.from_env(
             {
-                "WALKCODE_CHANNEL": "telegram",
-                "TELEGRAM_BOT_TOKEN": "fake",
+                "WALKCODE_CHANNEL": "lark",
+                "LARK_APP_ID": "cli_x",
+                "LARK_APP_SECRET": "s",
                 "WALKCODE_AGENT": "codex",
                 "WALKCODE_CWD": "/tmp",
             }
         )
         with patch.object(runtime_module.shutil, "which", return_value="/usr/bin/codex"):
             transports = runtime_module._build_transports(cfg)
-        self.assertIn("Telegram", transports["codex_app_server"].environment_context)
+        self.assertIn("Feishu (Lark)", transports["codex_app_server"].environment_context)
 
 
 if __name__ == "__main__":

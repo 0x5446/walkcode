@@ -7,24 +7,22 @@ from walkcode.channel_native import (
 
 
 class ChannelNativeConfigTests(unittest.TestCase):
-    def test_telegram_channel_config_binds_agent_to_claude(self):
+    def test_lark_channel_config_binds_agent_to_claude(self):
         cfg = ChannelNativeConfig.from_env(
             {
-                "WALKCODE_CHANNEL": "telegram",
-                "TELEGRAM_BOT_TOKEN": "tg-token",
+                "WALKCODE_CHANNEL": "lark",
+                "LARK_APP_ID": "cli_x",
+                "LARK_APP_SECRET": "s",
                 "WALKCODE_AGENT": "claude",
-                "TELEGRAM_ALLOWED_CHAT_IDS": "1,2",
-                "TELEGRAM_POLLING": "1",
+                "LARK_ALLOWED_CHAT_IDS": "1,2",
                 "WALKCODE_CWD": "/tmp/project",
                 "WALKCODE_STATE_PATH": "/tmp/state.json",
             }
         )
 
-        self.assertEqual(cfg.channel_kind, "telegram")
-        self.assertEqual(cfg.channel.credentials["bot_token"], "tg-token")
+        self.assertEqual(cfg.channel_kind, "lark")
+        self.assertEqual(cfg.channel.credentials["app_id"], "cli_x")
         self.assertEqual(cfg.channel.options["allowed_chat_ids"], ("1", "2"))
-        self.assertTrue(cfg.channel.options["polling"])
-        self.assertFalse(cfg.channel.options["rich_messages"])
         self.assertEqual(cfg.agent, "claude")
         self.assertEqual(cfg.agent_transport_kind, "claude_headless")
         self.assertEqual(cfg.cwd, "/tmp/project")
@@ -35,10 +33,11 @@ class ChannelNativeConfigTests(unittest.TestCase):
         # ADR 0051: auto is the shipped default (user decision 2026-07-13);
         # off stays as the explicit escape hatch.
         base = {
-            "WALKCODE_CHANNEL": "telegram",
-            "TELEGRAM_BOT_TOKEN": "tg-token",
+            "WALKCODE_CHANNEL": "lark",
+            "LARK_APP_ID": "cli_x",
+            "LARK_APP_SECRET": "s",
             "WALKCODE_AGENT": "claude",
-            "TELEGRAM_ALLOWED_CHAT_IDS": "1",
+            "LARK_ALLOWED_CHAT_IDS": "1",
             "WALKCODE_CWD": "/tmp/project",
             "WALKCODE_STATE_PATH": "/tmp/state.json",
         }
@@ -47,33 +46,14 @@ class ChannelNativeConfigTests(unittest.TestCase):
         with self.assertRaisesRegex(ChannelConfigError, "WALKCODE_HANDOFF_CONTINUE"):
             ChannelNativeConfig.from_env({**base, "WALKCODE_HANDOFF_CONTINUE": "on"})
 
-    def test_telegram_rich_messages_are_explicit_opt_in(self):
-        default_cfg = ChannelNativeConfig.from_env(
-            {
-                "WALKCODE_CHANNEL": "telegram",
-                "TELEGRAM_BOT_TOKEN": "tg-token",
-                "WALKCODE_AGENT": "claude",
-            }
-        )
-        enabled_cfg = ChannelNativeConfig.from_env(
-            {
-                "WALKCODE_CHANNEL": "telegram",
-                "TELEGRAM_BOT_TOKEN": "tg-token",
-                "WALKCODE_AGENT": "claude",
-                "WALKCODE_TELEGRAM_RICH_MESSAGES": "1",
-            }
-        )
-
-        self.assertFalse(default_cfg.channel.options["rich_messages"])
-        self.assertTrue(enabled_cfg.channel.options["rich_messages"])
-
-    def test_e2e_telegram_chat_id_restricts_v3_runtime_by_default(self):
+    def test_e2e_lark_chat_id_restricts_v3_runtime_by_default(self):
         cfg = ChannelNativeConfig.from_env(
             {
-                "WALKCODE_CHANNEL": "telegram",
-                "TELEGRAM_BOT_TOKEN": "tg-token",
+                "WALKCODE_CHANNEL": "lark",
+                "LARK_APP_ID": "cli_x",
+                "LARK_APP_SECRET": "s",
                 "WALKCODE_AGENT": "claude",
-                "WALKCODE_E2E_TELEGRAM_CHAT_ID": "123",
+                "WALKCODE_E2E_LARK_CHAT_ID": "123",
             }
         )
 
@@ -102,18 +82,32 @@ class ChannelNativeConfigTests(unittest.TestCase):
         with self.assertRaisesRegex(ChannelConfigError, "WALKCODE_CHANNELS is not supported"):
             ChannelNativeConfig.from_env(
                 {
-                    "WALKCODE_CHANNELS": "telegram",
+                    "WALKCODE_CHANNELS": "lark",
+                    "LARK_APP_ID": "cli_x",
+                    "LARK_APP_SECRET": "s",
+                    "WALKCODE_AGENT": "claude",
+                }
+            )
+
+    def test_removed_plural_channel_env_guidance_names_lark(self):
+        with self.assertRaisesRegex(ChannelConfigError, "use WALKCODE_CHANNEL=lark"):
+            ChannelNativeConfig.from_env({"WALKCODE_CHANNELS": "lark", "WALKCODE_AGENT": "claude"})
+
+    def test_retired_telegram_channel_is_rejected_with_adr_pointer(self):
+        with self.assertRaisesRegex(ChannelConfigError, "ADR 0069"):
+            ChannelNativeConfig.from_env(
+                {
+                    "WALKCODE_CHANNEL": "telegram",
                     "TELEGRAM_BOT_TOKEN": "tg-token",
                     "WALKCODE_AGENT": "claude",
                 }
             )
 
     def test_channel_env_rejects_multiple_channel_values(self):
-        with self.assertRaisesRegex(ChannelConfigError, "exactly one channel"):
+        with self.assertRaisesRegex(ChannelConfigError, "exactly one channel: lark"):
             ChannelNativeConfig.from_env(
                 {
-                    "WALKCODE_CHANNEL": "telegram,lark",
-                    "TELEGRAM_BOT_TOKEN": "tg-token",
+                    "WALKCODE_CHANNEL": "lark,lark",
                     "WALKCODE_AGENT": "claude",
                     "LARK_APP_ID": "app-id",
                     "LARK_APP_SECRET": "secret",
@@ -123,21 +117,23 @@ class ChannelNativeConfigTests(unittest.TestCase):
     def test_bound_agent_accepts_product_names_not_transport_config(self):
         cfg = ChannelNativeConfig.from_env(
             {
-                "WALKCODE_CHANNEL": "telegram",
-                "TELEGRAM_BOT_TOKEN": "tg-token",
+                "WALKCODE_CHANNEL": "lark",
+                "LARK_APP_ID": "cli_x",
+                "LARK_APP_SECRET": "s",
                 "WALKCODE_AGENT": "codex",
             }
         )
 
         self.assertEqual(cfg.agent, "codex")
         self.assertEqual(cfg.agent_transport_kind, "codex_app_server")
-        self.assertTrue(cfg.state_path.endswith("/.walkcode/telegram-codex-state.json"))
+        self.assertTrue(cfg.state_path.endswith("/.walkcode/lark-codex-state.json"))
 
         with self.assertRaisesRegex(ChannelConfigError, "unknown agent"):
             ChannelNativeConfig.from_env(
                 {
-                    "WALKCODE_CHANNEL": "telegram",
-                    "TELEGRAM_BOT_TOKEN": "tg-token",
+                    "WALKCODE_CHANNEL": "lark",
+                    "LARK_APP_ID": "cli_x",
+                    "LARK_APP_SECRET": "s",
                     "WALKCODE_AGENT": "unknown-agent",
                 }
             )
@@ -146,16 +142,18 @@ class ChannelNativeConfigTests(unittest.TestCase):
         with self.assertRaisesRegex(ChannelConfigError, "missing WALKCODE_AGENT"):
             ChannelNativeConfig.from_env(
                 {
-                    "WALKCODE_CHANNEL": "telegram",
-                    "TELEGRAM_BOT_TOKEN": "tg-token",
+                    "WALKCODE_CHANNEL": "lark",
+                    "LARK_APP_ID": "cli_x",
+                    "LARK_APP_SECRET": "s",
                 }
             )
 
     def test_claude_settings_are_agent_options(self):
         cfg = ChannelNativeConfig.from_env(
             {
-                "WALKCODE_CHANNEL": "telegram",
-                "TELEGRAM_BOT_TOKEN": "tg-token",
+                "WALKCODE_CHANNEL": "lark",
+                "LARK_APP_ID": "cli_x",
+                "LARK_APP_SECRET": "s",
                 "WALKCODE_AGENT": "claude",
                 "WALKCODE_CLAUDE_SETTINGS": "~/profiles/vertex.json",
                 "WALKCODE_CLAUDE_CLI_PATH": "~/bin/claude",
@@ -169,14 +167,15 @@ class ChannelNativeConfigTests(unittest.TestCase):
     def test_profile_defaults_empty_and_keeps_legacy_state_path(self):
         cfg = ChannelNativeConfig.from_env(
             {
-                "WALKCODE_CHANNEL": "telegram",
-                "TELEGRAM_BOT_TOKEN": "tg-token",
+                "WALKCODE_CHANNEL": "lark",
+                "LARK_APP_ID": "cli_x",
+                "LARK_APP_SECRET": "s",
                 "WALKCODE_AGENT": "claude",
             }
         )
 
         self.assertEqual(cfg.profile, "")
-        self.assertTrue(cfg.state_path.endswith("/.walkcode/telegram-claude-state.json"))
+        self.assertTrue(cfg.state_path.endswith("/.walkcode/lark-claude-state.json"))
 
     def test_profile_names_state_path_by_profile_and_agent(self):
         cfg = ChannelNativeConfig.from_env(
@@ -211,8 +210,9 @@ class ChannelNativeConfigTests(unittest.TestCase):
             with self.assertRaisesRegex(ChannelConfigError, "invalid WALKCODE_PROFILE"):
                 ChannelNativeConfig.from_env(
                     {
-                        "WALKCODE_CHANNEL": "telegram",
-                        "TELEGRAM_BOT_TOKEN": "tg-token",
+                        "WALKCODE_CHANNEL": "lark",
+                        "LARK_APP_ID": "cli_x",
+                        "LARK_APP_SECRET": "s",
                         "WALKCODE_AGENT": "claude",
                         "WALKCODE_PROFILE": bad,
                     }
@@ -221,8 +221,9 @@ class ChannelNativeConfigTests(unittest.TestCase):
     def test_claude_config_dir_is_agent_option(self):
         cfg = ChannelNativeConfig.from_env(
             {
-                "WALKCODE_CHANNEL": "telegram",
-                "TELEGRAM_BOT_TOKEN": "tg-token",
+                "WALKCODE_CHANNEL": "lark",
+                "LARK_APP_ID": "cli_x",
+                "LARK_APP_SECRET": "s",
                 "WALKCODE_AGENT": "claude",
                 "WALKCODE_CLAUDE_CONFIG_DIR": "~/.claude-profiles/work",
             }
@@ -236,8 +237,9 @@ class ChannelNativeConfigTests(unittest.TestCase):
     def test_claude_anthropic_base_url_is_agent_option(self):
         cfg = ChannelNativeConfig.from_env(
             {
-                "WALKCODE_CHANNEL": "telegram",
-                "TELEGRAM_BOT_TOKEN": "tg-token",
+                "WALKCODE_CHANNEL": "lark",
+                "LARK_APP_ID": "cli_x",
+                "LARK_APP_SECRET": "s",
                 "WALKCODE_AGENT": "claude",
                 "WALKCODE_CLAUDE_ANTHROPIC_BASE_URL": "http://127.0.0.1:18899",
             }
@@ -250,8 +252,9 @@ class ChannelNativeConfigTests(unittest.TestCase):
     def test_claude_anthropic_base_url_absent_by_default(self):
         cfg = ChannelNativeConfig.from_env(
             {
-                "WALKCODE_CHANNEL": "telegram",
-                "TELEGRAM_BOT_TOKEN": "tg-token",
+                "WALKCODE_CHANNEL": "lark",
+                "LARK_APP_ID": "cli_x",
+                "LARK_APP_SECRET": "s",
                 "WALKCODE_AGENT": "claude",
             }
         )
@@ -262,8 +265,9 @@ class ChannelNativeConfigTests(unittest.TestCase):
         with self.assertRaisesRegex(ChannelConfigError, "invalid WALKCODE_CLAUDE_ANTHROPIC_BASE_URL"):
             ChannelNativeConfig.from_env(
                 {
-                    "WALKCODE_CHANNEL": "telegram",
-                    "TELEGRAM_BOT_TOKEN": "tg-token",
+                    "WALKCODE_CHANNEL": "lark",
+                    "LARK_APP_ID": "cli_x",
+                    "LARK_APP_SECRET": "s",
                     "WALKCODE_AGENT": "claude",
                     "WALKCODE_CLAUDE_ANTHROPIC_BASE_URL": "127.0.0.1:18899",
                 }
@@ -273,8 +277,9 @@ class ChannelNativeConfigTests(unittest.TestCase):
         with self.assertRaisesRegex(ChannelConfigError, "invalid WALKCODE_CLAUDE_ANTHROPIC_BASE_URL"):
             ChannelNativeConfig.from_env(
                 {
-                    "WALKCODE_CHANNEL": "telegram",
-                    "TELEGRAM_BOT_TOKEN": "tg-token",
+                    "WALKCODE_CHANNEL": "lark",
+                    "LARK_APP_ID": "cli_x",
+                    "LARK_APP_SECRET": "s",
                     "WALKCODE_AGENT": "claude",
                     "WALKCODE_CLAUDE_ANTHROPIC_BASE_URL": "http://",
                 }
@@ -286,8 +291,9 @@ class ChannelNativeConfigTests(unittest.TestCase):
         with self.assertRaisesRegex(ChannelConfigError, "invalid WALKCODE_CLAUDE_ANTHROPIC_BASE_URL"):
             ChannelNativeConfig.from_env(
                 {
-                    "WALKCODE_CHANNEL": "telegram",
-                    "TELEGRAM_BOT_TOKEN": "tg-token",
+                    "WALKCODE_CHANNEL": "lark",
+                    "LARK_APP_ID": "cli_x",
+                    "LARK_APP_SECRET": "s",
                     "WALKCODE_AGENT": "claude",
                     "WALKCODE_CLAUDE_ANTHROPIC_BASE_URL": "http://:18899",
                 }
@@ -296,8 +302,9 @@ class ChannelNativeConfigTests(unittest.TestCase):
     def test_claude_anthropic_base_url_accepts_uppercase_scheme(self):
         cfg = ChannelNativeConfig.from_env(
             {
-                "WALKCODE_CHANNEL": "telegram",
-                "TELEGRAM_BOT_TOKEN": "tg-token",
+                "WALKCODE_CHANNEL": "lark",
+                "LARK_APP_ID": "cli_x",
+                "LARK_APP_SECRET": "s",
                 "WALKCODE_AGENT": "claude",
                 "WALKCODE_CLAUDE_ANTHROPIC_BASE_URL": "HTTP://127.0.0.1:18899",
             }
@@ -313,8 +320,9 @@ class ChannelNativeConfigTests(unittest.TestCase):
         ):
             ChannelNativeConfig.from_env(
                 {
-                    "WALKCODE_CHANNEL": "telegram",
-                    "TELEGRAM_BOT_TOKEN": "tg-token",
+                    "WALKCODE_CHANNEL": "lark",
+                    "LARK_APP_ID": "cli_x",
+                    "LARK_APP_SECRET": "s",
                     "WALKCODE_AGENT": "claude",
                     "WALKCODE_CLAUDE_SETTINGS": "/tmp/vertex.json",
                     "WALKCODE_CLAUDE_ANTHROPIC_BASE_URL": "http://127.0.0.1:18899",
@@ -324,8 +332,9 @@ class ChannelNativeConfigTests(unittest.TestCase):
     def test_codex_home_is_agent_option(self):
         cfg = ChannelNativeConfig.from_env(
             {
-                "WALKCODE_CHANNEL": "telegram",
-                "TELEGRAM_BOT_TOKEN": "tg-token",
+                "WALKCODE_CHANNEL": "lark",
+                "LARK_APP_ID": "cli_x",
+                "LARK_APP_SECRET": "s",
                 "WALKCODE_AGENT": "codex",
                 "WALKCODE_CODEX_HOME": "~/.codex-profiles/personal",
             }
@@ -340,8 +349,9 @@ class ChannelNativeConfigTests(unittest.TestCase):
         with self.assertRaisesRegex(ChannelConfigError, "WALKCODE_DEFAULT_TRANSPORT is not supported"):
             ChannelNativeConfig.from_env(
                 {
-                    "WALKCODE_CHANNEL": "telegram",
-                    "TELEGRAM_BOT_TOKEN": "tg-token",
+                    "WALKCODE_CHANNEL": "lark",
+                    "LARK_APP_ID": "cli_x",
+                    "LARK_APP_SECRET": "s",
                     "WALKCODE_AGENT": "claude",
                     "WALKCODE_DEFAULT_TRANSPORT": "claude_headless",
                 }
@@ -363,7 +373,8 @@ class ChannelNativeConfigTests(unittest.TestCase):
         with self.assertRaisesRegex(ChannelConfigError, "no channel"):
             ChannelNativeConfig.from_env(
                 {
-                    "TELEGRAM_BOT_TOKEN": "tg-token",
+                    "LARK_APP_ID": "cli_x",
+                    "LARK_APP_SECRET": "s",
                     "WALKCODE_AGENT": "claude",
                 }
             )

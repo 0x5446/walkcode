@@ -46,8 +46,9 @@ class ChannelNativeDebugScriptTests(unittest.TestCase):
             env_file.write_text(
                 "\n".join(
                     [
-                        "WALKCODE_CHANNEL=telegram",
-                        "TELEGRAM_BOT_TOKEN=fake-token",
+                        "WALKCODE_CHANNEL=lark",
+                        "LARK_APP_ID=cli_x",
+                        "LARK_APP_SECRET=s",
                         "WALKCODE_AGENT=claude",
                         f"WALKCODE_STATE_PATH={state_path}",
                         f"WALKCODE_CWD={tmp}",
@@ -82,8 +83,9 @@ class ChannelNativeDebugScriptTests(unittest.TestCase):
             env_file.write_text(
                 "\n".join(
                     [
-                        "WALKCODE_CHANNEL=telegram",
-                        "TELEGRAM_BOT_TOKEN=fake-token",
+                        "WALKCODE_CHANNEL=lark",
+                        "LARK_APP_ID=cli_x",
+                        "LARK_APP_SECRET=s",
                         "WALKCODE_AGENT=claude",
                         f"WALKCODE_STATE_PATH={state_path}",
                         f"WALKCODE_CWD={tmp}",
@@ -93,7 +95,7 @@ class ChannelNativeDebugScriptTests(unittest.TestCase):
             sessions = SessionRegistry(now=lambda: 1000.0)
             sessions.create_structured_session(
                 binding=ChannelBinding(
-                    channel_kind="telegram",
+                    channel_kind="lark",
                     account_id="bot",
                     chat_id="chat",
                     root_message_id="root",
@@ -101,7 +103,7 @@ class ChannelNativeDebugScriptTests(unittest.TestCase):
                 transport_kind="claude_headless",
                 transport_ref={"handle_id": "stale"},
                 cwd=tmp,
-                owner=ActorRef("telegram", "owner", "Owner"),
+                owner=ActorRef("lark", "owner", "Owner"),
             )
             JsonFileStateStore(state_path).save(
                 StateSnapshot(
@@ -141,8 +143,9 @@ class ChannelNativeDebugScriptTests(unittest.TestCase):
             env_file.write_text(
                 "\n".join(
                     [
-                        "WALKCODE_CHANNEL=telegram",
-                        "TELEGRAM_BOT_TOKEN=fake-token",
+                        "WALKCODE_CHANNEL=lark",
+                        "LARK_APP_ID=cli_x",
+                        "LARK_APP_SECRET=s",
                         "WALKCODE_AGENT=claude",
                         f"WALKCODE_STATE_PATH={state_path}",
                         f"WALKCODE_CWD={tmp}",
@@ -152,7 +155,7 @@ class ChannelNativeDebugScriptTests(unittest.TestCase):
             sessions = SessionRegistry(now=lambda: 1000.0)
             session = sessions.create_structured_session(
                 binding=ChannelBinding(
-                    channel_kind="telegram",
+                    channel_kind="lark",
                     account_id="bot",
                     chat_id="chat",
                     root_message_id="root",
@@ -160,7 +163,7 @@ class ChannelNativeDebugScriptTests(unittest.TestCase):
                 transport_kind="claude_headless",
                 transport_ref={"handle_id": "stale"},
                 cwd=tmp,
-                owner=ActorRef("telegram", "owner", "Owner"),
+                owner=ActorRef("lark", "owner", "Owner"),
             )
             session.lifecycle_state = "ERROR_RECOVERABLE"
             session.last_progress_event = "session.error"
@@ -206,8 +209,9 @@ class ChannelNativeDebugScriptTests(unittest.TestCase):
             env_file.write_text(
                 "\n".join(
                     [
-                        "WALKCODE_CHANNEL=telegram",
-                        "TELEGRAM_BOT_TOKEN=fake-token",
+                        "WALKCODE_CHANNEL=lark",
+                        "LARK_APP_ID=cli_x",
+                        "LARK_APP_SECRET=s",
                         "WALKCODE_AGENT=codex",
                         f"WALKCODE_STATE_PATH={state_path}",
                         f"WALKCODE_CWD={tmp}",
@@ -218,7 +222,7 @@ class ChannelNativeDebugScriptTests(unittest.TestCase):
             session = sessions.create_observed_session(
                 session_id="tui-codex-dead",
                 binding=ChannelBinding(
-                    channel_kind="telegram",
+                    channel_kind="lark",
                     account_id="bot",
                     chat_id="chat",
                     root_message_id="root",
@@ -230,7 +234,7 @@ class ChannelNativeDebugScriptTests(unittest.TestCase):
                         "process_ref": {"pid": 999999, "allow_terminate": False},
                     },
                 },
-                owner=ActorRef("telegram", "owner", "Owner"),
+                owner=ActorRef("lark", "owner", "Owner"),
             )
             JsonFileStateStore(state_path).save(
                 StateSnapshot(
@@ -274,8 +278,9 @@ class ChannelNativeDebugScriptTests(unittest.TestCase):
             env_file.write_text(
                 "\n".join(
                     [
-                        "WALKCODE_CHANNEL=telegram",
-                        "TELEGRAM_BOT_TOKEN=fake-token",
+                        "WALKCODE_CHANNEL=lark",
+                        "LARK_APP_ID=cli_x",
+                        "LARK_APP_SECRET=s",
                         "WALKCODE_AGENT=claude",
                         f"WALKCODE_STATE_PATH={state_path}",
                         f"WALKCODE_CWD={tmp}",
@@ -286,7 +291,7 @@ class ChannelNativeDebugScriptTests(unittest.TestCase):
             session = sessions.create_observed_session(
                 session_id="tui-claude-stopped",
                 binding=ChannelBinding(
-                    channel_kind="telegram",
+                    channel_kind="lark",
                     account_id="bot",
                     chat_id="chat",
                     root_message_id="root",
@@ -299,7 +304,7 @@ class ChannelNativeDebugScriptTests(unittest.TestCase):
                         "process_ref": {"pid": 1, "allow_terminate": False},
                     },
                 },
-                owner=ActorRef("telegram", "owner", "Owner"),
+                owner=ActorRef("lark", "owner", "Owner"),
             )
             session.last_progress_event = "external_tui.stop"
             JsonFileStateStore(state_path).save(
@@ -344,8 +349,9 @@ class ChannelNativeDebugScriptTests(unittest.TestCase):
             env_file.write_text(
                 "\n".join(
                     [
-                        "WALKCODE_CHANNEL=telegram",
-                        "TELEGRAM_BOT_TOKEN=fake-token",
+                        "WALKCODE_CHANNEL=lark",
+                        "LARK_APP_ID=cli_x",
+                        "LARK_APP_SECRET=s",
                         "WALKCODE_AGENT=claude",
                         f"WALKCODE_STATE_PATH={state_path}",
                         f"WALKCODE_CWD={tmp}",
@@ -355,7 +361,7 @@ class ChannelNativeDebugScriptTests(unittest.TestCase):
             sessions = SessionRegistry(now=lambda: 1000.0)
             session = sessions.create_structured_session(
                 binding=ChannelBinding(
-                    channel_kind="telegram",
+                    channel_kind="lark",
                     account_id="bot",
                     chat_id="chat",
                     root_message_id="root",
@@ -363,7 +369,7 @@ class ChannelNativeDebugScriptTests(unittest.TestCase):
                 transport_kind="claude_headless",
                 transport_ref={"handle_id": "old", "agent_session_id": "agent-session-1"},
                 cwd=tmp,
-                owner=ActorRef("telegram", "owner", "Owner"),
+                owner=ActorRef("lark", "owner", "Owner"),
             )
             session.lifecycle_state = "IDLE"
             JsonFileStateStore(state_path).save(
@@ -401,8 +407,9 @@ class ChannelNativeDebugScriptTests(unittest.TestCase):
             env_file.write_text(
                 "\n".join(
                     [
-                        "WALKCODE_CHANNEL=telegram",
-                        "TELEGRAM_BOT_TOKEN=fake-token",
+                        "WALKCODE_CHANNEL=lark",
+                        "LARK_APP_ID=cli_x",
+                        "LARK_APP_SECRET=s",
                         "WALKCODE_AGENT=claude",
                         f"WALKCODE_STATE_PATH={state_path}",
                         f"WALKCODE_CWD={tmp}",
@@ -413,14 +420,14 @@ class ChannelNativeDebugScriptTests(unittest.TestCase):
             sessions.create_observed_session(
                 session_id="tui-claude-observed",
                 binding=ChannelBinding(
-                    channel_kind="telegram",
+                    channel_kind="lark",
                     account_id="bot",
                     chat_id="chat",
                     root_message_id="root",
                 ),
                 cwd=tmp,
                 external_ref={"source": "native_hook", "agent": "claude"},
-                owner=ActorRef("telegram", "owner", "Owner"),
+                owner=ActorRef("lark", "owner", "Owner"),
             )
             JsonFileStateStore(state_path).save(
                 StateSnapshot(
@@ -457,8 +464,9 @@ class ChannelNativeDebugScriptTests(unittest.TestCase):
             env_file.write_text(
                 "\n".join(
                     [
-                        "WALKCODE_CHANNEL=telegram",
-                        "TELEGRAM_BOT_TOKEN=fake-token",
+                        "WALKCODE_CHANNEL=lark",
+                        "LARK_APP_ID=cli_x",
+                        "LARK_APP_SECRET=s",
                         "WALKCODE_AGENT=claude",
                         f"WALKCODE_STATE_PATH={state_path}",
                         f"WALKCODE_CWD={tmp}",
@@ -492,8 +500,9 @@ class ChannelNativeDebugScriptTests(unittest.TestCase):
             env_file.write_text(
                 "\n".join(
                     [
-                        "WALKCODE_CHANNEL=telegram",
-                        "TELEGRAM_BOT_TOKEN=fake-token",
+                        "WALKCODE_CHANNEL=lark",
+                        "LARK_APP_ID=cli_x",
+                        "LARK_APP_SECRET=s",
                         "WALKCODE_AGENT=claude",
                         f"WALKCODE_STATE_PATH={state_path}",
                         f"WALKCODE_CWD={tmp}",
@@ -502,7 +511,7 @@ class ChannelNativeDebugScriptTests(unittest.TestCase):
             )
             outbox = DurableOutbox(now=lambda: 1000.0)
             outbox.enqueue(
-                channel_binding_key=("telegram", "bot", "chat", "", "root"),
+                channel_binding_key=("lark", "bot", "chat", "", "root"),
                 view_model={"type": "turn_completed", "message": ""},
                 idempotency_key="empty",
             )
@@ -784,7 +793,7 @@ class ChannelNativeDebugScriptTests(unittest.TestCase):
         ps_output = "\n".join(
             [
                 "  101     1 /opt/python /Users/alpha/.local/bin/walkcode serve",
-                "  102     1 uv run python -m walkcode native serve --once --poll-timeout 0",
+                "  102     1 uv run python -m walkcode native serve",
                 "  103     1 /opt/python scripts/channel_native_debug.py runtime",
             ]
         )
@@ -813,13 +822,13 @@ class ChannelNativeDebugScriptTests(unittest.TestCase):
         self.assertEqual(payload["competing_consumer_count"], 1)
         self.assertIn("stop competing", payload["warnings"][0])
 
-    def test_telegram_debug_allows_other_channel_native_consumers(self):
+    def test_runtime_debug_can_allow_other_channel_native_consumers(self):
         result = subprocess.CompletedProcess(
             args=["ps"],
             returncode=0,
             stdout=(
-                "  101     1 /opt/python /Users/alpha/.local/bin/walkcode native serve --poll-timeout 5\n"
-                "  102     1 /opt/python /Users/alpha/.local/bin/walkcode native serve --poll-timeout 5\n"
+                "  101     1 /opt/python /Users/alpha/.local/bin/walkcode native serve\n"
+                "  102     1 /opt/python /Users/alpha/.local/bin/walkcode native serve\n"
             ),
             stderr="",
         )
@@ -830,15 +839,15 @@ class ChannelNativeDebugScriptTests(unittest.TestCase):
         self.assertTrue(payload["ok"])
         self.assertEqual(payload["competing_consumer_count"], 0)
         self.assertEqual(payload["native_consumer_count"], 2)
-        self.assertIn("Telegram 409", payload["warnings"][0])
+        self.assertIn("a second consumer of the same bot would compete", payload["warnings"][0])
 
     def test_runtime_debug_allows_managed_per_agent_launchd_services(self):
         ps_result = subprocess.CompletedProcess(
             args=["ps"],
             returncode=0,
             stdout=(
-                "  101     1 /opt/python /Users/alpha/.local/bin/walkcode native serve --poll-timeout 5\n"
-                "  102     1 /opt/python /Users/alpha/.local/bin/walkcode native serve --poll-timeout 5\n"
+                "  101     1 /opt/python /Users/alpha/.local/bin/walkcode native serve\n"
+                "  102     1 /opt/python /Users/alpha/.local/bin/walkcode native serve\n"
             ),
             stderr="",
         )
@@ -846,8 +855,8 @@ class ChannelNativeDebugScriptTests(unittest.TestCase):
             args=["launchctl", "list"],
             returncode=0,
             stdout=(
-                "101\t0\tcom.walkcode.telegram-claude\n"
-                "102\t0\tcom.walkcode.telegram-codex\n"
+                "101\t0\tcom.walkcode.work-claude\n"
+                "102\t0\tcom.walkcode.work-codex\n"
             ),
             stderr="",
         )
@@ -858,8 +867,10 @@ class ChannelNativeDebugScriptTests(unittest.TestCase):
             patch.dict(
                 channel_native_debug.os.environ,
                 {
-                    "WALKCODE_CHANNEL": "telegram",
-                    "TELEGRAM_BOT_TOKEN": "fake-token",
+                    "WALKCODE_CHANNEL": "lark",
+                    "WALKCODE_PROFILE": "work",
+                    "LARK_APP_ID": "a",
+                    "LARK_APP_SECRET": "s",
                     "WALKCODE_AGENT": "claude",
                 },
                 clear=True,
@@ -868,7 +879,7 @@ class ChannelNativeDebugScriptTests(unittest.TestCase):
             payload = channel_native_debug.debug_runtime_processes()
 
         self.assertTrue(payload["ok"])
-        self.assertEqual(payload["expected_service_label"], "com.walkcode.telegram-claude")
+        self.assertEqual(payload["expected_service_label"], "com.walkcode.work-claude")
         self.assertEqual(payload["competing_consumer_count"], 0)
         self.assertEqual(payload["native_consumer_count"], 2)
         self.assertEqual(payload["managed_native_consumer_count"], 2)
@@ -878,8 +889,8 @@ class ChannelNativeDebugScriptTests(unittest.TestCase):
             args=["ps"],
             returncode=0,
             stdout=(
-                "  101     1 /opt/python /Users/alpha/.local/bin/walkcode native serve --poll-timeout 5\n"
-                "  102     1 /opt/python /Users/alpha/.local/bin/walkcode native serve --poll-timeout 5\n"
+                "  101     1 /opt/python /Users/alpha/.local/bin/walkcode native serve\n"
+                "  102     1 /opt/python /Users/alpha/.local/bin/walkcode native serve\n"
             ),
             stderr="",
         )
@@ -904,7 +915,6 @@ class ChannelNativeDebugScriptTests(unittest.TestCase):
                     "WALKCODE_PROFILE": "personal",
                     "LARK_APP_ID": "a",
                     "LARK_APP_SECRET": "s",
-                    "TELEGRAM_BOT_TOKEN": "fake-token",
                     "WALKCODE_AGENT": "claude",
                 },
                 clear=True,
@@ -922,7 +932,7 @@ class ChannelNativeDebugScriptTests(unittest.TestCase):
         ps_result = subprocess.CompletedProcess(
             args=["ps"],
             returncode=0,
-            stdout="  101     1 /opt/python /Users/alpha/.local/bin/walkcode native serve --poll-timeout 5\n",
+            stdout="  101     1 /opt/python /Users/alpha/.local/bin/walkcode native serve\n",
             stderr="",
         )
         launchctl_result = subprocess.CompletedProcess(
@@ -938,8 +948,10 @@ class ChannelNativeDebugScriptTests(unittest.TestCase):
             patch.dict(
                 channel_native_debug.os.environ,
                 {
-                    "WALKCODE_CHANNEL": "telegram",
-                    "TELEGRAM_BOT_TOKEN": "fake-token",
+                    "WALKCODE_CHANNEL": "lark",
+                    "WALKCODE_PROFILE": "work",
+                    "LARK_APP_ID": "a",
+                    "LARK_APP_SECRET": "s",
                     "WALKCODE_AGENT": "claude",
                 },
                 clear=True,
@@ -986,7 +998,7 @@ class ChannelNativeDebugScriptTests(unittest.TestCase):
             walkcode.mkdir()
             (walkcode / "claude.env").write_text("FEISHU_APP_ID=cli_xxx", encoding="utf-8")
             selected_env = walkcode / "selected.env"
-            selected_env.write_text("TELEGRAM_BOT_TOKEN=x\n", encoding="utf-8")
+            selected_env.write_text("LARK_APP_ID=x\n", encoding="utf-8")
 
             with patch.dict(
                 channel_native_debug.os.environ,
@@ -1030,91 +1042,6 @@ class ChannelNativeDebugScriptTests(unittest.TestCase):
                 remnants = channel_native_debug._detect_legacy_runtime_remnants(home=home)
 
         self.assertEqual(remnants, [])
-
-    def test_telegram_debug_blocks_when_competing_consumer_exists(self):
-        class _Runtime:
-            async def diagnose_telegram_ingress(self, *, limit):
-                self.limit = limit
-                return {
-                    "bot": {"ok": True},
-                    "webhook": {"ok": True},
-                    "pending_updates": {"count": 0, "items": []},
-                    "safe_to_run_serve_once": True,
-                }
-
-        process_report = {
-            "ok": False,
-            "current_pid": 99,
-            "competing_consumer_count": 1,
-            "competing_consumers": [
-                {
-                    "pid": 101,
-                    "ppid": 1,
-                    "kind": "legacy_walkcode_serve",
-                    "command": "walkcode serve",
-                }
-            ],
-            "warnings": ["stop competing walkcode serve process(es) before consuming IM updates"],
-        }
-
-        with (
-            patch.object(channel_native_debug.ChannelNativeRuntime, "from_env", return_value=_Runtime()),
-            patch.object(channel_native_debug, "debug_runtime_processes", return_value=process_report),
-        ):
-            payload = asyncio.run(channel_native_debug.debug_telegram(limit=5))
-
-        self.assertFalse(payload["ok"])
-        self.assertFalse(payload["safe_to_run_serve_once"])
-        self.assertEqual(payload["runtime_processes"]["competing_consumer_count"], 1)
-        self.assertIn("competing walkcode serve", payload["warnings"][0])
-
-    def test_telegram_debug_treats_running_native_service_409_as_healthy(self):
-        class _Runtime:
-            async def diagnose_telegram_ingress(self, *, limit):
-                return {
-                    "bot": {"ok": True},
-                    "webhook": {"ok": True, "pending_update_count": 0},
-                    "pending_updates": {
-                        "count": 0,
-                        "limit": limit,
-                        "error": "HTTPError",
-                        "message": "HTTP Error 409: Conflict",
-                        "items": [],
-                    },
-                    "safe_to_run_serve_once": False,
-                    "warnings": ["could not inspect Telegram pending updates"],
-                }
-
-        process_report = {
-            "ok": True,
-            "current_pid": 99,
-            "competing_consumer_count": 0,
-            "competing_consumers": [],
-            "native_consumer_count": 1,
-            "native_consumers": [
-                {
-                    "pid": 101,
-                    "ppid": 1,
-                    "kind": "channel_native_serve",
-                    "command": "walkcode native serve",
-                }
-            ],
-            "legacy_remnant_count": 0,
-            "legacy_remnants": [],
-            "warnings": ["walkcode native serve process(es) are running"],
-        }
-
-        with (
-            patch.object(channel_native_debug.ChannelNativeRuntime, "from_env", return_value=_Runtime()),
-            patch.object(channel_native_debug, "debug_runtime_processes", return_value=process_report),
-        ):
-            payload = asyncio.run(channel_native_debug.debug_telegram(limit=5))
-
-        self.assertTrue(payload["ok"])
-        self.assertFalse(payload["safe_to_run_serve_once"])
-        self.assertTrue(payload["polling_owned_by_running_service"])
-        self.assertNotIn("could not inspect Telegram pending updates", payload["warnings"])
-        self.assertIn("expected to return 409", payload["warnings"][0])
 
 
 if __name__ == "__main__":

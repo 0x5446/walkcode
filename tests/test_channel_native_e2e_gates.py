@@ -7,35 +7,41 @@ class ChannelNativeE2EGateTests(unittest.TestCase):
     def test_all_gates_are_closed_by_default_with_actionable_reasons(self):
         gates = ChannelNativeE2EGates.from_env({})
 
-        for name in ("telegram", "lark", "claude_headless", "codex_app_server"):
+        self.assertEqual(set(gates.all()), {"lark", "claude_headless", "codex_app_server"})
+        for name in ("lark", "claude_headless", "codex_app_server"):
             result = gates.evaluate(name)
             self.assertFalse(result.enabled)
             self.assertIn("set", result.reason)
             self.assertIn("WALKCODE_E2E_", result.reason)
 
     def test_opted_in_gate_reports_missing_required_variables(self):
-        result = ChannelNativeE2EGates.from_env({"WALKCODE_E2E_TELEGRAM": "1"}).evaluate("telegram")
+        result = ChannelNativeE2EGates.from_env({"WALKCODE_E2E_LARK": "1"}).evaluate("lark")
 
         self.assertFalse(result.enabled)
         self.assertEqual(
             result.missing,
-            ("TELEGRAM_BOT_TOKEN", "WALKCODE_E2E_TELEGRAM_CHAT_ID"),
+            ("LARK_APP_ID", "LARK_APP_SECRET", "WALKCODE_E2E_LARK_CHAT_ID"),
         )
-        self.assertIn("TELEGRAM_BOT_TOKEN", result.reason)
+        self.assertIn("LARK_APP_ID", result.reason)
 
     def test_gate_enables_when_flag_and_requirements_are_present(self):
         result = ChannelNativeE2EGates.from_env(
             {
-                "WALKCODE_E2E_TELEGRAM": "1",
-                "TELEGRAM_BOT_TOKEN": "token",
+                "WALKCODE_E2E_LARK": "1",
+                "LARK_APP_ID": "app-id",
+                "LARK_APP_SECRET": "secret",
                 "WALKCODE_AGENT": "claude",
-                "WALKCODE_E2E_TELEGRAM_CHAT_ID": "chat",
+                "WALKCODE_E2E_LARK_CHAT_ID": "chat",
             }
-        ).evaluate("telegram")
+        ).evaluate("lark")
 
         self.assertTrue(result.enabled)
         self.assertEqual(result.missing, ())
         self.assertEqual(result.reason, "")
+
+    def test_retired_telegram_gate_is_unknown(self):
+        with self.assertRaisesRegex(ValueError, "unknown E2E gate"):
+            ChannelNativeE2EGates.from_env({"WALKCODE_E2E_TELEGRAM": "1"}).evaluate("telegram")
 
     def test_lark_claude_and_codex_gates_have_separate_requirements(self):
         env = {

@@ -107,10 +107,6 @@ WALKCODE_CWD=~/.walkcode/workspace
 # Per-profile agent isolation.
 # WALKCODE_CLAUDE_CONFIG_DIR=~/.claude-profiles/work
 # WALKCODE_CODEX_HOME=~/.codex-profiles/work
-
-# Telegram peer channel (architecture-validation only) uses a separate env:
-# WALKCODE_CHANNEL=telegram
-# TELEGRAM_BOT_TOKEN=
 ENVFILE
 
   warn "$(msg \
@@ -164,8 +160,8 @@ detect_legacy_remnants() {
     for env_path in "$CONFIG_DIR"/*.env; do
       if grep -q 'FEISHU_' "$env_path" 2>/dev/null; then
         warn "$(msg \
-          "Legacy FEISHU_* env detected: $env_path. V3 uses TELEGRAM_* or LARK_* and a dedicated state path." \
-          "检测到旧版 FEISHU_* env: ${env_path}。V3 使用 TELEGRAM_* 或 LARK_*，且需要独立 state path。")"
+          "Legacy FEISHU_* env detected: $env_path. V3 uses LARK_* and a dedicated state path." \
+          "检测到旧版 FEISHU_* env: ${env_path}。V3 使用 LARK_*，且需要独立 state path。")"
         found=1
       fi
     done
@@ -173,8 +169,8 @@ detect_legacy_remnants() {
 
   if env | grep -q '^FEISHU_'; then
     warn "$(msg \
-      "Current shell exports FEISHU_* variables. Start V3 from a clean Telegram/Lark env file." \
-      "当前 shell 导出了 FEISHU_* 变量。V3 应从干净的 Telegram/Lark env 文件启动。")"
+      "Current shell exports FEISHU_* variables. Start V3 from a clean Lark env file." \
+      "当前 shell 导出了 FEISHU_* 变量。V3 应从干净的 Lark env 文件启动。")"
     found=1
   fi
 
@@ -203,13 +199,13 @@ main() {
   info "$(msg "Installation complete." "安装完成。")"
   if is_zh; then
     echo "  后续步骤:"
-    echo "  1. 编辑 ${ENV_FILE}，填写 TELEGRAM_BOT_TOKEN 和 WALKCODE_AGENT"
+    echo "  1. 编辑 ${ENV_FILE}，填写 LARK_APP_ID/LARK_APP_SECRET 和 WALKCODE_AGENT"
     echo "  2. 运行: WALKCODE_ENV_FILE=$ENV_FILE walkcode native doctor"
     echo "  3. 如果在仓库 checkout 中，运行模块检查: python scripts/channel_native_debug.py --env-file $ENV_FILE runtime"
     echo "  4. 启动: WALKCODE_ENV_FILE=$ENV_FILE walkcode native serve"
   else
     echo "  Next steps:"
-    echo "  1. Edit $ENV_FILE with TELEGRAM_BOT_TOKEN and WALKCODE_AGENT"
+    echo "  1. Edit $ENV_FILE with LARK_APP_ID/LARK_APP_SECRET and WALKCODE_AGENT"
     echo "  2. Run: WALKCODE_ENV_FILE=$ENV_FILE walkcode native doctor"
     echo "  3. From a repository checkout, run module checks: python scripts/channel_native_debug.py --env-file $ENV_FILE runtime"
     echo "  4. Start: WALKCODE_ENV_FILE=$ENV_FILE walkcode native serve"

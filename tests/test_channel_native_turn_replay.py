@@ -46,11 +46,11 @@ class _Clock:
 
 
 def _actor(actor_id: str = "owner") -> ActorRef:
-    return ActorRef(channel_kind="telegram", actor_id=actor_id, display_name=actor_id.title())
+    return ActorRef(channel_kind="lark", actor_id=actor_id, display_name=actor_id.title())
 
 
 def _binding(root: str = "root") -> ChannelBinding:
-    return ChannelBinding("telegram", "bot", "chat", "topic", root)
+    return ChannelBinding("lark", "bot", "chat", "topic", root)
 
 
 def _channel_caps() -> ChannelCapabilities:
@@ -102,12 +102,12 @@ def _pending_turn_lost_event(*, traffic_seen: bool = False, pending_lost: int = 
 def _orchestrator(transport=None):
     clock = _Clock()
     transport = transport or FakeAgentTransport("claude_headless", _transport_caps())
-    channel = FakeChannelAdapter("telegram", _channel_caps())
+    channel = FakeChannelAdapter("lark", _channel_caps())
     orchestrator = Orchestrator(
         sessions=SessionRegistry(now=clock),
         interactions=InteractionStore(now=clock),
         outbox=DurableOutbox(now=clock),
-        channels={"telegram": channel},
+        channels={"lark": channel},
         transports={"claude_headless": transport},
         authz=AuthorizationStore(),
         now=clock,
