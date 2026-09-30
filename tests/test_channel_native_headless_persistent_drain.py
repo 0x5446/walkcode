@@ -1252,17 +1252,9 @@ class PersistentStreamTests(unittest.TestCase):
 class OrchestratorPersistentDrainTests(unittest.TestCase):
     def _channel_caps(self):
         return ChannelCapabilities(
-            thread_context=True,
             editable_message=True,
-            interactive_message=True,
-            interactive_update=True,
             private_callback_ack=True,
-            toast_or_ephemeral_notice=True,
-            force_reply=True,
             attachment_download=True,
-            forum_or_topic=True,
-            max_text_chars=4096,
-            max_callback_payload_bytes=64,
         )
 
     def _build(self, client_cls, *, grace=0.05, ceiling=30.0):
@@ -1521,17 +1513,9 @@ class DeepReviewRegressionTests(unittest.TestCase):
             channel = FakeChannelAdapter(
                 "lark",
                 ChannelCapabilities(
-                    thread_context=True,
                     editable_message=True,
-                    interactive_message=True,
-                    interactive_update=True,
                     private_callback_ack=True,
-                    toast_or_ephemeral_notice=True,
-                    force_reply=True,
                     attachment_download=True,
-                    forum_or_topic=True,
-                    max_text_chars=4096,
-                    max_callback_payload_bytes=64,
                 ),
             )
             orch = Orchestrator(
@@ -1579,17 +1563,9 @@ class DeepReviewRegressionTests(unittest.TestCase):
             channel = FakeChannelAdapter(
                 "lark",
                 ChannelCapabilities(
-                    thread_context=True,
                     editable_message=True,
-                    interactive_message=True,
-                    interactive_update=True,
                     private_callback_ack=True,
-                    toast_or_ephemeral_notice=True,
-                    force_reply=True,
                     attachment_download=True,
-                    forum_or_topic=True,
-                    max_text_chars=4096,
-                    max_callback_payload_bytes=64,
                 ),
             )
             orch = Orchestrator(
@@ -1674,17 +1650,9 @@ class DeepReviewRegressionTests(unittest.TestCase):
             channel = FakeChannelAdapter(
                 "lark",
                 ChannelCapabilities(
-                    thread_context=True,
                     editable_message=True,
-                    interactive_message=True,
-                    interactive_update=True,
                     private_callback_ack=True,
-                    toast_or_ephemeral_notice=True,
-                    force_reply=True,
                     attachment_download=True,
-                    forum_or_topic=True,
-                    max_text_chars=4096,
-                    max_callback_payload_bytes=64,
                 ),
             )
             orch = Orchestrator(

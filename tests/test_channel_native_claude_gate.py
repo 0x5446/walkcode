@@ -304,7 +304,6 @@ class GateTransportTests(unittest.TestCase):
             self.assertTrue(caps.ask_user_question)
             self.assertFalse(caps.structured_input)
             self.assertFalse(caps.set_model)
-            self.assertFalse(caps.multi_client_write)
 
     def test_approve_permission_writes_decision_and_notifies(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -1037,14 +1037,8 @@ class _UnavailableTransport:
             structured_output=False,
             permission_callback=False,
             ask_user_question=False,
-            interrupt=False,
             set_model=False,
-            set_permission_mode=False,
-            checkpoint_rewind=False,
             resume_after_complete=False,
-            resume_active_turn=False,
-            multi_client_observe=False,
-            multi_client_write=False,
             external_tui_takeover=False,
         )
 

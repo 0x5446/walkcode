@@ -35,14 +35,8 @@ def _transport_caps() -> TransportCapabilities:
         structured_output=True,
         permission_callback=True,
         ask_user_question=True,
-        interrupt=True,
         set_model=True,
-        set_permission_mode=True,
-        checkpoint_rewind=True,
         resume_after_complete=True,
-        resume_active_turn=False,
-        multi_client_observe=False,
-        multi_client_write=False,
         external_tui_takeover=False,
     )
 
