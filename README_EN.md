@@ -15,20 +15,19 @@ Each local runtime instance has one clear identity line:
   state path and launchd label; each profile isolates its agent credentials
   and config through `WALKCODE_CLAUDE_CONFIG_DIR` / `WALKCODE_CODEX_HOME`
   (codex gets one managed app-server daemon per profile).
-- Select the channel with `WALKCODE_CHANNEL=lark|telegram`.
+- The channel is `WALKCODE_CHANNEL=lark` (Lark/Feishu is the only channel; Telegram
+  was removed in ADR 0069 and `telegram` is now a config error).
 - Bind the coding agent with `WALKCODE_AGENT=claude|codex`.
 - When `WALKCODE_ENV_FILE` is explicit, the env file owns the instance
   identity; hook commands must carry `WALKCODE_ENV_FILE` explicitly (there is
   no implicit default).
 - Claude Code and Codex require separate bots, env files, state files, and runtime processes.
 - `/claude` and `/codex` are not in-bot agent routers; they are rejected.
-- **Lark/Feishu is the first deployable channel**: one adapter serves both the
+- **Lark/Feishu is the only channel**: one adapter serves both the
   company Feishu tenant (open.feishu.cn) and personal Lark tenant
   (open.larksuite.com) via `LARK_OPENAPI_DOMAIN`; sessions map to reply-chain
   topics, and the card UI is ported from the proven V2 Feishu design
   (three-button permission card, AskUserQuestion three modes, health card).
-- Telegram remains the architecture-validation channel (code and tests stay;
-  no further UX investment).
 
 The standard local deployment is a {work, personal} x {claude, codex} instance
 matrix (add more profiles for extra model routes); see
@@ -227,7 +226,8 @@ V3 does not inherit the old Feishu/tmux/hook runtime. Before switching:
 
 See [docs/lark-profile-deploy.md](docs/lark-profile-deploy.md) and
 [docs/channel-native-local-deploy.md](docs/channel-native-local-deploy.md)
-(Telegram, demoted) for deployment and validation details.
+(runtime reference: commands, `/reload`, TUI hooks, debug gates) for deployment
+and validation details.
 The current progress/TODO export is
 [docs/reports/2026-07-02-channel-native-v3-progress-todo.md](docs/reports/2026-07-02-channel-native-v3-progress-todo.md).
 

@@ -2,7 +2,8 @@
 
 Date: 2026-06-28
 
-Status: Accepted
+Status: Accepted. Amended 2026-09-30 by ADR 0069: `telegram` is no longer a
+valid `WALKCODE_CHANNEL`; the single-channel rule is unchanged.
 
 ## Context
 

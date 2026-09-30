@@ -104,10 +104,10 @@ Acceptance:
 Verification:
 
 ```text
-uv run --with pytest python -m pytest tests/test_channel_native_telegram_claude.py
+uv run --with pytest python -m pytest tests/test_channel_native_claude_headless.py
 6 passed
 
-uv run --with pytest python -m pytest tests/test_channel_native_core.py tests/test_channel_native_telegram_claude.py
+uv run --with pytest python -m pytest tests/test_channel_native_core.py tests/test_channel_native_claude_headless.py
 15 passed
 
 uv run python -m compileall -q src/walkcode/channel_native
@@ -157,7 +157,7 @@ Verification:
 uv run --with pytest python -m pytest tests/test_channel_native_lark.py
 4 passed
 
-uv run --with pytest python -m pytest tests/test_channel_native_core.py tests/test_channel_native_telegram_claude.py tests/test_channel_native_lark.py
+uv run --with pytest python -m pytest tests/test_channel_native_core.py tests/test_channel_native_claude_headless.py tests/test_channel_native_lark.py
 19 passed
 
 uv run python -m compileall -q src/walkcode/channel_native
@@ -207,7 +207,7 @@ Verification:
 uv run --with pytest python -m pytest tests/test_channel_native_codex.py
 4 passed
 
-uv run --with pytest python -m pytest tests/test_channel_native_core.py tests/test_channel_native_telegram_claude.py tests/test_channel_native_lark.py tests/test_channel_native_codex.py
+uv run --with pytest python -m pytest tests/test_channel_native_core.py tests/test_channel_native_claude_headless.py tests/test_channel_native_lark.py tests/test_channel_native_codex.py
 23 passed
 
 uv run python -m compileall -q src/walkcode/channel_native
@@ -255,7 +255,7 @@ Verification:
 uv run --with pytest python -m pytest tests/test_channel_native_takeover.py
 3 passed
 
-uv run --with pytest python -m pytest tests/test_channel_native_core.py tests/test_channel_native_telegram_claude.py tests/test_channel_native_lark.py tests/test_channel_native_codex.py tests/test_channel_native_takeover.py
+uv run --with pytest python -m pytest tests/test_channel_native_core.py tests/test_channel_native_claude_headless.py tests/test_channel_native_lark.py tests/test_channel_native_codex.py tests/test_channel_native_takeover.py
 26 passed
 
 uv run python -m compileall -q src/walkcode/channel_native
@@ -349,7 +349,7 @@ Verification:
 uv run --with pytest python -m pytest tests/test_channel_native_views_auth_outbox.py
 8 passed
 
-uv run --with pytest python -m pytest tests/test_channel_native_core.py tests/test_channel_native_telegram_claude.py tests/test_channel_native_lark.py tests/test_channel_native_codex.py tests/test_channel_native_takeover.py tests/test_channel_native_views_auth_outbox.py
+uv run --with pytest python -m pytest tests/test_channel_native_core.py tests/test_channel_native_claude_headless.py tests/test_channel_native_lark.py tests/test_channel_native_codex.py tests/test_channel_native_takeover.py tests/test_channel_native_views_auth_outbox.py
 35 passed
 
 uv run --with pytest python -m pytest
@@ -479,7 +479,7 @@ Verification:
 uv run --with pytest python -m pytest tests/test_channel_native_persistence_reliability.py
 5 passed
 
-uv run --with pytest python -m pytest tests/test_channel_native_core.py tests/test_channel_native_telegram_claude.py tests/test_channel_native_lark.py tests/test_channel_native_codex.py tests/test_channel_native_takeover.py tests/test_channel_native_views_auth_outbox.py tests/test_channel_native_persistence_reliability.py
+uv run --with pytest python -m pytest tests/test_channel_native_core.py tests/test_channel_native_claude_headless.py tests/test_channel_native_lark.py tests/test_channel_native_codex.py tests/test_channel_native_takeover.py tests/test_channel_native_views_auth_outbox.py tests/test_channel_native_persistence_reliability.py
 40 passed
 
 uv run python -m compileall -q src/walkcode/channel_native
@@ -525,7 +525,7 @@ Verification:
 uv run --with pytest python -m pytest tests/test_channel_native_streaming_guardrails.py
 3 passed
 
-uv run --with pytest python -m pytest tests/test_channel_native_core.py tests/test_channel_native_telegram_claude.py tests/test_channel_native_lark.py tests/test_channel_native_codex.py tests/test_channel_native_takeover.py tests/test_channel_native_views_auth_outbox.py tests/test_channel_native_persistence_reliability.py tests/test_channel_native_streaming_guardrails.py
+uv run --with pytest python -m pytest tests/test_channel_native_core.py tests/test_channel_native_claude_headless.py tests/test_channel_native_lark.py tests/test_channel_native_codex.py tests/test_channel_native_takeover.py tests/test_channel_native_views_auth_outbox.py tests/test_channel_native_persistence_reliability.py tests/test_channel_native_streaming_guardrails.py
 43 passed
 
 uv run --with pytest python -m pytest
@@ -575,7 +575,7 @@ Verification:
 uv run --with pytest python -m pytest tests/test_channel_native_persistence_reliability.py
 9 passed
 
-uv run --with pytest python -m pytest tests/test_channel_native_core.py tests/test_channel_native_telegram_claude.py tests/test_channel_native_lark.py tests/test_channel_native_codex.py tests/test_channel_native_takeover.py tests/test_channel_native_views_auth_outbox.py tests/test_channel_native_persistence_reliability.py tests/test_channel_native_streaming_guardrails.py
+uv run --with pytest python -m pytest tests/test_channel_native_core.py tests/test_channel_native_claude_headless.py tests/test_channel_native_lark.py tests/test_channel_native_codex.py tests/test_channel_native_takeover.py tests/test_channel_native_views_auth_outbox.py tests/test_channel_native_persistence_reliability.py tests/test_channel_native_streaming_guardrails.py
 47 passed
 
 uv run python -m compileall -q src/walkcode/channel_native
@@ -625,7 +625,7 @@ Verification:
 uv run --with pytest python -m pytest tests/test_channel_native_views_auth_outbox.py
 12 passed
 
-uv run --with pytest python -m pytest tests/test_channel_native_core.py tests/test_channel_native_telegram_claude.py tests/test_channel_native_lark.py tests/test_channel_native_codex.py tests/test_channel_native_takeover.py tests/test_channel_native_views_auth_outbox.py tests/test_channel_native_persistence_reliability.py tests/test_channel_native_streaming_guardrails.py
+uv run --with pytest python -m pytest tests/test_channel_native_core.py tests/test_channel_native_claude_headless.py tests/test_channel_native_lark.py tests/test_channel_native_codex.py tests/test_channel_native_takeover.py tests/test_channel_native_views_auth_outbox.py tests/test_channel_native_persistence_reliability.py tests/test_channel_native_streaming_guardrails.py
 51 passed
 
 uv run python -m compileall -q src/walkcode/channel_native
@@ -725,7 +725,7 @@ Verification:
 uv run --with pytest python -m pytest tests/test_channel_native_e2e_gates.py
 5 passed
 
-uv run --with pytest python -m pytest tests/test_channel_native_core.py tests/test_channel_native_telegram_claude.py tests/test_channel_native_lark.py tests/test_channel_native_codex.py tests/test_channel_native_takeover.py tests/test_channel_native_views_auth_outbox.py tests/test_channel_native_persistence_reliability.py tests/test_channel_native_streaming_guardrails.py tests/test_channel_native_config.py tests/test_channel_native_e2e_gates.py
+uv run --with pytest python -m pytest tests/test_channel_native_core.py tests/test_channel_native_claude_headless.py tests/test_channel_native_lark.py tests/test_channel_native_codex.py tests/test_channel_native_takeover.py tests/test_channel_native_views_auth_outbox.py tests/test_channel_native_persistence_reliability.py tests/test_channel_native_streaming_guardrails.py tests/test_channel_native_config.py tests/test_channel_native_e2e_gates.py
 61 passed
 
 uv run python -m compileall -q src/walkcode/channel_native
@@ -852,7 +852,7 @@ Verification:
 uv run --with pytest python -m pytest tests/test_channel_native_routing.py
 4 passed
 
-uv run --with pytest python -m pytest tests/test_channel_native_telegram_claude.py tests/test_channel_native_routing.py tests/test_channel_native_attachments.py
+uv run --with pytest python -m pytest tests/test_channel_native_claude_headless.py tests/test_channel_native_routing.py tests/test_channel_native_attachments.py
 13 passed
 
 uv run python -m compileall -q src/walkcode/channel_native
@@ -898,7 +898,7 @@ Verification:
 uv run --with pytest python -m pytest tests/test_channel_native_callback_ack.py
 3 passed
 
-uv run --with pytest python -m pytest tests/test_channel_native_callback_ack.py tests/test_channel_native_views_auth_outbox.py tests/test_channel_native_telegram_claude.py tests/test_channel_native_lark.py
+uv run --with pytest python -m pytest tests/test_channel_native_callback_ack.py tests/test_channel_native_views_auth_outbox.py tests/test_channel_native_claude_headless.py tests/test_channel_native_lark.py
 27 passed
 
 uv run python -m compileall -q src/walkcode/channel_native
@@ -1293,7 +1293,7 @@ Verification:
 uv run --with pytest python -m pytest tests/test_channel_native_resume_boundary.py
 4 passed
 
-uv run --with pytest python -m pytest tests/test_channel_native_resume_boundary.py tests/test_channel_native_takeover_orchestrator.py tests/test_channel_native_takeover.py tests/test_channel_native_codex.py tests/test_channel_native_telegram_claude.py tests/test_channel_native_persistence_reliability.py
+uv run --with pytest python -m pytest tests/test_channel_native_resume_boundary.py tests/test_channel_native_takeover_orchestrator.py tests/test_channel_native_takeover.py tests/test_channel_native_codex.py tests/test_channel_native_claude_headless.py tests/test_channel_native_persistence_reliability.py
 33 passed
 
 uv run python -m compileall -q src/walkcode/channel_native
@@ -1555,10 +1555,10 @@ Design:
 Verification:
 
 ```text
-uv run --with pytest python -m pytest tests/test_channel_native_telegram_claude.py -k real_sdk_shape
+uv run --with pytest python -m pytest tests/test_channel_native_claude_headless.py -k real_sdk_shape
 1 passed, 7 deselected
 
-uv run --with pytest python -m pytest tests/test_channel_native_telegram_claude.py tests/test_channel_native_runtime.py tests/test_channel_native_config.py
+uv run --with pytest python -m pytest tests/test_channel_native_claude_headless.py tests/test_channel_native_runtime.py tests/test_channel_native_config.py
 26 passed
 
 uv run --with pytest python -m pytest tests/test_channel_native_*.py
@@ -2013,7 +2013,7 @@ Verification target:
 uv run --with pytest python -m pytest \
   tests/test_channel_native_config.py \
   tests/test_channel_native_routing.py \
-  tests/test_channel_native_telegram_claude.py \
+  tests/test_channel_native_claude_headless.py \
   tests/test_channel_native_runtime.py
 
 51 passed
@@ -2208,7 +2208,7 @@ Verification:
 
 ```text
 uv run --with pytest python -m pytest \
-  tests/test_channel_native_telegram_claude.py \
+  tests/test_channel_native_claude_headless.py \
   tests/test_channel_native_config.py \
   tests/test_channel_native_runtime.py \
   tests/test_channel_native_core.py \
@@ -2249,7 +2249,7 @@ Verification:
 ```text
 uv run --with pytest python -m pytest \
   tests/test_channel_native_runtime.py \
-  tests/test_channel_native_telegram_claude.py
+  tests/test_channel_native_claude_headless.py
 
 54 passed
 ```
@@ -2286,7 +2286,7 @@ Verification:
 ```text
 uv run --with pytest python -m pytest \
   tests/test_channel_native_runtime.py \
-  tests/test_channel_native_telegram_claude.py \
+  tests/test_channel_native_claude_headless.py \
   tests/test_channel_native_persistence_reliability.py
 ```
 
@@ -2345,7 +2345,7 @@ Verification:
 ```text
 uv run --with pytest python -m pytest \
   tests/test_channel_native_runtime.py \
-  tests/test_channel_native_telegram_claude.py \
+  tests/test_channel_native_claude_headless.py \
   tests/test_channel_native_codex.py
 ```
 
@@ -2436,7 +2436,7 @@ uv run --with pytest python -m pytest \
   tests/test_channel_native_routing.py \
   tests/test_channel_native_takeover_orchestrator.py \
   tests/test_channel_native_runtime.py \
-  tests/test_channel_native_telegram_claude.py
+  tests/test_channel_native_claude_headless.py
 ```
 
 ## Slice 43: Observed TUI Lease Reconciliation and Idempotent Takeover

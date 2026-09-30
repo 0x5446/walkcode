@@ -58,7 +58,8 @@ identities.
 
 ## Channels
 
-Lark/Feishu is the first deployable channel (ADR 0044). One
+Lark/Feishu is the only channel (ADR 0044; Telegram was removed in ADR 0069
+and `WALKCODE_CHANNEL=telegram` is a config error). One
 `LarkChannelAdapter` serves both tenants; `LARK_OPENAPI_DOMAIN` selects
 open.feishu.cn (work) or open.larksuite.com (personal). Ingress is the
 lark-oapi WebSocket client bridged from its callback thread into the asyncio
@@ -151,13 +152,11 @@ The throttle watermark (`Session.title_refreshed_at`) is persisted on the
 session rather than the transport, because one codex thread hops between TUI
 and app-server across takeover/handback.
 
-Telegram is a peer `ChannelAdapter` kept as the architecture-validation
-channel (code and tests stay; no further UX investment). Telegram session
-placement is capability-driven:
-
-- forum supergroup with topic-management rights: one topic per agent session;
-- private chat with bot private-topic mode: one topic per agent session;
-- plain private chat or non-topic group: root reply-chain fallback.
+The core stays channel-neutral: `ChannelAdapter` is still the seam, and
+`channel_kind` is still part of every binding key, so a future channel is a new
+adapter rather than a core change. Persisted bindings of a removed channel
+(old `channel_kind: "telegram"` sessions) load normally; the runtime simply
+has no adapter to deliver to them.
 
 The durable channel binding key is:
 
@@ -297,9 +296,9 @@ Legacy implementation details no longer define the architecture:
 Before a V3 runtime consumes IM updates:
 
 ```bash
-uv run --with claude-agent-sdk python scripts/channel_native_debug.py --env-file ~/.walkcode/telegram-claude.env runtime
-uv run --with claude-agent-sdk python scripts/channel_native_debug.py --env-file ~/.walkcode/telegram-claude.env state
-uv run --with claude-agent-sdk python scripts/channel_native_debug.py --env-file ~/.walkcode/telegram-claude.env telegram
+uv run --with claude-agent-sdk python scripts/channel_native_debug.py --env-file ~/.walkcode/work-claude.env runtime
+uv run --with claude-agent-sdk python scripts/channel_native_debug.py --env-file ~/.walkcode/work-claude.env state
+uv run --with claude-agent-sdk python scripts/channel_native_debug.py --env-file ~/.walkcode/work-claude.env lark
 ```
 
 The runtime gate reports old LaunchAgents, old `walkcode hook` configs, shell
