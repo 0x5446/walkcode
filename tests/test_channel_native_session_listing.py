@@ -32,11 +32,11 @@ class _Clock:
 
 
 def _actor(actor_id: str = "owner") -> ActorRef:
-    return ActorRef(channel_kind="telegram", actor_id=actor_id, display_name=actor_id.title())
+    return ActorRef(channel_kind="lark", actor_id=actor_id, display_name=actor_id.title())
 
 
 def _binding(root: str = "root", *, chat: str = "chat", thread: str = "topic") -> ChannelBinding:
-    return ChannelBinding("telegram", "bot", chat, thread, root)
+    return ChannelBinding("lark", "bot", chat, thread, root)
 
 
 def _channel_caps() -> ChannelCapabilities:
@@ -81,7 +81,7 @@ def _orchestrator():
         sessions=SessionRegistry(now=clock),
         interactions=InteractionStore(now=clock),
         outbox=DurableOutbox(now=clock),
-        channels={"telegram": FakeChannelAdapter("telegram", _channel_caps())},
+        channels={"lark": FakeChannelAdapter("lark", _channel_caps())},
         transports={"fake-transport": transport},
         authz=authz,
         now=clock,
@@ -117,7 +117,7 @@ class SessionListingTests(unittest.TestCase):
         )
 
         summaries = sessions.list_sessions(
-            channel_kind="telegram",
+            channel_kind="lark",
             account_id="bot",
             chat_id="chat",
             thread_id="topic",

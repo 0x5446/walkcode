@@ -1271,12 +1271,12 @@ class OrchestratorPersistentDrainTests(unittest.TestCase):
             settle_grace_seconds=grace,
             background_wait_ceiling_seconds=ceiling,
         )
-        channel = FakeChannelAdapter("telegram", self._channel_caps())
+        channel = FakeChannelAdapter("lark", self._channel_caps())
         orch = Orchestrator(
             sessions=SessionRegistry(),
             interactions=InteractionStore(),
             outbox=DurableOutbox(),
-            channels={"telegram": channel},
+            channels={"lark": channel},
             transports={"claude_headless": transport},
             authz=AuthorizationStore(),
             defer_event_drain=True,
@@ -1303,8 +1303,8 @@ class OrchestratorPersistentDrainTests(unittest.TestCase):
         async def scenario():
             cls = _stream_client_class()
             transport, channel, orch = self._build(cls)
-            owner = ActorRef("telegram", "owner", "Owner")
-            binding = ChannelBinding("telegram", "bot", "chat", "topic", "root")
+            owner = ActorRef("lark", "owner", "Owner")
+            binding = ChannelBinding("lark", "bot", "chat", "topic", "root")
             session = await orch.start_session(binding, "claude_headless", "/tmp/p", owner)
             await orch.submit_user_input(
                 session.session_id, TurnInput(text="深度调研"), actor=owner, generation=session.generation
@@ -1338,8 +1338,8 @@ class OrchestratorPersistentDrainTests(unittest.TestCase):
             cls = _stream_client_class()
             # Long grace keeps the listener attached between the two submits.
             transport, channel, orch = self._build(cls, grace=5.0)
-            owner = ActorRef("telegram", "owner", "Owner")
-            binding = ChannelBinding("telegram", "bot", "chat", "topic", "root")
+            owner = ActorRef("lark", "owner", "Owner")
+            binding = ChannelBinding("lark", "bot", "chat", "topic", "root")
             session = await orch.start_session(binding, "claude_headless", "/tmp/p", owner)
             await orch.submit_user_input(
                 session.session_id, TurnInput(text="one"), actor=owner, generation=session.generation
@@ -1374,8 +1374,8 @@ class OrchestratorPersistentDrainTests(unittest.TestCase):
         async def scenario():
             cls = _stream_client_class()
             transport, channel, orch = self._build(cls)
-            owner = ActorRef("telegram", "owner", "Owner")
-            binding = ChannelBinding("telegram", "bot", "chat", "topic", "root")
+            owner = ActorRef("lark", "owner", "Owner")
+            binding = ChannelBinding("lark", "bot", "chat", "topic", "root")
             session = await orch.start_session(binding, "claude_headless", "/tmp/p", owner)
             await orch.submit_user_input(
                 session.session_id, TurnInput(text="one"), actor=owner, generation=session.generation
@@ -1519,7 +1519,7 @@ class DeepReviewRegressionTests(unittest.TestCase):
                 background_wait_ceiling_seconds=30.0,
             )
             channel = FakeChannelAdapter(
-                "telegram",
+                "lark",
                 ChannelCapabilities(
                     thread_context=True,
                     editable_message=True,
@@ -1538,13 +1538,13 @@ class DeepReviewRegressionTests(unittest.TestCase):
                 sessions=SessionRegistry(),
                 interactions=InteractionStore(),
                 outbox=DurableOutbox(),
-                channels={"telegram": channel},
+                channels={"lark": channel},
                 transports={"claude_headless": transport},
                 authz=AuthorizationStore(),
                 defer_event_drain=True,
             )
-            owner = ActorRef("telegram", "owner", "Owner")
-            binding = ChannelBinding("telegram", "bot", "chat", "topic", "root")
+            owner = ActorRef("lark", "owner", "Owner")
+            binding = ChannelBinding("lark", "bot", "chat", "topic", "root")
             session = await orch.start_session(binding, "claude_headless", "/tmp/p", owner)
             await orch.submit_user_input(
                 session.session_id, TurnInput(text="one"), actor=owner, generation=session.generation
@@ -1577,7 +1577,7 @@ class DeepReviewRegressionTests(unittest.TestCase):
             cls = _stream_client_class()
             transport = _transport(cls, grace=5.0)
             channel = FakeChannelAdapter(
-                "telegram",
+                "lark",
                 ChannelCapabilities(
                     thread_context=True,
                     editable_message=True,
@@ -1596,12 +1596,12 @@ class DeepReviewRegressionTests(unittest.TestCase):
                 sessions=SessionRegistry(),
                 interactions=InteractionStore(),
                 outbox=DurableOutbox(),
-                channels={"telegram": channel},
+                channels={"lark": channel},
                 transports={"claude_headless": transport},
                 defer_event_drain=True,
             )
-            owner = ActorRef("telegram", "owner", "Owner")
-            binding = ChannelBinding("telegram", "bot", "chat", "topic", "root")
+            owner = ActorRef("lark", "owner", "Owner")
+            binding = ChannelBinding("lark", "bot", "chat", "topic", "root")
             session = await orch.start_session(binding, "claude_headless", "/tmp/p", owner)
             await orch.submit_user_input(
                 session.session_id, TurnInput(text="one"), actor=owner, generation=session.generation
@@ -1672,7 +1672,7 @@ class DeepReviewRegressionTests(unittest.TestCase):
             cls = _stream_client_class()
             transport = _transport(cls, grace=0.05, ceiling=0.3)
             channel = FakeChannelAdapter(
-                "telegram",
+                "lark",
                 ChannelCapabilities(
                     thread_context=True,
                     editable_message=True,
@@ -1691,13 +1691,13 @@ class DeepReviewRegressionTests(unittest.TestCase):
                 sessions=SessionRegistry(),
                 interactions=InteractionStore(),
                 outbox=DurableOutbox(),
-                channels={"telegram": channel},
+                channels={"lark": channel},
                 transports={"claude_headless": transport},
                 authz=AuthorizationStore(),
                 defer_event_drain=True,
             )
-            owner = ActorRef("telegram", "owner", "Owner")
-            binding = ChannelBinding("telegram", "bot", "chat", "topic", "root")
+            owner = ActorRef("lark", "owner", "Owner")
+            binding = ChannelBinding("lark", "bot", "chat", "topic", "root")
             session = await orch.start_session(binding, "claude_headless", "/tmp/p", owner)
             await orch.submit_user_input(
                 session.session_id, TurnInput(text="go"), actor=owner, generation=session.generation

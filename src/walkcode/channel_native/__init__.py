@@ -15,7 +15,6 @@ import subprocess
 import time
 import uuid
 import inspect
-import html
 import json
 import math
 import os
@@ -23,9 +22,7 @@ import re
 import shlex
 import sys
 import tempfile
-import urllib.error
 import urllib.parse
-import urllib.request
 import random
 
 from collections.abc import Callable, Iterable, Iterator
@@ -71,8 +68,7 @@ UNSAFE_SANDBOX_MESSAGE = (
     "refusing to run an unsandboxed Codex thread on a channel with no sender "
     "allowlist: anyone who can message this bot would get arbitrary command "
     "execution on this host. Set the channel's allowlist "
-    "(LARK_ALLOWED_CHAT_IDS / LARK_ALLOWED_OPEN_IDS, TELEGRAM_ALLOWED_CHAT_IDS / "
-    "TELEGRAM_ALLOWED_ACTOR_IDS), or constrain the sandbox via "
+    "(LARK_ALLOWED_CHAT_IDS / LARK_ALLOWED_OPEN_IDS), or constrain the sandbox via "
     "WALKCODE_CODEX_SANDBOX, or opt in explicitly with "
     "WALKCODE_CODEX_ALLOW_UNRESTRICTED_WITHOUT_ALLOWLIST=1"
 )
@@ -164,8 +160,8 @@ class ChannelConfigError(ValueError):
 class UnsafeSandboxError(RuntimeError):
     """Raised when a thread would run unsandboxed on an unrestricted channel.
 
-    Deliberately NOT a ChannelConfigError: the lark/telegram ingress loops
-    re-raise that one to kill the process, and under launchd a fatal error
+    Deliberately NOT a ChannelConfigError: the lark ingress loop
+    re-raises that one to kill the process, and under launchd a fatal error
     thrown per inbound message is a crash loop with nothing visible in chat.
     Refusing the one thread keeps the instance alive and the refusal in the
     logs. The genuinely static half of this check — an explicit
@@ -305,8 +301,11 @@ class ChannelNativeConfig:
             )
 
         if channel_kind == "telegram":
-            channel = _telegram_config_from_env(source)
-        elif channel_kind == "lark":
+            raise ChannelConfigError(
+                "WALKCODE_CHANNEL=telegram is no longer supported: the Telegram channel "
+                "was retired (ADR 0069). Use WALKCODE_CHANNEL=lark"
+            )
+        if channel_kind == "lark":
             channel = _lark_config_from_env(source)
         else:
             raise ChannelConfigError(f"unknown channel configured: {channel_kind}")
@@ -385,11 +384,6 @@ class E2EGateResult:
 
 class ChannelNativeE2EGates:
     _SPECS = {
-        "telegram": E2EGateSpec(
-            name="telegram",
-            flag="WALKCODE_E2E_TELEGRAM",
-            required_env=("TELEGRAM_BOT_TOKEN", "WALKCODE_E2E_TELEGRAM_CHAT_ID"),
-        ),
         "lark": E2EGateSpec(
             name="lark",
             flag="WALKCODE_E2E_LARK",
@@ -452,7 +446,7 @@ def _configured_channel_kind(source: Any) -> str:
     explicit = str(source.get("WALKCODE_CHANNEL", "") or "").strip()
     if explicit:
         if "," in explicit:
-            raise ChannelConfigError("WALKCODE_CHANNEL accepts exactly one channel: telegram or lark")
+            raise ChannelConfigError("WALKCODE_CHANNEL accepts exactly one channel: lark")
         return explicit
     return ""
 
@@ -622,7 +616,7 @@ def _configured_state_path(source: Any, channel_kind: str, agent: str, profile: 
 
 def _reject_removed_runtime_env(source: Any) -> None:
     removed = {
-        "WALKCODE_CHANNELS": "use WALKCODE_CHANNEL=telegram or WALKCODE_CHANNEL=lark",
+        "WALKCODE_CHANNELS": "use WALKCODE_CHANNEL=lark",
         "WALKCODE_PRIMARY_CHANNEL": "remove it; one runtime instance has exactly one WALKCODE_CHANNEL",
         "WALKCODE_TRANSPORTS": "remove it; AgentTransport wiring is internal",
         "WALKCODE_DEFAULT_TRANSPORT": "use WALKCODE_AGENT=claude|codex to bind this bot to one agent",
@@ -677,40 +671,6 @@ def _agent_to_transport_kind(agent: str) -> str:
     if normalized == "codex":
         return "codex_app_server"
     raise ChannelConfigError(f"unknown agent configured: {agent}")
-
-
-def _telegram_config_from_env(source: Any) -> ChannelEndpointConfig:
-    token = source.get("TELEGRAM_BOT_TOKEN", "")
-    if not token:
-        raise ChannelConfigError("missing TELEGRAM_BOT_TOKEN for telegram channel")
-    webhook_url = source.get("TELEGRAM_WEBHOOK_URL", "")
-    allowed_chat_ids = _split_csv(source.get("TELEGRAM_ALLOWED_CHAT_IDS", ""))
-    e2e_chat_id = str(source.get("WALKCODE_E2E_TELEGRAM_CHAT_ID", "") or "").strip()
-    if not allowed_chat_ids and e2e_chat_id:
-        allowed_chat_ids = [e2e_chat_id]
-    tui_chat_id = str(source.get("WALKCODE_TELEGRAM_TUI_CHAT_ID", "") or "").strip()
-    tui_thread_id = str(source.get("WALKCODE_TELEGRAM_TUI_THREAD_ID", "") or "").strip()
-    allowed_actor_ids = _split_csv(
-        source.get("TELEGRAM_ALLOWED_ACTOR_IDS", "")
-        or source.get("TELEGRAM_ALLOWED_USER_IDS", "")
-    )
-    return ChannelEndpointConfig(
-        kind="telegram",
-        credentials={"bot_token": token},
-        options={
-            "allowed_chat_ids": tuple(allowed_chat_ids),
-            "allowed_actor_ids": tuple(allowed_actor_ids),
-            "rich_messages": _env_bool(
-                source.get("WALKCODE_TELEGRAM_RICH_MESSAGES")
-                or source.get("TELEGRAM_RICH_MESSAGES"),
-                default=False,
-            ),
-            "tui_chat_id": tui_chat_id,
-            "tui_thread_id": tui_thread_id,
-            "webhook_url": webhook_url,
-            "polling": _env_bool(source.get("TELEGRAM_POLLING"), default=not bool(webhook_url)),
-        },
-    )
 
 
 def _lark_config_from_env(source: Any) -> ChannelEndpointConfig:
@@ -910,7 +870,6 @@ Interaction context (important): The user is talking to you through {channel} ch
 
 _CHANNEL_DISPLAY_NAMES = {
     "lark": "Feishu (Lark)",
-    "telegram": "Telegram",
 }
 
 
@@ -925,16 +884,16 @@ def _channel_allowlist_configured(channel: ChannelEndpointConfig) -> bool:
     """True when this channel restricts who may drive the agent.
 
     Every allowlist option is "empty means allow everyone" (see
-    `_lark_chat_allowed` / the telegram equivalents), which is a reasonable
+    `_lark_chat_allowed` / `_lark_sender_allowed`), which is a reasonable
     bootstrap default on its own but not in combination with an unsandboxed
-    agent. Any one list being non-empty counts as restricted: the channels
-    apply chat-level and sender-level lists independently, so requiring both
+    agent. Any one list being non-empty counts as restricted: the channel
+    applies chat-level and sender-level lists independently, so requiring both
     would reject setups that are already locked down by one of them.
     """
     options = channel.options or {}
     return any(
         bool(options.get(key))
-        for key in ("allowed_chat_ids", "allowed_open_ids", "allowed_actor_ids")
+        for key in ("allowed_chat_ids", "allowed_open_ids")
     )
 
 
@@ -3138,9 +3097,9 @@ class ViewModelFactory:
                 }
             )
         submit = None if immediate else {"action": "submit_all", "label": "Submit", "token": tok("submit_all")}
-        # Flattened actions for channels with a generic button renderer
-        # (e.g. Telegram inline keyboard); the Lark card renderer uses the
-        # structured `questions` layout instead.
+        # Flattened actions for generic button renderers (and the plain-text
+        # fallback); the Lark card renderer uses the structured `questions`
+        # layout instead.
         flat_actions: list[dict[str, Any]] = []
         for q in questions:
             for opt in q["options"]:
@@ -4479,90 +4438,6 @@ def _is_takeover_command(text: str) -> bool:
     return command in {"/takeover", "/take_over"}
 
 
-def _telegram_should_render_markdown(view_model: dict[str, Any], text: str) -> bool:
-    if view_model.get("type") not in {"turn_delta", "turn_completed", "text"}:
-        return False
-    return bool(
-        re.search(
-            r"(^|\n)\s{0,3}#{1,6}\s+"
-            r"|(^|\n)\s*\|.+\|\s*($|\n)"
-            r"|```"
-            r"|`[^`\n]+`"
-            r"|\*\*[^*\n][\s\S]*?\*\*"
-            r"|\[[^\]\n]+\]\(https?://[^)\s]+\)",
-            text,
-        )
-    )
-
-
-def _telegram_html_from_markdown(text: str) -> str:
-    parts: list[str] = []
-    pos = 0
-    fence_pattern = re.compile(r"```[ \t]*([A-Za-z0-9_+-]+)?[ \t]*\n?([\s\S]*?)```")
-    for match in fence_pattern.finditer(text):
-        parts.append(_telegram_html_from_markdown_segment(text[pos:match.start()]))
-        code = html.escape(match.group(2).strip("\n"), quote=False)
-        parts.append(f"<pre>{code}</pre>")
-        pos = match.end()
-    parts.append(_telegram_html_from_markdown_segment(text[pos:]))
-    return "".join(parts)
-
-
-def _telegram_html_from_markdown_segment(text: str) -> str:
-    lines = text.splitlines()
-    rendered: list[str] = []
-    index = 0
-    while index < len(lines):
-        line = lines[index]
-        stripped = line.strip()
-        if _looks_like_markdown_table_row(stripped):
-            table_lines = []
-            while index < len(lines) and _looks_like_markdown_table_row(lines[index].strip()):
-                table_lines.append(lines[index])
-                index += 1
-            rendered.append(f"<pre>{html.escape(chr(10).join(table_lines), quote=False)}</pre>")
-            continue
-        heading = re.match(r"^\s{0,3}#{1,6}\s+(.+?)\s*#*\s*$", line)
-        if heading:
-            rendered.append(f"<b>{_telegram_inline_markdown_to_html(heading.group(1))}</b>")
-        else:
-            rendered.append(_telegram_inline_markdown_to_html(line))
-        index += 1
-    if not lines:
-        return ""
-    suffix = "\n" if text.endswith("\n") else ""
-    return "\n".join(rendered) + suffix
-
-
-def _looks_like_markdown_table_row(line: str) -> bool:
-    return line.startswith("|") and line.endswith("|") and line.count("|") >= 2
-
-
-def _telegram_inline_markdown_to_html(text: str) -> str:
-    code_spans: list[str] = []
-
-    def keep_code(match: re.Match[str]) -> str:
-        code_spans.append(f"<code>{html.escape(match.group(1), quote=False)}</code>")
-        return f"\x00CODE{len(code_spans) - 1}\x00"
-
-    protected = re.sub(r"`([^`\n]+)`", keep_code, text)
-    escaped = html.escape(protected, quote=False)
-    escaped = re.sub(
-        r"\[([^\]\n]+)\]\((https?://[^)\s]+)\)",
-        lambda match: (
-            f'<a href="{html.escape(match.group(2), quote=True)}">'
-            f"{match.group(1)}</a>"
-        ),
-        escaped,
-    )
-    escaped = re.sub(r"\*\*([^*\n]+?)\*\*", r"<b>\1</b>", escaped)
-    escaped = re.sub(r"__([^_\n]+?)__", r"<u>\1</u>", escaped)
-    escaped = re.sub(r"~~([^~\n]+?)~~", r"<s>\1</s>", escaped)
-    for index, code in enumerate(code_spans):
-        escaped = escaped.replace(f"\x00CODE{index}\x00", code)
-    return escaped
-
-
 def _format_ask_answers(ctx: "InteractionContext") -> str:
     # "周末计划: 出门浪、吃啥: 碳水快乐" — keyed by each question's header,
     # multi-select labels comma-joined (not a Python list repr).
@@ -4794,431 +4669,6 @@ def _sdk_block_field(content: Any, key: str) -> Any:
     return getattr(content, key, "")
 
 
-def _telegram_http_error_details(exc: urllib.error.HTTPError) -> tuple[str, float | None]:
-    body = ""
-    try:
-        body = exc.read().decode("utf-8", errors="replace")
-    except Exception:
-        body = ""
-    retry_after: float | None = None
-    description = ""
-    if body:
-        try:
-            payload = json.loads(body)
-        except json.JSONDecodeError:
-            payload = {}
-        if isinstance(payload, dict):
-            description = str(payload.get("description", "") or "")
-            parameters = payload.get("parameters", {})
-            if isinstance(parameters, dict) and parameters.get("retry_after") is not None:
-                try:
-                    retry_after = float(parameters["retry_after"])
-                except (TypeError, ValueError):
-                    retry_after = None
-    reason = description or getattr(exc, "reason", "") or str(exc)
-    return f"HTTP Error {exc.code}: {reason}", retry_after
-
-
-class TelegramBotApi:
-    def __init__(self, token: str, caller: Callable[[str, dict[str, Any]], Any] | None = None):
-        self.token = token
-        self._caller = caller
-
-    async def call(self, method: str, payload: dict[str, Any]) -> dict[str, Any]:
-        if self._caller is not None:
-            result = self._caller(method, payload)
-            return await _maybe_await(result)
-        return await asyncio.to_thread(self._call_sync, method, payload)
-
-    async def download_file(self, file_path: str) -> bytes:
-        if self._caller is not None:
-            result = self._caller("downloadFile", {"file_path": file_path})
-            result = await _maybe_await(result)
-            if isinstance(result, bytes):
-                return result
-            if isinstance(result, str):
-                return result.encode("utf-8")
-            if isinstance(result, dict):
-                content = result.get("content", b"")
-                if isinstance(content, bytes):
-                    return content
-                return str(content).encode("utf-8")
-            return bytes(result)
-        return await asyncio.to_thread(self._download_file_sync, file_path)
-
-    def _call_sync(self, method: str, payload: dict[str, Any]) -> dict[str, Any]:
-        url = f"https://api.telegram.org/bot{self.token}/{method}"
-        body = json.dumps(payload).encode("utf-8")
-        request = urllib.request.Request(
-            url,
-            data=body,
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        try:
-            with urllib.request.urlopen(request, timeout=self._http_timeout(method, payload)) as response:
-                return json.loads(response.read().decode("utf-8"))
-        except urllib.error.HTTPError as exc:
-            message, retry_after = _telegram_http_error_details(exc)
-            if exc.code == 429 or 500 <= exc.code <= 599:
-                raise TransientDeliveryError(message, retry_after=retry_after) from exc
-            raise
-        except (TimeoutError, ConnectionError, urllib.error.URLError) as exc:
-            raise TransientDeliveryError(str(exc)) from exc
-
-    def _download_file_sync(self, file_path: str) -> bytes:
-        url = f"https://api.telegram.org/file/bot{self.token}/{file_path}"
-        with urllib.request.urlopen(url, timeout=30) as response:
-            return response.read()
-
-    @staticmethod
-    def _http_timeout(method: str, payload: dict[str, Any]) -> int:
-        if method != "getUpdates":
-            return 30
-        try:
-            poll_timeout = int(payload.get("timeout", 0) or 0)
-        except (TypeError, ValueError):
-            poll_timeout = 0
-        return max(30, poll_timeout + 10)
-
-
-class TelegramChannelAdapter:
-    def __init__(
-        self,
-        api: TelegramBotApi,
-        *,
-        max_text_chars: int = 4096,
-        use_rich_messages: bool = False,
-    ):
-        self.kind = "telegram"
-        self.api = api
-        self.use_rich_messages = use_rich_messages
-        self._capabilities = ChannelCapabilities(
-            thread_context=True,
-            editable_message=True,
-            interactive_message=True,
-            interactive_update=True,
-            private_callback_ack=True,
-            toast_or_ephemeral_notice=False,
-            force_reply=True,
-            attachment_download=True,
-            forum_or_topic=True,
-            max_text_chars=max_text_chars,
-            max_callback_payload_bytes=64,
-            edit_rate_limit_hint="coalesce streaming edits",
-        )
-        self.sent_texts: list[str] = []
-
-    def capabilities(self) -> ChannelCapabilities:
-        return self._capabilities
-
-    def parse_update(self, update: dict[str, Any]) -> InboundEvent:
-        update_id = str(update.get("update_id", ""))
-        if "callback_query" in update:
-            query = update["callback_query"]
-            message = query.get("message", {})
-            sender = query.get("from", {})
-            data = str(query.get("data", ""))
-            token = data[3:] if data.startswith("cb:") else data
-            chat = message.get("chat", {})
-            return InboundEvent(
-                event_id=f"telegram:{update_id}",
-                channel_kind="telegram",
-                account_id="bot",
-                chat_id=str(chat.get("id", "")),
-                thread_id=str(message.get("message_thread_id", "") or ""),
-                message_id=str(message.get("message_id", "")),
-                root_message_id=str(message.get("reply_to_message", {}).get("message_id", "") or ""),
-                sender_id=str(sender.get("id", "")),
-                sender_display=self._display_name(sender),
-                text=data,
-                callback={"callback_query_id": str(query.get("id", "")), "data": data, "token": token},
-                raw=update,
-            )
-        message = update.get("message", {})
-        sender = message.get("from", {})
-        chat = message.get("chat", {})
-        return InboundEvent(
-            event_id=f"telegram:{update_id}",
-            channel_kind="telegram",
-            account_id="bot",
-            chat_id=str(chat.get("id", "")),
-            thread_id=str(message.get("message_thread_id", "") or ""),
-            message_id=str(message.get("message_id", "")),
-            root_message_id=str(message.get("reply_to_message", {}).get("message_id", "") or ""),
-            sender_id=str(sender.get("id", "")),
-            sender_display=self._display_name(sender),
-            text=str(message.get("text", "") or message.get("caption", "") or ""),
-            attachments=self._attachments_from_message(message),
-            raw=update,
-        )
-
-    async def send_view(self, binding: ChannelBinding, view_model: dict[str, Any]) -> str:
-        text = self._text_from_view(view_model)
-        reply_markup = self._reply_markup_from_view(view_model)
-        if _telegram_should_render_markdown(view_model, text):
-            if self.use_rich_messages:
-                rich_payload: dict[str, Any] = {
-                    "chat_id": binding.chat_id,
-                    "rich_message": {"markdown": text},
-                }
-                if binding.thread_id:
-                    rich_payload["message_thread_id"] = binding.thread_id
-                if reply_markup:
-                    rich_payload["reply_markup"] = reply_markup
-                try:
-                    result = await self.api.call("sendRichMessage", rich_payload)
-                    self.sent_texts.append(text)
-                    return str(result.get("result", {}).get("message_id", ""))
-                except (TransientDeliveryError, PermanentDeliveryError):
-                    raise
-                except Exception:
-                    pass
-            html_text = _telegram_html_from_markdown(text)
-            if len(html_text) <= self._capabilities.max_text_chars:
-                try:
-                    result = await self._send_text_once(
-                        binding,
-                        html_text,
-                        reply_markup=reply_markup,
-                        parse_mode="HTML",
-                    )
-                    self.sent_texts.append(html_text)
-                    return str(result.get("result", {}).get("message_id", ""))
-                except (TransientDeliveryError, PermanentDeliveryError):
-                    raise
-                except Exception:
-                    pass
-        chunks = [{"text": chunk} for chunk in self._split_text(text)]
-        last_message_id = ""
-        for chunk in chunks:
-            result = await self._send_text_once(binding, chunk["text"], reply_markup=reply_markup)
-            self.sent_texts.append(chunk["text"])
-            last_message_id = str(result.get("result", {}).get("message_id", ""))
-        return last_message_id
-
-    async def edit_view(self, binding: ChannelBinding, message_id: str, view_model: dict[str, Any]) -> bool:
-        text = self._text_from_view(view_model)
-        reply_markup = self._reply_markup_from_view(view_model)
-        if _telegram_should_render_markdown(view_model, text):
-            if self.use_rich_messages:
-                payload: dict[str, Any] = {
-                    "chat_id": binding.chat_id,
-                    "message_id": message_id,
-                    "rich_message": {"markdown": text},
-                }
-                if reply_markup:
-                    payload["reply_markup"] = reply_markup
-                try:
-                    result = await self.api.call("editMessageText", payload)
-                    return bool(result.get("ok", True))
-                except (TransientDeliveryError, PermanentDeliveryError):
-                    raise
-                except Exception:
-                    pass
-            html_text = _telegram_html_from_markdown(text)
-            if len(html_text) <= self._capabilities.max_text_chars:
-                try:
-                    return await self._edit_text_once(
-                        binding,
-                        message_id,
-                        html_text,
-                        reply_markup=reply_markup,
-                        parse_mode="HTML",
-                    )
-                except (TransientDeliveryError, PermanentDeliveryError):
-                    raise
-                except Exception:
-                    pass
-        chunks = self._split_text(text)
-        if len(chunks) != 1:
-            return False
-        return await self._edit_text_once(binding, message_id, chunks[0], reply_markup=reply_markup)
-
-    async def _send_text_once(
-        self,
-        binding: ChannelBinding,
-        text: str,
-        *,
-        reply_markup: dict[str, Any] | None = None,
-        parse_mode: str = "",
-    ) -> dict[str, Any]:
-        payload: dict[str, Any] = {"chat_id": binding.chat_id, "text": text}
-        if parse_mode:
-            payload["parse_mode"] = parse_mode
-        if binding.thread_id:
-            payload["message_thread_id"] = binding.thread_id
-        if reply_markup:
-            payload["reply_markup"] = reply_markup
-        return await self.api.call("sendMessage", payload)
-
-    async def _edit_text_once(
-        self,
-        binding: ChannelBinding,
-        message_id: str,
-        text: str,
-        *,
-        reply_markup: dict[str, Any] | None = None,
-        parse_mode: str = "",
-    ) -> bool:
-        payload: dict[str, Any] = {
-            "chat_id": binding.chat_id,
-            "message_id": message_id,
-            "text": text,
-        }
-        if parse_mode:
-            payload["parse_mode"] = parse_mode
-        if reply_markup:
-            payload["reply_markup"] = reply_markup
-        result = await self.api.call("editMessageText", payload)
-        return bool(result.get("ok", True))
-
-    async def pin_message(self, binding: ChannelBinding, message_id: str) -> bool:
-        payload: dict[str, Any] = {
-            "chat_id": binding.chat_id,
-            "message_id": message_id,
-            "disable_notification": True,
-        }
-        result = await self.api.call("pinChatMessage", payload)
-        return bool(result.get("ok", True))
-
-    async def send_action(self, binding: ChannelBinding, action: str = "typing") -> bool:
-        payload: dict[str, Any] = {"chat_id": binding.chat_id, "action": action}
-        if binding.thread_id:
-            payload["message_thread_id"] = binding.thread_id
-        result = await self.api.call("sendChatAction", payload)
-        return bool(result.get("ok", True))
-
-    async def react_to_message(self, binding: ChannelBinding, message_id: str, emoji: str = "✅") -> bool:
-        if not message_id:
-            return False
-        result = await self.api.call(
-            "setMessageReaction",
-            {
-                "chat_id": binding.chat_id,
-                "message_id": int(message_id),
-                "reaction": [{"type": "emoji", "emoji": emoji}],
-            },
-        )
-        return bool(result.get("ok", True))
-
-    async def set_bot_commands(self, commands: list[dict[str, str]]) -> bool:
-        payload = {
-            "commands": [
-                {
-                    "command": str(command.get("command", "")).lstrip("/").lower(),
-                    "description": str(command.get("description", ""))[:256],
-                }
-                for command in commands
-                if str(command.get("command", "")).strip()
-            ],
-        }
-        result = await self.api.call("setMyCommands", payload)
-        return bool(result.get("ok", True))
-
-    async def ack_callback(self, inbound: InboundEvent) -> None:
-        callback_query_id = str((inbound.callback or {}).get("callback_query_id", ""))
-        if callback_query_id:
-            await self.api.call("answerCallbackQuery", {"callback_query_id": callback_query_id})
-
-    async def download_attachment(self, attachment: AttachmentRef) -> AttachmentRef:
-        result = await self.api.call("getFile", {"file_id": attachment.source_id})
-        file_path = str(result.get("result", {}).get("file_path", ""))
-        if not file_path:
-            raise PermanentDeliveryError(f"Telegram file path missing for {attachment.source_id}")
-        content = await self.api.download_file(file_path)
-        suffix = Path(file_path).suffix
-        with tempfile.NamedTemporaryFile(
-            "wb",
-            prefix="walkcode-telegram-",
-            suffix=suffix,
-            dir=attachment_download_dir(),
-            delete=False,
-        ) as tmp:
-            tmp.write(content)
-            local_path = tmp.name
-        return AttachmentRef(
-            source_id=attachment.source_id,
-            mime=attachment.mime,
-            local_path=local_path,
-            source_message_id=attachment.source_message_id,
-        )
-
-    def rendered_text(self) -> str:
-        return "\n".join(self.sent_texts)
-
-    def _split_text(self, text: str) -> list[str]:
-        if not text:
-            return [""]
-        limit = self._capabilities.max_text_chars
-        return [text[i:i + limit] for i in range(0, len(text), limit)]
-
-    @staticmethod
-    def _display_name(sender: dict[str, Any]) -> str:
-        first = str(sender.get("first_name", "") or "")
-        last = str(sender.get("last_name", "") or "")
-        username = str(sender.get("username", "") or "")
-        return " ".join(x for x in (first, last) if x) or username
-
-    @staticmethod
-    def _attachments_from_message(message: dict[str, Any]) -> list[AttachmentRef]:
-        attachments: list[AttachmentRef] = []
-        source_message_id = str(message.get("message_id", ""))
-        photos = message.get("photo", [])
-        if isinstance(photos, list) and photos:
-            def photo_weight(item: Any) -> int:
-                if not isinstance(item, dict):
-                    return 0
-                if item.get("file_size") is not None:
-                    return int(item.get("file_size", 0) or 0)
-                return int(item.get("width", 0) or 0) * int(item.get("height", 0) or 0)
-
-            best = max((item for item in photos if isinstance(item, dict)), key=photo_weight, default={})
-            if best.get("file_id"):
-                attachments.append(
-                    AttachmentRef(
-                        source_id=str(best["file_id"]),
-                        mime="image/jpeg",
-                        source_message_id=source_message_id,
-                    )
-                )
-        document = message.get("document")
-        if isinstance(document, dict) and document.get("file_id"):
-            attachments.append(
-                AttachmentRef(
-                    source_id=str(document["file_id"]),
-                    mime=str(document.get("mime_type", "") or ""),
-                    source_message_id=source_message_id,
-                )
-            )
-        return attachments
-
-    @staticmethod
-    def _text_from_view(view_model: dict[str, Any]) -> str:
-        return render_view_text(view_model)
-
-    @staticmethod
-    def _reply_markup_from_view(view_model: dict[str, Any]) -> dict[str, Any] | None:
-        actions = view_model.get("actions")
-        if not isinstance(actions, list) or not actions:
-            return None
-        keyboard = []
-        for action in actions:
-            if not isinstance(action, dict):
-                continue
-            token = str(action.get("token", "") or "")
-            callback_data = f"cb:{token}" if token else str(action.get("action", ""))
-            keyboard.append(
-                [
-                    {
-                        "text": str(action.get("label", "") or action.get("action", "")),
-                        "callback_data": callback_data,
-                    }
-                ]
-            )
-        return {"inline_keyboard": keyboard} if keyboard else None
-
-
 class LarkBotApi:
     def __init__(self, caller: Callable[[str, dict[str, Any]], Any] | None = None):
         self._caller = caller
@@ -5336,7 +4786,7 @@ class LarkChannelAdapter:
             sender_id=str(event.get("open_id", "") or event.get("operator", {}).get("open_id", "")),
             sender_display="",
             text=token,
-            # "data" mirrors Telegram's callback_data: tokenless buttons (e.g.
+            # "data" carries the action name: tokenless buttons (e.g.
             # the status card's request_takeover) are routed by action name.
             # "form" carries a form-container submit's field values (locally
             # staged selections arrive in one callback).
@@ -9863,9 +9313,7 @@ class Orchestrator:
         return session
 
     # Per-channel reaction pools for lightweight acks (Lark values are
-    # emoji_type keys). Telegram is deliberately absent: its runtime already
-    # pre-acks every inbound message with ✅ (_ack_telegram_received), and a
-    # second setMessageReaction would overwrite that receipt.
+    # emoji_type keys).
     _ACK_REACTIONS: dict[str, tuple[str, ...]] = {
         "lark": ("DONE", "OK", "THUMBSUP", "MUSCLE", "APPLAUSE"),
     }
@@ -10854,8 +10302,6 @@ class Orchestrator:
         view = dict(health.view_model)
         view["actions"] = self._status_card_actions(session)
         message_id = str(binding.health_message_id or "")
-        if message_id and bool(binding.capabilities.get("static_status_card")):
-            return
         fingerprint = self._status_card_fingerprint(view)
         # Keyed by the message the fingerprint was taken ON, not just the
         # session: a session can change status cards mid-life (the rootless
@@ -10918,24 +10364,12 @@ class Orchestrator:
                 str(new_message_id),
                 fingerprint,
             )
-        await self._pin_status_card_if_requested(channel, binding)
 
     @staticmethod
     def _status_card_actions(session: Session) -> list[dict[str, Any]]:
         if not _session_is_external_tui_takeover_candidate(session):
             return []
         return [{"action": "request_takeover", "label": "Take over"}]
-
-    async def _pin_status_card_if_requested(self, channel: ChannelAdapter, binding: ChannelBinding) -> None:
-        if not binding.health_message_id or not bool(binding.capabilities.get("pin_status_card")):
-            return
-        pin = getattr(channel, "pin_message", None)
-        if pin is None:
-            return
-        try:
-            await pin(binding, binding.health_message_id)
-        except Exception:
-            return
 
     def _authorize_session_control(
         self,
@@ -11140,11 +10574,9 @@ class Orchestrator:
     @staticmethod
     def _new_binding_capabilities(inbound: InboundEvent) -> dict[str, Any]:
         capabilities: dict[str, Any] = {}
-        if inbound.channel_kind in {"telegram", "lark"} and inbound.thread_id:
+        if inbound.channel_kind == "lark" and inbound.thread_id:
             capabilities["status_card"] = True
             capabilities["native_topic"] = True
-            capabilities["pin_status_card"] = inbound.channel_kind == "telegram"
-            capabilities["static_status_card"] = inbound.channel_kind == "telegram"
             capabilities["origin"] = inbound.channel_kind
         title = _title_from_text(inbound.text)
         if title:
@@ -12259,8 +11691,8 @@ class Orchestrator:
                 and channel.capabilities().editable_message
                 and binding is not None
             ):
-                # edit_view reports failure both ways: False return (e.g.
-                # Telegram API "not modified") and raised errors. Either one
+                # edit_view reports failure both ways: False return and
+                # raised errors. Either one
                 # must fall through to sending a fresh card, with a trace.
                 try:
                     edited = await channel.edit_view(binding, edit_card.message_id, view)
@@ -13047,8 +12479,6 @@ __all__ = [
     "TakeoverError",
     "TakeoverPhase",
     "TakeoverTransaction",
-    "TelegramBotApi",
-    "TelegramChannelAdapter",
     "TransportCapabilities",
     "TransportHandle",
     "TransportUnavailable",

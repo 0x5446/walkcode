@@ -2,7 +2,7 @@
 
 Date: 2026-06-30
 
-Status: Accepted
+Status: Superseded by ADR 0069 (Telegram channel removed, 2026-09-30)
 
 ## Context
 

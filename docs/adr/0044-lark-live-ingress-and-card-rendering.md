@@ -2,7 +2,9 @@
 
 Date: 2026-07-02
 
-Status: Accepted
+Status: Accepted. Amended 2026-09-30 by ADR 0069: the demoted Telegram channel was
+removed entirely, so Lark/Feishu is the only channel and `serve --once` no
+longer exists.
 
 ## Context
 

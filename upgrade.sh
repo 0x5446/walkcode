@@ -12,8 +12,8 @@ set -euo pipefail
 #   ./upgrade.sh [--dry-run]
 #
 # Optional env:
-#   WALKCODE_V3_LAUNCHD_LABELS="com.walkcode.telegram-claude,com.walkcode.telegram-codex"
-#   WALKCODE_ENV_FILE=~/.walkcode/telegram-claude.env
+#   WALKCODE_V3_LAUNCHD_LABELS="com.walkcode.work-claude,com.walkcode.work-codex"
+#   WALKCODE_ENV_FILE=~/.walkcode/work-claude.env
 
 DRY_RUN=false
 [ "${1:-}" = "--dry-run" ] && DRY_RUN=true
@@ -21,7 +21,7 @@ DRY_RUN=false
 REPO="0x5446/walkcode"
 GITHUB_URL="https://github.com/${REPO}.git"
 PYTHON_SPEC="${WALKCODE_PYTHON:-3.13}"
-ENV_FILE="${WALKCODE_ENV_FILE:-$HOME/.walkcode/telegram-claude.env}"
+ENV_FILE="${WALKCODE_ENV_FILE:-$HOME/.walkcode/work-claude.env}"
 LABELS_RAW="${WALKCODE_V3_LAUNCHD_LABELS:-}"
 UID_NUM="$(id -u)"
 

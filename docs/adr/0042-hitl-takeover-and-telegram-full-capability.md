@@ -4,7 +4,8 @@ Date: 2026-07-01
 
 Status: Accepted as target behavior; Codex Telegram-origin server-request
 roundtrip, durable HITL store, and takeover stale-HITL handling implemented;
-live shared-app-server recovery pending.
+live shared-app-server recovery pending. The Telegram half is superseded by
+ADR 0069 (Telegram channel removed); the HITL/takeover rules apply to Lark.
 
 ## Context
 

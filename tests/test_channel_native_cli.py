@@ -14,21 +14,26 @@ from walkcode import channel_native_runtime
 
 class _FakeRuntime:
     def __init__(self, hook_result=None):
-        self.polled = []
+        self.served = []
         self.hooks = []
         self.deferred_hooks = []
         self.hook_result = hook_result or SubmitResult(True)
-        self.config = SimpleNamespace(channel_kind="telegram")
+        self.config = SimpleNamespace(
+            channel_kind="lark",
+            channel=SimpleNamespace(kind="lark"),
+            agent="claude",
+            profile="work",
+        )
 
     def describe(self):
         return {
-            "channel": {"kind": "telegram", "live_ingress": "polling", "configured": True},
+            "channel": {"kind": "lark", "live_ingress": "websocket", "configured": True},
             "agent": "claude",
             "e2e_gates": {
-                "telegram": {
+                "lark": {
                     "enabled": False,
-                    "missing": ["WALKCODE_E2E_TELEGRAM_CHAT_ID"],
-                    "reason": "missing required env for telegram E2E: WALKCODE_E2E_TELEGRAM_CHAT_ID",
+                    "missing": ["WALKCODE_E2E_LARK_CHAT_ID"],
+                    "reason": "missing required env for lark E2E: WALKCODE_E2E_LARK_CHAT_ID",
                 }
             },
             "agent_status": {
@@ -38,39 +43,8 @@ class _FakeRuntime:
             "cwd": "/tmp/project",
         }
 
-    async def poll_telegram_once(self, *, timeout, limit):
-        self.polled.append({"timeout": timeout, "limit": limit})
-        return 2
-
-    async def diagnose_telegram_ingress(self, *, limit):
-        return {
-            "channel": {
-                "kind": "telegram",
-                "polling_enabled": True,
-                "allowlist_configured": True,
-                "allowlist_count": 1,
-                "allowlist_matches_existing_session": True,
-            },
-            "bot": {"ok": True, "username": "walkcode_test_bot"},
-            "webhook": {"ok": True, "has_url": False, "pending_update_count": 1, "last_error_present": False},
-            "pending_updates": {
-                "count": 1,
-                "limit": limit,
-                "items": [
-                    {
-                        "index": 0,
-                        "event_kind": "message",
-                        "chat_allowed": True,
-                        "chat_matches_existing_session": True,
-                        "text_present": True,
-                        "attachment_count": 0,
-                    }
-                ],
-            },
-            "safe_to_run_serve_once": True,
-            "warnings": [],
-            "note": "diagnostic getUpdates does not advance Telegram offset",
-        }
+    async def serve_lark_ws(self):
+        self.served.append("lark_ws")
 
     async def process_tui_hook(self, *, hook_type, payload, agent=""):
         self.hooks.append({"hook_type": hook_type, "payload": dict(payload), "agent": agent})
@@ -91,34 +65,36 @@ class ChannelNativeCliTests(unittest.TestCase):
 
         payload = json.loads(stdout.getvalue())
 
-        self.assertEqual(payload["channel"]["kind"], "telegram")
-        self.assertEqual(payload["channel"]["live_ingress"], "polling")
+        self.assertEqual(payload["channel"]["kind"], "lark")
+        self.assertEqual(payload["channel"]["live_ingress"], "websocket")
         self.assertEqual(payload["agent"], "claude")
-        self.assertFalse(payload["e2e_gates"]["telegram"]["enabled"])
+        self.assertFalse(payload["e2e_gates"]["lark"]["enabled"])
 
-    def test_native_serve_once_polls_once_and_exits(self):
+    def test_native_serve_runs_lark_websocket_ingress(self):
         runtime = _FakeRuntime()
         with patch.object(channel_native_runtime.ChannelNativeRuntime, "from_env", return_value=runtime), \
-             patch.object(sys, "argv", ["walkcode", "native", "serve", "--once", "--poll-timeout", "0", "--limit", "7"]), \
+             patch.dict("os.environ", {}, clear=False), \
+             patch.object(sys, "argv", ["walkcode", "native", "serve"]), \
              patch("sys.stdout", new_callable=io.StringIO) as stdout:
             main.main()
 
-        self.assertEqual(runtime.polled, [{"timeout": 0, "limit": 7}])
-        self.assertIn("processed 2 update(s)", stdout.getvalue())
+        self.assertEqual(runtime.served, ["lark_ws"])
+        self.assertIn("listening via Lark WebSocket", stdout.getvalue())
 
-    def test_native_debug_telegram_json_peeks_without_serving(self):
-        runtime = _FakeRuntime()
-        with patch.object(channel_native_runtime.ChannelNativeRuntime, "from_env", return_value=runtime), \
-             patch.object(sys, "argv", ["walkcode", "native", "debug", "telegram", "--json", "--limit", "3"]), \
-             patch("sys.stdout", new_callable=io.StringIO) as stdout:
-            main.main()
+    def test_native_serve_rejects_retired_polling_flags(self):
+        for flag in (["--once"], ["--poll-timeout", "1"], ["--limit", "1"]):
+            with patch.object(sys, "argv", ["walkcode", "native", "serve", *flag]), \
+                 patch("sys.stderr", new_callable=io.StringIO):
+                with self.assertRaises(SystemExit) as raised:
+                    main.main()
+            self.assertEqual(raised.exception.code, 2)
 
-        payload = json.loads(stdout.getvalue())
-
-        self.assertEqual(payload["bot"]["username"], "walkcode_test_bot")
-        self.assertEqual(payload["pending_updates"]["limit"], 3)
-        self.assertTrue(payload["safe_to_run_serve_once"])
-        self.assertEqual(runtime.polled, [])
+    def test_native_debug_telegram_is_gone(self):
+        with patch.object(sys, "argv", ["walkcode", "native", "debug", "telegram"]), \
+             patch("sys.stderr", new_callable=io.StringIO):
+            with self.assertRaises(SystemExit) as raised:
+                main.main()
+        self.assertEqual(raised.exception.code, 2)
 
     def test_native_doctor_text_reports_e2e_gate_status(self):
         runtime = _FakeRuntime()
@@ -129,8 +105,8 @@ class ChannelNativeCliTests(unittest.TestCase):
 
         output = stdout.getvalue()
         self.assertIn("e2e_gates:", output)
-        self.assertIn("telegram: enabled=False", output)
-        self.assertIn("WALKCODE_E2E_TELEGRAM_CHAT_ID", output)
+        self.assertIn("lark: enabled=False", output)
+        self.assertIn("WALKCODE_E2E_LARK_CHAT_ID", output)
 
     def test_native_config_error_exits_without_traceback(self):
         with patch.object(

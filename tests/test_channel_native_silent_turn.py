@@ -38,11 +38,11 @@ from test_channel_native_codex import _FakeCodexClient
 
 
 def _actor() -> ActorRef:
-    return ActorRef(channel_kind="telegram", actor_id="owner", display_name="Owner")
+    return ActorRef(channel_kind="lark", actor_id="owner", display_name="Owner")
 
 
 def _binding() -> ChannelBinding:
-    return ChannelBinding("telegram", "bot", "chat", "topic", "root")
+    return ChannelBinding("lark", "bot", "chat", "topic", "root")
 
 
 def _channel_caps() -> ChannelCapabilities:
@@ -85,12 +85,12 @@ def _orchestrator(scripted_events=None):
         _transport_caps(),
         scripted_events=list(scripted_events or []),
     )
-    channel = FakeChannelAdapter("telegram", _channel_caps())
+    channel = FakeChannelAdapter("lark", _channel_caps())
     orchestrator = Orchestrator(
         sessions=SessionRegistry(),
         interactions=InteractionStore(),
         outbox=DurableOutbox(),
-        channels={"telegram": channel},
+        channels={"lark": channel},
         transports={"fake-transport": transport},
         authz=AuthorizationStore(),
     )
@@ -240,12 +240,12 @@ class SilentTurnOverRealCodexEventsTests(unittest.TestCase):
         client = _FakeCodexClient()
         client.event_batches["thread-1"] = list(raw_events)
         transport = CodexAppServerTransport(client=client, event_silence_ceiling=0)
-        channel = FakeChannelAdapter("telegram", _channel_caps())
+        channel = FakeChannelAdapter("lark", _channel_caps())
         orchestrator = Orchestrator(
             sessions=SessionRegistry(),
             interactions=InteractionStore(),
             outbox=DurableOutbox(),
-            channels={"telegram": channel},
+            channels={"lark": channel},
             transports={"codex_app_server": transport},
             authz=AuthorizationStore(),
         )

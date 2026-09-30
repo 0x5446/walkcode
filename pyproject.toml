@@ -1,12 +1,12 @@
 [project]
 name = "walkcode"
 version = "0.14.36"
-description = "Channel-native Telegram/Lark runtime for Claude Code and Codex"
+description = "Channel-native Lark/Feishu runtime for Claude Code and Codex"
 readme = "README.md"
 requires-python = ">=3.13"
 license = {text = "MIT"}
 authors = [{name = "0x5446"}]
-keywords = ["claude-code", "codex", "agent", "human-in-the-loop", "telegram", "lark", "remote"]
+keywords = ["claude-code", "codex", "agent", "human-in-the-loop", "lark", "feishu", "remote"]
 classifiers = [
     "Operating System :: MacOS",
     "Programming Language :: Python :: 3",

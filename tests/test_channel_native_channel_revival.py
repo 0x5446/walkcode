@@ -48,11 +48,11 @@ class _Clock:
 
 
 def _actor(actor_id: str = "owner") -> ActorRef:
-    return ActorRef(channel_kind="telegram", actor_id=actor_id, display_name=actor_id.title())
+    return ActorRef(channel_kind="lark", actor_id=actor_id, display_name=actor_id.title())
 
 
 def _binding(root: str = "root") -> ChannelBinding:
-    return ChannelBinding("telegram", "bot", "chat", "topic", root)
+    return ChannelBinding("lark", "bot", "chat", "topic", root)
 
 
 def _channel_caps() -> ChannelCapabilities:
@@ -95,12 +95,12 @@ def _headless_orchestrator(transport=None):
     clock = _Clock()
     authz = AuthorizationStore()
     transport = transport or FakeAgentTransport("claude_headless", _transport_caps())
-    channel = FakeChannelAdapter("telegram", _channel_caps())
+    channel = FakeChannelAdapter("lark", _channel_caps())
     orchestrator = Orchestrator(
         sessions=SessionRegistry(now=clock),
         interactions=InteractionStore(now=clock),
         outbox=DurableOutbox(now=clock),
-        channels={"telegram": channel},
+        channels={"lark": channel},
         transports={"claude_headless": transport},
         authz=authz,
         now=clock,
@@ -281,7 +281,7 @@ class ChannelRevivalTests(unittest.TestCase):
 
         inbound = InboundEvent(
             event_id="evt-1",
-            channel_kind="telegram",
+            channel_kind="lark",
             account_id="bot",
             chat_id="chat",
             thread_id="topic",
@@ -310,7 +310,7 @@ class ChannelRevivalTests(unittest.TestCase):
         # it is actually revivable AND the call site opted into revival.
         orchestrator, _transport, _channel, session = _headless_orchestrator()
         _sweep_to_stopped(session)
-        reply_key = ("telegram", "bot", "chat", "topic", "reply-root")
+        reply_key = ("lark", "bot", "chat", "topic", "reply-root")
 
         resolution = orchestrator.sessions.resolve_active_binding(
             reply_key, revival_eligible=lambda s: True
@@ -345,7 +345,7 @@ class ChannelRevivalTests(unittest.TestCase):
                 _binding("root-2"), "claude_headless", "/tmp/project", _actor("owner")
             )
         )
-        reply_key = ("telegram", "bot", "chat", "topic", "reply-root")
+        reply_key = ("lark", "bot", "chat", "topic", "reply-root")
 
         resolution = orchestrator.sessions.resolve_active_binding(
             reply_key, revival_eligible=lambda s: True
@@ -366,7 +366,7 @@ class ChannelRevivalTests(unittest.TestCase):
         _sweep_to_stopped(newer)
         older.last_progress_at = 100.0
         newer.last_progress_at = 200.0
-        reply_key = ("telegram", "bot", "chat", "topic", "reply-root")
+        reply_key = ("lark", "bot", "chat", "topic", "reply-root")
 
         resolution = orchestrator.sessions.resolve_active_binding(
             reply_key, revival_eligible=lambda s: True
@@ -388,7 +388,7 @@ class ChannelRevivalTests(unittest.TestCase):
         first.last_progress_at = 500.0
         second.last_progress_at = 500.0
         expected = max(first.session_id, second.session_id)
-        reply_key = ("telegram", "bot", "chat", "topic", "reply-root")
+        reply_key = ("lark", "bot", "chat", "topic", "reply-root")
 
         for _ in range(3):
             resolution = orchestrator.sessions.resolve_active_binding(
@@ -445,7 +445,7 @@ class ChannelRevivalTests(unittest.TestCase):
             generation=session.generation,
             questions=[{"question": "Which env?", "options": ["dev", "prod"]}],
         )
-        other_key = ("telegram", "bot", "chat", "topic-2", "root-2")
+        other_key = ("lark", "bot", "chat", "topic-2", "root-2")
         orchestrator.interactions.begin_awaiting_other(
             ctx.interaction_id, other_key, question_index=0
         )
@@ -474,7 +474,7 @@ class ChannelRevivalTests(unittest.TestCase):
 
         inbound = InboundEvent(
             event_id="evt-2",
-            channel_kind="telegram",
+            channel_kind="lark",
             account_id="bot",
             chat_id="chat",
             thread_id="topic",
@@ -499,12 +499,12 @@ class ChannelRevivalTests(unittest.TestCase):
         clock = _Clock()
         authz = AuthorizationStore()
         transport = FakeAgentTransport("fake-transport", _transport_caps())
-        channel = FakeChannelAdapter("telegram", _channel_caps())
+        channel = FakeChannelAdapter("lark", _channel_caps())
         orchestrator = Orchestrator(
             sessions=SessionRegistry(now=clock),
             interactions=InteractionStore(now=clock),
             outbox=DurableOutbox(now=clock),
-            channels={"telegram": channel},
+            channels={"lark": channel},
             transports={"fake-transport": transport},
             external_tui_controllers={"fake-process": FakeExternalTuiController("fake-process")},
             authz=authz,

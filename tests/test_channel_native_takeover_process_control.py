@@ -38,11 +38,11 @@ class _Clock:
 
 
 def _actor(actor_id: str = "owner") -> ActorRef:
-    return ActorRef(channel_kind="telegram", actor_id=actor_id, display_name=actor_id.title())
+    return ActorRef(channel_kind="lark", actor_id=actor_id, display_name=actor_id.title())
 
 
 def _binding() -> ChannelBinding:
-    return ChannelBinding("telegram", "bot", "chat", "topic", "root")
+    return ChannelBinding("lark", "bot", "chat", "topic", "root")
 
 
 def _channel_caps() -> ChannelCapabilities:
@@ -82,7 +82,7 @@ def _transport_caps() -> TransportCapabilities:
 def _callback(token: str, *, event_id: str = "cb-1") -> InboundEvent:
     return InboundEvent(
         event_id=event_id,
-        channel_kind="telegram",
+        channel_kind="lark",
         account_id="bot",
         chat_id="chat",
         thread_id="topic",
@@ -106,7 +106,7 @@ def _setup(*, terminate_ref=None, controller=None, transport=None, agent_session
     interactions = InteractionStore(now=clock)
     outbox = DurableOutbox(now=clock)
     authz = AuthorizationStore()
-    channel = FakeChannelAdapter("telegram", _channel_caps())
+    channel = FakeChannelAdapter("lark", _channel_caps())
     transport = transport or FakeAgentTransport("fake-transport", _transport_caps())
     controller = controller if controller is not None else FakeExternalTuiController("fake-process")
     controllers = {controller.kind: controller} if controller is not None else {}
@@ -114,7 +114,7 @@ def _setup(*, terminate_ref=None, controller=None, transport=None, agent_session
         sessions=sessions,
         interactions=interactions,
         outbox=outbox,
-        channels={"telegram": channel},
+        channels={"lark": channel},
         transports={"fake-transport": transport},
         external_tui_controllers=controllers,
         authz=authz,

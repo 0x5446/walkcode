@@ -22,8 +22,6 @@ from walkcode.channel_native import (
     PermanentDeliveryError,
     SessionRegistry,
     SessionRole,
-    TelegramBotApi,
-    TelegramChannelAdapter,
     TransientDeliveryError,
     TransportCapabilities,
     TurnInput,
@@ -40,10 +38,10 @@ class _Clock:
 
 
 def _actor(actor_id: str = "u1") -> ActorRef:
-    return ActorRef(channel_kind="telegram", actor_id=actor_id, display_name=f"User {actor_id}")
+    return ActorRef(channel_kind="lark", actor_id=actor_id, display_name=f"User {actor_id}")
 
 
-def _binding(kind: str = "telegram") -> ChannelBinding:
+def _binding(kind: str = "lark") -> ChannelBinding:
     return ChannelBinding(
         channel_kind=kind,
         account_id="bot",
@@ -92,7 +90,7 @@ def _transport_caps(**overrides) -> TransportCapabilities:
 
 
 class ViewModelRenderingTests(unittest.TestCase):
-    def test_permission_prompt_renders_short_tokens_for_telegram_and_lark(self):
+    def test_permission_prompt_renders_as_lark_card(self):
         store = InteractionStore(now=_Clock())
         ctx = store.register_permission(
             session_id="s1",
@@ -102,24 +100,6 @@ class ViewModelRenderingTests(unittest.TestCase):
             actions=["allow_once", "deny"],
         )
         view = ViewModelFactory(store).permission_prompt(ctx)
-
-        telegram_calls = []
-
-        async def telegram_caller(method, payload):
-            telegram_calls.append((method, payload))
-            return {"result": {"message_id": 10}}
-
-        telegram = TelegramChannelAdapter(TelegramBotApi("token", caller=telegram_caller))
-        msg_id = asyncio.run(telegram.send_view(_binding("telegram"), view))
-
-        self.assertEqual(msg_id, "10")
-        self.assertEqual(telegram_calls[0][0], "sendMessage")
-        buttons = telegram_calls[0][1]["reply_markup"]["inline_keyboard"]
-        self.assertEqual([button["text"] for row in buttons for button in row], ["Allow once", "Deny"])
-        for row in buttons:
-            for button in row:
-                self.assertLessEqual(len(button["callback_data"]), 64)
-                self.assertTrue(button["callback_data"].startswith("cb:"))
 
         lark_calls = []
 
@@ -147,9 +127,9 @@ class ViewModelRenderingTests(unittest.TestCase):
         labels = [action["label"] for action in view["actions"]]
         self.assertEqual(labels, ["A", "B", "Other", "Submit"])
 
-        store.begin_awaiting_other(ctx.interaction_id, _binding("telegram").key(), question_index=0)
+        store.begin_awaiting_other(ctx.interaction_id, _binding("lark").key(), question_index=0)
         result = store.answer_awaiting_other(
-            _binding("telegram").key(),
+            _binding("lark").key(),
             actor=_actor(),
             text="custom answer",
             current_generation=4,
@@ -170,7 +150,7 @@ class ViewModelRenderingTests(unittest.TestCase):
             questions=[{"prompt": "Pick one", "options": ["A", "B"], "allow_other": True}],
             ttl=60,
         )
-        key = _binding("telegram").key()
+        key = _binding("lark").key()
         store.begin_awaiting_other(ctx.interaction_id, key, question_index=0)
         self.assertIsNotNone(store.awaiting_context_for_binding(key))
 
@@ -252,7 +232,6 @@ class ViewModelRenderingTests(unittest.TestCase):
         for view in (health,):
             self.assertIsInstance(view, dict)
             self.assertIn("type", view)
-            self.assertNotIn("telegram_html", view)
             self.assertNotIn("lark_card", view)
 
 
@@ -479,12 +458,12 @@ class AskUserQuestionStateMachineTests(unittest.TestCase):
             sessions=SessionRegistry(now=clock),
             interactions=interactions,
             outbox=DurableOutbox(now=clock),
-            channels={"telegram": FakeChannelAdapter("telegram", _channel_caps())},
+            channels={"lark": FakeChannelAdapter("lark", _channel_caps())},
             transports={"fake-transport": transport},
             now=clock,
         )
         session = asyncio.run(
-            orchestrator.start_session(_binding("telegram"), "fake-transport", "/tmp/project", _actor("owner"))
+            orchestrator.start_session(_binding("lark"), "fake-transport", "/tmp/project", _actor("owner"))
         )
         ctx = interactions.register_ask_user_question(
             session_id=session.session_id,
@@ -496,7 +475,7 @@ class AskUserQuestionStateMachineTests(unittest.TestCase):
 
         callback = InboundEvent(
             event_id="cb-1",
-            channel_kind="telegram",
+            channel_kind="lark",
             account_id="bot",
             chat_id="chat",
             thread_id="topic",
@@ -515,7 +494,7 @@ class AskUserQuestionStateMachineTests(unittest.TestCase):
 
         text = InboundEvent(
             event_id="txt-1",
-            channel_kind="telegram",
+            channel_kind="lark",
             account_id="bot",
             chat_id="chat",
             thread_id="topic",
@@ -538,7 +517,7 @@ class AskUserQuestionStateMachineTests(unittest.TestCase):
         submit_token = submit_view["submit"]["token"]
         submit_event = InboundEvent(
             event_id="cb-2",
-            channel_kind="telegram",
+            channel_kind="lark",
             account_id="bot",
             chat_id="chat",
             thread_id="topic",
@@ -624,14 +603,14 @@ class AuthorizationTests(unittest.TestCase):
             sessions=sessions,
             interactions=InteractionStore(now=_Clock()),
             outbox=DurableOutbox(now=_Clock()),
-            channels={"telegram": FakeChannelAdapter("telegram", _channel_caps())},
+            channels={"lark": FakeChannelAdapter("lark", _channel_caps())},
             transports={"fake-transport": transport},
             authz=authz,
             now=_Clock(),
         )
         session = asyncio.run(
             orchestrator.start_session(
-                _binding("telegram"),
+                _binding("lark"),
                 "fake-transport",
                 "/tmp/project",
                 _actor("owner"),
@@ -661,14 +640,14 @@ class OutboxAndInboundTests(unittest.TestCase):
             sessions=SessionRegistry(now=_Clock()),
             interactions=InteractionStore(now=_Clock()),
             outbox=DurableOutbox(now=_Clock()),
-            channels={"telegram": FakeChannelAdapter("telegram", _channel_caps())},
+            channels={"lark": FakeChannelAdapter("lark", _channel_caps())},
             transports={"fake-transport": transport},
             inbound_ledger=ledger,
             now=_Clock(),
         )
         inbound = InboundEvent(
             event_id="evt-1",
-            channel_kind="telegram",
+            channel_kind="lark",
             account_id="bot",
             chat_id="chat",
             thread_id="topic",
@@ -689,7 +668,7 @@ class OutboxAndInboundTests(unittest.TestCase):
 
     def test_orchestrator_enqueues_output_before_dispatch(self):
         outbox = DurableOutbox(now=_Clock())
-        channel = FakeChannelAdapter("telegram", _channel_caps())
+        channel = FakeChannelAdapter("lark", _channel_caps())
         transport = FakeAgentTransport(
             "fake-transport",
             _transport_caps(),
@@ -699,12 +678,12 @@ class OutboxAndInboundTests(unittest.TestCase):
             sessions=SessionRegistry(now=_Clock()),
             interactions=InteractionStore(now=_Clock()),
             outbox=outbox,
-            channels={"telegram": channel},
+            channels={"lark": channel},
             transports={"fake-transport": transport},
             now=_Clock(),
         )
 
-        session = asyncio.run(orchestrator.start_session(_binding("telegram"), "fake-transport", "/tmp/project", _actor()))
+        session = asyncio.run(orchestrator.start_session(_binding("lark"), "fake-transport", "/tmp/project", _actor()))
         result = asyncio.run(
             orchestrator.submit_user_input(
                 session.session_id,
@@ -721,19 +700,16 @@ class OutboxAndInboundTests(unittest.TestCase):
 
     def test_outbox_dispatcher_maps_transient_and_permanent_failures(self):
         outbox = DurableOutbox(now=_Clock())
-        transient = FakeChannelAdapter("telegram", _channel_caps())
-        permanent = FakeChannelAdapter("lark", _channel_caps())
+        channel = FakeChannelAdapter("lark", _channel_caps())
 
-        async def transient_send(_binding, _view):
-            raise TransientDeliveryError("rate limited")
-
-        async def permanent_send(_binding, _view):
+        async def failing_send(binding, _view):
+            if binding.chat_id == "chat-transient":
+                raise TransientDeliveryError("rate limited")
             raise PermanentDeliveryError("bad chat")
 
-        transient.send_view = transient_send
-        permanent.send_view = permanent_send
+        channel.send_view = failing_send
         outbox.enqueue(
-            channel_binding_key=("telegram", "bot", "chat", "topic", "root"),
+            channel_binding_key=("lark", "bot", "chat-transient", "topic", "root"),
             view_model={"type": "text", "text": "retry"},
             idempotency_key="k1",
         )
@@ -743,7 +719,7 @@ class OutboxAndInboundTests(unittest.TestCase):
             idempotency_key="k2",
         )
 
-        dispatcher = OutboxDispatcher(outbox, {"telegram": transient, "lark": permanent})
+        dispatcher = OutboxDispatcher(outbox, {"lark": channel})
         asyncio.run(dispatcher.flush_once())
 
         self.assertEqual(outbox.pending_count(), 1)

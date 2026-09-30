@@ -2,7 +2,8 @@
 
 Date: 2026-06-29
 
-Status: Accepted
+Status: Accepted; Telegram-specific wording superseded by ADR 0069 (the guard
+itself is channel-independent and stays)
 
 ## Context
 

@@ -511,14 +511,14 @@ class PermissionBridgeOrchestratorTests(unittest.TestCase):
 
     def _build(self, client_cls):
         transport = ClaudeHeadlessTransport(sdk_loader=lambda: _make_sdk(client_cls))
-        channel = FakeChannelAdapter("telegram", self._channel_caps())
+        channel = FakeChannelAdapter("lark", self._channel_caps())
         interactions = InteractionStore()
         authz = AuthorizationStore()
         orch = Orchestrator(
             sessions=SessionRegistry(),
             interactions=interactions,
             outbox=DurableOutbox(),
-            channels={"telegram": channel},
+            channels={"lark": channel},
             transports={"claude_headless": transport},
             authz=authz,
             defer_event_drain=True,
@@ -534,7 +534,7 @@ class PermissionBridgeOrchestratorTests(unittest.TestCase):
     def _callback(self, token):
         return InboundEvent(
             event_id=f"cb-{token[:6]}",
-            channel_kind="telegram",
+            channel_kind="lark",
             account_id="bot",
             chat_id="chat",
             thread_id="topic",
@@ -549,8 +549,8 @@ class PermissionBridgeOrchestratorTests(unittest.TestCase):
     def test_permission_card_click_unblocks_and_completes_turn(self):
         async def scenario():
             transport, channel, orch = self._build(_client_class())
-            owner = ActorRef("telegram", "owner", "Owner")
-            binding = ChannelBinding("telegram", "bot", "chat", "topic", "root")
+            owner = ActorRef("lark", "owner", "Owner")
+            binding = ChannelBinding("lark", "bot", "chat", "topic", "root")
             session = await orch.start_session(binding, "claude_headless", "/tmp/project", owner)
             # Captured up front: the worker's stream ends after the turn and
             # the listener closes (unregisters) it.
@@ -587,8 +587,8 @@ class PermissionBridgeOrchestratorTests(unittest.TestCase):
 
         async def scenario():
             transport, channel, orch = self._build(client_cls)
-            owner = ActorRef("telegram", "owner", "Owner")
-            binding = ChannelBinding("telegram", "bot", "chat", "topic", "root")
+            owner = ActorRef("lark", "owner", "Owner")
+            binding = ChannelBinding("lark", "bot", "chat", "topic", "root")
             session = await orch.start_session(binding, "claude_headless", "/tmp/project", owner)
             # Captured up front: the worker's stream ends after the turn and
             # the listener closes (unregisters) it.
@@ -658,8 +658,8 @@ class BridgeBypassAndStaleWorkerTests(PermissionBridgeOrchestratorTests):
 
         async def scenario():
             transport, channel, orch = self._build(client_cls)
-            owner = ActorRef("telegram", "owner", "Owner")
-            binding = ChannelBinding("telegram", "bot", "chat", "topic", "root")
+            owner = ActorRef("lark", "owner", "Owner")
+            binding = ChannelBinding("lark", "bot", "chat", "topic", "root")
             session = await orch.start_session(binding, "claude_headless", "/tmp/project", owner)
             await orch.submit_user_input(
                 session.session_id, TurnInput(text="run"), actor=owner, generation=session.generation
@@ -707,8 +707,8 @@ class BridgeBypassAndStaleWorkerTests(PermissionBridgeOrchestratorTests):
 
         async def scenario():
             transport, channel, orch = self._build(client_cls)
-            owner = ActorRef("telegram", "owner", "Owner")
-            binding = ChannelBinding("telegram", "bot", "chat", "topic", "root")
+            owner = ActorRef("lark", "owner", "Owner")
+            binding = ChannelBinding("lark", "bot", "chat", "topic", "root")
             session = await orch.start_session(binding, "claude_headless", "/tmp/project", owner)
             await orch.submit_user_input(
                 session.session_id, TurnInput(text="run"), actor=owner, generation=session.generation
@@ -748,8 +748,8 @@ class BridgeBypassAndStaleWorkerTests(PermissionBridgeOrchestratorTests):
 
         async def scenario():
             transport, channel, orch = self._build(client_cls)
-            owner = ActorRef("telegram", "owner", "Owner")
-            binding = ChannelBinding("telegram", "bot", "chat", "topic", "root")
+            owner = ActorRef("lark", "owner", "Owner")
+            binding = ChannelBinding("lark", "bot", "chat", "topic", "root")
             session = await orch.start_session(binding, "claude_headless", "/tmp/project", owner)
             await orch.submit_user_input(
                 session.session_id, TurnInput(text="run"), actor=owner, generation=session.generation
@@ -792,11 +792,10 @@ class BridgeBypassAndStaleWorkerTests(PermissionBridgeOrchestratorTests):
     def test_headless_submit_reacts_on_user_message(self):
         async def scenario():
             transport, channel, orch = self._build(_client_class())
-            # Telegram is pre-acked by its runtime, so the orchestrator pool
-            # excludes it; inject a test pool for the fake telegram channel.
-            orch._ACK_REACTIONS = {**Orchestrator._ACK_REACTIONS, "telegram": ("👍",)}
-            owner = ActorRef("telegram", "owner", "Owner")
-            binding = ChannelBinding("telegram", "bot", "chat", "topic", "root")
+            # Pin the pool to one reaction so the assertion is deterministic.
+            orch._ACK_REACTIONS = {**Orchestrator._ACK_REACTIONS, "lark": ("👍",)}
+            owner = ActorRef("lark", "owner", "Owner")
+            binding = ChannelBinding("lark", "bot", "chat", "topic", "root")
             session = await orch.start_session(binding, "claude_headless", "/tmp/project", owner)
             await orch.submit_user_input(
                 session.session_id,
