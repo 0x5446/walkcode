@@ -648,7 +648,8 @@ class GateDrainTests(unittest.TestCase):
             with mock.patch.object(runtime_mod, "CLAUDE_GATE_RETIRE_MAX_TRIES", 2):
                 for _ in range(5):
                     asyncio.run(runtime.drain_claude_gate_requests())
-            self.assertIn("toolu_edit_1", runtime._gate_cards_retiring)
+            [hitl] = runtime.orchestrator.hitls.open_gate_cards()
+            self.assertTrue(hitl.card_open)
 
             outbox = runtime.orchestrator.outbox
             for item in outbox._pending.values():
@@ -657,7 +658,7 @@ class GateDrainTests(unittest.TestCase):
             asyncio.run(runtime.drain_claude_gate_requests())
 
             self.assertEqual(len(self._edits(api)), 1)
-            self.assertEqual(runtime._gate_cards_retiring, {})
+            self.assertEqual(runtime.orchestrator.hitls.open_gate_cards(), [])
 
     def test_failed_card_edit_is_logged_and_retried(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -680,12 +681,12 @@ class GateDrainTests(unittest.TestCase):
             with mock.patch("walkcode.channel_native._log_degrade") as log:
                 asyncio.run(runtime.drain_claude_gate_requests())
             self.assertEqual(log.call_args.args[0], "gate_card_retire_edit_failed")
-            self.assertIn("toolu_edit_1", runtime._gate_cards_retiring)
+            self.assertEqual(len(runtime.orchestrator.hitls.open_gate_cards()), 1)
 
             asyncio.run(runtime.drain_claude_gate_requests())
 
             self.assertEqual(len(self._edits(api)), 1)
-            self.assertEqual(runtime._gate_cards_retiring, {})
+            self.assertEqual(runtime.orchestrator.hitls.open_gate_cards(), [])
 
     def test_unreadable_pending_file_is_not_mistaken_for_a_returned_hook(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -698,26 +699,56 @@ class GateDrainTests(unittest.TestCase):
             self.assertEqual(len(runtime.orchestrator.hitls.pending_for_session("observed-1")), 1)
             self.assertEqual(self._edits(api), [])
 
+    def _restart(self, runtime, api):
+        runtime.save_state()
+        return ChannelNativeRuntime.from_config(runtime.config, lark_api=api)
+
     def test_card_is_retired_after_a_restart_even_past_its_expiry(self):
-        # Card tracking used to live in memory: a hook that timed out while
-        # the runtime was restarting left its card clickable forever.
+        # Card tracking used to live in memory, and a restart past the HITL
+        # expiry let the startup compaction drop the request before the
+        # retire scan saw it: the card stayed clickable forever.
         with tempfile.TemporaryDirectory() as tmp:
             runtime, _session, api = _runtime_with_observed_session(tmp)
             state = runtime.state_store.path
             claude_gate.write_pending(state, self._pending_for_session())
             asyncio.run(runtime.drain_claude_gate_requests())
             [hitl] = runtime.orchestrator.hitls.pending_for_session("observed-1")
+            hitl.expires_at = time.time() - 1  # down past the expiry
+            claude_gate.cleanup_gate_files(state, "toolu_edit_1")  # hook timed out meanwhile
 
-            # Restart: in-memory drain bookkeeping is gone; the runtime was
-            # down past the HITL expiry, and the hook timed out meanwhile.
-            runtime._gate_dispatched.clear()
-            runtime._gate_cards_retiring.clear()
-            hitl.expires_at = time.time() - 1
-            claude_gate.cleanup_gate_files(state, "toolu_edit_1")
-            asyncio.run(runtime.drain_claude_gate_requests())
+            restarted = self._restart(runtime, api)
+            restarted.compact_state()  # startup order: compaction runs first
+            asyncio.run(restarted.drain_claude_gate_requests())
 
             self.assertEqual(len(self._edits(api)), 1)
-            self.assertEqual(hitl.status, "stale")
+            self.assertEqual(restarted.orchestrator.hitls.open_gate_cards(), [])
+
+    def test_card_retire_resumes_after_a_restart_mid_retry(self):
+        # Settled (stale) but the edit kept failing when the runtime restarted:
+        # the retry lived only in memory before.
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime, _session, api = _runtime_with_observed_session(tmp)
+            state = runtime.state_store.path
+            channel = runtime.channels["lark"]
+
+            async def refuse(binding, message_id, view):
+                return False
+
+            real_edit = channel.edit_view
+            channel.edit_view = refuse
+            claude_gate.write_pending(state, self._pending_for_session())
+            asyncio.run(runtime.drain_claude_gate_requests())
+            claude_gate.cleanup_gate_files(state, "toolu_edit_1")
+            with mock.patch("walkcode.channel_native._log_degrade"):
+                asyncio.run(runtime.drain_claude_gate_requests())
+            channel.edit_view = real_edit
+
+            restarted = self._restart(runtime, api)
+            restarted.compact_state()
+            asyncio.run(restarted.drain_claude_gate_requests())
+
+            self.assertEqual(len(self._edits(api)), 1)
+            self.assertEqual(restarted.orchestrator.hitls.open_gate_cards(), [])
 
     def test_card_decided_on_the_channel_is_not_retired(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -726,7 +757,7 @@ class GateDrainTests(unittest.TestCase):
             claude_gate.write_pending(state, self._pending_for_session())
             asyncio.run(runtime.drain_claude_gate_requests())
             [hitl] = runtime.orchestrator.hitls.pending_for_session("observed-1")
-            hitl.status = "decided"  # a card click settled it first
+            runtime.orchestrator.hitls.mark_decided(hitl.hitl_request_id)  # a card click settled it first
             claude_gate.cleanup_gate_files(state, "toolu_edit_1")
             asyncio.run(runtime.drain_claude_gate_requests())
             self.assertFalse([m for m, _ in api.calls if m.startswith("edit")])
@@ -1008,31 +1039,71 @@ class GateWithoutDaemonTests(unittest.TestCase):
     def test_click_during_the_hook_timeout_close_is_refused_not_lost(self):
         # The hook's close (last decision read, then pending removal) and a
         # click's delivery must not interleave: a click written between the
-        # two used to be reported as approved and then deleted.
+        # two used to be reported as approved and then deleted. Removing the
+        # lock on EITHER side makes this test fail.
         with tempfile.TemporaryDirectory() as tmp:
-            state = Path(tmp) / "state.json"
-            claude_gate.write_pending(state, {"rid": "toolu_race", "kind": "permission"})
-            transport = ClaudeGateTransport(gate_state_path=state)
+            runtime, _session, _api = _runtime_with_observed_session(tmp)
+            state = runtime.state_store.path
+            claude_gate.touch_heartbeat(state)
+            payload = _pre_tool_payload("Edit", {"file_path": "/tmp/x"})
+            rid = payload["tool_use_id"]
+            in_close, release = threading.Event(), threading.Event()
+            real_cleanup = claude_gate.cleanup_gate_files
+
+            def paused_cleanup(state_path, request_id):
+                in_close.set()  # the hook holds the gate lock here
+                release.wait(5)
+                real_cleanup(state_path, request_id)
+
             outcome = {}
 
             def click():
+                transport = ClaudeGateTransport(gate_state_path=state)
                 try:
-                    asyncio.run(transport.approve_permission(None, "toolu_race", {"action": "allow"}))
-                    outcome["result"] = "delivered"
+                    asyncio.run(transport.approve_permission(None, rid, {"action": "allow"}))
+                    outcome["click"] = "delivered"
                 except claude_gate.GateDecisionFailed as exc:
-                    outcome["result"] = exc.reason
+                    outcome["click"] = exc.reason
 
-            with claude_gate.gate_lock(state):  # the hook is inside its close
-                self.assertIsNone(claude_gate.read_decision(state, "toolu_race"))
+            with mock.patch.object(claude_gate, "wait_for_decision", lambda *a, **k: None), \
+                    mock.patch.object(claude_gate, "cleanup_gate_files", paused_cleanup):
+                hook = threading.Thread(
+                    target=lambda: outcome.update(
+                        hook=runtime.gate_tui_hook(hook_type="PreToolUse", payload=payload, agent="claude")
+                    )
+                )
+                hook.start()
+                self.assertTrue(in_close.wait(5))
                 clicker = threading.Thread(target=click)
                 clicker.start()
-                time.sleep(0.1)
-                self.assertTrue(clicker.is_alive())  # waits for the close
-                claude_gate.cleanup_gate_files(state, "toolu_race")
-            clicker.join(timeout=5)
+                time.sleep(0.2)
+                blocked = clicker.is_alive()
+                release.set()
+                hook.join(5)
+                clicker.join(5)
 
-            self.assertEqual(outcome["result"], "stale_gate")
-            self.assertIsNone(claude_gate.read_decision(state, "toolu_race"))
+            self.assertTrue(blocked, outcome)  # the click waited for the close
+            self.assertEqual(outcome["click"], "stale_gate")
+            self.assertIsNone(claude_gate.read_decision(state, rid))
+
+    def test_click_on_disk_beats_a_stale_heartbeat_pass(self):
+        # The poll saw no decision, a click landed, then the heartbeat check
+        # returned a local "pass": the close used to skip the re-read and
+        # delete the approval while the card showed it as taken.
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime, _session, _api = _runtime_with_observed_session(tmp)
+            state = runtime.state_store.path
+            claude_gate.touch_heartbeat(state)
+            payload = _pre_tool_payload("Edit", {"file_path": "/tmp/x"})
+
+            def click_then_offline(state_path, request_id, *, timeout):
+                claude_gate.write_decision(state_path, request_id, {"kind": "permission", "action": "allow"})
+                return {"action": "pass", "reason": "walkcode_offline"}
+
+            with mock.patch.object(claude_gate, "wait_for_decision", click_then_offline):
+                output = runtime.gate_tui_hook(hook_type="PreToolUse", payload=payload, agent="claude")
+
+            self.assertEqual(output["hookSpecificOutput"]["permissionDecision"], "allow")
 
     def test_retired_daemon_mode_off_no_longer_disables_the_gate(self):
         # Before ADR 0068, WALKCODE_CLAUDE_DAEMON_MODE=off silently turned the

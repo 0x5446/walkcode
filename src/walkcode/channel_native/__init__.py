@@ -8915,6 +8915,15 @@ class HitlRequest:
     interaction_id: str = ""
     # When the request was answered; the retention clock for "decided".
     decided_at: float = 0.0
+    # PreToolUse-gate cards: still showing live buttons, and where. Persisted
+    # so a card whose hook returned while the runtime was down (or whose edit
+    # was still being retried) is retired after a restart.
+    card_open: bool = False
+    card_message_id: str = ""
+
+
+# How long a gate card that could not be retired keeps its HITL record.
+GATE_CARD_RETIRE_HORIZON_SECONDS = 7 * 86400.0
 
 
 class HitlStore:
@@ -8958,6 +8967,7 @@ class HitlStore:
             prompt_kind=prompt_kind,
             created_at=now,
             expires_at=now + self._request_ttl,
+            card_open=native_method == "pre_tool_use_hook",
         )
         self._requests[request.hitl_request_id] = request
         self._by_transport[key] = request.hitl_request_id
@@ -8984,22 +8994,17 @@ class HitlStore:
             and request.expires_at > now
         ]
 
-    def open_gate_requests(self) -> list[HitlRequest]:
-        """Undecided PreToolUse-gate requests, expired ones included.
-
-        Their cards stay clickable until retired; a runtime that was down past
-        the expiry still has to retire them.
-        """
-        return [
-            request
-            for request in self._requests.values()
-            if request.status == "pending" and request.native_method == "pre_tool_use_hook"
-        ]
+    def open_gate_cards(self) -> list[HitlRequest]:
+        """Gate requests whose card still shows live buttons, whatever their
+        status (a stale one may be mid-retire across a restart)."""
+        return [request for request in self._requests.values() if request.card_open]
 
     def mark_decided(self, hitl_request_id: str) -> None:
         request = self._requests[hitl_request_id]
         request.status = "decided"
         request.decided_at = self._now()
+        # The click that decided it flips the card itself.
+        request.card_open = False
 
     def mark_pending_for_session_stale(
         self,
@@ -9021,6 +9026,9 @@ class HitlStore:
         for hitl_id, request in list(self._requests.items()):
             if request.status == "pending" and request.expires_at <= now:
                 request.status = "expired"
+            if request.card_open and request.created_at + GATE_CARD_RETIRE_HORIZON_SECONDS > now:
+                # Its card still needs retiring; keep what the edit needs.
+                continue
             if request.status in {"decided", "stale", "expired"}:
                 # Requests decided before v0.14.36 carry no decided_at; they
                 # were answered before expiring, so expires_at is a later,
@@ -9086,6 +9094,8 @@ class HitlStore:
             "status": request.status,
             "interaction_id": request.interaction_id,
             "decided_at": request.decided_at,
+            "card_open": request.card_open,
+            "card_message_id": request.card_message_id,
         }
 
     @staticmethod
@@ -9103,6 +9113,14 @@ class HitlStore:
             status=str(data.get("status", "pending")),
             interaction_id=str(data.get("interaction_id", "")),
             decided_at=float(data.get("decided_at", 0.0) or 0.0),
+            # Pre-v0.14.39 records carry no flag: a gate request still pending
+            # then has a live card that needs retiring.
+            card_open=bool(
+                data["card_open"]
+                if "card_open" in data
+                else data.get("native_method") == "pre_tool_use_hook" and data.get("status", "pending") == "pending"
+            ),
+            card_message_id=str(data.get("card_message_id", "") or ""),
         )
 
 
@@ -11771,27 +11789,17 @@ class Orchestrator:
             idempotency_key=f"tui_conflict:{kind}:{dedupe_key or pid}",
         )
 
-    def settle_timed_out_gate(self, session_id: str, rid: str) -> HitlRequest | None:
+    def settle_timed_out_gate(self, request: HitlRequest) -> None:
         """Close a blocking-gate prompt whose hook returned without a card
         decision (timed out and handed the prompt to the terminal).
 
         Only a click used to settle a gate card, so a prompt answered in the
         terminal kept live buttons forever. The HITL request goes stale and
         its interaction is recorded as answered in the terminal, so old
-        tokens stop working. Returns the request, or None when it was not
-        pending (decided on the card already). The card itself is edited
-        separately by ``retire_gate_card``, which may need several passes.
+        tokens stop working. The card itself is edited separately by
+        ``retire_gate_card``, which may need several passes (``card_open``
+        stays set until then).
         """
-        request = next(
-            (
-                r
-                for r in self.hitls.open_gate_requests()
-                if r.session_id == session_id and r.transport_request_id == rid
-            ),
-            None,
-        )
-        if request is None:
-            return None
         request.status = "stale"
         if request.interaction_id:
             try:
@@ -11802,7 +11810,6 @@ class Orchestrator:
                 ctx.decision = {"action": "terminal"}
                 ctx.decided_at = self._now()
                 ctx.awaiting_other = None
-        return request
 
     async def retire_gate_card(self, session_id: str, rid: str, request: HitlRequest) -> str:
         """Edit a settled gate card into its terminal result.
@@ -11821,7 +11828,7 @@ class Orchestrator:
         if channel is None or not channel.capabilities().editable_message:
             return "gone"
         key = f"{session_id}:{request.generation}:gate:{rid}"
-        message_id = self.outbox.sent_message_id(key)
+        message_id = request.card_message_id or self.outbox.sent_message_id(key)
         if not message_id:
             # Still queued (a retry may deliver the original card later) or
             # dead / compacted. Only a queued card is worth waiting for.

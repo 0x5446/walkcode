@@ -433,6 +433,26 @@ class RetentionPolicyTests(unittest.TestCase):
         self.assertEqual(restored.sent_message_id("s1:0:gate:toolu_1"), "om_card")
         self.assertEqual(restored.sent_message_id("missing"), "")
 
+    def test_legacy_pending_gate_request_loads_with_an_open_card(self):
+        legacy = {
+            "requests": {
+                "hitl-1": {
+                    "hitl_request_id": "hitl-1", "session_id": "s", "generation": 1,
+                    "transport_kind": "external_tui", "transport_request_id": "toolu_1",
+                    "native_method": "pre_tool_use_hook", "prompt_kind": "permission",
+                    "created_at": 1.0, "expires_at": 2.0, "status": "pending",
+                },
+                "hitl-2": {
+                    "hitl_request_id": "hitl-2", "session_id": "s", "generation": 1,
+                    "transport_kind": "claude_headless", "transport_request_id": "r2",
+                    "native_method": "can_use_tool", "prompt_kind": "permission",
+                    "created_at": 1.0, "expires_at": 2.0, "status": "pending",
+                },
+            }
+        }
+        store = HitlStore.from_dict(legacy, now=lambda: 1.5)
+        self.assertEqual([r.hitl_request_id for r in store.open_gate_cards()], ["hitl-1"])
+
     def test_sent_items_keep_only_the_view_type(self):
         # Delivered items stay a day for dedupe and the message id; their card
         # bodies were ~1 MB of dead weight in a busy state file.

@@ -1550,10 +1550,9 @@ class ChannelNativeRuntime:
         # the user chose "always allow" for (in-memory: hooks cannot persist
         # permission rules, so the scope is this runtime process).
         self._gate_dispatched: dict[str, float] = {}
-        # Settled cards still to be edited: rid -> (session id, request, tries).
-        # The edit can lag (card still queued for delivery, transient edit
-        # failure), so it is retried on later passes, bounded.
-        self._gate_cards_retiring: dict[str, tuple[str, Any, int]] = {}
+        # Failed edits per gate card being retired (the card_open flag on the
+        # HITL request is the persisted part; this only bounds the retries).
+        self._gate_retire_failures: dict[str, int] = {}
         # ADR 0065: foreign-turn mirror (created on first reconcile) and the
         # thread each mirrored session is subscribed to.
         self._codex_mirror: CodexForeignTurnMirror | None = None
@@ -3200,8 +3199,10 @@ class ChannelNativeRuntime:
             # (read here and honoured) or finds no pending and is refused —
             # never written, shown as approved, then deleted.
             with claude_gate.gate_lock(state_path):
-                if decision is None:
-                    decision = claude_gate.read_decision(state_path, rid)
+                # A decision on disk wins over a locally made exit (timeout, or
+                # "pass" on a stale heartbeat): a click written after the last
+                # poll must be honoured, not deleted.
+                decision = claude_gate.read_decision(state_path, rid) or decision
                 claude_gate.cleanup_gate_files(state_path, rid)
         if decision is None:
             decision = claude_gate.timeout_decision(kind)
@@ -3287,6 +3288,7 @@ class ChannelNativeRuntime:
             async with self._ingress_lock:
                 posted = await self.orchestrator.post_claude_gate_prompt(session_id, request)
             if posted:
+                self._remember_gate_card_message(session_id, rid)
                 self._gate_dispatched[rid] = now
                 processed += 1
                 self.save_state()
@@ -3299,34 +3301,33 @@ class ChannelNativeRuntime:
         for rid in list(self._gate_dispatched):
             if rid not in live_rids:
                 self._gate_dispatched.pop(rid, None)
-        # Cards whose hook has returned (decided, timed out to the terminal,
-        # or gone while this runtime was down) are found from persisted HITL
-        # state, not from memory, so a restart cannot strand one.
-        for gate_request in self.orchestrator.hitls.open_gate_requests():
-            rid, session_id = gate_request.transport_request_id, gate_request.session_id
-            if rid in self._gate_cards_retiring:
-                continue
-            # live_rids only holds files that parsed; a read error must not
-            # look like the hook having returned.
-            if rid in live_rids or claude_gate.pending_path(state_path, rid).exists():
-                continue
-            async with self._ingress_lock:
-                request = self.orchestrator.settle_timed_out_gate(session_id, rid)
-            if request is not None:
+        # Gate cards are retired from persisted HITL state (card_open), not
+        # from memory: a hook that returned while this runtime was down, or a
+        # card whose edit was still being retried, survives a restart.
+        for request in self.orchestrator.hitls.open_gate_cards():
+            rid, session_id = request.transport_request_id, request.session_id
+            if request.status == "pending":
+                # live_rids only holds files that parsed; a read error must
+                # not look like the hook having returned.
+                if rid in live_rids or claude_gate.pending_path(state_path, rid).exists():
+                    continue
+                async with self._ingress_lock:
+                    self.orchestrator.settle_timed_out_gate(request)
                 claude_gate.trace("settle_card_hook_gone", rid=rid)
-                self._gate_cards_retiring[rid] = (session_id, request, 0)
                 self.save_state()
-        for rid, (session_id, request, tries) in list(self._gate_cards_retiring.items()):
             outcome = await self.orchestrator.retire_gate_card(session_id, rid, request)
             if outcome == "queued":
                 # Waiting on delivery (possibly a long rate-limit backoff) is
                 # not a failed edit; the outbox ends it by sending or dying.
                 continue
-            if outcome == "retry" and tries + 1 < CLAUDE_GATE_RETIRE_MAX_TRIES:
-                self._gate_cards_retiring[rid] = (session_id, request, tries + 1)
+            tries = self._gate_retire_failures.get(rid, 0) + 1
+            if outcome == "retry" and tries < CLAUDE_GATE_RETIRE_MAX_TRIES:
+                self._gate_retire_failures[rid] = tries
                 continue
-            self._gate_cards_retiring.pop(rid, None)
-            claude_gate.trace("retire_card", rid=rid, outcome=outcome, tries=tries + 1)
+            self._gate_retire_failures.pop(rid, None)
+            request.card_open = False
+            self.save_state()
+            claude_gate.trace("retire_card", rid=rid, outcome=outcome, tries=tries)
         # Documented contract: decision files whose pending is gone (stale card
         # clicked after the hook gave up) are reaped here.
         for orphan in claude_gate.list_orphan_decision_paths(state_path):
@@ -3336,6 +3337,15 @@ class ChannelNativeRuntime:
             except OSError:
                 pass
         return processed
+
+    def _remember_gate_card_message(self, session_id: str, rid: str) -> None:
+        # Pin the card's message id on its HITL request while the outbox still
+        # has it (sent items are compacted after a day).
+        for request in self.orchestrator.hitls.open_gate_cards():
+            if request.session_id == session_id and request.transport_request_id == rid:
+                key = f"{session_id}:{request.generation}:gate:{rid}"
+                request.card_message_id = self.orchestrator.outbox.sent_message_id(key)
+                return
 
     def _claude_gate_session_id(self, request: dict[str, Any]) -> str | None:
         resume_ref = request.get("resume_ref")
