@@ -3,114 +3,13 @@
 from __future__ import annotations
 
 import argparse
-import json
 import os
-import re
-import shlex
 import subprocess
 import sys
-import urllib.error
-import urllib.request
 from pathlib import Path
 
 
-_GITHUB_REPO = "0x5446/walkcode"
-_GITHUB_URL = f"https://github.com/{_GITHUB_REPO}.git"
-_HOOKS_ASSIGN = re.compile(r"^\s*hooks\s*=")
-
-
-def _run(cmd: str, **kwargs) -> None:
-    print(f"  -> {cmd}")
-    result = subprocess.run(cmd, shell=True, **kwargs)
-    if result.returncode != 0:
-        print(f"command failed with exit code {result.returncode}")
-        raise SystemExit(1)
-
-
-_SEMVER_TAG = re.compile(r"^v(\d+)\.(\d+)\.(\d+)$")
-
-
-def _validated_tag(tag: str | None) -> str | None:
-    """Accept only `vX.Y.Z`.
-
-    Every source here is remote-controlled and the result is interpolated into
-    a `uv tool install "walkcode @ git+<url>@<tag>"` shell command, so the
-    shape is checked once, centrally, rather than trusted per source.
-    """
-    tag = (tag or "").strip()
-    return tag if _SEMVER_TAG.match(tag) else None
-
-
-def _latest_tag_via_gh() -> str | None:
-    """Authenticated release lookup. The only source that knows which release
-    GitHub calls "latest" (a hotfix on an older line must not win)."""
-    try:
-        result = subprocess.run(
-            ["gh", "api", f"repos/{_GITHUB_REPO}/releases/latest", "--jq", ".tag_name"],
-            capture_output=True,
-            text=True,
-            timeout=20,
-        )
-    except Exception:
-        return None
-    return _validated_tag(result.stdout if result.returncode == 0 else "")
-
-
-def _latest_tag_via_api() -> str | None:
-    url = f"https://api.github.com/repos/{_GITHUB_REPO}/releases/latest"
-    try:
-        req = urllib.request.Request(url, headers={"Accept": "application/vnd.github+json"})
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            return _validated_tag(json.loads(resp.read()).get("tag_name"))
-    except Exception:
-        return None
-
-
-class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        return None
-
-
-def _latest_tag_via_release_redirect() -> str | None:
-    """Latest release from the HTML redirect: no API, so no rate limit.
-
-    `github.com/<repo>/releases/latest` 302s to `/releases/tag/<tag>`. Reading
-    the tag list over `git ls-remote` would be simpler but wrong: `release.sh`
-    pushes the tag BEFORE creating the Release, so a failed `gh release create`
-    leaves a tag with no Release behind — and AGENTS.md is explicit that
-    upgrade installs *Releases*. This endpoint can only ever name a real one.
-    """
-    url = f"https://github.com/{_GITHUB_REPO}/releases/latest"
-    opener = urllib.request.build_opener(_NoRedirect)
-    try:
-        opener.open(url, timeout=10)
-    except urllib.error.HTTPError as exc:
-        location = (exc.headers or {}).get("Location", "")
-    except Exception:
-        return None
-    else:
-        # 200 without a redirect means no release exists (or the page shape
-        # changed): either way there is nothing trustworthy to install.
-        return None
-    if "/releases/tag/" not in location:
-        return None
-    return _validated_tag(location.rstrip("/").rsplit("/", 1)[-1])
-
-
-def _get_latest_tag() -> str | None:
-    """Resolve the release to install, hardest source first.
-
-    The anonymous releases API is rate-limited per IP and WILL return 403
-    (observed 2026-08-07). When it did, the old single-source lookup fell
-    through to "install from the default branch" without saying anything —
-    an upgrade that silently ships unreleased code. Try gh (authenticated),
-    then the anonymous API, then the release-page redirect.
-    """
-    for resolve in (_latest_tag_via_gh, _latest_tag_via_api, _latest_tag_via_release_redirect):
-        tag = resolve()
-        if tag:
-            return tag
-    return None
+_UPGRADE_SH_URL = "https://raw.githubusercontent.com/0x5446/walkcode/main/upgrade.sh"
 
 
 def _current_version() -> str:
@@ -131,214 +30,49 @@ def cmd_install_hooks(_args) -> None:
     raise SystemExit(2)
 
 
-def _parse_launchd_labels(listing: str) -> list[str]:
-    """Pick V3 runtime labels out of `launchctl list` output.
+def _checkout_upgrade_script() -> Path | None:
+    """upgrade.sh of the source checkout this package runs from, if any.
 
-    com.walkcode.tap-* is excluded on purpose: the debug proxies carry live
-    Claude API traffic, kickstarting them would sever every local session's
-    in-flight request.
+    Only a checkout (`uv run walkcode`, editable install) has one; a
+    `uv tool install` copy lives in site-packages and does not.
     """
-    labels = []
-    for line in listing.splitlines():
-        parts = line.split()
-        name = parts[-1] if parts else ""
-        if name.startswith("com.walkcode.") and not name.startswith("com.walkcode.tap-"):
-            labels.append(name)
-    return sorted(set(labels))
+    root = Path(__file__).resolve().parents[2]
+    script = root / "upgrade.sh"
+    if script.is_file() and (root / "pyproject.toml").is_file():
+        return script
+    return None
 
 
-def _discover_v3_launchd_labels() -> list[str]:
-    try:
-        result = subprocess.run(
-            ["launchctl", "list"], capture_output=True, text=True, timeout=10
-        )
-    except (OSError, subprocess.SubprocessError):
-        return []
-    return _parse_launchd_labels(result.stdout or "")
+def cmd_upgrade(args) -> None:
+    """Delegate to upgrade.sh, the single gated upgrade path.
 
-
-def _self_driver_label() -> str:
-    """ADR 0058: the launchd label of the runtime driving THIS process, or "".
-
-    Priority 1 is the WALKCODE_DRIVER_LABEL marker exported by `walkcode
-    native serve` (v0.14.10+) and inherited by every worker subprocess.
-    Fallback climbs the process tree for a `walkcode native serve` ancestor
-    and maps its PID to a label via `launchctl list` (LC_ALL=C: day-first
-    locales broke ps parsing before, v0.14.4).
+    This used to be a Python re-implementation that drifted from upgrade.sh
+    (no claude-agent-sdk floor, no --reinstall, no legacy-remnant gate, no
+    lock, aborted on the first failed kickstart). Instead of keeping two
+    copies in sync, run the real script when it ships alongside this code
+    and otherwise print how to run it.
     """
-    marker = os.environ.get("WALKCODE_DRIVER_LABEL", "")
-    if marker:
-        return marker
-    env = {**os.environ, "LC_ALL": "C"}
-    try:
-        listing = subprocess.run(
-            ["launchctl", "list"], capture_output=True, text=True, env=env
-        ).stdout
-    except Exception:
-        listing = ""
-    pid_to_label: dict[str, str] = {}
-    for line in listing.splitlines():
-        parts = line.split()
-        if len(parts) >= 3 and parts[-1].startswith("com.walkcode."):
-            pid_to_label[parts[0]] = parts[-1]
-    pid = str(os.getpid())
-    for _ in range(25):
-        try:
-            out = subprocess.run(
-                ["ps", "-o", "ppid=,command=", "-p", pid],
-                capture_output=True,
-                text=True,
-                env=env,
-            ).stdout.strip()
-        except Exception:
-            return ""
-        if not out:
-            return ""
-        ppid, _, command = out.partition(" ")
-        ppid = ppid.strip()
-        if "walkcode native serve" in command and pid in pid_to_label:
-            return pid_to_label[pid]
-        if not ppid or ppid == pid or ppid in {"0", "1"}:
-            return ""
-        pid = ppid
-    return ""
-
-
-def _schedule_deferred_self_restart(label: str) -> None:
-    """Restart our own driver runtime later, from a detached process.
-
-    start_new_session=True: the restarter must survive the SIGTERM it will
-    deliver to our own ancestry. `&&` (not `;`): a failed sleep must never
-    fall through to an immediate kickstart.
-    """
-    delay_raw = os.environ.get("WALKCODE_SELF_RESTART_DELAY", "120")
-    # isascii too: str.isdigit() accepts full-width digits, which the system
-    # `sleep` rejects — the detached restarter would die silently (review R2).
-    delay = delay_raw if (delay_raw.isascii() and delay_raw.isdigit()) else "120"
-    if delay != delay_raw:
-        print(f"invalid WALKCODE_SELF_RESTART_DELAY {delay_raw!r}; using 120s.")
-    # Say everything and FLUSH before starting the timer (R3): with a
-    # zero/short delay the detached kickstart could otherwise kill the driver
-    # before buffered output lands.
+    extra = ["--dry-run"] if getattr(args, "dry_run", False) else []
+    script = _checkout_upgrade_script()
+    if script is not None:
+        print(f"Running {script} {' '.join(extra)}".rstrip(), flush=True)
+        os.execv("/bin/bash", ["/bin/bash", str(script), *extra])
     print(
-        f"this upgrade runs inside a session driven by {label}; its restart is "
-        f"deferred by {delay}s (detached). Wrap up the final reply now — the "
-        "session revives on the next message.",
-        flush=True,
+        "walkcode upgrade delegates to upgrade.sh, which is not bundled with this install.\n"
+        "Run it from a WalkCode checkout:  ./upgrade.sh [--dry-run]\n"
+        f"or directly:  curl -fsSL {_UPGRADE_SH_URL} | bash -s -- [--dry-run]",
+        file=sys.stderr,
     )
-    sys.stderr.flush()
-    uid = str(os.getuid())
-    subprocess.Popen(
-        [
-            "/bin/sh",
-            "-c",
-            'sleep "$1" && exec launchctl kickstart -k "gui/$2/$3"',
-            "sh",
-            delay,
-            uid,
-            label,
-        ],
-        start_new_session=True,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-
-
-def cmd_upgrade(_args) -> None:
-    current = _current_version()
-    print(f"Current version: {current}")
-
-    tag = _get_latest_tag()
-    if tag:
-        print(f"Latest release: {tag}")
-        source = f"walkcode @ git+{_GITHUB_URL}@{tag}"
-    elif os.environ.get("WALKCODE_ALLOW_MAIN") == "1":
-        print("Could not resolve latest release; WALKCODE_ALLOW_MAIN=1 → installing from the default branch.")
-        source = f"walkcode @ git+{_GITHUB_URL}"
-    else:
-        # Falling through to the default branch here used to be silent, which
-        # turns "upgrade to the release" into "ship whatever is on main".
-        print(
-            "Could not resolve the latest release tag (gh, the anonymous API and "
-            "the release-page redirect all failed). Refusing to install from the default "
-            "branch: authenticate gh (`gh auth login`) or set WALKCODE_ALLOW_MAIN=1 to override."
-        )
-        raise SystemExit(1)
-
-    python_spec = os.environ.get("WALKCODE_PYTHON", "3.13")
-    _run(
-        "uv tool install "
-        f"--python {shlex.quote(python_spec)} "
-        "--with claude-agent-sdk "
-        "--with lark-oapi "
-        f"{shlex.quote(source)} "
-        "--force"
-    )
-
-    labels = [
-        item.strip()
-        for item in os.environ.get("WALKCODE_V3_LAUNCHD_LABELS", "").split(",")
-        if item.strip()
-    ]
-    if not labels:
-        labels = _discover_v3_launchd_labels()
-        if labels:
-            print(
-                "WALKCODE_V3_LAUNCHD_LABELS is empty; restarting discovered labels: "
-                + ", ".join(labels)
-            )
-    # Hard guard even against explicit configuration: taps proxy live Claude
-    # API traffic; kickstarting one severs every local session's in-flight
-    # request.
-    for label in labels:
-        if label.startswith("com.walkcode.tap-"):
-            print(f"refusing to restart tap proxy {label} (carries live Claude API traffic).")
-    labels = [label for label in labels if not label.startswith("com.walkcode.tap-")]
-    # ADR 0058 suicide-trap guard, same semantics as upgrade.sh: never
-    # kickstart the runtime that drives the session running this command.
-    self_label = _self_driver_label()
-    deferred_self = ""
-    if self_label and self_label in labels:
-        deferred_self = self_label
-        labels = [label for label in labels if label != self_label]
-    if labels:
-        uid = os.getuid()
-        for label in labels:
-            _run(f"launchctl kickstart -k gui/{uid}/{shlex.quote(label)}")
-    else:
-        print(
-            "WALKCODE_V3_LAUNCHD_LABELS is empty and no loaded com.walkcode.* "
-            "service was found; no V3 runtime was restarted."
-        )
-
-    env_file = os.environ.get("WALKCODE_ENV_FILE")
-    if env_file:
-        _run(f"WALKCODE_ENV_FILE={shlex.quote(env_file)} walkcode native doctor")
-    else:
-        # A bare doctor without an env file only reports a config error; bind
-        # each restarted instance to its own env file instead.
-        ran_doctor = False
-        for label in [*labels, *([deferred_self] if deferred_self else [])]:
-            label_env = Path.home() / ".walkcode" / (label.removeprefix("com.walkcode.") + ".env")
-            if label_env.is_file():
-                _run(f"WALKCODE_ENV_FILE={shlex.quote(str(label_env))} walkcode native doctor")
-                ran_doctor = True
-            else:
-                print(f"no env file for {label} (expected {label_env}); doctor skipped.")
-        if not ran_doctor:
-            _run("walkcode native doctor")
-    print("Upgrade complete.")
-    if deferred_self:
-        # Scheduled dead last, after every print: even a zero/short delay
-        # must not kill the driver before this command's output lands.
-        _schedule_deferred_self_restart(deferred_self)
+    raise SystemExit(1)
 
 
 def cmd_uninstall(_args) -> None:
     print("Removing walkcode uv tool.")
     subprocess.run(["uv", "tool", "uninstall", "walkcode"], capture_output=True)
-    print("Uninstall complete. Remove any V3 LaunchAgents and env files you no longer need.")
+    print(
+        "Uninstall complete. For LaunchAgents and TUI hooks run uninstall.sh "
+        "(keeps env files and the workspace)."
+    )
 
 
 def cmd_removed_legacy(args) -> None:
@@ -376,7 +110,8 @@ def main() -> None:
         legacy_parser = sub.add_parser(legacy_name, help=argparse.SUPPRESS)
         legacy_parser.add_argument("legacy_args", nargs=argparse.REMAINDER)
 
-    sub.add_parser("upgrade", help="Upgrade to latest V3 release")
+    up = sub.add_parser("upgrade", help="Upgrade to the latest V3 release (runs upgrade.sh)")
+    up.add_argument("--dry-run", action="store_true", help="Pass --dry-run to upgrade.sh")
     sub.add_parser("uninstall", help="Uninstall WalkCode CLI")
 
     np = sub.add_parser("native", help="Channel-native V3 runtime")

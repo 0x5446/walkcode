@@ -17,7 +17,7 @@ metadata:
 
 ## 铁律（违反即停）
 
-- **顺序不可换：先 release，再 upgrade**。`walkcode upgrade` 拉的是 GitHub **Release**（Releases API），所以必须先把改动合并进 `main` 并建好 Release，本地 upgrade 才拿得到新代码。
+- **顺序不可换：先 release，再 upgrade**。`./upgrade.sh` 拉的是 GitHub **Release**（Releases API），所以必须先把改动合并进 `main` 并建好 Release，本地 upgrade 才拿得到新代码。
 - **账号必须是 `0x5446`**（脚本会校验 `gh` 当前账号）。
 - **门禁**：单测必须全绿、deep-review skill 必须过且**无 Critical**，才能合并 PR。
   Review 门禁由 deep-review skill 执行；不要用普通 `codex review` / `claude review` 替代。
