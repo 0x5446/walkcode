@@ -2079,6 +2079,48 @@ class TakeoverInjectedTurnRegressionTests(unittest.TestCase):
         self.assertTrue(errors, "zero-traffic EOF with a pending submit was silent")
         self.assertEqual(errors[-1].payload.get("reason"), "pending_turn_lost")
 
+    def test_typeerror_inside_connect_is_not_retried(self):
+        # connect() used to be retried bare on TypeError: an error raised
+        # inside the body could start a second CLI subprocess.
+        class _BuggyConnectClient(_stream_client_class()):
+            connects = 0
+
+            async def connect(self, prompt=None):
+                type(self).connects += 1
+                raise TypeError("internal bug")
+
+        async def scenario():
+            transport = _transport(_BuggyConnectClient)
+            with self.assertRaises(TypeError):
+                await transport.launch_session(cwd="/tmp/p", session_id="s1")
+
+        asyncio.run(scenario())
+        self.assertEqual(_BuggyConnectClient.connects, 1)
+
+    def test_typeerror_inside_query_is_not_retried(self):
+        # query() used to be retried without session_id on TypeError: the
+        # same user message could be submitted twice.
+        class _BuggyQueryClient(_stream_client_class()):
+            def __init__(self, options=None):
+                super().__init__(options)
+                self.queries = 0
+
+            async def query(self, prompt, session_id="default"):
+                self.queries += 1
+                raise TypeError("internal bug")
+
+        async def scenario():
+            transport = _transport(_BuggyQueryClient)
+            handle = await transport.launch_session(cwd="/tmp/p", session_id="s1")
+            client = transport._clients[handle.handle_id]
+            with self.assertRaises(TypeError):
+                await transport.submit_turn(handle, TurnInput(text="hi"), "k1")
+            return transport, handle, client
+
+        transport, handle, client = asyncio.run(scenario())
+        self.assertEqual(client.queries, 1)
+        self.assertNotIn(handle.handle_id, transport._pending_turns)  # marker rolled back
+
     def test_internal_typeerror_from_control_method_is_not_swallowed(self):
         # Signature binding (not try/except) decides the call shape: a
         # TypeError raised INSIDE the method must propagate, not trigger a

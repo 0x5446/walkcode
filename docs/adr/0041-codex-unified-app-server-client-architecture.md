@@ -147,10 +147,13 @@ termination before WalkCode submits input.
 
 The runtime defaults to `WALKCODE_CODEX_APP_SERVER_MODE=auto`:
 
-- if the local Codex standalone daemon install exists at the CLI-managed
-  location, WalkCode starts/uses `codex app-server daemon` and connects through
-  the daemon's Unix control socket using a WebSocket JSON-RPC connection;
-- if the standalone daemon install is missing, WalkCode falls back to the
+- if the managed daemon executable
+  (`$CODEX_HOME/packages/app-server-daemon/current/bin/codex`) resolves,
+  WalkCode starts/uses `codex app-server daemon` and connects through
+  the daemon's Unix control socket using a WebSocket JSON-RPC connection
+  (*amended 2026-09-30:* this used to probe the standalone CLI package, which
+  kept choosing the daemon after its `current` link went dangling);
+- otherwise WalkCode falls back to the
   isolated `codex app-server --stdio` client so Telegram-origin Codex sessions
   still work instead of failing at startup;
 - `stdio` forces the isolated client, while `daemon`, `managed`, or `shared`

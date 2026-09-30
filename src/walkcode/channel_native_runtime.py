@@ -3191,12 +3191,11 @@ class ChannelNativeRuntime:
             if session_id not in candidates:
                 self._codex_mirror_backoff.pop(session_id, None)
         subscribed = 0
-        now = time.monotonic()
         for session_id, (thread_id, cwd) in candidates.items():
             if self._codex_mirror_threads.get(session_id) == thread_id and transport.foreign_sink_current(thread_id):
                 continue
             retry_at, delay, last_error = self._codex_mirror_backoff.get(session_id, (0.0, 0.0, ""))
-            if now < retry_at:
+            if time.monotonic() < retry_at:
                 continue
             if mirror.is_active(session_id):
                 mirror.interrupt(session_id)
@@ -3212,7 +3211,9 @@ class ChannelNativeRuntime:
                         error=error,
                         retry_in=int(delay),
                     )
-                self._codex_mirror_backoff[session_id] = (now + delay, delay, error)
+                # Measured from the failure: a 30 s request timeout must not
+                # eat the delay it is meant to start.
+                self._codex_mirror_backoff[session_id] = (time.monotonic() + delay, delay, error)
                 self._codex_mirror_threads.pop(session_id, None)
                 await mirror.close(session_id)
                 continue

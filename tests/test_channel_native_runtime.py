@@ -3355,6 +3355,34 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
 
             asyncio.run(run())
 
+    def test_mirror_backoff_starts_when_the_slow_request_fails(self):
+        # A subscribe that times out after 30 s must not have spent the delay
+        # that should start at the failure.
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime, fake, taken_over = self._reconcile_setup(tmp)
+            clock = [1000.0]
+            attempts = []
+
+            async def slow_failure(thread_id, *, cwd, sink):
+                attempts.append(clock[0])
+                clock[0] += 30.0  # the request itself took 30 s
+                raise RuntimeError("timed out")
+
+            fake.subscribe_foreign_mirror = slow_failure
+
+            async def run():
+                with patch.object(runtime_module.time, "monotonic", lambda: clock[0]), \
+                        patch.object(runtime_module, "_log_degrade"):
+                    await runtime.reconcile_codex_mirrors()
+                    clock[0] += runtime_module.CODEX_MIRROR_RETRY_MIN_SECONDS - 1
+                    await runtime.reconcile_codex_mirrors()
+                    self.assertEqual(len(attempts), 1)  # full delay not yet over
+                    clock[0] += 1
+                    await runtime.reconcile_codex_mirrors()
+                    self.assertEqual(len(attempts), 2)
+
+            asyncio.run(run())
+
     def test_auto_mode_needs_the_managed_daemon_executable(self):
         # The standalone CLI package does not make `app-server daemon start`
         # work; a dangling daemon `current` link must fall back to stdio.
