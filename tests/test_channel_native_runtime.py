@@ -3140,6 +3140,24 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
             session = snapshot.sessions.get(session.session_id)
             self.assertEqual(session.lifecycle_state, "EXTERNAL_OBSERVED_READONLY")
 
+            # A turn that ends without any tool event clears the wait too.
+            asyncio.run(
+                runtime.process_tui_hook(
+                    hook_type="permission-request",
+                    agent="claude",
+                    payload={"session_id": "claude-session-1", "cwd": tmp, "tool_name": "Edit", "summary": "x"},
+                )
+            )
+            asyncio.run(
+                runtime.process_tui_hook(
+                    hook_type="stop", agent="claude", payload={"session_id": "claude-session-1", "cwd": tmp}
+                )
+            )
+            snapshot = JsonFileStateStore(state_path).load()
+            self.assertEqual(
+                snapshot.sessions.get(session.session_id).lifecycle_state, "EXTERNAL_OBSERVED_READONLY"
+            )
+
     def test_raw_stop_hook_name_is_normalized_before_processing(self):
         with tempfile.TemporaryDirectory() as tmp:
             state_path = str(Path(tmp) / "state.json")
@@ -3467,6 +3485,46 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
 
             self.assertTrue(hook.exists())
             self.assertFalse((qdir / "bad" / "00-hook.json").exists())
+
+    def test_undecodable_deferred_tui_hook_is_archived_and_the_queue_moves_on(self):
+        from walkcode import channel_native_runtime as runtime_module
+
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = str(Path(tmp) / "state.json")
+            cfg = ChannelNativeConfig.from_env(
+                {
+                    "WALKCODE_CHANNEL": "lark",
+                    "LARK_APP_ID": "cli_x",
+                    "LARK_APP_SECRET": "s",
+                    "WALKCODE_AGENT": "claude",
+                    "WALKCODE_STATE_PATH": state_path,
+                    "WALKCODE_CWD": tmp,
+                }
+            )
+            runtime = ChannelNativeRuntime.from_config(
+                cfg,
+                lark_api=_FakeLarkApi(),
+                transports={"claude_headless": FakeAgentTransport("claude_headless", _transport_caps())},
+            )
+            qdir = Path(f"{state_path}.tui-hooks.d")
+            qdir.mkdir(parents=True, exist_ok=True)
+            (qdir / "00-bad.json").write_bytes(b"\xff\xfe not utf-8")
+            (qdir / "01-next.json").write_text(
+                json.dumps({"created_at": time.time(), "hook_type": "SessionStart", "agent": "claude",
+                            "payload": {"session_id": "s-next", "cwd": tmp}}),
+                encoding="utf-8",
+            )
+            seen = []
+
+            async def process(*, hook_type, agent, payload):
+                seen.append(payload["session_id"])
+                return runtime_module.SubmitResult(True)
+
+            runtime.process_tui_hook = process
+            asyncio.run(runtime.drain_deferred_tui_hooks())
+
+            self.assertTrue((qdir / "bad" / "00-bad.json").exists())
+            self.assertEqual(seen, ["s-next"])
 
     def test_deferred_tui_hook_filename_uses_nanosecond_order(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -2980,6 +2980,10 @@ class ChannelNativeRuntime:
                 raw = path.read_text(encoding="utf-8")
             except FileNotFoundError:
                 continue
+            except UnicodeDecodeError:
+                # Corrupt bytes are a bad event, not a read error.
+                self._archive_bad_tui_hook(path)
+                continue
             except OSError as exc:
                 # A read error says nothing about the event: keep it queued.
                 print(f"deferred TUI hook unreadable, retrying: {type(exc).__name__}: {exc}", file=sys.stderr)
