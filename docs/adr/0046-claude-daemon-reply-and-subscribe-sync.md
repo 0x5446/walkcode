@@ -2,7 +2,12 @@
 
 Date: 2026-07-04
 
-Status: Accepted; v1 implemented 2026-07-04 — reply 写路径、subscribe 状态
+> **Superseded（2026-09-30，ADR 0068）**：daemon 模式已退役——v1 reply/subscribe、
+> v3 attach 按键注入与 notify gate 的代码全部删除。只有 v2 的阻塞式 PreToolUse
+> gate 保留，决策投递改由 `ClaudeGateTransport` 承担，不再依赖 daemon。
+> 下文作为历史记录保留。
+
+Status: Superseded by ADR 0068 (v2 blocking gate survives). Originally: Accepted; v1 implemented 2026-07-04 — reply 写路径、subscribe 状态
 watcher、takeover 回落、`WALKCODE_CLAUDE_DAEMON_MODE` 门禁（细节与验证记录见
 `docs/design/claude-daemon-multi-ui-sync.md`）；v2 implemented 2026-07-05 —
 权限/AskUserQuestion 闭环改走 PreToolUse gate（`permission-response` 实测为

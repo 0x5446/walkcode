@@ -186,6 +186,12 @@ WALKCODE_DEFAULT_TRANSPORT
 WALKCODE_DEFAULT_AGENT
 ```
 
+The keys of the retired Claude daemon mode (ADR 0068) —
+`WALKCODE_CLAUDE_DAEMON_MODE`, `WALKCODE_CLAUDE_SPAWN_MODE`,
+`WALKCODE_CLAUDE_LIST_ADOPT`, `WALKCODE_CLAUDE_GATE_STYLE` — are different:
+deployed env files still carry them, so they are ignored with a one-line
+stderr notice instead of failing startup.
+
 ## IM-Started Sessions
 
 For IM-started sessions, WalkCode launches the configured agent through the
@@ -212,6 +218,17 @@ IM input to a TUI-owned session is read-only at first. If the user chooses
 takeover from IM, WalkCode can terminate only an authorized local process with
 `allow_terminate=true`, resume the headless transport, and submit the blocked
 input. It never injects IM text into a live TUI.
+
+Claude TUI permission prompts and AskUserQuestion reach the channel through
+the blocking PreToolUse gate (`walkcode native hook PreToolUse --gate`, ADR
+0046 v2 / ADR 0068). The hook process writes
+`<state>.tui-hooks.d/gate/pending/<rid>.json` and blocks; the serve loop's gate
+drain turns it into a card; the card callback goes through
+`Orchestrator._interaction_transport`, which routes TUI sessions to the
+`claude_gate` transport (`ClaudeGateTransport`), and that writes the
+write-once `decisions/<rid>.json` the hook returns to Claude Code. No decision
+within the wait budget, or no serve loop heartbeat, and the hook abstains so
+the native terminal prompt takes over; a card left behind is edited to say so.
 
 ## Reliability
 

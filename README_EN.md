@@ -57,30 +57,18 @@ read-only:
 Every takeover / terminal resume forks a new session id; WalkCode tracks the
 lineage and the topic stays the same.
 
-## Dual-Drive: Terminal and IM Share One Claude Session
+## Terminal Sessions: Approvals and Questions Answered on IM
 
-When a Claude session runs daemon-native (a manual `claude --bg` then attach,
-or the explicit dual-UI opt-in described in the
-[deploy doc](docs/lark-profile-deploy.md); **since ADR 0050 the default is
-single-master UI** — a bare wrapper launch is a plain TUI with read-only IM
-observation plus takeover), the terminal TUI and Feishu/Lark
-**read and write the same session at the same time**:
-
-- **Direct write from IM**: a message in the session topic is injected into
-  the terminal session (as if typed there), acknowledged with an emoji
-  reaction on your message (text receipt as fallback); terminal-side input
-  and model replies stream back into the topic.
-- **Permission approvals on IM**: tools that would prompt for permission
-  (Bash / Edit / Write, minus whatever your allow rules already cover) render
-  as cards — Allow / Always allow / Deny — and a click takes effect in the
-  terminal session immediately. The mechanism is a blocking PreToolUse hook
-  (the "gate") built entirely on Claude Code's public hook protocol; no
-  private APIs.
-- **AskUserQuestion on IM**: model questions render as option cards
-  (single / multi select / free text); submitted answers are injected into the
-  tool input, so the terminal never shows the dialog.
-- **State sync**: running / waiting-for-approval / ended status cards update
-  live; confirmations handled on the terminal side sync back to the topic.
+For a Claude TUI session running in the terminal, tools that would prompt for
+permission (Bash / Edit / Write, minus whatever your allow rules already
+cover) and AskUserQuestion render as cards in the session's Feishu/Lark
+topic — Allow / Always allow / Deny, or option cards for questions. A
+blocking PreToolUse hook (the "gate", built entirely on Claude Code's public
+hook protocol) waits for the click and hands the answer straight back to the
+terminal session. If nobody answers on IM in time (default 1800s), the hook
+abstains, the native terminal dialog appears as usual, and the card flips to
+"moved to the terminal". WalkCode's own headless sessions bypass the gate
+(the SDK closes that loop in-process).
 
 Enable it by switching the claude profile's PreToolUse hook to the `--gate`
 variant (the enlarged hook timeout is required — the 60s default would kill
@@ -98,13 +86,13 @@ Tunables: `WALKCODE_CLAUDE_GATE_MODE=auto|off|ask_only`,
 `WALKCODE_CLAUDE_GATE_TIMEOUT` (default 1800s; on timeout the hook abstains and the native terminal prompt takes over),
 `WALKCODE_CLAUDE_GATE_TOOLS` (replace the default gated tool set). Fail-safe:
 when the walkcode service is not running the hook abstains and the native
-terminal prompt flow keeps working; `WALKCODE_CLAUDE_DAEMON_MODE=off` reverts
-to read-only observation + takeover entirely.
+terminal prompt flow keeps working.
 
-Design and protocol notes:
-[docs/design/claude-daemon-multi-ui-sync.md](docs/design/claude-daemon-multi-ui-sync.md),
-[docs/design/daemon-appserver-protocol-reference.md](docs/design/daemon-appserver-protocol-reference.md),
-[ADR 0046](docs/adr/0046-claude-daemon-reply-and-subscribe-sync.md).
+The earlier Claude daemon dual-write mode (`claude --bg` + attach keystroke
+injection) was retired in
+[ADR 0068](docs/adr/0068-retire-claude-daemon-mode.md). Old env files may
+still set `WALKCODE_CLAUDE_DAEMON_MODE` / `SPAWN_MODE` / `LIST_ADOPT` /
+`GATE_STYLE`; they are ignored and safe to delete.
 
 ## Install
 

@@ -89,6 +89,13 @@ scripts; orchestration and gates live in the skill.
   user was reading. Item `status` outranks the method name (`item/completed` is
   also how a *declined* patch arrives). `fileChange` cards carry paths and a
   count, never the diff.
+- **Claude TUI gate (ADR 0068)**: the blocking `native hook PreToolUse --gate` is
+  the only way TUI permission / AskUserQuestion prompts reach the channel. Its
+  decisions go through the `claude_gate` transport (`ClaudeGateTransport`), which
+  depends on nothing but the gate spool — keep it that way. Gating it on an
+  unrelated switch is how `WALKCODE_CLAUDE_DAEMON_MODE=off` used to kill every TUI
+  card silently. The Claude daemon mode is gone; its env keys are ignored, not
+  rejected, because deployed env files still set them.
 - Legacy remnants are blockers for upgrade and real E2E: old LaunchAgents,
   `walkcode hook` configs, shell wrapper source lines, and `FEISHU_*` env must be
   cleaned first.

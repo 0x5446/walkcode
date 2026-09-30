@@ -176,10 +176,9 @@ TUI hook 归属锚定：把 walkcode hook 命令写进各 profile 的
 WALKCODE_ENV_FILE=$HOME/.walkcode/work-claude.env walkcode native hook <type> --agent claude --defer
 ```
 
-claude 的 **PreToolUse 例外**：daemon 多端闭环（ADR 0046 v2/v3）要求它用
-gate 变体，且必须放大 Claude 侧 hook 超时（v3 对 daemon 会话捕获后立即弃权，
-但 dontAsk / 非 daemon 会话仍走阻塞路径，默认 60s 会先杀掉 hook、静默退
-回终端原生提示）：
+claude 的 **PreToolUse 例外**：飞书审批/提问卡（ADR 0046 v2 / ADR 0068）要求
+它用 gate 变体，且必须放大 Claude 侧 hook 超时（gate 阻塞等飞书作答，默认
+60s 会先杀掉 hook、静默退回终端原生提示）：
 
 ```json
 "PreToolUse": [{"matcher": "", "hooks": [{
@@ -189,13 +188,11 @@ gate 变体，且必须放大 Claude 侧 hook 超时（v3 对 daemon 会话捕�
 }]}]
 ```
 
-gate 行为（v3 真双端）：AskUserQuestion 与会原生弹权限的工具（Bash/Edit/Write
-等，减去 allow 规则命中）在 daemon 会话上**终端对话框与飞书卡片同时可答，先答
-先生效**——飞书点卡经 attach 按键注入驱动原生对话框；dontAsk / 非 daemon 会话
-保留 v2 阻塞式（飞书为主）。walkcode 服务没在跑时 hook 自动弃权、终端原生提示
-照旧。调参：`WALKCODE_CLAUDE_GATE_STYLE=dual|block`（block 整体退回 v2）、
-`WALKCODE_CLAUDE_GATE_MODE=auto|off|ask_only`、`WALKCODE_CLAUDE_GATE_TIMEOUT`
-（仅 block 路径）、`WALKCODE_CLAUDE_GATE_TOOLS`。
+gate 行为：AskUserQuestion 与会原生弹权限的工具（Bash/Edit/Write 等，减去
+allow 规则命中）在 TUI 会话上变成飞书卡片，hook 阻塞等点卡；飞书超时没答则
+弃权，终端弹原生对话框、卡片翻面「已转到终端」。walkcode 服务没在跑时 hook
+自动弃权、终端原生提示照旧。调参：`WALKCODE_CLAUDE_GATE_MODE=auto|off|ask_only`、
+`WALKCODE_CLAUDE_GATE_TIMEOUT`、`WALKCODE_CLAUDE_GATE_TOOLS`。
 
 ## 3. Env 文件（×6）
 
@@ -243,33 +240,19 @@ walkcode 会把回显值记在 `CodexAppServerTransport.effective_sandbox`；显
 任意命令。确实要这么跑就显式设
 `WALKCODE_CODEX_ALLOW_UNRESTRICTED_WITHOUT_ALLOWLIST=1`。
 
-claude 实例默认保留 daemon 传输能力（ADR 0046，`DAEMON_MODE` 默认 auto）：
-**bg 会话**（`daemon_live`）飞书直写走 daemon `reply`，socket 路径由
-`WALKCODE_CLAUDE_CONFIG_DIR` 自动推导；普通 TUI 会话走 hooks 只读观察 +
-takeover（ADR 0050 默认形态）。要彻底禁用 daemon 面设
-`WALKCODE_CLAUDE_DAEMON_MODE=off`。
+单 master UI（ADR 0050）：飞书新建会话 headless 出生（飞书独占），TUI 会话
+hook 只读观察 + takeover 乒乓。Claude daemon 模式（`claude --bg` 生会话、
+daemon reply 直写、list 收编、attach 按键注入）已由 ADR 0068 退役；旧 env 里的
+`WALKCODE_CLAUDE_DAEMON_MODE` / `WALKCODE_CLAUDE_SPAWN_MODE` /
+`WALKCODE_CLAUDE_LIST_ADOPT` / `WALKCODE_CLAUDE_GATE_STYLE` 会被忽略（启动时
+stderr 打一行提示），可以删掉。
 
-单 master UI（ADR 0050，2026-07-13 起为默认，翻回 ADR 0048 的 daemon 默认）：
-`WALKCODE_CLAUDE_SPAWN_MODE` 默认 `headless`——飞书新建会话 headless 出生
-（飞书独占），TUI 会话 hook 只读观察 + takeover 乒乓；attach 端双端并发渲染
-混乱是翻回的原因。双 UI 大一统（ADR 0048：飞书新建会话生而为 daemon bg
-worker，终端可 attach、飞书 v3 真双端）仍完整可用，显式设
-`WALKCODE_CLAUDE_SPAWN_MODE=daemon` 开启；显式 `SPAWN_MODE=daemon` +
-`DAEMON_MODE=off` 的矛盾组合在配置期报错。
-`WALKCODE_CLAUDE_LIST_ADOPT=off` 关掉 list 兜底收编（默认开：walkcode
-不认识的活 daemon job——如手动 `claude --bg`——会被补建为观察会话）。
-要彻底关掉 daemon 面（含收编与 reply 直写），设
-`WALKCODE_CLAUDE_DAEMON_MODE=off` 单变量即可。
+⚠️ TUI 观察会话依赖一个可解析的观察群：`LARK_ALLOWED_CHAT_IDS` 若不止一个，
+必须显式设 `WALKCODE_LARK_TUI_CHAT_ID`；只有单条白名单群时才会自动用它当观察群。
 
-⚠️ 收编（及一切 TUI 观察会话）依赖一个可解析的观察群：`LARK_ALLOWED_CHAT_IDS`
-若不止一个，必须显式设 `WALKCODE_LARK_TUI_CHAT_ID`，否则收编只会静默跳过并
-打 `claude daemon list adopt skipped ...`——开关看似生效却见不到观察会话。
-只有单条白名单群时才会自动用它当观察群。收编策略可在 `native doctor` 的
-`claude_daemon.spawn_mode` / `list_adopt` 字段核对实际生效值。
-
-claude wrapper 默认回归纯 TUI（ADR 0050）：wrapper 内置
-`WALKCODE_NO_BG=1`，裸启动 = 普通 `claude` TUI，`--resume` 恢复官方原义，
-`/exit` 就是退出。飞书侧对 TUI 会话只读观察，想写先过 takeover 卡；终端
+claude wrapper 是纯 TUI（ADR 0050）：裸启动 = 普通 `claude` TUI，`--resume`
+是官方原义，`/exit` 就是退出（wrapper 里残留的 `WALKCODE_NO_BG=1` 已无作用，
+可删）。飞书侧对 TUI 会话只读观察，想写先过 takeover 卡；终端
 `claude --resume <uuid>`（用状态卡上的最新 id）即夺回 TUI master。
 
 handoff 撞上 pending 提问/权限卡时（ADR 0051）：终端 resume 认领会立即
@@ -278,12 +261,6 @@ handoff 撞上 pending 提问/权限卡时（ADR 0051）：终端 resume 认领�
 takeover 方向默认 `WALKCODE_HANDOFF_CONTINUE=auto`——接管后悬空的提问
 自动以新卡重现（注入对话题不可见；重问由模型执行，措辞可能与原问略有
 出入）。不想要自动续接设 `WALKCODE_HANDOFF_CONTINUE=off`。
-
-如需临时回到 daemon-native 双 UI（ADR 0048 形态：裸启动 = `claude --bg` +
-attach + `--resume` DWIM），在 wrapper 里去掉 `WALKCODE_NO_BG=1` 并把实例
-env 的 `WALKCODE_CLAUDE_SPAWN_MODE` 显式设回 `daemon`；attach 模式下
-`/exit` = detach（会话保活），结束用 `claude stop <short>`，DWIM 调试用
-`WALKCODE_RESUME_DWIM_DRYRUN=1`。
 
 ## 4. launchd（×6）
 
@@ -359,31 +336,18 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.walkcode.work-claude
   复活并带上当前配置（新加的 MCP 这时才生效）；
 - TUI 起会话 → 话题只读观察 → 接管提示 → 接管后可写。
 
-daemon-native 会话另验（ADR 0046 v3，真双端）——**ADR 0050 后这是显式
-opt-in 路径**，验收前先去掉 wrapper 的 `WALKCODE_NO_BG=1` 并在实例 env
-显式设 `WALKCODE_CLAUDE_SPAWN_MODE=daemon`（或直接手动 `claude --bg` 起
-会话），否则以下双端行为不会出现：
+TUI 会话的 gate 另验（ADR 0046 v2 / ADR 0068，claude 实例）：
 
-- 飞书发消息 → 终端实时出现该输入，飞书**无 "TUI input" 回显**、用户消息
-  被贴表情回执（reaction 失败时回退 "✅ 已发送到终端会话" 文本）；
-- 会话内触发 AskUserQuestion → **终端原生对话框与飞书卡片同时出现**（卡片
-  带"终端与飞书均可回答，先答先生效"注记）；飞书点选提交 → 终端对话框被
-  按键注入解除、卡片翻"✅ 已回答"、模型按答案继续；
-- 会话内触发权限工具（如 Bash 写命令）→ 终端权限框与飞书权限卡同时出现；
-  飞书点允许 → 命令执行、卡翻"✅ 已允许"；点拒绝 → 命令不执行、turn 取消
-  回 idle（会话可继续输入）；
-- **终端先答**：终端按键后话题出现"✅ 已在终端处理"，其后迟点旧卡 →
-  卡片如实翻"已在终端处理，本卡片未生效"（不得显示成功）；
-- "始终允许"：本会话内同工具后续**零卡片自动放行**（serve 日志见
-  `auto_allow_session ... mode=notify` + `inject_ok`；重启 walkcode 后
-  记忆失效属预期）；
-- 自动放行类调用（如 `date` 这类安全只读命令）不发卡、不留悬空按钮；
-- v3 卡在场时无旧橙色提醒卡、无 "Claude needs your permission" 英文透传；
-  空闲会话不弹权限橙卡；
-- `permission_mode=dontAsk` 与非 daemon 普通 TUI 会话仍走 v2 阻塞 gate
-  （飞书为主答、终端等待）；
-- 终端 `/exit`（detach）→ 状态卡不标已结束、无 Take over 按钮；
-  `claude stop <short>` 后状态卡才转已结束。
+- 终端会话触发 AskUserQuestion → 终端不弹框、飞书出选项卡；飞书提交 → 模型
+  按答案继续、卡片翻"✅ 已回答"；
+- 终端会话触发权限工具（如 Bash 写命令）→ 飞书权限卡；点允许 → 命令执行、
+  卡翻"✅ 已允许"；点拒绝 → 命令不执行；
+- "始终允许"：本会话内同工具后续零卡片放行（serve 日志见
+  `walkcode-gate auto_allow_session`；重启 walkcode 后记忆失效属预期）；
+- 飞书不答直到超时（可临时调小 `WALKCODE_CLAUDE_GATE_TIMEOUT` 验）→ 终端
+  弹原生对话框，卡片翻"飞书上没有及时作答，已转到终端"；迟点旧卡 → 卡片
+  翻"已失效"，不得显示成功；
+- serve 日志不再出现 `claude_daemon_reply_failed`。
 
 部署顺序：work-claude → work-codex（验证 CODEX_HOME 双 daemon 隔离）→
 personal-claude / personal-codex（验证个人飞书身份隔离）。

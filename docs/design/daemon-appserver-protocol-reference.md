@@ -19,6 +19,10 @@ sufficient to implement a secondary UI client alongside the native TUI.
 
 ## Part 1: Claude Code Daemon Protocol
 
+> **Historical (ADR 0068, 2026-09-30):** WalkCode no longer talks to the
+> Claude Code daemon; this part is kept as a protocol record only. Part 2
+> (Codex app-server) is still in use.
+
 ### 1.1 Architecture Overview
 
 ```
