@@ -82,8 +82,8 @@ class ChannelNativeCliTests(unittest.TestCase):
         self.assertIn("listening via Lark WebSocket", stdout.getvalue())
 
     def test_native_serve_rejects_retired_polling_flags(self):
-        for flag in ("--once", "--poll-timeout", "--limit"):
-            with patch.object(sys, "argv", ["walkcode", "native", "serve", flag, "1"]), \
+        for flag in (["--once"], ["--poll-timeout", "1"], ["--limit", "1"]):
+            with patch.object(sys, "argv", ["walkcode", "native", "serve", *flag]), \
                  patch("sys.stderr", new_callable=io.StringIO):
                 with self.assertRaises(SystemExit) as raised:
                     main.main()

@@ -24,7 +24,7 @@ metadata:
 - **tag 打在合并后的 `main`**，不在分支上发版。
 - **V3 launchd 实例显式优先、自动兜底**：设置了 `WALKCODE_V3_LAUNCHD_LABELS`
   就只重启其中的 native runtime（例如
-  `com.walkcode.telegram-claude,com.walkcode.telegram-codex`）；为空时自动重启
+  `com.walkcode.work-claude,com.walkcode.work-codex`）；为空时自动重启
   已加载的 `com.walkcode.*` 服务，但**永不碰 `com.walkcode.tap-*`**（tap 代理
   承载本机 Claude 会话的实时 API 流量）。不重启旧 `walkcode serve/start` daemon。
 - **旧版残留是阻断项**：旧 LaunchAgent、`walkcode hook`、shell wrapper source、
@@ -60,7 +60,7 @@ metadata:
    - kickstart `WALKCODE_V3_LAUNCHD_LABELS`；为空时自动发现已加载的
      `com.walkcode.*`（排除 `tap-*`）。
    - 对每个重启的实例按其 env 文件运行 `walkcode native doctor`；真实验收继续跑模块 gate：
-     `config`、`runtime`、`state`、`outbox`、`agent`、`telegram`、必要时
+     `config`、`runtime`、`state`、`outbox`、`agent`、`lark`、必要时
      `agent-smoke --live`。
    - 并发升级被目录锁挡住。
 6. **报告**：版本号、PR URL、Release URL、每个 V3 runtime label 的 doctor/gate 状态。
@@ -73,8 +73,10 @@ metadata:
 
 ```
 uv tool install 'git+https://github.com/0x5446/walkcode@v<上个好版本>' --force --reinstall --refresh-package walkcode
-launchctl kickstart -k gui/$(id -u)/com.walkcode.telegram-claude
-launchctl kickstart -k gui/$(id -u)/com.walkcode.telegram-codex
+# 只重启，别再跑 ./upgrade.sh（它会装回最新版）；跳过 tap-* 代理
+for l in $(LC_ALL=C launchctl list | awk '/com\.walkcode\./ && !/tap-/ {print $3}'); do
+  launchctl kickstart -k gui/$(id -u)/$l
+done
 ```
 
 ## 脚本速查

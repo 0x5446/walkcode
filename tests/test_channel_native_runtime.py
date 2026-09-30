@@ -3126,6 +3126,20 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
             )
             self.assertEqual(len(api.calls), before, api.calls[before:])
 
+            # The user rejected the prompt and asked something else: no tool
+            # event follows, but the new prompt ends the wait — the card must
+            # not keep showing "waiting for approval".
+            asyncio.run(
+                runtime.process_tui_hook(
+                    hook_type="user-prompt-submit",
+                    agent="claude",
+                    payload={"session_id": "claude-session-1", "cwd": tmp, "prompt": "never mind"},
+                )
+            )
+            snapshot = JsonFileStateStore(state_path).load()
+            session = snapshot.sessions.get(session.session_id)
+            self.assertEqual(session.lifecycle_state, "EXTERNAL_OBSERVED_READONLY")
+
     def test_raw_stop_hook_name_is_normalized_before_processing(self):
         with tempfile.TemporaryDirectory() as tmp:
             state_path = str(Path(tmp) / "state.json")
@@ -3416,6 +3430,43 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
             self.assertEqual(list(qdir.glob("*.json")), [])
             self.assertTrue((qdir / "bad" / "00-poison.json").exists())
             self.assertEqual(seen.count("01-next.json"), 1)
+
+    def test_unreadable_deferred_tui_hook_stays_queued(self):
+        # A read error is not a corrupt event: archiving it lost a valid hook
+        # that nothing replays.
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = str(Path(tmp) / "state.json")
+            cfg = ChannelNativeConfig.from_env(
+                {
+                    "WALKCODE_CHANNEL": "lark",
+                    "LARK_APP_ID": "cli_x",
+                    "LARK_APP_SECRET": "s",
+                    "WALKCODE_AGENT": "claude",
+                    "WALKCODE_STATE_PATH": state_path,
+                    "WALKCODE_CWD": tmp,
+                }
+            )
+            runtime = ChannelNativeRuntime.from_config(
+                cfg,
+                lark_api=_FakeLarkApi(),
+                transports={"claude_headless": FakeAgentTransport("claude_headless", _transport_caps())},
+            )
+            qdir = Path(f"{state_path}.tui-hooks.d")
+            qdir.mkdir(parents=True, exist_ok=True)
+            hook = qdir / "00-hook.json"
+            hook.write_text("{}", encoding="utf-8")
+            real_read = Path.read_text
+
+            def flaky_read(self, *args, **kwargs):
+                if self == hook:
+                    raise OSError("I/O error")
+                return real_read(self, *args, **kwargs)
+
+            with patch.object(Path, "read_text", flaky_read):
+                asyncio.run(runtime.drain_deferred_tui_hooks())
+
+            self.assertTrue(hook.exists())
+            self.assertFalse((qdir / "bad" / "00-hook.json").exists())
 
     def test_deferred_tui_hook_filename_uses_nanosecond_order(self):
         with tempfile.TemporaryDirectory() as tmp:

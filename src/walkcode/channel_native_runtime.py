@@ -2977,8 +2977,16 @@ class ChannelNativeRuntime:
         processed = 0
         for path in self._deferred_tui_hook_paths(limit=limit):
             try:
-                item = json.loads(path.read_text(encoding="utf-8"))
-            except Exception:
+                raw = path.read_text(encoding="utf-8")
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                # A read error says nothing about the event: keep it queued.
+                print(f"deferred TUI hook unreadable, retrying: {type(exc).__name__}: {exc}", file=sys.stderr)
+                break
+            try:
+                item = json.loads(raw)
+            except ValueError:
                 self._archive_bad_tui_hook(path)
                 continue
             if not isinstance(item, dict):
@@ -4165,6 +4173,12 @@ class ChannelNativeRuntime:
     async def _send_tui_hook_output(
         self, session, *, hook_type: str, payload: dict[str, Any], agent: str = ""
     ) -> None:
+        if hook_type in {"user-prompt-submit", "stop"} and session.lifecycle_state == "WAITING_PERMISSION":
+            # A new prompt or a finished turn means the approval prompt is
+            # gone (answered or rejected) even when no tool event followed —
+            # otherwise the card keeps showing "waiting for approval".
+            session.lifecycle_state = "EXTERNAL_OBSERVED_READONLY"
+            await self.orchestrator.refresh_session_status_card(session)
         tool_event = _tui_hook_tool_event(hook_type, payload)
         if tool_event is not None:
             session.last_event_seq += 1
