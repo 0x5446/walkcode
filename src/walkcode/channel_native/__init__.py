@@ -26,6 +26,11 @@ this package does not reach the submodules.
 
 from __future__ import annotations
 
+# This module only re-exports (the pre-split public and private names, plus
+# stdlib modules tests reach as package attributes), so "imported but unused"
+# is its whole point.
+# ruff: noqa: F401
+
 # The pre-split module imported these; keep them reachable as package
 # attributes (tests use e.g. ``channel_native.subprocess`` and ``.signal``).
 import asyncio

@@ -93,10 +93,6 @@ from .channel_native.codex_app_server import (
     CodexManagedAppServerClient,
     CodexStdioAppServerClient,
     _is_codex_hitl_server_request_message,
-    _notification_matches_thread,
-    _notification_thread_id,
-    _read_websocket_frame,
-    _websocket_frame,
 )
 
 

@@ -38,7 +38,7 @@ from walkcode.channel_native import (
     TransportUnavailable,
     TurnInput,
 )
-from walkcode.channel_native_runtime import (
+from walkcode.channel_native.codex_app_server import (
     CodexManagedAppServerClient,
     CodexStdioAppServerClient,
     _notification_matches_thread,
