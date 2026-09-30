@@ -16,6 +16,7 @@ scripts to assert their gates:
 Everything uses the local bare remote, so nothing touches the network.
 """
 
+import json
 import os
 import re
 import shutil
@@ -30,6 +31,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 RELEASE_SH = REPO_ROOT / "release.sh"
 INSTALL_SH = REPO_ROOT / "install.sh"
 UPGRADE_SH = REPO_ROOT / "upgrade.sh"
+UNINSTALL_SH = REPO_ROOT / "uninstall.sh"
 
 _GIT = shutil.which("git")
 # Prefer the system bash: on macOS that is 3.2, the interpreter these scripts
@@ -603,7 +605,7 @@ esac
         # the variable name ("ENV_FILE?: unbound variable" under set -u) —
         # every expansion followed by CJK text must use ${VAR}.
         pat = re.compile(r"\$[A-Za-z_][A-Za-z0-9_]*[　-〿一-鿿＀-￯]")
-        for script in (UPGRADE_SH, RELEASE_SH, INSTALL_SH):
+        for script in (UPGRADE_SH, RELEASE_SH, INSTALL_SH, UNINSTALL_SH):
             for lineno, line in enumerate(script.read_text().splitlines(), 1):
                 self.assertIsNone(
                     pat.search(line),
@@ -637,6 +639,175 @@ esac
         r = self._run("upgrade.sh", extra_env=self._upgrade_env())
         self.assertNotRegex(r.stdout + r.stderr, r"another upgrade is running|已有升级在运行")
         self.assertRegex(r.stdout + r.stderr, r"stale|残留")
+
+
+_WC_HOOK = "WALKCODE_ENV_FILE=/x/work-claude.env walkcode native hook {} --agent claude --defer"
+_OTHER_HOOK = "node /x/other-hook.mjs"
+
+
+@unittest.skipUnless(_BASH and shutil.which("python3"), "bash and python3 required")
+class UninstallScriptTests(unittest.TestCase):
+    """uninstall.sh against a throwaway HOME with fake launchctl/uv on PATH."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="wc-uninstall-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.home = self.tmp / "home"
+        fakebin = self.tmp / "bin"
+        fakebin.mkdir()
+        _write_exe(fakebin / "launchctl", FAKE_LAUNCHCTL)
+        _write_exe(fakebin / "uv", FAKE_UV)
+        self.launchctl_log = self.tmp / "launchctl.log"
+        self.uv_log = self.tmp / "uv.log"
+
+        agents = self.home / "Library" / "LaunchAgents"
+        agents.mkdir(parents=True)
+        for label in ("com.walkcode.a-claude", "com.walkcode.b-codex", "com.walkcode.tap-work"):
+            (agents / f"{label}.plist").write_text("<plist/>")
+        self.agents = agents
+
+        # Mixed PreToolUse entry: the other hook must survive.
+        self.claude_settings = self.home / ".claude-profiles" / "work" / "settings.json"
+        self.claude_settings.parent.mkdir(parents=True)
+        self.claude_settings.write_text(json.dumps({
+            "model": "opus",
+            "hooks": {
+                "PreToolUse": [{"matcher": "", "hooks": [
+                    {"type": "command", "command": _OTHER_HOOK},
+                    {"type": "command", "command": _WC_HOOK.format("PreToolUse"), "timeout": 1830},
+                ]}],
+                "Stop": [{"matcher": "", "hooks": [
+                    {"type": "command", "command": _WC_HOOK.format("Stop")},
+                ]}],
+                "SessionStart": [{"matcher": "", "hooks": [
+                    {"type": "command", "command": _OTHER_HOOK},
+                ]}],
+            },
+        }, indent=2))
+        self.codex_hooks = self.home / ".codex" / "hooks.json"
+        self.codex_hooks.parent.mkdir(parents=True)
+        self.codex_hooks.write_text(json.dumps({"hooks": {"Stop": [{"hooks": [
+            {"type": "command", "command": "walkcode hook stop"},
+        ]}]}}))
+        self.clean_codex = self.home / ".codex-profiles" / "personal" / "hooks.json"
+        self.clean_codex.parent.mkdir(parents=True)
+        self.clean_codex.write_text(json.dumps({"hooks": {"Stop": [{"hooks": [
+            {"type": "command", "command": _OTHER_HOOK},
+        ]}]}}))
+
+        walk = self.home / ".walkcode"
+        (walk / "workspace").mkdir(parents=True)
+        (walk / "logs").mkdir()
+        self.kept = [
+            walk / "workspace" / "user_code.py",
+            walk / "a-claude.env",
+            walk / "a-claude-state.json",
+            walk / "logs" / "a-claude.log",
+        ]
+        for path in self.kept:
+            path.write_text("keep me")
+
+        self.env = _sanitized_host_env(os.environ)
+        self.env.update({
+            "PATH": f"{fakebin}{os.pathsep}{self.env['PATH']}",
+            "HOME": str(self.home),
+            "LANG": "en_US.UTF-8",
+            "FAKE_LAUNCHCTL_LOG": str(self.launchctl_log),
+            "FAKE_UV_LOG": str(self.uv_log),
+            "FAKE_LAUNCHCTL_LIST": "\n".join([
+                "PID\tStatus\tLabel",
+                "123\t0\tcom.walkcode.a-claude",
+                "-\t0\tcom.walkcode.tap-work",
+                "77\t0\tcom.apple.foo",
+            ]),
+        })
+
+    def _run(self, *args, **extra_env):
+        env = dict(self.env)
+        env.update(extra_env)
+        # New session = no controlling terminal: every prompt must take the
+        # non-interactive default instead of blocking on /dev/tty.
+        return subprocess.run(
+            [_BASH, str(UNINSTALL_SH), *args], env=env, capture_output=True,
+            text=True, errors="replace", start_new_session=True, timeout=60,
+        )
+
+    def _snapshot(self):
+        return {
+            str(p.relative_to(self.home)): p.read_bytes()
+            for p in self.home.rglob("*") if p.is_file()
+        }
+
+    def _log(self, path):
+        return path.read_text().splitlines() if path.exists() else []
+
+    def _backups(self):
+        return sorted(self.home.rglob("*.walkcode-uninstall-*.bak"))
+
+    def test_dry_run_has_no_side_effects(self):
+        before = self._snapshot()
+        r = self._run("--dry-run")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(self._snapshot(), before)
+        self.assertEqual(self._backups(), [])
+        self.assertFalse(any("bootout" in l for l in self._log(self.launchctl_log)))
+        self.assertEqual(self._log(self.uv_log), [])
+        self.assertIn("[dry-run] launchctl bootout", r.stdout)
+        self.assertIn("[dry-run] uv tool uninstall walkcode", r.stdout)
+        self.assertIn("[dry-run] remove 2 WalkCode hook(s)", r.stdout)
+
+    def test_non_interactive_without_yes_aborts_untouched(self):
+        before = self._snapshot()
+        r = self._run()
+        self.assertNotEqual(r.returncode, 0)
+        self.assertEqual(self._snapshot(), before)
+        self.assertEqual(self._log(self.uv_log), [])
+
+    def test_removes_only_walkcode_hooks_and_non_tap_agents(self):
+        original_settings = self.claude_settings.read_text()
+        original_clean = self.clean_codex.read_text()
+        r = self._run("--yes")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+        bootouts = [l for l in self._log(self.launchctl_log) if l.startswith("bootout")]
+        uid = os.getuid()
+        self.assertIn(f"bootout gui/{uid}/com.walkcode.a-claude", bootouts)
+        self.assertIn(f"bootout gui/{uid}/com.walkcode.b-codex", bootouts)
+        self.assertFalse(any("tap-" in l for l in bootouts), bootouts)
+        self.assertFalse((self.agents / "com.walkcode.a-claude.plist").exists())
+        self.assertFalse((self.agents / "com.walkcode.b-codex.plist").exists())
+        self.assertTrue((self.agents / "com.walkcode.tap-work.plist").exists())
+        self.assertEqual(self._log(self.uv_log), ["tool uninstall walkcode"])
+
+        settings = json.loads(self.claude_settings.read_text())
+        self.assertEqual(settings["model"], "opus")
+        self.assertEqual(
+            settings["hooks"]["PreToolUse"],
+            [{"matcher": "", "hooks": [{"type": "command", "command": _OTHER_HOOK}]}],
+        )
+        self.assertNotIn("Stop", settings["hooks"])
+        self.assertIn("SessionStart", settings["hooks"])
+        self.assertNotIn("hooks", json.loads(self.codex_hooks.read_text()))
+        self.assertEqual(self.clean_codex.read_text(), original_clean)
+
+        backups = self._backups()
+        self.assertEqual(
+            sorted(b.parent for b in backups),
+            sorted([self.claude_settings.parent, self.codex_hooks.parent]),
+        )
+        claude_backup = next(b for b in backups if b.parent == self.claude_settings.parent)
+        self.assertEqual(claude_backup.read_text(), original_settings)
+
+        # Non-interactive: state/logs kept too; workspace and env never touched.
+        for path in self.kept:
+            self.assertEqual(path.read_text(), "keep me", path)
+
+    def test_self_driver_label_is_booted_out_last(self):
+        r = self._run("--yes", WALKCODE_DRIVER_LABEL="com.walkcode.a-claude")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        bootouts = [l for l in self._log(self.launchctl_log) if l.startswith("bootout")]
+        self.assertTrue(bootouts[-1].endswith("/com.walkcode.a-claude"), bootouts)
+        self.assertEqual(len(bootouts), 2, bootouts)
 
 
 if __name__ == "__main__":

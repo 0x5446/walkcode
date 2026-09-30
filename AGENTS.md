@@ -31,7 +31,7 @@ Use the **`walkcode-release`** skill (`.claude/skills/walkcode-release/SKILL.md`
 encodes the gated, fully-automatable pipeline. Mechanical steps live in two root
 scripts; orchestration and gates live in the skill.
 
-- **Order is fixed: release first, then local upgrade** — `walkcode upgrade` pulls the
+- **Order is fixed: release first, then local upgrade** — `./upgrade.sh` pulls the
   latest GitHub *Release*, so the change must be merged to `main` and a Release created
   before upgrading locally.
 - `./release.sh prepare [VERSION] -m MSG` — bump `pyproject.toml`, run tests, branch
@@ -41,7 +41,13 @@ scripts; orchestration and gates live in the skill.
   (labels from `WALKCODE_V3_LAUNCHD_LABELS` when set, otherwise the loaded
   `com.walkcode.*` services excluding `com.walkcode.tap-*` proxies), and
   verify each restarted instance with `walkcode native doctor` bound to its
-  env file.
+  env file. It is the only upgrade implementation: `walkcode upgrade` just
+  execs it from a source checkout (otherwise prints how to run it) — don't
+  re-implement upgrade steps in Python.
+- `./uninstall.sh [--dry-run] [--yes]` — boot out `com.walkcode.*` LaunchAgents
+  (never `tap-*`), `uv tool uninstall walkcode`, and strip only WalkCode hook
+  entries from Claude/codex configs (backed up first). It never deletes env
+  files or the workspace under `~/.walkcode`.
 - **Release tag resolution (ADR 0061)**: `gh api …/releases/latest` →
   anonymous releases API → the `releases/latest` HTML redirect; every source
   must yield `vX.Y.Z`. All three failing is a hard error — upgrade refuses to
