@@ -1977,7 +1977,6 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
                 owner=ActorRef("telegram", "456", "Ada"),
             )
             session.lifecycle_state = "IDLE"
-            session.writer_lease = None
             runtime.state.authz.grant(session.session_id, ActorRef("telegram", "456", "Ada"), SessionRole.OWNER)
             clock.now += 31.0
 
@@ -2034,7 +2033,6 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
                 owner=ActorRef("telegram", "456", "Ada"),
             )
             session.lifecycle_state = "IDLE"
-            session.writer_lease = None
             runtime.state.authz.grant(session.session_id, ActorRef("telegram", "456", "Ada"), SessionRole.OWNER)
             clock.now += 31.0
 
@@ -3004,7 +3002,7 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
 
     @staticmethod
     def _session_state(session):
-        return (session.lifecycle_state, session.writer_owner.kind, session.generation, session.last_event_seq, session.writer_lease)
+        return (session.lifecycle_state, session.writer_owner.kind, session.generation, session.last_event_seq)
 
     def test_mirror_renders_a_tui_turn_without_touching_session_state(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -4777,9 +4775,7 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
                 transport_kind="claude_headless",
                 transport_request_id="perm-1",
                 native_method="permission.requested",
-                native_params={"prompt": "Allow shell?"},
                 prompt_kind="permission",
-                channel_binding_key=session.channel_binding.key(),
             )
 
             result = asyncio.run(
@@ -4853,9 +4849,7 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
                 transport_kind="claude_headless",
                 transport_request_id="perm-1",
                 native_method="permission.requested",
-                native_params={"prompt": "Allow shell?"},
                 prompt_kind="permission",
-                channel_binding_key=session.channel_binding.key(),
             )
 
             result = asyncio.run(
@@ -5216,7 +5210,6 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
             session.lifecycle_state = "STOPPED"
             session.stop_reason = "runtime_restart"
             session.writer_owner = None
-            session.writer_lease = None
             old_generation = session.generation
 
             # Live proof: a real running pid whose CURRENT identity classifies
@@ -5300,7 +5293,6 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
             session.lifecycle_state = "STOPPED"
             session.stop_reason = "runtime_restart"
             session.writer_owner = None
-            session.writer_lease = None
 
             # A pid that is guaranteed dead: spawn and reap it.
             dead = subprocess.Popen(["sleep", "0.01"])
@@ -5364,7 +5356,6 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
             session.lifecycle_state = "STOPPED"
             session.stop_reason = "runtime_restart"
             session.writer_owner = None
-            session.writer_lease = None
 
             result = asyncio.run(
                 runtime.process_tui_hook(

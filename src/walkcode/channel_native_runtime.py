@@ -87,8 +87,10 @@ from .channel_native import (
     ViewModelFactory,
     WriterOwner,
     _agent_to_transport_kind,
+    _session_has_durable_resume_ref,
     _session_is_channel_revival_candidate,
     _session_is_external_tui_takeover_candidate,
+    compact_sessions,
 )
 from .channel_native import claude_gate
 from .channel_native.claude_gate_transport import CLAUDE_GATE_TRANSPORT_KEY, ClaudeGateTransport
@@ -2992,7 +2994,6 @@ class ChannelNativeRuntime:
                     session.status = "stopped"
                     session.lifecycle_state = "STOPPED"
                     session.stop_reason = "runtime_restart"
-                    session.writer_lease = None
                     session.writer_owner = WriterOwner(kind="none")
                     session.background_tasks = []
                     session.last_progress_at = self._now()
@@ -3050,17 +3051,23 @@ class ChannelNativeRuntime:
     def compact_state(self) -> dict[str, dict[str, int]]:
         # Synchronous: no task can observe a half-compacted snapshot. Existing
         # store retention policies preserve pending deliveries/live prompts.
+        # Sessions go last: their "still referenced" check reads what the
+        # other stores kept.
         removed = {
             "outbox": self.state.outbox.compact(),
             "interactions": self.state.interactions.compact(),
             "hitls": self.state.hitls.compact(),
         }
+        removed["sessions"] = compact_sessions(self.state)
         self.save_state()
         if any(value for counts in removed.values() for value in counts.values()):
             print(f"walkcode maintenance=state_compacted removed={removed}", file=sys.stderr)
         return removed
 
     async def _compact_state_forever(self) -> None:
+        swept = self.state_store.sweep_stale_temp_files()
+        if swept:
+            print(f"walkcode maintenance=state_temp_swept removed={swept}", file=sys.stderr)
         while True:
             try:
                 async with self._ingress_lock:
@@ -3290,6 +3297,12 @@ class ChannelNativeRuntime:
         # Nothing above changed state: ignored hooks return without a save
         # (a full fsync'd rewrite of a multi-MB state file per tool call).
         if not self.state.inbound_ledger.start(event_id):
+            if self.state_store.last_save_failed:
+                # The completion mark may exist only in memory: the save after
+                # the first attempt failed. "Accepted" lets the drain delete
+                # the queue file, so persist the mark first — if this save
+                # fails too, the raise keeps the file for the retry path.
+                self.save_state()
             return SubmitResult(True, BlockedReason.DUPLICATE_INBOUND)
         try:
             session = await self._claim_or_create_tui_observed_session(
@@ -3847,7 +3860,6 @@ class ChannelNativeRuntime:
                     external_ref=dict(external_ref),
                     acquired_at=self._now(),
                 )
-                session.writer_lease = None
                 session.last_progress_at = self._now()
                 session.last_progress_event = "external_tui.claimed"
                 self._ensure_tui_observed_binding_capabilities(session)
@@ -4374,9 +4386,6 @@ class ChannelNativeRuntime:
         if session.writer_owner is None or session.writer_owner.kind != "none":
             session.writer_owner = WriterOwner(kind="none")
             changed = True
-        if session.writer_lease is not None:
-            session.writer_lease = None
-            changed = True
         if session.last_progress_event != "external_tui.detached":
             session.last_progress_event = "external_tui.detached"
             changed = True
@@ -4758,7 +4767,6 @@ class ChannelNativeRuntime:
         session.status = "stopped"
         session.lifecycle_state = "STOPPED"
         session.stop_reason = f"external_tui_{hook_type}"
-        session.writer_lease = None
         session.writer_owner = WriterOwner(kind="none")
 
     def save_state(self) -> None:
@@ -5315,7 +5323,7 @@ def _load_or_create_state(state_store: JsonFileStateStore, *, now=time.time) -> 
         sessions=SessionRegistry(now=now),
         interactions=_new_interaction_store(now=now),
         outbox=DurableOutbox(now=now),
-        authz=AuthorizationStore(now=now),
+        authz=AuthorizationStore(),
         inbound_ledger=InboundLedger(now=now),
     )
 
@@ -7145,24 +7153,6 @@ def _looks_like_internal_tui_text(text: str) -> bool:
     ):
         return True
     return False
-
-
-def _session_has_durable_resume_ref(session: Any) -> bool:
-    ref = getattr(session, "transport_ref", {}) or {}
-    transport_kind = str(getattr(session, "transport_kind", ""))
-    if transport_kind == "external_tui":
-        nested = ref.get("resume_ref") if isinstance(ref, dict) else None
-        if not isinstance(nested, dict):
-            return False
-        nested_kind = str(nested.get("transport_kind", "") or nested.get("kind", ""))
-        return _resume_ref_is_durable(nested_kind, nested)
-    return _resume_ref_is_durable(transport_kind, ref)
-
-
-def _resume_ref_is_durable(transport_kind: str, ref: dict[str, Any]) -> bool:
-    if transport_kind in {"claude_headless", "codex_app_server"}:
-        return bool(agent_session_id(transport_kind, ref))
-    return bool(ref)
 
 
 def _external_tui_process_ref(session: Any) -> dict[str, Any]:

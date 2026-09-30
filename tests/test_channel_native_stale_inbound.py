@@ -85,7 +85,7 @@ def _setup():
         outbox=DurableOutbox(now=clock),
         channels={"telegram": channel},
         transports={"claude_headless": transport},
-        authz=AuthorizationStore(now=clock),
+        authz=AuthorizationStore(),
         now=clock,
     )
     binding = ChannelBinding("telegram", "bot", "chat", "topic", "root")

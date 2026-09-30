@@ -2059,10 +2059,7 @@ class CodexAppServerTransportTests(unittest.TestCase):
         self.assertEqual(client.responses, [("approval-1", {"decision": "accept"})])
         decided = orchestrator.hitls.get(pending[0].hitl_request_id)
         self.assertEqual(decided.status, "decided")
-        self.assertEqual(
-            orchestrator.hitls.decision_for(pending[0].hitl_request_id).native_response["action"],
-            "accept",
-        )
+        self.assertGreater(decided.decided_at, 0)
 
     def test_events_convert_tool_request_user_input_and_answer_by_question_id(self):
         client = _FakeCodexClient()

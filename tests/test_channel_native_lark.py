@@ -749,6 +749,56 @@ class LarkInboxReliabilityTests(_LarkRuntimeHarness):
         self.assertEqual(len(loaded["pending"]), 1)
         self.assertEqual(loaded["sent"], {})
 
+    def test_runtime_compaction_prunes_expired_stopped_sessions_and_persists(self):
+        from walkcode.channel_native import ActorRef, ChannelBinding
+
+        runtime, _, _ = self._runtime()
+        sessions = runtime.state.sessions
+        stale = sessions.create_observed_session(
+            session_id="tui-stale", binding=ChannelBinding("lark", "app-id", "oc_chat", "omt_1", "om_1"),
+            cwd=self._tmp.name, external_ref={"source": "native_tui_hook"}, owner=ActorRef("lark", "ou_owner"),
+        )
+        stale.status = "stopped"
+        stale.stop_reason = "external_tui_process_gone"
+        sessions._now = lambda: stale.last_progress_at + 8 * 86400.0
+
+        removed = runtime.compact_state()
+
+        self.assertEqual(removed["sessions"], {"sessions": 1})
+        self.assertEqual(runtime.state_store.load().sessions.to_dict()["sessions"], {})
+
+    def test_duplicate_tui_hook_keeps_its_queue_file_until_the_completion_is_saved(self):
+        # deep-review 2026-09-30: the first attempt completes the ledger entry
+        # in memory, then its save fails. The retry is judged a duplicate and
+        # "accepted" — which used to unlink the queue file while the event
+        # existed only in memory (lost if the process exited before the next
+        # successful save).
+        runtime, _, _ = self._runtime()
+        # A Stop for a session nobody observes: the only state change is the
+        # ledger completion, and the only save is the one after it.
+        runtime.defer_tui_hook(
+            hook_type="stop",
+            agent="claude",
+            payload={"session_id": "claude-session-1", "turn_id": "turn-1", "cwd": self._tmp.name},
+        )
+        queue_dir = Path(f"{runtime.state_store.path}.tui-hooks.d")
+        [queued] = list(queue_dir.glob("*.json"))
+        failing_write = mock.patch(
+            "walkcode.channel_native._atomic_write_json", side_effect=OSError("disk full")
+        )
+
+        with failing_write, contextlib.redirect_stderr(io.StringIO()):
+            asyncio.run(runtime.drain_deferred_tui_hooks())  # processed, save fails
+            asyncio.run(runtime.drain_deferred_tui_hooks())  # duplicate, save fails
+        self.assertTrue(queued.exists())
+        self.assertFalse(runtime.state_store.path.exists())
+
+        self.assertEqual(asyncio.run(runtime.drain_deferred_tui_hooks()), 1)
+
+        self.assertFalse(queued.exists())
+        completed = json.loads(runtime.state_store.path.read_text())["inbound_ledger"]["completed"]
+        self.assertEqual(len(completed), 1)
+
 
 class LarkRuntimeTests(_LarkRuntimeHarness):
     def test_plain_message_creates_session_rooted_at_status_card(self):

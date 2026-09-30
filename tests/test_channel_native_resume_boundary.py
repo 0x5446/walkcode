@@ -96,7 +96,7 @@ def _setup(transport):
     clock = _Clock()
     sessions = SessionRegistry(now=clock)
     interactions = InteractionStore(now=clock)
-    authz = AuthorizationStore(now=clock)
+    authz = AuthorizationStore()
     channel = FakeChannelAdapter("telegram", _channel_caps())
     orchestrator = Orchestrator(
         sessions=sessions,

@@ -601,7 +601,7 @@ class BindingSerializationTests(unittest.TestCase):
 
 class AuthorizationTests(unittest.TestCase):
     def test_roles_gate_submit_high_risk_decision_and_takeover(self):
-        authz = AuthorizationStore(now=_Clock())
+        authz = AuthorizationStore()
         authz.grant("s1", _actor("owner"), SessionRole.OWNER)
         authz.grant("s1", _actor("collab"), SessionRole.COLLABORATOR)
         authz.grant("s1", _actor("reviewer"), SessionRole.REVIEWER)
@@ -617,7 +617,7 @@ class AuthorizationTests(unittest.TestCase):
         self.assertFalse(authz.can_takeover("s1", _actor("reviewer")).allowed)
 
     def test_orchestrator_denies_unprivileged_input_without_calling_transport(self):
-        authz = AuthorizationStore(now=_Clock())
+        authz = AuthorizationStore()
         sessions = SessionRegistry(now=_Clock())
         transport = FakeAgentTransport("fake-transport", _transport_caps())
         orchestrator = Orchestrator(

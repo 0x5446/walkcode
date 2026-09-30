@@ -153,7 +153,6 @@ class StructuredToExternalHandoffTests(unittest.TestCase):
         self.assertEqual(updated.generation, 1)
         self.assertEqual(updated.lifecycle_state, "EXTERNAL_OBSERVED_READONLY")
         self.assertEqual(updated.writer_owner.kind, "external_tui")
-        self.assertIsNone(updated.writer_lease)
         self.assertEqual(updated.transport_kind, "external_tui")
         self.assertEqual(updated.transport_ref["resume_ref"]["agent_session_id"], "claude-1")
         self.assertEqual(updated.transport_ref["terminate_ref"]["process_ref"]["pid"], 123)
