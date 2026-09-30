@@ -87,35 +87,15 @@ from .channel_native import (
     ViewModelFactory,
     WriterOwner,
     _agent_to_transport_kind,
-    _external_claude_resume_ref,
     _session_is_channel_revival_candidate,
     _session_is_external_tui_takeover_candidate,
 )
 from .channel_native import claude_gate
-from .channel_native.claude_daemon import (
-    ClaudeDaemonTransport,
-    claude_daemon_short_from_resume_ref,
-    claude_daemon_short_id,
-)
+from .channel_native.claude_gate_transport import CLAUDE_GATE_TRANSPORT_KEY, ClaudeGateTransport
 from .channel_native.lark_live import AckRegistry, LarkIngressBridge, build_lark_live_api
 
 
 TELEGRAM_FORUM_TOPIC_ICON_COLORS = (0x6FB9F0, 0xFFD67E, 0xCB86DB, 0x8EEE98, 0xFF93B2, 0xFB6F5F)
-CLAUDE_DAEMON_WATCH_INTERVAL_SECONDS = 5.0
-CLAUDE_DAEMON_UNAVAILABLE_RETRY_SECONDS = 30.0
-# List-fallback adoption (ADR 0048): a wild job must have existed this long
-# before it is registered, so the runtime's own daemon-native spawn always
-# wins the race and registers its session (with the user's chat binding) first.
-# MUST exceed the spawner's own worst-case register latency — the daemon-native
-# spawn holds a job in the daemon list (with its real createdAt) for up to
-# SPAWN_BG_READY_TIMEOUT_SECONDS before it registers under the ingress lock; a
-# threshold below that window lets the watcher adopt the runtime's own in-flight
-# job, which the spawner then kills as a duplicate (ADR 0048 review finding).
-CLAUDE_DAEMON_ADOPT_MIN_AGE_SECONDS = 60.0
-# Bounded wait for the spawn-time observer attach handshake before the first
-# turn is submitted (ADR 0048 round-2): long enough for a local unix-socket
-# attach, short enough not to stall the ingress path if the daemon is wedged.
-CLAUDE_DAEMON_OBSERVER_READY_TIMEOUT_SECONDS = 3.0
 CLAUDE_GATE_DRAIN_INTERVAL_SECONDS = 1.0
 # Failed edits of a settled gate card (about one pass a second) before giving
 # up on it. Waiting for the card's delivery does not count.
@@ -128,16 +108,6 @@ CLAUDE_GATE_UNROUTABLE_GRACE_SECONDS = 10.0
 # Pending files whose hook process must be gone (deadline long past) get
 # reaped by the drain loop.
 CLAUDE_GATE_REAP_SLACK_SECONDS = 60.0
-# Hot-path budget for the gate hook's "is this session a daemon job?" probe:
-# one `has` round trip on the local unix socket. Anything slower degrades to
-# the blocking (v2) path, so a daemon blip costs UX, never correctness.
-CLAUDE_GATE_DAEMON_PROBE_TIMEOUT_SECONDS = 0.5
-# A notify pending only becomes a card once the native dialog actually shows
-# (needs match). Auto-approved calls (safe read-only Bash etc.) never render
-# one — after this grace the pending is dropped silently instead of leaving a
-# dangling live card (live-E2E finding). Sized for dialog render latency
-# behind model thinking (live-observed up to ~9s).
-CLAUDE_GATE_NOTIFY_DIALOG_GRACE_SECONDS = 30.0
 TUI_HOOK_DRAIN_TIMEOUT_SECONDS = 30.0
 TUI_HOOK_DRAIN_BATCH_SIZE = 25
 TUI_HOOK_RECENT_PRIORITY_WINDOW_SECONDS = 300.0
@@ -155,10 +125,8 @@ OUTBOX_FLUSH_INTERVAL_SECONDS = 1.0
 STATE_COMPACT_INTERVAL_SECONDS = 300.0
 TUI_BINDING_REFRESH_INTERVAL_SECONDS = 5.0
 # ADR 0066: how often live TUI processes behind observed sessions are checked
-# (one batched ps per pass), and how long the Claude daemon socket must stay
-# missing before a daemon worker counts as gone.
+# (one batched ps per pass).
 TUI_EXIT_SWEEP_INTERVAL_SECONDS = 30.0
-CLAUDE_DAEMON_SOCKET_GONE_SECONDS = 60.0
 # 被 @ 进别人的飞书话题时，最多读回多少条既有讨论作为首轮上下文。够覆盖一场
 # 有来有回的讨论，又不至于让一个长话题把整个回合的输入撑爆。
 LARK_THREAD_CONTEXT_MESSAGE_LIMIT = 50
@@ -1612,16 +1580,9 @@ class ChannelNativeRuntime:
         # every 5 s pass forever, spawning a codex process and a log line each time.
         self._codex_mirror_backoff: dict[str, tuple[float, float, str]] = {}
         self._gate_always_allow: set[tuple[str, str]] = set()
-        # ADR 0066: since when the Claude daemon socket file has been missing
-        # (0 = present / not yet seen missing).
-        self._daemon_socket_missing_since = 0.0
-        daemon_transport = self._claude_daemon_transport()
-        if daemon_transport is not None:
-            daemon_transport.on_gate_decision = self._record_gate_decision
-            # Daemon-native spawn (ADR 0048): channel-born sessions start as
-            # daemon bg workers when WALKCODE_CLAUDE_SPAWN_MODE=daemon. The
-            # orchestrator calls this before start_session; None falls back.
-            self.orchestrator.daemon_spawner = self._spawn_claude_daemon_native_session
+        gate_transport = self._claude_gate_transport()
+        if gate_transport is not None:
+            gate_transport.on_gate_decision = self._record_gate_decision
 
     @classmethod
     def from_env(
@@ -1703,36 +1664,10 @@ class ChannelNativeRuntime:
             "agent_status": agent_status,
             "runtime_status": self._describe_runtime_status(),
             "tui_hook_status": _describe_tui_hook_status(self.config.agent, codex_home),
-            "claude_daemon": self._describe_claude_daemon(),
             "handoff_continue": self.config.handoff_continue,
             "state_path": self.config.state_path,
             "cwd": self.config.cwd,
             "e2e_gates": self.e2e_gates,
-        }
-
-    def _describe_claude_daemon(self) -> dict[str, Any]:
-        transport = self._claude_daemon_transport()
-        if transport is None:
-            return {
-                "enabled": False,
-                "reason": "daemon_mode is off or the agent is not claude",
-            }
-        socket_path = transport.client.socket_path
-        options = self.config.agent_options.get("claude", {})
-        return {
-            "enabled": True,
-            "socket_path": socket_path,
-            "socket_present": os.path.exists(socket_path),
-            "config_dir": transport.config_dir,
-            # Rollout visibility (ADR 0048): daemon transport enabled does not
-            # by itself mean new sessions are daemon-born (spawn_mode can be
-            # headless), so surface the actual spawn/adoption policy for
-            # status/doctor. The config parser resolves the default (headless
-            # since ADR 0050; daemon is an explicit opt-in); the fallback
-            # below only guards states that never went through the parser.
-            "spawn_mode": str(options.get("spawn_mode", "") or "headless"),
-            "list_adopt": str(options.get("list_adopt", "") or "auto"),
-            "daemon_spawner_installed": self.orchestrator.daemon_spawner is not None,
         }
 
     def _describe_runtime_status(self) -> dict[str, Any]:
@@ -2990,15 +2925,11 @@ class ChannelNativeRuntime:
             *(
                 [
                     asyncio.create_task(
-                        self._watch_claude_daemon_forever(),
-                        name="walkcode-claude-daemon-watch",
-                    ),
-                    asyncio.create_task(
                         self._drain_claude_gate_requests_forever(),
                         name="walkcode-claude-gate-drain",
                     ),
                 ]
-                if self._claude_daemon_transport() is not None
+                if self._claude_gate_transport() is not None
                 else []
             ),
         ]
@@ -3265,7 +3196,7 @@ class ChannelNativeRuntime:
             ):
                 continue  # claimed, revived or stopped while ps ran
             state = _process_ref_state(process_ref, probes.get(pid, _ProcProbe("error")))
-            if state == "alive" and self._tui_switched_away(session):
+            if state == "alive" and Orchestrator._claude_tui_switched_away(session):
                 # ADR 0067: the process lives on but runs another session now
                 # (/clear, /resume) — this topic is no longer the terminal's.
                 self._mark_stale_tui_process_detached(session, reason="external_tui_session_switched")
@@ -3277,12 +3208,6 @@ class ChannelNativeRuntime:
         if marked:
             self.save_state()
         return marked
-
-    @staticmethod
-    def _tui_switched_away(session) -> bool:
-        if isinstance(session.transport_ref, dict) and session.transport_ref.get("daemon_live"):
-            return False  # a daemon worker may carry it on (ADR 0048)
-        return Orchestrator._claude_tui_switched_away(session)
 
     async def _sweep_exited_tui_sessions_forever(self, *, interval: float) -> None:
         while True:
@@ -3575,330 +3500,9 @@ class ChannelNativeRuntime:
             await self._best_effort_drain_deferred_tui_hooks()
             await asyncio.sleep(interval)
 
-    def _claude_daemon_transport(self) -> ClaudeDaemonTransport | None:
-        transport = self.transports.get("claude_daemon")
-        return transport if isinstance(transport, ClaudeDaemonTransport) else None
-
-    async def _claude_daemon_session_alive(self, session) -> bool:
-        """Is the daemon worker behind this TUI-observed session still running?
-
-        Daemon-native sessions outlive their attach TUI (``/exit`` detaches).
-        Stop paths keyed on the TUI process must not end the session while the
-        worker is alive; the daemon's ``settled`` event is the authority.
-        """
-        transport = self._claude_daemon_transport()
-        if transport is None:
-            return False
-        resume_ref = _external_claude_resume_ref(session)
-        if not resume_ref:
-            return False
-        short = claude_daemon_short_from_resume_ref(resume_ref)
-        if not short:
-            return False
-        try:
-            alive = await transport.client.job_alive(short)
-        except Exception:
-            alive = None
-        # Every probe updates the missing-socket clock, so a daemon that came
-        # back resets it and a later blip starts a fresh 60 s window.
-        socket_gone = self._claude_daemon_socket_gone(transport)
-        if alive is None:
-            # Probe failure means "unknown", not "dead": a socket blip or a
-            # restarting daemon must not let stop paths end a live session.
-            # But a socket FILE missing for CLAUDE_DAEMON_SOCKET_GONE_SECONDS
-            # means no daemon is running: the stale daemon_live flag would
-            # otherwise keep the session "running" forever (ADR 0066).
-            if socket_gone:
-                return False
-            # Fall back to the last observed state (settled clears the flag).
-            return bool(
-                isinstance(session.transport_ref, dict)
-                and session.transport_ref.get("daemon_live")
-            )
-        return alive
-
-    def _claude_daemon_socket_gone(self, transport) -> bool:
-        socket_path = str(getattr(transport.client, "socket_path", "") or "")
-        if not socket_path or os.path.exists(socket_path):
-            self._daemon_socket_missing_since = 0.0
-            return False
-        now = self._now()
-        if not self._daemon_socket_missing_since:
-            self._daemon_socket_missing_since = now
-        return now - self._daemon_socket_missing_since >= CLAUDE_DAEMON_SOCKET_GONE_SECONDS
-
-    # -- daemon-native spawn + list adoption (ADR 0048) -----------------------
-
-    async def _spawn_claude_daemon_native_session(
-        self,
-        binding: ChannelBinding,
-        transport_kind: str,
-        cwd: str,
-        owner: ActorRef,
-    ):
-        """Create a channel-born session as a daemon bg worker.
-
-        The session is registered external-TUI shaped — writer external_tui,
-        nested claude resume_ref — so every already-verified v3 mechanism
-        (daemon reply writes, subscribe watcher, hook content, dual gate)
-        applies from the first turn. Returns None on any failure so the
-        orchestrator falls back to the headless SDK spawn.
-
-        Concurrency contract (ADR 0048): the sole caller is
-        ``Orchestrator.handle_inbound_event`` via the ``daemon_spawner`` hook,
-        which runs under ``_ingress_lock`` (held by ``serve_lark_ws`` /
-        ``poll_telegram_once`` around ``process_*``). This method therefore
-        MUST NOT re-acquire ``_ingress_lock`` — ``asyncio.Lock`` is not
-        reentrant, so doing so self-deadlocks the whole ingress path. The
-        registration below is already serialized by the caller's lock.
-        """
-        if transport_kind != "claude_headless":
-            return None
-        options = self.config.agent_options.get("claude", {})
-        if str(options.get("spawn_mode", "") or "headless") != "daemon":
-            return None
-        transport = self._claude_daemon_transport()
-        if transport is None:
-            return None
-        headless = self.transports.get("claude_headless")
-        settings = ""
-        cli_path = ""
-        if isinstance(headless, ClaudeHeadlessTransport):
-            cli_path = str(headless.cli_path or "")
-            try:
-                if headless.anthropic_base_url:
-                    # Same tap/base-url override file the headless SDK spawn
-                    # uses — the bg worker must hit the same upstream.
-                    settings = headless._anthropic_base_url_settings_override()
-                elif headless.settings:
-                    settings = str(headless.settings)
-            except Exception as exc:
-                _log_degrade(
-                    "claude_daemon_spawn_settings_failed",
-                    error=exc,
-                    fallback="headless_spawn",
-                )
-                return None
-        try:
-            job = await transport.spawn_bg_job(cwd, settings=settings, cli_path=cli_path)
-        except (TransportUnavailable, CapabilityUnsupported) as exc:
-            _log_degrade(
-                "claude_daemon_spawn_failed",
-                error=exc,
-                fallback="headless_spawn",
-            )
-            return None
-        agent_session_id = str(job.get("session_id", "") or "")
-        short = str(job.get("short", "") or "")
-        nested_resume_ref = {
-            "transport_kind": "claude_headless",
-            "agent_session_id": agent_session_id,
-        }
-        external_ref = {
-            "source": "walkcode_daemon_spawn",
-            "agent": "claude",
-            "resume_ref": nested_resume_ref,
-            "daemon_short": short,
-            "daemon_live": True,
-        }
-        writer_actor = ActorRef(
-            channel_kind=self.config.channel.kind,
-            actor_id=f"claude_daemon:{short}",
-            display_name="claude bg worker",
-        )
-        # No _ingress_lock here — the caller already holds it (see contract in
-        # the docstring). Any failure after spawn_bg_job succeeded must reap the
-        # orphan job: otherwise a live worker is left that nobody tracks (and
-        # that list adoption would later resurface as a duplicate session).
-        try:
-            existing = self.state.sessions.find_by_resume_ref(
-                transport_kind="claude_headless",
-                resume_ref={"agent_session_id": agent_session_id},
-            )
-            if existing:
-                # A fresh uuid colliding with a known session means state is
-                # inconsistent; reap the just-spawned job and go headless.
-                _log_degrade(
-                    "claude_daemon_spawn_duplicate_session",
-                    session_id=existing,
-                    fallback="headless_spawn",
-                )
-                await self._reap_daemon_job(transport, short, reason="spawn_duplicate_session")
-                return None
-            # The binding is the user's own chat/topic; this origin marker
-            # blocks the hook-claim path from repainting it as a readonly
-            # observation topic (_ensure_tui_observed_binding_capabilities).
-            binding.capabilities["origin"] = "daemon_spawn"
-            session = self.state.sessions.create_observed_session(
-                session_id=self._tui_observed_session_id(
-                    "claude", "claude_headless", nested_resume_ref
-                ),
-                binding=binding,
-                cwd=str(job.get("cwd", "") or cwd),
-                external_ref=external_ref,
-                owner=writer_actor,
-            )
-            initial_title = str(binding.capabilities.get("initial_title", "") or "").strip()
-            if initial_title:
-                session.cached_title = initial_title
-                session.title_source = "initial_user_input"
-            if self.state.authz is not None:
-                self.state.authz.grant(session.session_id, owner, SessionRole.OWNER)
-        except Exception as exc:
-            _log_degrade(
-                "claude_daemon_spawn_register_failed",
-                error=exc,
-                fallback="headless_spawn",
-            )
-            await self._reap_daemon_job(transport, short, reason="spawn_register_failed")
-            return None
-        # Observer attach BEFORE the first turn is submitted: the daemon only
-        # publishes state patches while ≥1 attacher is connected (live-E2E
-        # finding 2026-07-07), and the first dialog can open right after the
-        # first reply lands. Await the attach handshake (bounded) so the very
-        # first permission/ask dialog is already observable — fire-and-forget
-        # would race the first reply (round-2 review finding). Timeout is
-        # non-fatal: the first turn still carries model latency before any
-        # dialog, and the watcher sync keeps the observer alive afterwards.
-        try:
-            attached = await transport.ensure_observer_ready(
-                short, timeout=CLAUDE_DAEMON_OBSERVER_READY_TIMEOUT_SECONDS
-            )
-        except Exception as exc:
-            attached = False
-            _log_degrade(
-                "claude_daemon_observer_ready_error",
-                error=exc,
-                fallback="proceed_watcher_reensures",
-            )
-        if not attached:
-            _log_degrade(
-                "claude_daemon_observer_ready_timeout",
-                short=short,
-                fallback="proceed_watcher_reensures",
-            )
-        # State is persisted by the outer handle_inbound_event flow (submit ->
-        # refresh_session_status_card -> on_state_changed). Calling save_state()
-        # here would checkpoint the inbound ledger's in-progress mark mid-turn,
-        # so a crash before completion would reject the replayed message.
-        return session
-
-    async def _reap_daemon_job(
-        self, transport: "ClaudeDaemonTransport", short: str, *, reason: str
-    ) -> None:
-        """Best-effort kill of a half-born daemon job, with the failure logged.
-
-        Silent suppression here (the old behavior) meant an orphan worker left
-        by a failed spawn/adoption was invisible — the reap outcome must be
-        observable so operators can tell "reaped" from "leaked" (ADR 0048).
-        """
-        if not short:
-            return
-        transport.stop_observer(short)
-        try:
-            await transport.client.kill(short)
-        except Exception as exc:
-            _log_degrade(
-                "claude_daemon_reap_failed",
-                short=short,
-                reason=reason,
-                error=exc,
-                fallback="orphan_job_may_persist",
-            )
-
-    async def _maybe_adopt_wild_claude_daemon_job(self, job: dict[str, Any]) -> str:
-        """List-fallback session bootstrap (ADR 0048).
-
-        Registers a live daemon job walkcode has never seen (hook not
-        configured, spool lost, or an idle `claude --bg` that has produced no
-        hook events yet) as a TUI-observed session, using the same binding
-        shape hooks would create. Conservative on purpose: only CLI-born jobs
-        (source=shell), only after a settle age so the runtime's own spawn
-        path always registers its session (with the user's chat binding)
-        first, and deduped against resume_ref under the ingress lock.
-        Returns the session id ('' when not adopted).
-        """
-        if self.config.agent != "claude":
-            return ""
-        options = self.config.agent_options.get("claude", {})
-        if str(options.get("list_adopt", "") or "auto") == "off":
-            return ""
-        if str(job.get("source", "") or "") != "shell":
-            return ""
-        agent_session_id = str(job.get("sessionId", "") or "")
-        short = claude_daemon_short_id(job.get("short") or agent_session_id)
-        if not agent_session_id or not short:
-            return ""
-        created_at = job.get("createdAt") or job.get("startedAt")
-        try:
-            created_seconds = float(created_at) / 1000.0
-        except (TypeError, ValueError):
-            return ""
-        if self._now() - created_seconds < CLAUDE_DAEMON_ADOPT_MIN_AGE_SECONDS:
-            return ""
-        flat_resume_ref = {"agent_session_id": agent_session_id}
-        nested_resume_ref = {
-            "transport_kind": "claude_headless",
-            "agent_session_id": agent_session_id,
-        }
-        # Unlocked pre-check before the channel side effect: if a hook (or the
-        # daemon spawner) already registered this session, skip building an
-        # observation binding entirely. Creating the Lark root message /
-        # Telegram topic first and only then discovering the session exists
-        # (under the lock below) would orphan that channel object (ADR 0048
-        # review finding). The locked recheck stays authoritative for the
-        # residual TOCTOU window.
-        existing_pre = self.state.sessions.find_by_resume_ref(
-            transport_kind="claude_headless",
-            resume_ref=flat_resume_ref,
-        )
-        if existing_pre:
-            return existing_pre
-        try:
-            binding = await self._create_tui_observed_binding(
-                "claude", "claude_headless", flat_resume_ref, {}
-            )
-        except Exception as exc:
-            print(
-                f"claude daemon list adopt skipped ({short}): {type(exc).__name__}: {exc}",
-                file=sys.stderr,
-            )
-            return ""
-        external_ref = {
-            "source": "claude_daemon_list",
-            "agent": "claude",
-            "resume_ref": nested_resume_ref,
-        }
-        actor = ActorRef(
-            channel_kind=self.config.channel.kind,
-            actor_id=f"local_tui:claude_headless:{agent_session_id}",
-            display_name="claude TUI",
-        )
-        async with self._ingress_lock:
-            existing = self.state.sessions.find_by_resume_ref(
-                transport_kind="claude_headless",
-                resume_ref=flat_resume_ref,
-            )
-            if existing:
-                return existing
-            session = self.state.sessions.create_observed_session(
-                session_id=self._tui_observed_session_id(
-                    "claude", "claude_headless", nested_resume_ref
-                ),
-                binding=binding,
-                cwd=str(job.get("cwd", "") or self.config.cwd),
-                external_ref=external_ref,
-                owner=actor,
-            )
-            session.transport_ref["daemon_live"] = True
-            session.cached_title = _telegram_session_topic_name(
-                "claude", f"TUI {agent_session_id}"
-            )
-            session.title_source = "tui_hook"
-            self._grant_tui_channel_owners(session.session_id, binding)
-            self.save_state()
-        await self.orchestrator.refresh_session_status_card(session)
-        return session.session_id
+    def _claude_gate_transport(self) -> ClaudeGateTransport | None:
+        transport = self.transports.get(CLAUDE_GATE_TRANSPORT_KEY)
+        return transport if isinstance(transport, ClaudeGateTransport) else None
 
     def _tui_observed_session_id(
         self, agent_name: str, transport_kind: str, resume_ref: dict[str, Any]
@@ -3915,15 +3519,15 @@ class ChannelNativeRuntime:
             suffix += 1
             session_id = f"{base_session_id}-{suffix}"
 
-    # -- PreToolUse gate (ADR 0046 v2) ---------------------------------------
+    # -- PreToolUse gate (ADR 0046 v2, ADR 0068) -----------------------------
     #
     # Headless sessions close the permission / AskUserQuestion loop in-process
-    # (SDK can_use_tool -> Future -> card -> resolve). TUI/daemon sessions run
-    # the PreToolUse hook in a separate process, so the same loop runs over
-    # the gate spool: the blocking hook (gate_tui_hook, hook-process side)
-    # writes pending/<rid>.json and polls decisions/<rid>.json; the serve loop
+    # (SDK can_use_tool -> Future -> card -> resolve). TUI sessions run the
+    # PreToolUse hook in a separate process, so the same loop runs over the
+    # gate spool: the blocking hook (gate_tui_hook, hook-process side) writes
+    # pending/<rid>.json and polls decisions/<rid>.json; the serve loop
     # (drain_claude_gate_requests) turns pendings into cards, and the card
-    # callback writes the decision file via ClaudeDaemonTransport.
+    # callback writes the decision file via ClaudeGateTransport.
 
     def gate_tui_hook(
         self,
@@ -3956,8 +3560,6 @@ class ChannelNativeRuntime:
         if not rid or not tool_name:
             return None
         options = self.config.agent_options.get("claude", {})
-        if str(options.get("daemon_mode", "") or "auto") == "off":
-            return None
         config_dir = str(options.get("config_dir", "") or os.environ.get("CLAUDE_CONFIG_DIR", ""))
         permission_mode = str(payload.get("permission_mode", "") or "")
         gate_tools = options.get("gate_tools")
@@ -3992,23 +3594,6 @@ class ChannelNativeRuntime:
             "created_at": now,
             "hook_pid": os.getpid(),
         }
-        # v3 routing (ADR 0046 v3): daemon jobs get the dual-surface path —
-        # capture the structured tool_input, then abstain immediately so the
-        # native dialog renders and both surfaces can answer. dontAsk stays on
-        # the blocking path (abstain there means auto-deny: no dialog exists
-        # to inject into), as do non-daemon TUI sessions (no attach plane) and
-        # everything when gate_style=block (escape hatch).
-        gate_style = str(options.get("gate_style", "") or "dual").strip().lower()
-        if gate_style != "block" and permission_mode != "dontAsk":
-            daemon_short = self._probe_claude_daemon_short(str(payload.get("session_id", "") or ""))
-            if daemon_short:
-                request["mode"] = claude_gate.MODE_NOTIFY
-                request["daemon_short"] = daemon_short
-                claude_gate.write_pending(state_path, request)
-                claude_gate.trace(
-                    "gate_notify", rid=rid, kind=kind, tool=tool_name, short=daemon_short
-                )
-                return None
         timeout = float(options.get("gate_timeout", 0) or claude_gate.DEFAULT_WAIT_TIMEOUT_SECONDS)
         request["mode"] = claude_gate.MODE_BLOCK
         request["deadline"] = now + timeout
@@ -4062,8 +3647,13 @@ class ChannelNativeRuntime:
         now = time.time()
         for request in requests:
             rid = str(request.get("rid", "") or "")
+            if claude_gate.is_legacy_notify_pending(request):
+                # Written by a pre-ADR 0068 hook for a Claude daemon job. No
+                # hook waits on it and the daemon route is gone: drop it.
+                claude_gate.trace("drop_legacy_notify_pending", rid=rid)
+                claude_gate.remove_pending(state_path, rid)
+                continue
             live_rids.add(rid)
-            mode = claude_gate.pending_mode(request)
             deadline = float(request.get("deadline", 0) or 0)
             if deadline and now > deadline + CLAUDE_GATE_REAP_SLACK_SECONDS:
                 # The hook process is gone (denied on timeout or was killed).
@@ -4074,95 +3664,40 @@ class ChannelNativeRuntime:
             if rid in self._gate_dispatched:
                 continue
             created_at = float(request.get("created_at", now) or now)
-            if mode == claude_gate.MODE_NOTIFY:
-                # The card mirrors a real dialog. Auto-approved tool calls
-                # (safe read-only Bash etc.) never render one — wait for the
-                # dialog, then give up silently instead of posting a card
-                # with buttons that could never be delivered.
-                transport = self._claude_daemon_transport()
-                waiting = False
-                if transport is not None:
-                    try:
-                        waiting = await transport.notify_dialog_waiting(request)
-                    except Exception as exc:
-                        claude_gate.trace(
-                            "notify_dialog_probe_failed",
-                            rid=rid,
-                            error=f"{type(exc).__name__}: {exc}",
-                        )
-                        waiting = False
-                if not waiting:
-                    if now - created_at > CLAUDE_GATE_NOTIFY_DIALOG_GRACE_SECONDS:
-                        claude_gate.trace("notify_dialog_never_rendered", rid=rid)
-                        claude_gate.remove_pending(state_path, rid)
-                    continue
             session_id = self._claude_gate_session_id(request)
             if not session_id:
                 if now - created_at > CLAUDE_GATE_UNROUTABLE_GRACE_SECONDS:
-                    claude_gate.trace("pass_session_not_observed", rid=rid, mode=mode)
-                    if mode == claude_gate.MODE_NOTIFY:
-                        # No hook is waiting: the native dialog is the surface.
-                        claude_gate.remove_pending(state_path, rid)
-                    else:
-                        claude_gate.write_decision(
-                            state_path, rid, {"action": "pass", "reason": "session_not_observed"}
-                        )
-                        self._gate_dispatched[rid] = now
+                    claude_gate.trace("pass_session_not_observed", rid=rid)
+                    claude_gate.write_decision(
+                        state_path, rid, {"action": "pass", "reason": "session_not_observed"}
+                    )
+                    self._gate_dispatched[rid] = now
                 continue
             tool_name = str(request.get("tool_name", "") or "")
             if (
                 str(request.get("kind", "")) == claude_gate.KIND_PERMISSION
                 and (session_id, tool_name) in self._gate_always_allow
             ):
-                if mode == claude_gate.MODE_NOTIFY:
-                    # Single attempt, never a timed retry: a failed injection
-                    # may already have written keys, and a second automatic
-                    # press could confirm the WRONG dialog (review finding).
-                    outcome = await self._auto_inject_gate_allow(rid, request, session_id)
-                    if outcome in {"ok", "skip"}:
-                        claude_gate.remove_pending(state_path, rid)
-                        self._gate_dispatched[rid] = now
-                        if outcome == "ok":
-                            processed += 1
-                        continue
-                    # outcome == "card": fall through to a human card — clicks
-                    # re-run the pre-injection dialog check, so they stay safe.
-                else:
-                    claude_gate.trace("auto_allow_session", rid=rid, tool=tool_name)
-                    claude_gate.write_decision(
-                        state_path, rid, {"action": "allow", "reason": "always_allow(session)"}
-                    )
-                    self._gate_dispatched[rid] = now
-                    processed += 1
-                    continue
+                claude_gate.trace("auto_allow_session", rid=rid, tool=tool_name)
+                claude_gate.write_decision(
+                    state_path, rid, {"action": "allow", "reason": "always_allow(session)"}
+                )
+                self._gate_dispatched[rid] = now
+                processed += 1
+                continue
             async with self._ingress_lock:
                 posted = await self.orchestrator.post_claude_gate_prompt(session_id, request)
             if posted:
-                if mode == claude_gate.MODE_NOTIFY:
-                    # Card (or degraded notice) is up: the runtime owns the
-                    # pending from here on (the hook abstained long ago).
-                    # Degraded ask forms register too — the entry suppresses
-                    # the duplicate needs notice and is reaped by the watcher
-                    # when the terminal answers; unmappable answers are still
-                    # rejected at injection time (keys_for_ask_answer -> None).
-                    transport = self._claude_daemon_transport()
-                    if transport is not None:
-                        transport.register_notify_gate(rid, request, session_id=session_id)
-                    claude_gate.remove_pending(state_path, rid)
-                else:
-                    self._gate_block_cards[rid] = session_id
+                self._gate_block_cards[rid] = session_id
                 self._gate_dispatched[rid] = now
                 processed += 1
                 self.save_state()
             elif now - created_at > CLAUDE_GATE_UNROUTABLE_GRACE_SECONDS:
-                claude_gate.trace("pass_card_not_delivered", rid=rid, mode=mode)
-                if mode == claude_gate.MODE_NOTIFY:
-                    claude_gate.remove_pending(state_path, rid)
-                else:
-                    claude_gate.write_decision(
-                        state_path, rid, {"action": "pass", "reason": "card_not_delivered"}
-                    )
-                    self._gate_dispatched[rid] = now
+                claude_gate.trace("pass_card_not_delivered", rid=rid)
+                claude_gate.write_decision(
+                    state_path, rid, {"action": "pass", "reason": "card_not_delivered"}
+                )
+                self._gate_dispatched[rid] = now
         for rid in list(self._gate_dispatched):
             if rid not in live_rids:
                 self._gate_dispatched.pop(rid, None)
@@ -4216,399 +3751,17 @@ class ChannelNativeRuntime:
             )
         return None
 
-    async def _auto_inject_gate_allow(
-        self, rid: str, request: dict[str, Any], session_id: str
-    ) -> str:
-        """Session-scoped always_allow, v3 shape: press "1" on the dialog.
-
-        The v2 memory wrote an allow decision file; with notify mode nobody
-        reads decisions, so the same memory auto-injects allow-once instead.
-
-        Returns "ok" (injected), "skip" (the terminal settled it first —
-        drop the pending quietly), or "card" (injection could not be
-        confirmed — hand over to a human card, never auto-retry: the keys
-        may already have been written).
-        """
-        transport = self._claude_daemon_transport()
-        if transport is None:
-            return "card"
-        transport.register_notify_gate(rid, request, session_id=session_id)
-        handle = TransportHandle(
-            handle_id=f"claude-daemon-{request.get('daemon_short', '')}",
-            transport_kind="claude_daemon",
-            ref={"short": str(request.get("daemon_short", "") or "")},
-        )
-        try:
-            await transport.approve_permission(
-                handle, rid, {"action": "allow", "reason": "always_allow(session)"}
-            )
-        except claude_gate.GateInjectionFailed as exc:
-            claude_gate.trace("auto_allow_inject_missed", rid=rid, reason=exc.reason)
-            if exc.reason in {"dialog_mismatch", "already_resolved", "stale_gate"}:
-                return "skip"
-            return "card"
-        except Exception as exc:
-            claude_gate.trace(
-                "auto_allow_inject_error", rid=rid, error=f"{type(exc).__name__}: {exc}"
-            )
-            return "card"
-        claude_gate.trace(
-            "auto_allow_session", rid=rid, tool=request.get("tool_name", ""), mode="notify"
-        )
-        return "ok"
-
     def _record_gate_decision(self, rid: str, decision: dict[str, Any]) -> None:
         if str(decision.get("action", "") or "") != "always_allow":
             return
-        # v3 notify gates embed routing info in the decision (their pending
-        # file is gone by decision time); v2 block gates still read it back
-        # from the pending spool.
-        tool_name = str(decision.get("tool_name", "") or "")
-        session_id = str(decision.get("session_id", "") or "")
-        if not (session_id and tool_name):
-            request = claude_gate.read_pending(self.state_store.path, rid)
-            if not request:
-                return
-            tool_name = tool_name or str(request.get("tool_name", "") or "")
-            session_id = session_id or (self._claude_gate_session_id(request) or "")
+        # The hook is still blocked on this rid, so its pending is still there.
+        request = claude_gate.read_pending(self.state_store.path, rid)
+        if not request:
+            return
+        tool_name = str(request.get("tool_name", "") or "")
+        session_id = self._claude_gate_session_id(request) or ""
         if session_id and tool_name:
             self._gate_always_allow.add((session_id, tool_name))
-
-    def _probe_claude_daemon_short(self, session_id: str) -> str:
-        """8-hex daemon short id when this session is a live daemon job, else "".
-
-        Runs on the gate hook's hot path in the hook process: one bounded
-        ``has`` round trip through the registered daemon transport's client
-        (absent transport = daemon_mode off = not a daemon route). Any
-        failure or timeout returns "" and the caller stays on the blocking
-        (v2) path — a daemon blip can only degrade UX, never the gate.
-        """
-        short = claude_daemon_short_id(session_id)
-        if not short:
-            return ""
-        transport = self._claude_daemon_transport()
-        if transport is None:
-            return ""
-
-        async def _probe() -> bool:
-            return await asyncio.wait_for(
-                transport.client.job_ready(short),
-                timeout=CLAUDE_GATE_DAEMON_PROBE_TIMEOUT_SECONDS,
-            )
-
-        try:
-            ready = asyncio.run(_probe())
-        except Exception:
-            return ""
-        return short if ready else ""
-
-    async def _watch_claude_daemon_forever(
-        self,
-        *,
-        interval: float = CLAUDE_DAEMON_WATCH_INTERVAL_SECONDS,
-    ) -> None:
-        """Maintain one subscribe watcher per live TUI-owned Claude daemon job.
-
-        Read half of ADR 0046: ``list`` discovers which known sessions have a
-        live worker; each gets a long-lived ``subscribe`` connection whose
-        ``state`` patches drive lifecycle + health cards. Content still comes
-        from hooks, so this loop touches no message rendering.
-        """
-        transport = self._claude_daemon_transport()
-        if transport is None:
-            return
-        watchers: dict[str, asyncio.Task[None]] = {}
-        try:
-            while True:
-                delay = interval
-                try:
-                    await self._sync_claude_daemon_watchers(transport, watchers)
-                except TransportUnavailable:
-                    # No daemon for this profile right now (old Claude version,
-                    # daemon not started, proto drift). Cheap to re-probe later.
-                    delay = CLAUDE_DAEMON_UNAVAILABLE_RETRY_SECONDS
-                except Exception as exc:
-                    print(
-                        f"claude daemon watch transient error: {type(exc).__name__}: {exc}",
-                        file=sys.stderr,
-                    )
-                await asyncio.sleep(delay)
-        finally:
-            observer_tasks = transport.stop_all_observers()
-            for task in watchers.values():
-                task.cancel()
-            pending = [*watchers.values(), *observer_tasks]
-            if pending:
-                # Await observers too: cancel() only requests cancellation;
-                # their attach sockets close in the CancelledError handler, so
-                # the loop must not shut down before they drain (round-2
-                # review finding — the old code awaited only subscribe
-                # watchers and left observer tasks pending).
-                await asyncio.gather(*pending, return_exceptions=True)
-
-    async def _sync_claude_daemon_watchers(
-        self,
-        transport: ClaudeDaemonTransport,
-        watchers: dict[str, asyncio.Task[None]],
-    ) -> None:
-        for short, task in list(watchers.items()):
-            if task.done():
-                watchers.pop(short, None)
-        jobs = await transport.client.list_jobs()
-        # Two passes: known jobs first so their subscribe watchers come up
-        # immediately, THEN wild-job adoption (which does channel network I/O
-        # to build an observation binding). Inlining adoption in a single pass
-        # let one slow adoption stall subscribe creation for every known job
-        # behind it in the list (ADR 0048 review finding).
-        unknown_jobs: list[dict[str, Any]] = []
-        for job in jobs:
-            if job.get("dying") or job.get("outcome"):
-                continue
-            short = claude_daemon_short_id(job.get("short") or job.get("sessionId"))
-            if not short:
-                continue
-            session_id = self.state.sessions.find_by_resume_ref(
-                transport_kind="claude_headless",
-                resume_ref={"agent_session_id": str(job.get("sessionId", "") or "")},
-            )
-            if not session_id:
-                # Only try to adopt when there is no watcher yet; a job that
-                # already has a watcher already has a session.
-                if short not in watchers:
-                    unknown_jobs.append(job)
-                continue
-            # Reconcile EVERY tick, not just when the subscribe watcher is
-            # absent: the observer attach and the subscribe watcher are
-            # independent connections, and the observer can exit on a
-            # transient control-plane outage while the watcher stays alive.
-            # Gating this on `short not in watchers` (the old bug) would then
-            # leave a live job with zero attachers, freezing its tempo/needs
-            # patches and re-blinding the notify gate. ensure_observer and the
-            # watcher create are both idempotent, so re-calling is a no-op
-            # when everything is already healthy.
-            self._start_daemon_watcher_if_eligible(session_id, short, transport, watchers)
-        for job in unknown_jobs:
-            short = claude_daemon_short_id(job.get("short") or job.get("sessionId"))
-            if not short or short in watchers:
-                continue
-            # Unknown to walkcode: hooks stay the primary creation channel
-            # (clean cwd/transcript), but a live job nobody registered —
-            # hook not configured, spool lost, idle `claude --bg` with no
-            # first prompt yet — gets adopted from the list (ADR 0048).
-            session_id = await self._maybe_adopt_wild_claude_daemon_job(job)
-            if not session_id:
-                continue
-            self._start_daemon_watcher_if_eligible(session_id, short, transport, watchers)
-
-    def _start_daemon_watcher_if_eligible(
-        self,
-        session_id: str,
-        short: str,
-        transport: ClaudeDaemonTransport,
-        watchers: dict[str, asyncio.Task[None]],
-    ) -> None:
-        try:
-            session = self.state.sessions.get(session_id)
-        except KeyError:
-            return
-        if session.status == "stopped":
-            return
-        if not (session.writer_owner and session.writer_owner.kind == "external_tui"):
-            return
-        # The daemon only publishes state patches while the job has ≥1
-        # attacher (live-E2E finding 2026-07-07): keep a persistent observer
-        # attach alongside the subscribe watcher so dialogs on never-attached
-        # (Feishu-spawned) or detached jobs still surface via needs/tempo.
-        # ensure_observer rebuilds a task that exited on a transient outage
-        # and no-ops when one is already running — safe to call every tick.
-        transport.ensure_observer(short)
-        # Idempotent: only create the subscribe watcher when absent, so the
-        # every-tick observer reconciliation above does not orphan a live
-        # watcher task by overwriting it.
-        existing = watchers.get(short)
-        if existing is not None and not existing.done():
-            return
-        watchers[short] = asyncio.create_task(
-            self._watch_claude_daemon_job(session_id, short, transport),
-            name=f"walkcode-claude-daemon-sub-{short}",
-        )
-
-    async def _watch_claude_daemon_job(
-        self,
-        session_id: str,
-        short: str,
-        transport: ClaudeDaemonTransport,
-    ) -> None:
-        last_needs = ""
-        try:
-            async for event in transport.client.subscribe(short):
-                event_type = str(event.get("type", "") or "")
-                if event_type == "state":
-                    patch = event.get("patch")
-                    if not isinstance(patch, dict):
-                        continue
-                    async with self._ingress_lock:
-                        last_needs = await self._apply_claude_daemon_state_patch(
-                            session_id, patch, last_needs, short=short
-                        )
-                        self.save_state()
-                elif event_type == "settled":
-                    async with self._ingress_lock:
-                        await self._settle_claude_daemon_session(
-                            session_id,
-                            outcome=str(event.get("outcome", "") or ""),
-                            short=short,
-                        )
-                        self.save_state()
-                    transport.stop_observer(short)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            # The watcher is re-created by the discovery loop while the job is
-            # alive, so a dropped subscribe connection self-heals.
-            print(
-                f"claude daemon subscribe ended ({short}): {type(exc).__name__}: {exc}",
-                file=sys.stderr,
-            )
-
-    async def _apply_claude_daemon_state_patch(
-        self,
-        session_id: str,
-        patch: dict[str, Any],
-        last_needs: str,
-        *,
-        short: str = "",
-    ) -> str:
-        try:
-            session = self.state.sessions.get(session_id)
-        except KeyError:
-            return last_needs
-        if session.status == "stopped":
-            return last_needs
-        if not (session.writer_owner and session.writer_owner.kind == "external_tui"):
-            # Session was taken over meanwhile; the structured transport owns
-            # state now and daemon patches are no longer authoritative.
-            return last_needs
-        session.last_progress_at = self._now()
-        # A state patch only arrives from a live daemon worker: remember that
-        # so stop paths (TUI detach, stale-pid sweep) and the status card can
-        # tell "TUI closed" apart from "session over" (ADR 0046 v2).
-        session.transport_ref["daemon_live"] = True
-        tempo = str(patch.get("tempo", "") or "")
-        detail = str(patch.get("detail", "") or "").strip()
-        if tempo:
-            session.last_progress_event = f"external_tui.daemon_{tempo}" + (
-                f":{detail}" if detail else ""
-            )
-        changed = False
-        needs = patch.get("needs")
-        needs_text = str(needs or "").strip()
-        # needs carries two unrelated meanings (live-verified): a real tool
-        # permission gate is tempo=blocked / "approve <Tool>: <detail>", but
-        # an idle worker also reports needs like "send a prompt to start".
-        # Only the approve form may flip the session into WAITING_PERMISSION —
-        # treating every non-empty needs as a gate is the false-orange-card
-        # bug from the daemon-native rollout.
-        blocking_needs = needs_text if needs_text and (
-            needs_text.lower().startswith("approve ") or tempo == "blocked"
-        ) else ""
-        if blocking_needs:
-            already_waiting = session.lifecycle_state == "WAITING_PERMISSION"
-            if not already_waiting:
-                session.lifecycle_state = "WAITING_PERMISSION"
-                changed = True
-            # The permission-request hook may have raced ahead with its own
-            # notice card; only send ours on a fresh daemon-observed need.
-            # v3 notify gates already produce a rich interactive card from the
-            # gate drain — a second orange notice would be pure noise.
-            if (
-                blocking_needs != last_needs
-                and not already_waiting
-                and not (short and self._has_open_notify_gate(short))
-            ):
-                session.last_event_seq += 1
-                match = re.match(r"^approve\s+([A-Za-z0-9_-]+)", blocking_needs, re.IGNORECASE)
-                await self.orchestrator._send_session_view(
-                    session,
-                    {
-                        "type": "tui_permission_notice",
-                        "tool_name": match.group(1) if match else "",
-                        "summary": blocking_needs,
-                    },
-                    idempotency_key=f"external_tui:daemon_needs:{session.last_event_seq}",
-                )
-            last_needs = blocking_needs
-        elif needs is not None or needs_text:
-            transport = self._claude_daemon_transport()
-            injected = bool(
-                short and transport is not None and transport.recently_injected(short)
-            )
-            if short and transport is not None:
-                # Whoever answered, this job's open notify gates are done:
-                # tombstone them so a late card click flips honestly. This
-                # must NOT depend on lifecycle_state — a tool event can flip
-                # WAITING_PERMISSION away before this patch arrives (review
-                # finding + live-E2E observation).
-                transport.resolve_notify_gates_for_short(short)
-            was_waiting = session.lifecycle_state == "WAITING_PERMISSION"
-            if was_waiting:
-                session.lifecycle_state = "EXTERNAL_OBSERVED_READONLY"
-                changed = True
-                # Sync the terminal-side decision back to the channel (the
-                # notice/card would otherwise look pending forever) — unless
-                # the clearing was our own injection: the clicked card already
-                # flipped to the decision result.
-                if last_needs and not injected:
-                    session.last_event_seq += 1
-                    await self.orchestrator._send_session_view(
-                        session,
-                        {"type": "text", "text": f"✅ 已在终端处理：{last_needs}"},
-                        idempotency_key=f"external_tui:daemon_needs_cleared:{session.last_event_seq}",
-                    )
-            last_needs = ""
-        if tempo or changed:
-            await self.orchestrator.refresh_session_status_card(session)
-        return last_needs
-
-    async def _settle_claude_daemon_session(
-        self, session_id: str, *, outcome: str, short: str = ""
-    ) -> None:
-        transport = self._claude_daemon_transport()
-        if short and transport is not None:
-            # Job is gone, so are its dialogs: retire any open notify gates.
-            transport.resolve_notify_gates_for_short(short)
-        try:
-            session = self.state.sessions.get(session_id)
-        except KeyError:
-            return
-        if session.status == "stopped":
-            return
-        if not (session.writer_owner and session.writer_owner.kind == "external_tui"):
-            return
-        self._mark_tui_session_stopped(
-            session, hook_type=f"daemon_settled_{outcome or 'unknown'}"
-        )
-        await self.orchestrator.refresh_session_status_card(session)
-
-    def _has_open_notify_gate(self, short: str, *, tool_name: str = "") -> bool:
-        """Is a v3 dual-surface card open (or about to open) for this job?
-
-        With ``tool_name`` the match narrows to that tool, so a notice for an
-        unrelated native prompt is not swallowed by a gate on another tool.
-        """
-        transport = self._claude_daemon_transport()
-        if transport is not None and transport.has_notify_gate_for_short(
-            short, tool_name=tool_name
-        ):
-            return True
-        for request in claude_gate.list_pending(self.state_store.path):
-            if (
-                claude_gate.pending_mode(request) == claude_gate.MODE_NOTIFY
-                and str(request.get("daemon_short", "") or "") == short
-                and (not tool_name or str(request.get("tool_name", "") or "") == tool_name)
-            ):
-                return True
-        return False
 
     def _archive_bad_tui_hook(self, path: Path) -> None:
         try:
@@ -5191,7 +4344,6 @@ class ChannelNativeRuntime:
             state = await asyncio.to_thread(_process_ref_state_now, process_ref)
         if state != "gone":
             return False
-        worker_alive = await self._claude_daemon_session_alive(session)
         if (
             session.status == "stopped"
             or not _session_is_external_tui_writer(session)
@@ -5200,14 +4352,6 @@ class ChannelNativeRuntime:
             # A hook claimed or revived the session for another process while
             # we awaited the probes: the verdict is about a process it no
             # longer has. The next pass decides afresh.
-            return False
-        if worker_alive:
-            # Attach TUI is gone but the daemon worker lives on: this is a
-            # detach, not an end. Keep the session writable via daemon reply.
-            if session.last_progress_event != "external_tui.tui_detached_daemon_alive":
-                session.last_progress_event = "external_tui.tui_detached_daemon_alive"
-                session.last_progress_at = self._now()
-                return True
             return False
         return self._mark_stale_tui_process_detached(session)
 
@@ -5245,12 +4389,6 @@ class ChannelNativeRuntime:
     def _ensure_tui_observed_binding_capabilities(session) -> bool:
         binding = session.channel_binding
         if binding is None or binding.channel_kind not in {"telegram", "lark"}:
-            return False
-        if binding.capabilities.get("origin") == "daemon_spawn":
-            # Channel-born daemon session (ADR 0048): the binding is the
-            # user's own chat/topic. Repainting it as a readonly observation
-            # topic would strip the interactive semantics the user started
-            # the session with.
             return False
         if not binding.thread_id:
             return False
@@ -5512,22 +4650,15 @@ class ChannelNativeRuntime:
                     )
                 await self.orchestrator._upsert_tool_progress_view(session, channel, view)
             if hook_type == "permission-request":
-                # v3 dual-surface: when this dialog already has an interactive
-                # gate card (open notify gate for the same tool), the old
-                # "answer in the terminal" notice is both redundant and wrong.
-                notice_tool = str(tool_event.payload.get("tool_name", "") or "")
-                resume_ref = _external_claude_resume_ref(session)
-                short = claude_daemon_short_from_resume_ref(resume_ref) if resume_ref else ""
-                if not (short and self._has_open_notify_gate(short, tool_name=notice_tool)):
-                    await self.orchestrator._send_session_view(
-                        session,
-                        {
-                            "type": "tui_permission_notice",
-                            "tool_name": notice_tool,
-                            "summary": str(tool_event.payload.get("summary", "") or ""),
-                        },
-                        idempotency_key=f"external_tui:permission:{session.last_event_seq}",
-                    )
+                await self.orchestrator._send_session_view(
+                    session,
+                    {
+                        "type": "tui_permission_notice",
+                        "tool_name": str(tool_event.payload.get("tool_name", "") or ""),
+                        "summary": str(tool_event.payload.get("summary", "") or ""),
+                    },
+                    idempotency_key=f"external_tui:permission:{session.last_event_seq}",
+                )
             return
         text = _tui_hook_text(hook_type, payload)
         if hook_type == "user-prompt-submit" and not text:
@@ -5586,13 +4717,6 @@ class ChannelNativeRuntime:
         # would just repeat it.
         if hook_type == "notification" and session.lifecycle_state == "WAITING_PERMISSION":
             return
-        # Same dedup for the v3 path: an open notify gate means a rich card is
-        # already (or about to be) up for this dialog.
-        if hook_type == "notification" and "permission" in text.lower():
-            resume_ref = _external_claude_resume_ref(session)
-            short = claude_daemon_short_from_resume_ref(resume_ref) if resume_ref else ""
-            if short and self._has_open_notify_gate(short):
-                return
         # Idle noise ("Claude is waiting for your input") adds nothing on the
         # channel: the status card already shows the session is idle.
         if hook_type == "notification" and _is_idle_notification_text(text):
@@ -5611,15 +4735,6 @@ class ChannelNativeRuntime:
                 assistant_text=text if hook_type == "stop" else "",
             )
         await self.orchestrator.refresh_session_status_card(session)
-        # A prompt injected from the channel via daemon reply echoes back as a
-        # user-prompt-submit hook; re-posting it would repeat the sender's own
-        # message ("TUI input" echo bug from the daemon-native rollout).
-        if hook_type == "user-prompt-submit" and self.orchestrator.consume_daemon_reply_echo(
-            session.session_id, text
-        ):
-            # 频道注入的回显不是终端输入：抬水位会让频道后续连发被误判
-            # 滞留（ADR 0057 审查 R1）。daemon 直写路径已盖过频道时间。
-            return
         if hook_type == "user-prompt-submit":
             # ADR 0057：真实终端输入推进"最近一次被人说话"的时刻（hook
             # 捕获时间，非排水时间）；统一走带毒时间戳防护的盖章助手。
@@ -5645,8 +4760,6 @@ class ChannelNativeRuntime:
         session.stop_reason = f"external_tui_{hook_type}"
         session.writer_lease = None
         session.writer_owner = WriterOwner(kind="none")
-        if isinstance(session.transport_ref, dict):
-            session.transport_ref.pop("daemon_live", None)
 
     def save_state(self) -> None:
         self.state_store.save(self.state)
@@ -6259,17 +5372,12 @@ def _build_transports(config: ChannelNativeConfig) -> dict[str, AgentTransport]:
             ),
             environment_context=_channel_environment_context(config.channel.kind),
         )
-        # Multi-UI sync (ADR 0046): the daemon transport rides alongside the
-        # headless one — reply/subscribe against TUI-owned daemon workers.
-        # "auto" registers it unconditionally; every op degrades to
-        # TransportUnavailable when the per-profile daemon is not running.
-        if str(claude_options.get("daemon_mode", "") or "auto") != "off":
-            transports["claude_daemon"] = ClaudeDaemonTransport(
-                config_dir=str(claude_options.get("config_dir", "") or ""),
-                # Enables the PreToolUse gate decision path: card callbacks
-                # write decisions/<rid>.json under this state's hook spool.
-                gate_state_path=config.state_path,
-            )
+        # PreToolUse gate decisions for TUI-observed sessions (ADR 0068):
+        # card callbacks write decisions/<rid>.json under this state's hook
+        # spool, where the blocking `native hook PreToolUse --gate` waits.
+        transports[CLAUDE_GATE_TRANSPORT_KEY] = ClaudeGateTransport(
+            gate_state_path=config.state_path,
+        )
     elif kind == "codex_app_server":
         if shutil.which("codex"):
             codex_options = config.agent_options.get("codex", {})
@@ -8325,18 +7433,6 @@ def _format_status(status: dict[str, Any]) -> str:
     lines.append(f"  - live_ingress={channel.get('live_ingress')} configured={channel.get('configured')}")
     item = status.get("agent_status", {})
     lines.append(f"agent_status: available={item.get('available')}")
-    daemon = status.get("claude_daemon", {})
-    if daemon:
-        if daemon.get("enabled"):
-            lines.append(
-                "claude_daemon: enabled=True "
-                f"socket_present={daemon.get('socket_present')} "
-                f"spawn_mode={daemon.get('spawn_mode', '-')} "
-                f"list_adopt={daemon.get('list_adopt', '-')} "
-                f"spawner_installed={daemon.get('daemon_spawner_installed')}"
-            )
-        else:
-            lines.append(f"claude_daemon: enabled=False reason={daemon.get('reason', '-')}")
     if "handoff_continue" in status:
         lines.append(f"handoff_continue: {status.get('handoff_continue') or 'auto'}")
     hook_status = status.get("tui_hook_status", {})

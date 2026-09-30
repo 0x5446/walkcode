@@ -2475,28 +2475,6 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
         self.assertEqual(status["profile"], "work")
         self.assertIn("profile: work", runtime_module._format_status(status))
 
-    def test_format_status_renders_claude_daemon_policy(self):
-        text = runtime_module._format_status(
-            {
-                "claude_daemon": {
-                    "enabled": True,
-                    "socket_present": False,
-                    "spawn_mode": "daemon",
-                    "list_adopt": "auto",
-                    "daemon_spawner_installed": True,
-                }
-            }
-        )
-        self.assertIn("claude_daemon: enabled=True", text)
-        self.assertIn("spawn_mode=daemon", text)
-        self.assertIn("list_adopt=auto", text)
-        self.assertIn("spawner_installed=True", text)
-
-        disabled = runtime_module._format_status(
-            {"claude_daemon": {"enabled": False, "reason": "daemon_mode is off"}}
-        )
-        self.assertIn("claude_daemon: enabled=False reason=daemon_mode is off", disabled)
-
     def test_load_native_env_has_no_implicit_default_env_file(self):
         merged = runtime_module._load_native_env({"WALKCODE_AGENT": "claude"})
 
@@ -6659,40 +6637,6 @@ class TuiExitSweepTests(unittest.TestCase):
                 self.assertEqual(asyncio.run(runtime.sweep_exited_tui_sessions()), 0)
             self.assertEqual(runtime.state.sessions.get(session.session_id).status, "running")
 
-    def test_a_claim_during_the_daemon_probe_keeps_the_session(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            runtime = self._runtime(tmp)
-            session = self._observed(runtime, tmp, "x", 201)
-
-            async def daemon_probe(live):
-                # A fresh TUI hook re-claims the session for a new process
-                # while the (slow) daemon probe is out.
-                live.transport_ref["terminate_ref"] = {
-                    "controller_kind": "process",
-                    "process_ref": {"pid": 301, "lstart": "Tue Sep 29 12:00:00 2026"},
-                }
-                return False
-
-            for worker_alive in (False, True):
-                answer = worker_alive
-
-                async def probe(live, answer=answer):
-                    await daemon_probe(live)
-                    return answer
-
-                live = runtime.state.sessions.get(session.session_id)
-                live.transport_ref["terminate_ref"] = {
-                    "controller_kind": "process",
-                    "process_ref": {"pid": 201, "lstart": "Tue Sep 29 11:06:24 2026"},
-                }
-                with patch.object(
-                    runtime_module, "_probe_processes", return_value={201: channel_native_module._ProcProbe("gone")}
-                ), patch.object(runtime, "_claude_daemon_session_alive", side_effect=probe):
-                    self.assertEqual(asyncio.run(runtime.sweep_exited_tui_sessions()), 0)
-                live = runtime.state.sessions.get(session.session_id)
-                self.assertEqual(live.status, "running")
-                self.assertNotEqual(live.last_progress_event, "external_tui.tui_detached_daemon_alive")
-
     def test_single_probe_failure_does_not_end_the_session_on_startup(self):
         with tempfile.TemporaryDirectory() as tmp:
             runtime = self._runtime(tmp)
@@ -6700,50 +6644,6 @@ class TuiExitSweepTests(unittest.TestCase):
             with patch.object(runtime_module, "_probe_process", return_value=channel_native_module._ProcProbe("error")):
                 asyncio.run(runtime._refresh_loaded_tui_observed_bindings())
             self.assertEqual(runtime.state.sessions.get(session.session_id).status, "running")
-
-    def test_daemon_socket_missing_long_enough_means_no_worker(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            runtime = self._runtime(tmp)
-            socket_path = Path(tmp) / "daemon.sock"
-
-            class _Client:
-                def __init__(self):
-                    self.socket_path = str(socket_path)
-
-                answer = None  # probe failed
-
-                async def job_alive(self, short):
-                    return self.answer
-
-            transport = type("T", (), {"client": _Client()})()
-            session = self._observed(runtime, tmp, "x", 201)
-            session.transport_ref["daemon_live"] = True
-            now = [1000.0]
-            runtime._now = lambda: now[0]
-            with patch.object(runtime, "_claude_daemon_transport", return_value=transport), patch.object(
-                runtime_module, "claude_daemon_short_from_resume_ref", return_value="abc"
-            ), patch.object(runtime_module, "_external_claude_resume_ref", return_value={"x": 1}):
-                alive = lambda: asyncio.run(runtime._claude_daemon_session_alive(session))
-                self.assertTrue(alive())  # just went missing: maybe restarting
-                now[0] += runtime_module.CLAUDE_DAEMON_SOCKET_GONE_SECONDS - 1
-                self.assertTrue(alive())
-                socket_path.write_text("")  # back: the clock resets
-                self.assertTrue(alive())
-                socket_path.unlink()
-                now[0] += 1
-                self.assertTrue(alive())
-                now[0] += runtime_module.CLAUDE_DAEMON_SOCKET_GONE_SECONDS
-                self.assertFalse(alive())
-                # The daemon comes back and answers: the clock must reset, so a
-                # later blip gets a fresh window instead of an instant verdict.
-                socket_path.write_text("")
-                transport.client.answer = True
-                self.assertTrue(alive())
-                socket_path.unlink()
-                transport.client.answer = None
-                now[0] += 1
-                self.assertTrue(alive())
-
 
 def _as_utc_lstart(local_lstart: str) -> str:
     """How Claude's sessions/<pid>.json writes procStart: ps lstart rendered in UTC."""
@@ -6840,9 +6740,7 @@ class ClaudeTuiSessionSwitchTests(unittest.TestCase):
             runtime = self._runtime(tmp)
             left = self._observed(runtime, tmp, "left", 201, self.LSTART)
             current = self._observed(runtime, tmp, "current", 202, self.LSTART)
-            daemon = self._observed(runtime, tmp, "daemon", 203, self.LSTART)
-            daemon.transport_ref["daemon_live"] = True
-            running = {201: "another", 202: "current", 203: "another"}
+            running = {201: "another", 202: "current"}
             probes = {pid: channel_native_module._ProcProbe("ok", self.LSTART) for pid in running}
             with patch.object(runtime_module, "_probe_processes", return_value=probes), patch.object(
                 channel_native_module, "claude_tui_current_session", side_effect=lambda pid, lstart: running[pid]
@@ -6853,7 +6751,6 @@ class ClaudeTuiSessionSwitchTests(unittest.TestCase):
             self.assertEqual(gone.stop_reason, "external_tui_session_switched")
             self.assertEqual(gone.writer_owner.kind, "none")
             self.assertEqual(runtime.state.sessions.get(current.session_id).status, "running")
-            self.assertEqual(runtime.state.sessions.get(daemon.session_id).status, "running")
 
     def test_takeover_never_stops_a_terminal_that_moved_to_another_session(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -300,6 +300,7 @@ class ChannelNativeConfig:
     def from_env(cls, env: dict[str, str] | None = None) -> "ChannelNativeConfig":
         source = os.environ if env is None else env
         _reject_removed_runtime_env(source)
+        _note_retired_runtime_env(source)
         channel_kind = _configured_channel_kind(source)
         if not channel_kind:
             raise ChannelConfigError(
@@ -531,43 +532,6 @@ def _configured_agent_options(source: Any) -> dict[str, dict[str, Any]]:
                 "use a number of seconds (0 disables the ceiling)"
             )
         claude["background_wait_ceiling_seconds"] = ceiling_value
-    claude_daemon_mode = str(source.get("WALKCODE_CLAUDE_DAEMON_MODE") or "").strip().lower()
-    if claude_daemon_mode:
-        if claude_daemon_mode not in {"auto", "off"}:
-            raise ChannelConfigError(
-                f"invalid WALKCODE_CLAUDE_DAEMON_MODE: {claude_daemon_mode}; use auto or off"
-            )
-        claude["daemon_mode"] = claude_daemon_mode
-    claude_spawn_mode = str(source.get("WALKCODE_CLAUDE_SPAWN_MODE") or "").strip().lower()
-    if claude_spawn_mode:
-        if claude_spawn_mode not in {"headless", "daemon"}:
-            raise ChannelConfigError(
-                f"invalid WALKCODE_CLAUDE_SPAWN_MODE: {claude_spawn_mode}; use headless or daemon"
-            )
-        # An EXPLICIT daemon request that also disables the daemon transport
-        # is a contradiction the operator must resolve; the resolved default
-        # below degrades instead of erroring.
-        if claude_spawn_mode == "daemon" and claude_daemon_mode == "off":
-            raise ChannelConfigError(
-                "WALKCODE_CLAUDE_SPAWN_MODE=daemon requires the daemon transport; "
-                "unset WALKCODE_CLAUDE_DAEMON_MODE=off"
-            )
-    else:
-        # Single-master UI is the default (ADR 0050, reverting the ADR 0048
-        # daemon default): channel-born sessions spawn headless, TUI sessions
-        # stay hook-observed read-only with takeover as the only write
-        # handoff. The dual-UI daemon spawn path remains available as an
-        # explicit WALKCODE_CLAUDE_SPAWN_MODE=daemon opt-in (still rejected
-        # when combined with WALKCODE_CLAUDE_DAEMON_MODE=off above).
-        claude_spawn_mode = "headless"
-    claude["spawn_mode"] = claude_spawn_mode
-    claude_list_adopt = str(source.get("WALKCODE_CLAUDE_LIST_ADOPT") or "").strip().lower()
-    if claude_list_adopt:
-        if claude_list_adopt not in {"auto", "off"}:
-            raise ChannelConfigError(
-                f"invalid WALKCODE_CLAUDE_LIST_ADOPT: {claude_list_adopt}; use auto or off"
-            )
-        claude["list_adopt"] = claude_list_adopt
     claude_gate_mode = str(source.get("WALKCODE_CLAUDE_GATE_MODE") or "").strip().lower()
     if claude_gate_mode:
         if claude_gate_mode not in {"auto", "off", "ask_only"}:
@@ -591,13 +555,6 @@ def _configured_agent_options(source: Any) -> dict[str, dict[str, Any]]:
         claude["gate_tools"] = [
             tool.strip() for tool in claude_gate_tools.split(",") if tool.strip()
         ]
-    claude_gate_style = str(source.get("WALKCODE_CLAUDE_GATE_STYLE") or "").strip().lower()
-    if claude_gate_style:
-        if claude_gate_style not in {"dual", "block"}:
-            raise ChannelConfigError(
-                f"invalid WALKCODE_CLAUDE_GATE_STYLE: {claude_gate_style}; use dual or block"
-            )
-        claude["gate_style"] = claude_gate_style
     codex: dict[str, Any] = {}
     codex_home = str(source.get("WALKCODE_CODEX_HOME") or "").strip()
     if codex_home:
@@ -678,6 +635,34 @@ def _reject_removed_runtime_env(source: Any) -> None:
     for key, guidance in removed.items():
         if str(source.get(key, "") or "").strip():
             raise ChannelConfigError(f"{key} is not supported by channel-native V3; {guidance}")
+
+
+# Keys of the retired Claude daemon mode (ADR 0068). Deployed env files still
+# carry them (e.g. WALKCODE_CLAUDE_SPAWN_MODE=headless), so unlike the keys
+# above they must not stop the runtime: they are ignored with one notice.
+RETIRED_RUNTIME_ENV_KEYS = (
+    "WALKCODE_CLAUDE_DAEMON_MODE",
+    "WALKCODE_CLAUDE_SPAWN_MODE",
+    "WALKCODE_CLAUDE_LIST_ADOPT",
+    "WALKCODE_CLAUDE_GATE_STYLE",
+)
+_retired_env_noticed = False
+
+
+def _note_retired_runtime_env(source: Any) -> None:
+    global _retired_env_noticed
+    if _retired_env_noticed:
+        return
+    present = [key for key in RETIRED_RUNTIME_ENV_KEYS if str(source.get(key, "") or "").strip()]
+    if not present:
+        return
+    _retired_env_noticed = True
+    print(
+        f"walkcode: ignoring retired env {','.join(present)} "
+        "(Claude daemon mode was removed, ADR 0068); safe to delete",
+        file=sys.stderr,
+        flush=True,
+    )
 
 
 def _normalize_agent_name(value: str) -> str:
@@ -1174,8 +1159,8 @@ def _external_claude_resume_ref(session: Session) -> dict[str, Any]:
     """The Claude-native resume_ref of a TUI-observed session, if any.
 
     TUI hooks store it nested as ``transport_ref["resume_ref"]`` with a
-    ``transport_kind`` discriminator; only claude sessions can be driven
-    through the Claude daemon.
+    ``transport_kind`` discriminator; only claude sessions have PreToolUse
+    gate cards.
     """
     refs: list[dict[str, Any]] = []
     if isinstance(session.transport_ref, dict):
@@ -1632,10 +1617,15 @@ def _session_to_dict(session: Session) -> dict[str, Any]:
 
 
 def _session_from_dict(data: dict[str, Any]) -> Session:
+    transport_kind = str(data.get("transport_kind", ""))
+    if transport_kind == "claude_daemon":
+        # ADR 0068: the Claude daemon transport is gone; such a session was a
+        # TUI session driven through it, which is what external_tui means.
+        transport_kind = "external_tui"
     return Session(
         schema_version=int(data.get("schema_version", 1)),
         session_id=str(data.get("session_id", "")),
-        transport_kind=str(data.get("transport_kind", "")),
+        transport_kind=transport_kind,
         transport_ref=dict(data.get("transport_ref", {})),
         cwd=str(data.get("cwd", "")),
         channel_binding=_binding_from_dict(data.get("channel_binding")),
@@ -3384,7 +3374,6 @@ class ViewModelFactory:
         model: str = "",
         context_used: int = 0,
         context_limit: int = 0,
-        direct_write: bool = False,
         background_tasks: int = 0,
         agent_session_id: str = "",
     ) -> dict[str, Any]:
@@ -3409,9 +3398,6 @@ class ViewModelFactory:
             "model": model,
             "context_used": context_used,
             "context_limit": context_limit,
-            # TUI-observed session with live daemon direct-write: channel input
-            # reaches the terminal session without takeover (ADR 0046 v2).
-            "direct_write": direct_write,
             # Background subagents still running inside the agent process.
             "background_tasks": background_tasks,
         }
@@ -9886,7 +9872,6 @@ class Orchestrator:
         defer_event_drain: bool = False,
         outbox_dispatcher: OutboxDispatcher | None = None,
         on_state_changed: Callable[[], None] | None = None,
-        daemon_spawner: Callable[..., Any] | None = None,
         handoff_continue: str = "auto",
         now: Callable[[], float] = time.time,
     ):
@@ -9906,11 +9891,6 @@ class Orchestrator:
             on_state_changed=on_state_changed,
         )
         self.on_state_changed = on_state_changed
-        # Daemon-native spawn hook (ADR 0048): when set, a brand-new channel
-        # session is offered to this callback first — it may create the session
-        # as a daemon bg worker (external-TUI shaped, daemon reply write path)
-        # and return it, or return None to fall back to start_session().
-        self.daemon_spawner = daemon_spawner
         # ADR 0051: "auto" re-drives the agent after a takeover-only handoff
         # that stale-marked pending HITL prompts (see HANDOFF_CONTINUE_PROMPT).
         self.handoff_continue = handoff_continue
@@ -9921,12 +9901,6 @@ class Orchestrator:
         # split the SDK message stream between them.
         self._handle_event_drains: dict[str, asyncio.Task] = {}
         self._now = now
-        # Echo dedup for daemon replies (ADR 0046 v2): a channel message
-        # injected via daemon reply comes back as a user-prompt-submit hook;
-        # without this record it would be re-posted as "TUI input" — the
-        # sender's own words repeated at them. In-memory on purpose: the
-        # window is seconds, a restart in between just lets one echo through.
-        self._daemon_reply_echoes: dict[str, tuple[str, float]] = {}
         # ADR 0058：每会话最近一次被接受的用户提交，供 worker 死于回答之前
         # 时带退避自动重放。In-memory on purpose：runtime 重启后的下一条
         # 新消息本来就会走复活路径，不需要跨重启的重放。
@@ -10053,22 +10027,6 @@ class Orchestrator:
                 return ready
         validation = self.sessions.validate_submit(session_id, generation)
         if not validation.accepted:
-            if validation.reason == BlockedReason.EXTERNAL_TUI_READONLY and (
-                _session_is_external_tui_takeover_candidate(session)
-            ):
-                # Multi-UI write path (ADR 0046): a live daemon worker accepts
-                # the message directly (as if typed in the TUI), so no takeover
-                # is needed and the terminal stays attached. Falls through to
-                # the takeover prompt when the daemon or the job is gone.
-                daemon_result = await self._try_external_daemon_reply(
-                    session, turn, ack_message_id=ack_message_id
-                )
-                if daemon_result is not None:
-                    if daemon_result.accepted:
-                        # ADR 0057：daemon 直写同样是"被人说话"——不盖会让
-                        # 回显 hook 的本机时间独占水位（误拦后续连发）。
-                        self._stamp_last_user_input(session, turn.created_at)
-                    return daemon_result
             if validation.reason in {BlockedReason.EXTERNAL_TUI_READONLY, BlockedReason.SESSION_STOPPED} and (
                 _session_is_external_tui_takeover_candidate(session)
             ):
@@ -10172,87 +10130,6 @@ class Orchestrator:
         await self._drain_events(session, transport, handle)
         await self.refresh_session_status_card(session)
         return SubmitResult(True)
-
-    async def _try_external_daemon_reply(
-        self,
-        session: Session,
-        turn: TurnInput,
-        *,
-        ack_message_id: str = "",
-    ) -> SubmitResult | None:
-        """Inject a message into a TUI-owned Claude session via the daemon.
-
-        Returns a SubmitResult when the daemon accepted the reply, or None to
-        fall back to the takeover prompt. Writer ownership is intentionally
-        left with the external TUI: the hook pipeline keeps rendering content,
-        and the TUI process stays alive — that is the whole point of ADR 0046.
-        The injected input does echo back as a user-prompt-submit hook, but
-        the runtime consumes it via the echo record below (the sender sees a
-        short ack instead of their own words repeated).
-        """
-        transport = self.transports.get("claude_daemon")
-        if transport is None:
-            return None
-        resume_ref = _external_claude_resume_ref(session)
-        if not resume_ref:
-            return None
-        try:
-            handle = await transport.resume(
-                ResumeSpec(
-                    cwd=session.cwd,
-                    session_id=session.session_id,
-                    resume_ref=resume_ref,
-                )
-            )
-            await transport.submit_turn(
-                handle,
-                turn,
-                idempotency_key=f"{session.session_id}:{session.generation}:daemon-reply:{turn.text}",
-            )
-        except Exception as exc:
-            # Any failure here (dead socket, ENOJOB, ENOREPLY mid-turn, proto
-            # drift) degrades to the takeover prompt, which remains fully
-            # functional; the reply path must never hard-fail the inbound.
-            _log_degrade(
-                "claude_daemon_reply_failed",
-                session_id=session.session_id,
-                error=exc,
-                fallback="takeover_prompt",
-            )
-            return None
-        composed = _compose_turn_text(turn)
-        self._daemon_reply_echoes[session.session_id] = (composed.strip(), self._now())
-        session.last_progress_at = self._now()
-        session.last_progress_event = "external_tui.daemon_reply"
-        session.last_event_seq += 1
-        # Reaction on the user's own message beats a "✅ 已发送到终端会话"
-        # bubble; the text receipt stays as the fallback when the channel
-        # can't react (or the reaction call fails).
-        if not await self._react_ack(session, ack_message_id):
-            await self._send_session_view(
-                session,
-                {"type": "text", "text": "✅ 已发送到终端会话"},
-                idempotency_key=f"daemon_reply_ack:{session.last_event_seq}",
-            )
-        await self.refresh_session_status_card(session)
-        self._notify_state_changed()
-        return SubmitResult(True, "daemon_reply")
-
-    def consume_daemon_reply_echo(
-        self, session_id: str, text: str, *, max_age: float = 180.0
-    ) -> bool:
-        """True (and consumed) when this TUI prompt echo came from a daemon reply."""
-        record = self._daemon_reply_echoes.get(session_id)
-        if not record:
-            return False
-        recorded_text, recorded_at = record
-        if self._now() - recorded_at > max_age:
-            self._daemon_reply_echoes.pop(session_id, None)
-            return False
-        if str(text or "").strip() != recorded_text:
-            return False
-        self._daemon_reply_echoes.pop(session_id, None)
-        return True
 
     def _start_background_event_drain(
         self,
@@ -10862,11 +10739,6 @@ class Orchestrator:
             last_event_seq=session.last_event_seq,
             readonly=bool(session.writer_owner and session.writer_owner.kind == "external_tui"),
             model=session.model,
-            direct_write=bool(
-                session.status != "stopped"
-                and isinstance(session.transport_ref, dict)
-                and session.transport_ref.get("daemon_live")
-            ),
             context_used=_estimate_context_tokens(session.last_usage),
             context_limit=_context_window_limit(
                 session.model,
@@ -10913,9 +10785,6 @@ class Orchestrator:
         r"^(?:"
         r"external_tui\.(?:pre-tool|post-tool|post-tool-failure|post-tool-batch|"
         r"message-display|notification|user-prompt-submit)"
-        # daemon tempo carries a free-text detail ("…daemon_working:Bash"),
-        # which would otherwise put arbitrary strings in the fingerprint.
-        r"|external_tui\.daemon_[^:]*(?::.*)?"
         r"|tool\.(?:started|completed|failed)"
         r"|turn\.(?:delta|narration)"
         r"|background\.tasks"
@@ -11138,10 +11007,6 @@ class Orchestrator:
     def _status_card_actions(session: Session) -> list[dict[str, Any]]:
         if not _session_is_external_tui_takeover_candidate(session):
             return []
-        if session.status != "stopped" and session.transport_ref.get("daemon_live"):
-            # Daemon direct-write is live: channel input already reaches the
-            # session via reply, so a takeover button would only mislead.
-            return []
         return [{"action": "request_takeover", "label": "Take over"}]
 
     async def _pin_status_card_if_requested(self, channel: ChannelAdapter, binding: ChannelBinding) -> None:
@@ -11179,13 +11044,13 @@ class Orchestrator:
 
         TUI-observed sessions have ``transport_kind == "external_tui"`` which
         has no transport of its own; their permission / AskUserQuestion
-        decisions ride the Claude daemon transport's gate spool (ADR 0046 v2).
+        decisions go to the PreToolUse gate spool (ADR 0046 v2, ADR 0068).
         """
         transport = self.transports.get(session.transport_kind)
         if transport is not None:
             return transport
         if _session_is_external_tui_takeover_candidate(session) and _external_claude_resume_ref(session):
-            return self.transports.get("claude_daemon")
+            return self.transports.get("claude_gate")
         return None
 
     async def handle_inbound_event(
@@ -11299,24 +11164,12 @@ class Orchestrator:
                                 # as the thread root; register it so refreshes
                                 # patch that card instead of sending a second one.
                                 binding.health_message_id = preset_card
-                            session = None
-                            if self.daemon_spawner is not None:
-                                # ADR 0048: daemon-native spawn first; None
-                                # means "not eligible or spawn failed", and the
-                                # headless SDK path below stays authoritative.
-                                session = await self.daemon_spawner(
-                                    binding,
-                                    agent_transport_kind,
-                                    cwd,
-                                    actor,
-                                )
-                            if session is None:
-                                session = await self.start_session(
-                                    binding,
-                                    agent_transport_kind,
-                                    cwd,
-                                    actor,
-                                )
+                            session = await self.start_session(
+                                binding,
+                                agent_transport_kind,
+                                cwd,
+                                actor,
+                            )
                             turn = await self.prepare_turn_from_inbound(inbound)
                             if isinstance(turn, SubmitResult):
                                 result = turn
@@ -11506,31 +11359,26 @@ class Orchestrator:
             detail="会话进程已重启，这张卡片已失效。",
         )
 
-    async def _notify_gate_injection_failure(
+    async def _notify_gate_decision_failure(
         self,
         inbound: InboundEvent,
         session: Session,
         ctx: InteractionContext,
-        exc: "claude_gate.GateInjectionFailed",
+        exc: "claude_gate.GateDecisionFailed",
     ) -> None:
-        # v3 injection is best-effort by design: every miss leaves the native
-        # dialog on screen, so the honest degrade is "answer in the terminal"
-        # (ADR 0046 v3 — failure mode is single-surface usable, never blind).
+        # The click did not reach a waiting hook: say so on the card instead
+        # of pretending it took effect.
         _log_degrade(
-            "gate_injection_failed",
+            "gate_decision_failed",
             kind=ctx.kind,
             session_id=ctx.session_id,
             reason=exc.reason,
             error=str(exc),
         )
-        if exc.reason in {"dialog_mismatch", "already_resolved"}:
+        if exc.reason == "already_resolved":
             action, detail = "terminal", "已在终端处理（或对话框已变化），本卡片未生效。"
-        elif exc.reason == "stale_gate":
-            action, detail = "stale", "这个请求已经结束或服务重启过，这张卡片已失效；如终端仍在等待，请直接在终端处理。"
-        elif exc.reason == "not_injectable":
-            action, detail = "degraded", "该回答形态暂不支持从飞书注入，请在终端完成选择。"
         else:
-            action, detail = "degraded", "注入未生效，请直接在终端操作（对话框仍在等待）。"
+            action, detail = "stale", "这个请求已经结束或服务重启过，这张卡片已失效；如终端仍在等待，请直接在终端处理。"
         await self._flip_decided_card(
             inbound,
             kind=ctx.kind,
@@ -11615,11 +11463,10 @@ class Orchestrator:
                     ctx.transport_request_id or ctx.interaction_id,
                     approval_decision,
                 )
-            except claude_gate.GateInjectionFailed as exc:
-                # v3 keystroke injection missed: the native dialog is still on
-                # screen and the terminal fully usable — tell the truth on the
-                # card instead of pretending the click took effect.
-                await self._notify_gate_injection_failure(inbound, session, ctx, exc)
+            except claude_gate.GateDecisionFailed as exc:
+                # No hook is waiting for this click any more (timed out to the
+                # terminal, runtime restarted, or already decided).
+                await self._notify_gate_decision_failure(inbound, session, ctx, exc)
                 return SubmitResult(False, BlockedReason.NOT_FOUND)
             except TransportUnavailable as exc:
                 # Only the stale-worker path (runtime restarted, worker gone)
@@ -11652,8 +11499,8 @@ class Orchestrator:
                     idempotency_key=f"{inbound.event_id}:ask_user_view",
                     edit_card=inbound,
                 )
-            except claude_gate.GateInjectionFailed as exc:
-                await self._notify_gate_injection_failure(inbound, session, ctx, exc)
+            except claude_gate.GateDecisionFailed as exc:
+                await self._notify_gate_decision_failure(inbound, session, ctx, exc)
                 return SubmitResult(False, BlockedReason.NOT_FOUND)
             except TransportUnavailable as exc:
                 # Same narrowing as the permission branch: only worker-gone is
@@ -12648,7 +12495,7 @@ class Orchestrator:
         ``AgentEvent`` flows through ``_event_to_view`` (HITL + interaction
         registration with ``transport_request_id = rid``), so the card
         callback resolves through ``_handle_callback_event`` unchanged and the
-        decision lands in the gate spool via the daemon transport.
+        decision lands in the gate spool via ``ClaudeGateTransport``.
         """
         try:
             session = self.sessions.get(session_id)
@@ -12668,28 +12515,6 @@ class Orchestrator:
         # click on a valid-looking card must not silently do nothing.
         deadline = float(request.get("deadline", 0) or 0)
         interaction_ttl = max(60.0, deadline - self._now()) if deadline else 0
-        if claude_gate.pending_mode(request) == claude_gate.MODE_NOTIFY:
-            # Notify mode mirrors a dialog that never times out: the card
-            # stays decidable until someone answers on either surface.
-            interaction_ttl = 86400.0
-            if str(request.get("kind", "")) == claude_gate.KIND_ASK_USER and (
-                not claude_gate.ask_form_injectable(tool_input)
-            ):
-                # Outside the verified keystroke matrix: offering buttons that
-                # can never be delivered is worse than saying so up front.
-                question_count = len(tool_input.get("questions", []) or [])
-                await self._send_session_view(
-                    session,
-                    {
-                        "type": "text",
-                        "text": (
-                            f"❓ Claude 提了 {question_count} 个问题（含多选的多题形态），"
-                            "这类形态暂不支持从飞书作答，请在终端选择。"
-                        ),
-                    },
-                    idempotency_key=f"gate:{rid}",
-                )
-                return True
         if str(request.get("kind", "")) == claude_gate.KIND_ASK_USER:
             event = AgentEvent(
                 AgentEventType.ASK_USER_REQUESTED,
@@ -12714,10 +12539,6 @@ class Orchestrator:
                 },
             )
         view = self._event_to_view(session, event)
-        if claude_gate.pending_mode(request) == claude_gate.MODE_NOTIFY:
-            # v3 dual-surface: the native dialog is rendering in the terminal
-            # at the same time — say so on the card (first answer wins).
-            view["dual_surface"] = True
         session.last_event_seq += 1
         session.last_progress_at = self._now()
         session.last_progress_event = f"gate.waiting:{tool_name or 'ask_user_question'}"

@@ -160,15 +160,7 @@ def _permission_card(view: dict[str, Any]) -> dict[str, Any]:
     elements: list[dict[str, Any]] = [_md_div(content)]
     if buttons:
         elements.append(_action_row(buttons))
-    if view.get("dual_surface"):
-        elements.append(_dual_surface_note())
     return _card_message(title, template, elements)
-
-
-def _dual_surface_note() -> dict[str, Any]:
-    # v3 true dual-surface (ADR 0046 v3): the native terminal dialog renders
-    # at the same time as this card; whichever side answers first wins.
-    return _note("💡 终端与飞书均可回答，先答先生效。")
 
 
 def _ask_user_question_card(view: dict[str, Any]) -> dict[str, Any]:
@@ -180,8 +172,6 @@ def _ask_user_question_card(view: dict[str, Any]) -> dict[str, Any]:
         card = _ask_user_form_card(questions, submit)
     else:
         card = _ask_user_button_card(questions)
-    if view.get("dual_surface"):
-        card["content"]["elements"].append(_dual_surface_note())
     return card
 
 
@@ -327,9 +317,7 @@ def _health_card(view: dict[str, Any]) -> dict[str, Any]:
         detail_bits.append(f"**进展**: {escape_lark_md(_inline(str(view['last_progress_event'])))}")
     if detail_bits:
         elements.append({"tag": "markdown", "content": "　".join(detail_bits)})
-    if view.get("direct_write"):
-        elements.append(_md_div("🔁 双端同步中：这里发消息会直达终端会话。"))
-    elif view.get("readonly"):
+    if view.get("readonly"):
         elements.append(_md_div("👀 只读观察中：接管后才能从这里发消息。"))
     reason = str(view.get("reason", "") or "")
     if status in {"error", "stale"} and reason:
@@ -518,8 +506,7 @@ def _tui_permission_notice_card(view: dict[str, Any]) -> dict[str, Any]:
             # Post-gate this card only appears for confirmations that did NOT
             # route to a Feishu approval card (tool outside the gate set, gate
             # off/ask_only, or the gate abstained) — so the terminal is the
-            # only place to answer. No takeover pitch: daemon-native sessions
-            # are already dual-writable.
+            # only place to answer.
             _note("这个确认未走飞书审批通道，需要在终端里处理。"),
         ],
     )
@@ -533,10 +520,6 @@ def _decision_result_card(view: dict[str, Any]) -> dict[str, Any]:
         # runtime restarted and the in-flight prompt died with it).
         body = escape_lark_md(_inline(detail)) if detail else "会话进程已重启，这张卡片已失效。"
         return _card_message("⚠️ 卡片已失效", "orange", [_md_div(body)])
-    if action == "degraded":
-        # v3 keystroke injection missed; the native dialog is still waiting.
-        body = escape_lark_md(_inline(detail)) if detail else "注入未生效，请在终端操作。"
-        return _card_message("⚠️ 请在终端操作", "orange", [_md_div(body)])
     if action == "terminal":
         body = escape_lark_md(_inline(detail)) if detail else "已在终端处理。"
         return _card_message("✅ 已在终端处理", "green", [_md_div(body)])
