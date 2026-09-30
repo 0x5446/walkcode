@@ -900,7 +900,7 @@ _STRUCTURED_TRANSPORT_KINDS = frozenset({"claude_headless", "codex_app_server"})
 # a revival attempt did not land, or /reload deliberately cycled the backend
 # under a session the user wants to keep talking to.
 _CHANNEL_REVIVAL_STOP_REASONS = frozenset(
-    {"runtime_restart", "revive_failed", "backend_reload"}
+    {"runtime_restart", "revive_failed", "backend_reload", "idle_expired"}
 )
 
 # Lifecycle states where a turn is still in flight, so cycling the backend
@@ -1105,6 +1105,12 @@ def _resume_ref_is_durable(transport_kind: str, ref: dict[str, Any]) -> bool:
 # topic, no resumable identity) can never continue and gets the short window.
 SESSION_REVIVABLE_RETENTION_SECONDS = 90 * 86400.0
 SESSION_FINAL_RETENTION_SECONDS = 7 * 86400.0
+# A structured session left "running" with no worker and no activity this long
+# is stopped as idle_expired: a reply in its topic still revives it (ADR 0054),
+# and the stopped-session retention above can finally drop it. Without this
+# they stayed "running" forever (work-claude: 81, idle 23–90 days).
+SESSION_IDLE_EXPIRY_SECONDS = 30 * 86400.0
+_IDLE_LIFECYCLE_STATES = frozenset({"IDLE", "ERROR_RECOVERABLE"})
 
 
 def _session_revivable_from_topic(session: Session) -> bool:
@@ -1779,6 +1785,29 @@ class SessionRegistry:
             session.archived_by = actor.actor_id
             session.archive_reason = reason
         return ControlResult(True, state="archived")
+
+    def expire_idle_sessions(self, *, is_live: Callable[[Session], bool]) -> list[str]:
+        """Stop long-idle structured sessions whose worker is gone.
+
+        ``is_live`` guards against stopping a session whose worker is still
+        attached. Returns the expired session ids.
+        """
+        now = self._now()
+        expired = []
+        for session_id, session in self._sessions.items():
+            if (
+                session.status == "running"
+                and session.transport_kind in _STRUCTURED_TRANSPORT_KINDS
+                and session.lifecycle_state in _IDLE_LIFECYCLE_STATES
+                and now - _session_last_activity(session) >= SESSION_IDLE_EXPIRY_SECONDS
+                and not is_live(session)
+            ):
+                session.status = "stopped"
+                session.stop_reason = "idle_expired"
+                session.lifecycle_state = "STOPPED"
+                session.writer_owner = WriterOwner(kind="none")
+                expired.append(session_id)
+        return expired
 
     def prune_stopped_sessions(self, *, referenced: set[str]) -> list[str]:
         """Drop stopped sessions past their retention window (see
@@ -8955,6 +8984,18 @@ class HitlStore:
             and request.expires_at > now
         ]
 
+    def open_gate_requests(self) -> list[HitlRequest]:
+        """Undecided PreToolUse-gate requests, expired ones included.
+
+        Their cards stay clickable until retired; a runtime that was down past
+        the expiry still has to retire them.
+        """
+        return [
+            request
+            for request in self._requests.values()
+            if request.status == "pending" and request.native_method == "pre_tool_use_hook"
+        ]
+
     def mark_decided(self, hitl_request_id: str) -> None:
         request = self._requests[hitl_request_id]
         request.status = "decided"
@@ -11742,7 +11783,11 @@ class Orchestrator:
         separately by ``retire_gate_card``, which may need several passes.
         """
         request = next(
-            (r for r in self.hitls.pending_for_session(session_id) if r.transport_request_id == rid),
+            (
+                r
+                for r in self.hitls.open_gate_requests()
+                if r.session_id == session_id and r.transport_request_id == rid
+            ),
             None,
         )
         if request is None:

@@ -698,6 +698,27 @@ class GateDrainTests(unittest.TestCase):
             self.assertEqual(len(runtime.orchestrator.hitls.pending_for_session("observed-1")), 1)
             self.assertEqual(self._edits(api), [])
 
+    def test_card_is_retired_after_a_restart_even_past_its_expiry(self):
+        # Card tracking used to live in memory: a hook that timed out while
+        # the runtime was restarting left its card clickable forever.
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime, _session, api = _runtime_with_observed_session(tmp)
+            state = runtime.state_store.path
+            claude_gate.write_pending(state, self._pending_for_session())
+            asyncio.run(runtime.drain_claude_gate_requests())
+            [hitl] = runtime.orchestrator.hitls.pending_for_session("observed-1")
+
+            # Restart: in-memory drain bookkeeping is gone; the runtime was
+            # down past the HITL expiry, and the hook timed out meanwhile.
+            runtime._gate_dispatched.clear()
+            runtime._gate_cards_retiring.clear()
+            hitl.expires_at = time.time() - 1
+            claude_gate.cleanup_gate_files(state, "toolu_edit_1")
+            asyncio.run(runtime.drain_claude_gate_requests())
+
+            self.assertEqual(len(self._edits(api)), 1)
+            self.assertEqual(hitl.status, "stale")
+
     def test_card_decided_on_the_channel_is_not_retired(self):
         with tempfile.TemporaryDirectory() as tmp:
             runtime, _session, api = _runtime_with_observed_session(tmp)
@@ -983,6 +1004,35 @@ class GateWithoutDaemonTests(unittest.TestCase):
             self.assertEqual(output["hookSpecificOutput"]["permissionDecision"], "deny")
             self.assertIsNone(claude_gate.read_pending(state, rid))
             self.assertIsNone(claude_gate.read_decision(state, rid))
+
+    def test_click_during_the_hook_timeout_close_is_refused_not_lost(self):
+        # The hook's close (last decision read, then pending removal) and a
+        # click's delivery must not interleave: a click written between the
+        # two used to be reported as approved and then deleted.
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp) / "state.json"
+            claude_gate.write_pending(state, {"rid": "toolu_race", "kind": "permission"})
+            transport = ClaudeGateTransport(gate_state_path=state)
+            outcome = {}
+
+            def click():
+                try:
+                    asyncio.run(transport.approve_permission(None, "toolu_race", {"action": "allow"}))
+                    outcome["result"] = "delivered"
+                except claude_gate.GateDecisionFailed as exc:
+                    outcome["result"] = exc.reason
+
+            with claude_gate.gate_lock(state):  # the hook is inside its close
+                self.assertIsNone(claude_gate.read_decision(state, "toolu_race"))
+                clicker = threading.Thread(target=click)
+                clicker.start()
+                time.sleep(0.1)
+                self.assertTrue(clicker.is_alive())  # waits for the close
+                claude_gate.cleanup_gate_files(state, "toolu_race")
+            clicker.join(timeout=5)
+
+            self.assertEqual(outcome["result"], "stale_gate")
+            self.assertIsNone(claude_gate.read_decision(state, "toolu_race"))
 
     def test_retired_daemon_mode_off_no_longer_disables_the_gate(self):
         # Before ADR 0068, WALKCODE_CLAUDE_DAEMON_MODE=off silently turned the

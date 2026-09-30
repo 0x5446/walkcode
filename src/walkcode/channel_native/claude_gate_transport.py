@@ -103,17 +103,20 @@ class ClaudeGateTransport:
         # must not leave orphan decision files, must not feed always_allow via
         # the observer — and must NOT read as success to the caller, or the
         # card flips to "allowed" while nothing actually happened.
-        if claude_gate.read_pending(self.gate_state_path, rid) is None:
-            claude_gate.trace("decision_dropped_no_pending", rid=rid, action=payload.get("action"))
-            raise claude_gate.GateDecisionFailed(
-                "stale_gate",
-                "no pending gate is waiting for this decision (request settled or runtime restarted)",
-            )
-        if not claude_gate.write_decision(self.gate_state_path, rid, payload):
-            claude_gate.trace("decision_dropped_already_decided", rid=rid, action=payload.get("action"))
-            raise claude_gate.GateDecisionFailed(
-                "already_resolved", "another surface already decided this request"
-            )
+        # Under the gate lock: the hook's timeout close cannot slip between
+        # the pending check and the write (see claude_gate.gate_lock).
+        with claude_gate.gate_lock(self.gate_state_path):
+            if claude_gate.read_pending(self.gate_state_path, rid) is None:
+                claude_gate.trace("decision_dropped_no_pending", rid=rid, action=payload.get("action"))
+                raise claude_gate.GateDecisionFailed(
+                    "stale_gate",
+                    "no pending gate is waiting for this decision (request settled or runtime restarted)",
+                )
+            if not claude_gate.write_decision(self.gate_state_path, rid, payload):
+                claude_gate.trace("decision_dropped_already_decided", rid=rid, action=payload.get("action"))
+                raise claude_gate.GateDecisionFailed(
+                    "already_resolved", "another surface already decided this request"
+                )
         if self.on_gate_decision is not None:
             with contextlib.suppress(Exception):
                 self.on_gate_decision(rid, dict(payload))

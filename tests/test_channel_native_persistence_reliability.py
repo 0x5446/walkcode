@@ -772,6 +772,37 @@ class SessionRetentionTests(unittest.TestCase):
         self.assertEqual(self._compact(365), set())
         self.assertEqual(self.sessions.get(running.session_id).status, "running")
 
+    def test_long_idle_running_session_expires_then_revives_and_prunes(self):
+        # "running" sessions without a worker were never stopped, so never
+        # pruned (work-claude: 81 of them, idle 23-90 days).
+        idle = self._headless("idle", stop_reason="")
+        idle.lifecycle_state = "IDLE"
+        busy = self._headless("busy", stop_reason="")
+        busy.lifecycle_state = "ACTIVE"
+        live = self._headless("live", stop_reason="")
+        live.lifecycle_state = "IDLE"
+        self.clock.now += 30 * _DAY
+
+        expired = self.sessions.expire_idle_sessions(is_live=lambda s: s.session_id == live.session_id)
+
+        self.assertEqual(expired, [idle.session_id])
+        self.assertEqual(idle.stop_reason, "idle_expired")
+        self.assertEqual(live.status, "running")
+        self.assertEqual(busy.status, "running")
+        # A reply in its topic still revives it (ADR 0054)...
+        from walkcode.channel_native import _session_is_channel_revival_candidate
+
+        self.assertTrue(_session_is_channel_revival_candidate(idle))
+        # ...and it leaves under the revivable window like any other stop.
+        self.assertEqual(self._compact(59.9), set())
+        self.assertEqual(self._compact(0.2), {idle.session_id})
+
+    def test_recently_idle_session_is_not_expired(self):
+        idle = self._headless("fresh", stop_reason="")
+        idle.lifecycle_state = "IDLE"
+        self.clock.now += 29 * _DAY
+        self.assertEqual(self.sessions.expire_idle_sessions(is_live=lambda s: False), [])
+
     def test_pruning_drops_bindings_takeovers_grants_and_blocked_inputs(self):
         tui = self._tui("gone")
         blocked = self.sessions.block_input(
