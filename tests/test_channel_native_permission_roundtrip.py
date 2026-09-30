@@ -7,6 +7,7 @@ from walkcode.channel_native import (
     AgentEventType,
     AuthorizationStore,
     BlockedReason,
+    CapabilityUnsupported,
     ChannelBinding,
     ChannelCapabilities,
     ClaudeHeadlessTransport,
@@ -261,27 +262,18 @@ class PermissionRoundTripTests(unittest.TestCase):
         self.assertIsNone(interactions.get(ctx.interaction_id).decision)
         self.assertEqual(transport.permission_approval_calls, [])
 
-    def test_claude_headless_delegates_permission_approval_to_injected_client(self):
+    def test_claude_headless_approval_without_pending_request_is_unsupported(self):
+        # Decisions only travel through the can_use_tool bridge; a live worker
+        # with no pending callback for this rid has nothing that can take it.
         class Client:
-            def __init__(self):
-                self.calls = []
-
-            async def approve_permission(self, rid: str, decision: dict):
-                self.calls.append((rid, decision))
-
-            async def events(self):
-                return []
-
-            async def submit(self, _turn):
+            async def connect(self, prompt=None):
                 return None
 
-        client = Client()
-        transport = ClaudeHeadlessTransport(client_factory=lambda _spec: client)
+        transport = ClaudeHeadlessTransport(client_factory=lambda _spec: Client())
         handle = asyncio.run(transport.launch_session(cwd="/tmp/project", session_id="s1"))
 
-        asyncio.run(transport.approve_permission(handle, "perm-1", {"action": "allow_once"}))
-
-        self.assertEqual(client.calls, [("perm-1", {"action": "allow_once"})])
+        with self.assertRaises(CapabilityUnsupported):
+            asyncio.run(transport.approve_permission(handle, "perm-1", {"action": "allow_once"}))
 
 
 if __name__ == "__main__":

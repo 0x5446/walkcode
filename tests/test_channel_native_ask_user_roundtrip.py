@@ -6,6 +6,7 @@ from walkcode.channel_native import (
     AgentEvent,
     AuthorizationStore,
     BlockedReason,
+    CapabilityUnsupported,
     ChannelBinding,
     ChannelCapabilities,
     ClaudeHeadlessTransport,
@@ -578,27 +579,18 @@ class AskUserQuestionRoundTripTests(unittest.TestCase):
         self.assertIsNone(interactions.get(ctx.interaction_id).decision)
         self.assertEqual(transport.question_answer_calls, [])
 
-    def test_claude_headless_delegates_question_answer_to_injected_client(self):
+    def test_claude_headless_answer_without_pending_question_is_unsupported(self):
+        # Answers only travel through the can_use_tool bridge; a live worker
+        # with no pending callback for this rid has nothing that can take it.
         class Client:
-            def __init__(self):
-                self.calls = []
-
-            async def answer_user_question(self, rid: str, answers: dict):
-                self.calls.append((rid, answers))
-
-            async def events(self):
-                return []
-
-            async def submit(self, _turn):
+            async def connect(self, prompt=None):
                 return None
 
-        client = Client()
-        transport = ClaudeHeadlessTransport(client_factory=lambda _spec: client)
+        transport = ClaudeHeadlessTransport(client_factory=lambda _spec: Client())
         handle = asyncio.run(transport.launch_session(cwd="/tmp/project", session_id="s1"))
 
-        asyncio.run(transport.answer_user_question(handle, "ask-1", {0: "A"}))
-
-        self.assertEqual(client.calls, [("ask-1", {0: "A"})])
+        with self.assertRaises(CapabilityUnsupported):
+            asyncio.run(transport.answer_user_question(handle, "ask-1", {0: "A"}))
 
 
 if __name__ == "__main__":

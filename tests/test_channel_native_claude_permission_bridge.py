@@ -5,8 +5,9 @@ These cover the real gap wired in this slice: giving the Claude Agent SDK a
 ``PERMISSION_REQUESTED`` / ``ASK_USER_REQUESTED`` event mid-turn, blocks the SDK
 callback on a Future, and resolves it from a channel decision. A fake SDK stands
 in for ``claude_agent_sdk``: it exposes the PermissionResult types the bridge
-returns and a scripted streaming client whose ``receive_response`` drives one
-tool through the bridge, blocking until the decision arrives.
+returns and a scripted streaming client whose ``receive_messages`` drives one
+tool through the bridge, blocking until the decision arrives. Stream messages
+are real ``claude_agent_sdk`` types — the shape production receives.
 """
 
 import asyncio
@@ -14,6 +15,15 @@ import json
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+
+from claude_agent_sdk import (
+    AssistantMessage,
+    ResultMessage,
+    TextBlock,
+    ToolResultBlock,
+    ToolUseBlock,
+    UserMessage,
+)
 
 from walkcode.channel_native import (
     ActorRef,
@@ -98,9 +108,10 @@ def _make_sdk(client_cls):
 class _ScriptedClient:
     """Fake streaming client that pushes one tool through can_use_tool.
 
-    ``receive_response`` yields the tool_use block, then invokes the bridged
+    ``receive_messages`` yields the tool_use block, then invokes the bridged
     ``can_use_tool`` (blocking until the decision resolves) exactly as the real
-    turn would, then yields the tool_result + result. A fresh instance is built
+    turn would, then yields the tool_result + result and ends (worker EOF, so
+    the session-level listener closes the worker). A fresh instance is built
     per launch, so the class captures construction args via ``configure``.
     """
 
@@ -120,29 +131,40 @@ class _ScriptedClient:
     async def query(self, prompt, session_id="default"):
         return None
 
-    async def receive_response(self):
-        yield {
-            "content": [
-                {
-                    "type": "tool_use",
-                    "id": self.tool_use_id,
-                    "name": self.tool_name,
-                    "input": self.tool_input,
-                }
-            ]
-        }
+    async def disconnect(self):
+        return None
+
+    async def receive_messages(self):
+        yield AssistantMessage(
+            content=[ToolUseBlock(id=self.tool_use_id, name=self.tool_name, input=self.tool_input)],
+            model="claude-test",
+        )
         ctx = _Ctx(tool_use_id=self.tool_use_id, suggestions=self.ctx_suggestions)
         result = await self._can_use_tool(self.tool_name, self.tool_input, ctx)
         self.permission_results.append(result)
-        if getattr(result, "behavior", "") == "allow":
-            yield {"content": [{"type": "tool_result", "tool_use_id": self.tool_use_id, "content": "ok"}]}
-        else:
-            yield {
-                "content": [
-                    {"type": "tool_result", "tool_use_id": self.tool_use_id, "is_error": True, "content": "denied"}
-                ]
-            }
-        yield {"type": "result", "result": "done", "session_id": "claude-x"}
+        denied = getattr(result, "behavior", "") != "allow"
+        yield UserMessage(
+            content=[
+                ToolResultBlock(
+                    tool_use_id=self.tool_use_id,
+                    content="denied" if denied else "ok",
+                    is_error=denied or None,
+                )
+            ]
+        )
+        yield _result_message()
+
+
+def _result_message():
+    return ResultMessage(
+        subtype="success",
+        duration_ms=1,
+        duration_api_ms=1,
+        is_error=False,
+        num_turns=1,
+        session_id="claude-x",
+        result="done",
+    )
 
 
 def _client_class(**attrs):
@@ -323,9 +345,9 @@ class PermissionBridgeStreamTests(unittest.TestCase):
 
 
 class _NoToolClient(_ScriptedClient):
-    async def receive_response(self):
-        yield {"content": [{"type": "text", "text": "all done"}]}
-        yield {"type": "result", "result": "done", "session_id": "claude-x"}
+    async def receive_messages(self):
+        yield AssistantMessage(content=[TextBlock(text="all done")], model="claude-test")
+        yield _result_message()
 
 
 class PermissionBridgePassthroughTests(unittest.TestCase):
@@ -530,6 +552,9 @@ class PermissionBridgeOrchestratorTests(unittest.TestCase):
             owner = ActorRef("telegram", "owner", "Owner")
             binding = ChannelBinding("telegram", "bot", "chat", "topic", "root")
             session = await orch.start_session(binding, "claude_headless", "/tmp/project", owner)
+            # Captured up front: the worker's stream ends after the turn and
+            # the listener closes (unregisters) it.
+            client = transport._clients[session.transport_ref["handle_id"]]
             await orch.submit_user_input(
                 session.session_id, TurnInput(text="run"), actor=owner, generation=session.generation
             )
@@ -547,8 +572,6 @@ class PermissionBridgeOrchestratorTests(unittest.TestCase):
             drains = list(orch._background_event_drains)
             if drains:
                 await asyncio.wait_for(asyncio.gather(*drains), timeout=5.0)
-            handle_id = session.transport_ref["handle_id"]
-            client = transport._clients[handle_id]
             return session, client
 
         session, client = asyncio.run(scenario())
@@ -567,6 +590,9 @@ class PermissionBridgeOrchestratorTests(unittest.TestCase):
             owner = ActorRef("telegram", "owner", "Owner")
             binding = ChannelBinding("telegram", "bot", "chat", "topic", "root")
             session = await orch.start_session(binding, "claude_headless", "/tmp/project", owner)
+            # Captured up front: the worker's stream ends after the turn and
+            # the listener closes (unregisters) it.
+            client = transport._clients[session.transport_ref["handle_id"]]
             await orch.submit_user_input(
                 session.session_id, TurnInput(text="run"), actor=owner, generation=session.generation
             )
@@ -590,7 +616,6 @@ class PermissionBridgeOrchestratorTests(unittest.TestCase):
             drains = list(orch._background_event_drains)
             if drains:
                 await asyncio.wait_for(asyncio.gather(*drains), timeout=5.0)
-            client = transport._clients[session.transport_ref["handle_id"]]
             return client
 
         client = asyncio.run(scenario())

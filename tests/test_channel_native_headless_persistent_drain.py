@@ -25,6 +25,8 @@ import asyncio
 import time
 import unittest
 
+from claude_agent_sdk import UserMessage
+
 from walkcode.channel_native import (
     ActorRef,
     AgentEventType,
@@ -159,7 +161,7 @@ def _result(message="done", session_id="agent-1"):
 
 
 def _user(text):
-    return _sdk_message("UserMessage", content=text)
+    return UserMessage(content=text)
 
 
 def _task_started(task_id, description=""):
@@ -1404,14 +1406,14 @@ class OrchestratorPersistentDrainTests(unittest.TestCase):
 class DeepReviewRegressionTests(unittest.TestCase):
     """Fixes adopted from the v0.14.0 deep-review round (all VERIFIED)."""
 
-    def test_dict_user_message_is_not_echoed_as_agent_text(self):
+    def test_user_message_is_not_echoed_as_agent_text(self):
         converted = ClaudeHeadlessTransport._convert_sdk_message(
-            {"type": "user", "role": "user", "content": "<task-notification>t1</task-notification>"}
+            _user("<task-notification>t1</task-notification>")
         )
         events = converted if isinstance(converted, list) else ([] if converted is None else [converted])
         self.assertFalse(
             any(e.type == AgentEventType.TURN_DELTA for e in events),
-            f"dict user message leaked as agent text: {events}",
+            f"user message leaked as agent text: {events}",
         )
 
     def test_submit_failure_clears_pending_turn_marker(self):
@@ -1664,77 +1666,6 @@ class DeepReviewRegressionTests(unittest.TestCase):
         )
         self.assertEqual((is_task, changed, subtype), (True, True, "task_notification"))
         self.assertEqual(active, {})
-
-    def test_legacy_single_turn_client_second_submit_resumes(self):
-        # A legacy client (receive_response only, no receive_messages) has no
-        # session-level listener: the second submit must resume a fresh worker
-        # instead of reusing the stale one.
-        class _LegacyClient:
-            instances: list = []
-
-            def __init__(self, options=None):
-                self.options = options
-                self.queries: list = []
-                type(self).instances.append(self)
-
-            async def connect(self, prompt=None):
-                return None
-
-            async def query(self, prompt, session_id="default"):
-                self.queries.append(prompt)
-
-            async def receive_response(self):
-                yield {"content": [{"type": "text", "text": "legacy reply"}]}
-                yield {"type": "result", "result": "legacy reply", "session_id": "agent-legacy"}
-
-        _LegacyClient.instances = []
-
-        async def scenario():
-            transport = ClaudeHeadlessTransport(sdk_loader=lambda: _make_sdk(_LegacyClient))
-            channel = FakeChannelAdapter(
-                "telegram",
-                ChannelCapabilities(
-                    thread_context=True,
-                    editable_message=True,
-                    interactive_message=True,
-                    interactive_update=True,
-                    private_callback_ack=True,
-                    toast_or_ephemeral_notice=True,
-                    force_reply=True,
-                    attachment_download=True,
-                    forum_or_topic=True,
-                    max_text_chars=4096,
-                    max_callback_payload_bytes=64,
-                ),
-            )
-            orch = Orchestrator(
-                sessions=SessionRegistry(),
-                interactions=InteractionStore(),
-                outbox=DurableOutbox(),
-                channels={"telegram": channel},
-                transports={"claude_headless": transport},
-                authz=AuthorizationStore(),
-                defer_event_drain=True,
-            )
-            owner = ActorRef("telegram", "owner", "Owner")
-            binding = ChannelBinding("telegram", "bot", "chat", "topic", "root")
-            session = await orch.start_session(binding, "claude_headless", "/tmp/p", owner)
-            await orch.submit_user_input(
-                session.session_id, TurnInput(text="one"), actor=owner, generation=session.generation
-            )
-            drains = list(orch._background_event_drains)
-            if drains:
-                await asyncio.wait_for(asyncio.gather(*drains), timeout=5.0)
-            await orch.submit_user_input(
-                session.session_id, TurnInput(text="two"), actor=owner, generation=session.generation
-            )
-            drains = list(orch._background_event_drains)
-            if drains:
-                await asyncio.wait_for(asyncio.gather(*drains), timeout=5.0)
-            return _LegacyClient.instances
-
-        instances = asyncio.run(scenario())
-        self.assertEqual(len(instances), 2, "legacy client must be resumed, not reused")
 
     def test_ceiling_leaves_session_idle_not_error(self):
         async def scenario():
@@ -2083,7 +2014,7 @@ class TakeoverInjectedTurnRegressionTests(unittest.TestCase):
             consumer = asyncio.create_task(_consume(transport, handle, collected))
             # A user-role stream message opens an injected turn (submitted
             # prompts are never echoed back on the stream)...
-            client.feed({"type": "user", "role": "user", "content": "<task-notification>t</task-notification>"})
+            client.feed(_user("<task-notification>t</task-notification>"))
             await asyncio.sleep(0.02)
             # ...and its assistant output is injected-turn traffic.
             client.feed(_assistant("injected turn output"))
@@ -2127,25 +2058,16 @@ class TakeoverInjectedTurnRegressionTests(unittest.TestCase):
         transport, handle = asyncio.run(scenario())
         self.assertFalse(transport.handle_is_live(handle.handle_id))
 
-    def test_legacy_zero_traffic_eof_with_pending_submit_yields_error(self):
-        # Adversarial-verify residual: the legacy (receive_response-only)
-        # path must also surface a lost submit instead of ending silently.
-        class _DeadLegacyClient:
-            def __init__(self, options=None):
-                self.options = options
-
-            async def connect(self, prompt=None):
-                return None
-
-            async def query(self, prompt, session_id="default"):
-                return None
-
-            async def receive_response(self):
+    def test_zero_traffic_eof_with_pending_submit_yields_error(self):
+        # Adversarial-verify residual: a worker whose stream ends before any
+        # message must surface the lost submit instead of ending silently.
+        class _DeadClient(_stream_client_class()):
+            async def receive_messages(self):
                 return
                 yield  # pragma: no cover — makes this an empty async generator
 
         async def scenario():
-            transport = ClaudeHeadlessTransport(sdk_loader=lambda: _make_sdk(_DeadLegacyClient))
+            transport = ClaudeHeadlessTransport(sdk_loader=lambda: _make_sdk(_DeadClient))
             handle = await transport.launch_session(cwd="/tmp/p", session_id="s1")
             await transport.submit_turn(handle, TurnInput(text="hi"), "k1")
             collected: list = []
@@ -2154,7 +2076,8 @@ class TakeoverInjectedTurnRegressionTests(unittest.TestCase):
 
         events = asyncio.run(scenario())
         errors = [e for e in events if e.type == AgentEventType.SESSION_ERROR]
-        self.assertTrue(errors, "legacy zero-traffic EOF with a pending submit was silent")
+        self.assertTrue(errors, "zero-traffic EOF with a pending submit was silent")
+        self.assertEqual(errors[-1].payload.get("reason"), "pending_turn_lost")
 
     def test_internal_typeerror_from_control_method_is_not_swallowed(self):
         # Signature binding (not try/except) decides the call shape: a
