@@ -117,17 +117,10 @@ fi
 ```
 
 片段插在 `export CLAUDE_CONFIG_DIR=...` 之后。然后给**所有会创建 Claude
-worker 的调用**加上 `"${tap_settings[@]}"`。ADR 0050 后 wrapper 默认是纯
-TUI，只需改 `exec claude` 一处；若显式 opt-in 回 daemon-native wrapper
-（裸启动 = `claude --bg` + attach，ADR 0048 形态）则至少要改两处：
+worker 的调用**加上 `"${tap_settings[@]}"`。wrapper 是纯 TUI（ADR 0050；
+daemon-native `claude --bg` 形态已由 ADR 0068 退役），只需改 `exec claude` 一处：
 
-- `claude --bg` → `claude --bg "${tap_settings[@]}"`（裸启动的主路径，真正发
-  起上游请求的 worker 在这里创建，只改最后的 exec 会漏掉它）
-- `claude --bg --resume <id>` → 同上加 `"${tap_settings[@]}"`（`--resume`
-  DWIM 的死会话复活路径，见 ADR 0048，这里同样创建新 worker）
-- `exec claude "$@"` → `exec claude "${tap_settings[@]}" "$@"`（带参数/回退路径）
-
-`claude attach` 只是附着已有 worker，不需要加。
+- `exec claude "$@"` → `exec claude "${tap_settings[@]}" "$@"`
 
 覆盖文件写在 `{CLAUDE_CONFIG_DIR}/tui-tap-override-settings.json`（0600，每次
 启动重写），与 walkcode 侧的 `walkcode-tap-override-settings.json` 互不干扰。

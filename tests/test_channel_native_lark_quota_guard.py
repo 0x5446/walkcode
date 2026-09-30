@@ -159,13 +159,6 @@ class StatusCardNoiseFoldingTests(unittest.TestCase):
         ):
             self.assertTrue(regex.match(value), value)
 
-    def test_daemon_tempo_detail_does_not_leak_into_the_fingerprint(self):
-        regex = Orchestrator._STATUS_NOISE_PROGRESS
-        self.assertTrue(regex.match("external_tui.daemon_working"))
-        # Free text after the colon must fold too, or every distinct tool name
-        # becomes a new fingerprint.
-        self.assertTrue(regex.match("external_tui.daemon_working:Bash"))
-
     def test_real_state_changes_are_never_folded(self):
         # Folding these would make the card stop reporting what it exists for.
         regex = Orchestrator._STATUS_NOISE_PROGRESS

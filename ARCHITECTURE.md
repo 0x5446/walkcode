@@ -47,7 +47,7 @@ IM ChannelAdapter
 
 - `ChannelAdapter` owns IM-specific parsing, callbacks, attachments, and message
   rendering.
-- `Orchestrator` owns session routing, authorization, single-writer leases,
+- `Orchestrator` owns session routing, authorization, single-writer fencing,
   interaction state, idempotency, takeover state, and outbox enqueueing.
 - `AgentTransport` owns product-specific headless execution and resume.
 - `JsonFileStateStore` persists sessions, interaction tokens, auth state,
@@ -186,6 +186,12 @@ WALKCODE_DEFAULT_TRANSPORT
 WALKCODE_DEFAULT_AGENT
 ```
 
+The keys of the retired Claude daemon mode (ADR 0068) —
+`WALKCODE_CLAUDE_DAEMON_MODE`, `WALKCODE_CLAUDE_SPAWN_MODE`,
+`WALKCODE_CLAUDE_LIST_ADOPT`, `WALKCODE_CLAUDE_GATE_STYLE` — are different:
+deployed env files still carry them, so they are ignored with a one-line
+stderr notice instead of failing startup.
+
 ## IM-Started Sessions
 
 For IM-started sessions, WalkCode launches the configured agent through the
@@ -213,6 +219,17 @@ takeover from IM, WalkCode can terminate only an authorized local process with
 `allow_terminate=true`, resume the headless transport, and submit the blocked
 input. It never injects IM text into a live TUI.
 
+Claude TUI permission prompts and AskUserQuestion reach the channel through
+the blocking PreToolUse gate (`walkcode native hook PreToolUse --gate`, ADR
+0046 v2 / ADR 0068). The hook process writes
+`<state>.tui-hooks.d/gate/pending/<rid>.json` and blocks; the serve loop's gate
+drain turns it into a card; the card callback goes through
+`Orchestrator._interaction_transport`, which routes TUI sessions to the
+`claude_gate` transport (`ClaudeGateTransport`), and that writes the
+write-once `decisions/<rid>.json` the hook returns to Claude Code. No decision
+within the wait budget, or no serve loop heartbeat, and the hook abstains so
+the native terminal prompt takes over; a card left behind is edited to say so.
+
 ## Reliability
 
 V3 keeps the mature product capabilities but re-implements them inside the new
@@ -221,7 +238,7 @@ boundaries:
 - atomic JSON state persistence (private temporary file, flush/fsync, replace,
   cleanup on failure); persistence errors are logged and propagated, and the
   outbox cannot send a batch whose claim was not saved;
-- pending sessions and durable bindings;
+- durable bindings;
 - inbound dedupe;
 - durable outbox and retry/dead-letter state;
 - permission and AskUserQuestion interaction state;
@@ -252,7 +269,18 @@ existing empty-turn notice through the durable outbox.
 
 At startup and every five minutes the runtime invokes the existing outbox,
 interaction, and HITL retention policies and saves the compacted snapshot.
-Pending deliveries and unexpired prompts survive. Sessions are not pruned.
+Pending deliveries and unexpired prompts survive. The same pass prunes
+stopped sessions (`compact_sessions`): a session goes once it has been idle
+(no progress, user input, title refresh or blocked input) for its retention
+window and nothing references it — no undelivered outbox item for one of its
+bindings, no undecided interaction, no pending HITL request. Sessions a topic
+message can still continue (ADR 0054 revival candidates, and TUI-observed
+sessions with a durable resume ref, which continue through takeover) keep
+90 days; archived, topicless and unresumable ones keep 7. Pruning drops the
+session's binding index entries, takeovers, grants and blocked inputs; a later
+reply in a pruned topic is handled like any unbound topic message. At startup
+the maintenance task also removes `.<state>.*.tmp` files older than 60 s left
+by a writer killed mid-save.
 `native hook --defer` loads configuration and writes a private queue file
 directly; it does not load state or construct agent transports. Hook ordering,
 capture stamps, and `<state>.tui-hooks.d` filenames keep their existing contract.

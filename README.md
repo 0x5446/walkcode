@@ -42,27 +42,13 @@ WalkCode V3 是 channel-native 的 Coding Agent runtime。它把 IM 当成一等
 每次 takeover / 终端 resume 都是 fork 语义（新 session id，walkcode 按
 血缘跟踪、话题不变）。
 
-## 双端同步：终端与 IM 共驾同一个 Claude 会话
+## 终端会话的权限审批与提问：飞书卡片作答
 
-Claude 会话以 daemon-native 方式运行时（手动 `claude --bg` 启动后 attach，
-或按[部署文档](docs/lark-profile-deploy.md)显式 opt-in 双 UI 模式；**ADR 0050
-起默认是单 master UI**——wrapper 裸启动是普通 TUI，飞书只读观察 + takeover），
-终端 TUI 和飞书/Lark **同时可读可写同一个会话**：
-
-- **IM 直写**：在会话话题里发消息，文字直接注入终端会话（等同终端敲入回车），
-  机器人给你的消息贴一个表情作为回执（表情不可用时回退文本「✅ 已发送到终端
-  会话」）；终端侧的输入与模型回答也实时同步回话题。
-- **权限审批与提问，双端同时可答（v3）**：会触发权限确认的工具（Bash / Edit /
-  Write 等，减去你 allow 规则已覆盖的）和 AskUserQuestion 提问，终端渲染原生
-  对话框的**同时**飞书收到交互卡片——先答先生效。终端直接按键；飞书点卡后
-  答案通过 daemon attach 以按键注入驱动原生对话框（等同真人敲键盘）。注入前后
-  都有校验，失败时卡片如实翻面「请在终端操作」，终端始终可答。
-- **状态同步**：运行中 / 等待确认 / 已结束的状态卡实时更新；在终端处理过的
-  确认也会回传话题（飞书答的则由卡片翻面呈现，不重复播报）。
-
-双端路由的保守面：`permission_mode=dontAsk`（原生兜底是自动拒绝，没有对话框
-可注入）与非 daemon 的普通 TUI 会话仍走 v2 阻塞 gate（飞书为主、终端等待）；
-walkcode 自己的 headless 会话不经过 gate。
+终端里跑的 Claude TUI 会话，触发权限确认的工具（Bash / Edit / Write 等，减去你
+allow 规则已覆盖的）和 AskUserQuestion 提问，会在飞书话题里收到交互卡片。
+PreToolUse hook 以阻塞方式等你在飞书点卡，点完答案直接回到终端会话；飞书上
+超时没答（默认 1800s），hook 弃权，终端弹出原生对话框照常作答，卡片随之翻面
+「已转到终端」。walkcode 自己的 headless 会话不经过这个 gate（SDK 进程内闭环）。
 
 启用：把 claude profile `settings.json` 的 PreToolUse hook 换成 `--gate` 变体
 （必须放大 hook 超时，否则 60s 默认值会先杀掉等待中的 hook）：
@@ -75,16 +61,15 @@ walkcode 自己的 headless 会话不经过 gate。
 }]}]
 ```
 
-可调项：`WALKCODE_CLAUDE_GATE_STYLE=dual|block`（默认 `dual` 真双端；`block`
-整体退回 v2 阻塞式，作为逃生口）、`WALKCODE_CLAUDE_GATE_MODE=auto|off|ask_only`、
-`WALKCODE_CLAUDE_GATE_TIMEOUT`（仅对 block 路径有意义，默认 1800s，超时后弃权
-回落终端原生弹窗）、`WALKCODE_CLAUDE_GATE_TOOLS`（替换默认权限拦截工具集）。
-安全兜底：walkcode 服务没在运行时 hook 自动弃权，终端原生权限提示照常工作；
-`WALKCODE_CLAUDE_DAEMON_MODE=off` 可整体回退到只读观察 + takeover 模式。
+可调项：`WALKCODE_CLAUDE_GATE_MODE=auto|off|ask_only`、
+`WALKCODE_CLAUDE_GATE_TIMEOUT`（默认 1800s，超时后弃权回落终端原生弹窗）、
+`WALKCODE_CLAUDE_GATE_TOOLS`（替换默认权限拦截工具集）。
+安全兜底：walkcode 服务没在运行时 hook 自动弃权，终端原生权限提示照常工作。
 
-设计与协议细节：[docs/design/claude-daemon-multi-ui-sync.md](docs/design/claude-daemon-multi-ui-sync.md)、
-[docs/design/daemon-appserver-protocol-reference.md](docs/design/daemon-appserver-protocol-reference.md)、
-[docs/adr/0046](docs/adr/0046-claude-daemon-reply-and-subscribe-sync.md)。
+早期的 Claude daemon 双端直写模式（`claude --bg` + attach 按键注入）已在
+[ADR 0068](docs/adr/0068-retire-claude-daemon-mode.md) 退役；旧 env 里的
+`WALKCODE_CLAUDE_DAEMON_MODE` / `SPAWN_MODE` / `LIST_ADOPT` / `GATE_STYLE`
+会被忽略，可以删掉。
 
 ## 安装
 

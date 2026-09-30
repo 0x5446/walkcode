@@ -81,7 +81,7 @@ def _setup(*, resume_ref=None, caps=None, transport=None, handoff_continue="off"
     sessions = SessionRegistry(now=clock)
     interactions = InteractionStore(now=clock)
     outbox = DurableOutbox(now=clock)
-    authz = AuthorizationStore(now=clock)
+    authz = AuthorizationStore()
     channel = FakeChannelAdapter("telegram", _channel_caps())
     transport = transport or FakeAgentTransport("fake-transport", caps or _transport_caps())
     orchestrator = Orchestrator(
@@ -217,7 +217,6 @@ class TakeoverOrchestratorTests(unittest.TestCase):
         session.status = "stopped"
         session.lifecycle_state = "STOPPED"
         session.writer_owner = None
-        session.writer_lease = None
         session.stop_reason = "external_tui_stop"
         session.transport_ref.pop("terminate_ref", None)
         event = InboundEvent(
@@ -671,9 +670,7 @@ class TakeoverOrchestratorTests(unittest.TestCase):
             transport_kind=session.transport_kind,
             transport_request_id="perm-1",
             native_method="permission.requested",
-            native_params={"prompt": "Allow shell?"},
             prompt_kind="permission",
-            channel_binding_key=session.channel_binding.key(),
         )
         asyncio.run(
             orchestrator.submit_user_input(
@@ -711,9 +708,7 @@ class TakeoverOrchestratorTests(unittest.TestCase):
             transport_kind=session.transport_kind,
             transport_request_id="perm-1",
             native_method="permission.requested",
-            native_params={"prompt": "Allow shell?"},
             prompt_kind="permission",
-            channel_binding_key=session.channel_binding.key(),
         )
 
     def _status_card_takeover(self, orchestrator, channel, session):

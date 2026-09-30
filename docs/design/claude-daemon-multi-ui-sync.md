@@ -1,5 +1,9 @@
 # Claude Daemon 多端同步读写方案（1 daemon / 多 UI 订阅读写）
 
+> **已退役（2026-09-30，ADR 0068）**：本方案的 daemon 读写、notify gate 与按键
+> 注入代码已删除；只有「交互闭环 v2」的阻塞式 PreToolUse gate 保留（决策投递见
+> `channel_native/claude_gate_transport.py`）。本文仅作历史记录。
+
 Date: 2026-07-04（v2: 2026-07-05；v3 方案: 2026-07-06）
 Status: v1 已实现（reply 写路径 + subscribe 状态同步）；v2 已实现（PreToolUse gate 权限/AskUserQuestion 飞书闭环 + 状态卡/回显整改，见「交互闭环 v2」）；v3 **已实现并通过 Live E2E**（2026-07-06，attach 按键注入实现真双端，Step 0–5 完成、单测 621 绿、work 实例 Playwright 点卡全场景验收——推翻 v2「双端同时可答不可行」结论，见文末「交互闭环 v3」）
 Protocol grounding: `docs/design/daemon-appserver-protocol-reference.md`（2026-07-04 实测，Claude Code v2.1.201, proto 1）

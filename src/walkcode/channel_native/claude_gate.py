@@ -1,25 +1,21 @@
-"""Cross-process PreToolUse decision channel ("gate") for Claude TUI/daemon sessions.
+"""Cross-process PreToolUse decision channel ("gate") for Claude TUI sessions.
 
-Design: ``docs/design/claude-daemon-multi-ui-sync.md`` / ADR 0046. The headless
-transport closes the permission / AskUserQuestion loop in-process: the SDK's
-``can_use_tool`` callback floats a card event, awaits a Future, and maps the
-human decision back to a ``PermissionResult``. TUI/daemon sessions run the
-PreToolUse hook in a *separate process*, so the Future becomes a file
-rendezvous under the instance's TUI hook spool:
+ADR 0046 v2 / ADR 0068. The headless transport closes the permission /
+AskUserQuestion loop in-process: the SDK's ``can_use_tool`` callback floats a
+card event, awaits a Future, and maps the human decision back to a
+``PermissionResult``. TUI sessions run the PreToolUse hook in a *separate
+process*, so the Future becomes a file rendezvous under the instance's TUI
+hook spool:
 
     <state>.tui-hooks.d/gate/pending/<rid>.json     hook -> runtime request
     <state>.tui-hooks.d/gate/decisions/<rid>.json   runtime -> hook (write-once)
     <state>.tui-hooks.d/gate/serve.heartbeat        runtime drain liveness
 
-Pendings carry a ``mode`` (ADR 0046 v3):
-
-    block   v2 semantics (default for files without the field): the hook
-            blocks polling decisions/<rid>.json until decision or timeout.
-    notify  v3 true dual-surface: the hook captures the structured tool_input
-            and abstains immediately, letting the native dialog render; the
-            runtime turns the pending into a card and delivers the answer via
-            daemon attach keystroke injection instead of a decision file. No
-            hook is waiting, so the runtime owns pending cleanup.
+The hook blocks polling decisions/<rid>.json until a decision lands or the
+wait budget runs out. Pendings carry ``mode=block``. Hooks from before
+ADR 0068 could also write ``mode=notify`` for Claude daemon jobs (no hook
+waits on those); the runtime just deletes such files — see
+``is_legacy_notify_pending``.
 
 Decision mapping mirrors ``_ClaudePermissionBridge._result_from_decision``:
 
@@ -36,8 +32,9 @@ heartbeat) the hook abstains up front, so a TUI without its walkcode service
 keeps the native terminal prompt flow. Nothing here denies blind.
 
 This module must stay stdlib-only: the blocking hook path has to be
-import-light, and both ``channel_native/__init__`` and ``claude_daemon``
-import it (a dependency back into the package would cycle).
+import-light, and both ``channel_native/__init__`` and
+``claude_gate_transport`` import it (a dependency back into the package
+would cycle).
 """
 
 from __future__ import annotations
@@ -79,54 +76,31 @@ KIND_PERMISSION = "permission"
 KIND_ASK_USER = "ask_user_question"
 
 MODE_BLOCK = "block"
-MODE_NOTIFY = "notify"
+# Written only by hooks from before ADR 0068 (Claude daemon jobs). No hook
+# waits on such a pending, so the runtime deletes it on sight.
+LEGACY_MODE_NOTIFY = "notify"
 
 
-def pending_mode(request: dict[str, Any] | None) -> str:
-    """Rendezvous mode of a pending request; unknown/missing -> block (v2)."""
+def is_legacy_notify_pending(request: dict[str, Any] | None) -> bool:
     mode = str((request or {}).get("mode", "") or "").strip().lower()
-    return MODE_NOTIFY if mode == MODE_NOTIFY else MODE_BLOCK
+    return mode == LEGACY_MODE_NOTIFY
 
 
-class GateInjectionFailed(RuntimeError):
-    """A notify-mode card decision could not be keystroke-injected.
+class GateDecisionFailed(RuntimeError):
+    """A card decision could not be delivered to the waiting hook.
 
-    Lives here (stdlib module) so both ``claude_daemon`` (raises) and the
-    orchestrator in ``channel_native/__init__`` (catches, flips the card to a
-    "answer in the terminal" notice) can import it without a cycle.
+    Lives here (stdlib module) so both ``claude_gate_transport`` (raises) and
+    the orchestrator in ``channel_native/__init__`` (catches, flips the card
+    to an honest result) can import it without a cycle.
 
-    reasons: ``dialog_mismatch`` (needs/tempo no longer match this request —
-    typically the terminal answered first or another dialog replaced it),
-    ``not_injectable`` (answer shape outside the verified keystroke matrix),
-    ``inject_failed`` (attach write failed), ``not_cleared`` (keys sent but
-    the dialog did not resolve within the verify window),
-    ``already_resolved`` (this gate was settled on the terminal side earlier).
+    reasons: ``stale_gate`` (no hook is waiting any more: it timed out to the
+    terminal, or the runtime restarted), ``already_resolved`` (another click
+    decided this request first).
     """
 
     def __init__(self, reason: str, message: str = ""):
         super().__init__(message or reason)
         self.reason = str(reason or "unknown")
-
-
-def ask_form_injectable(tool_input: dict[str, Any]) -> bool:
-    """Is this AskUserQuestion *form* inside the verified injection matrix?
-
-    Answer-independent companion to ``claude_daemon.keys_for_ask_answer`` (the
-    two must stay in sync): used at card-post time to degrade unsupported
-    forms to a "answer in the terminal" notice instead of offering buttons
-    that could never be delivered. Free-text (Other) support still depends on
-    the eventual answers and is checked at injection time.
-    """
-    questions = tool_input.get("questions", []) if isinstance(tool_input, dict) else []
-    if not isinstance(questions, list) or not questions:
-        return False
-    if not all(isinstance(question, dict) for question in questions):
-        return False
-    if len(questions) == 1:
-        return True
-    return not any(
-        question.get("multiSelect") or question.get("allow_multiple") for question in questions
-    )
 
 
 def gate_root(state_path: Path | str) -> Path:

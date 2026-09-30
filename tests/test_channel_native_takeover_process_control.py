@@ -105,7 +105,7 @@ def _setup(*, terminate_ref=None, controller=None, transport=None, agent_session
     sessions = SessionRegistry(now=clock)
     interactions = InteractionStore(now=clock)
     outbox = DurableOutbox(now=clock)
-    authz = AuthorizationStore(now=clock)
+    authz = AuthorizationStore()
     channel = FakeChannelAdapter("telegram", _channel_caps())
     transport = transport or FakeAgentTransport("fake-transport", _transport_caps())
     controller = controller if controller is not None else FakeExternalTuiController("fake-process")

@@ -75,7 +75,7 @@ class ChannelNativeDebugScriptTests(unittest.TestCase):
         self.assertIn('"exists": false', result.stdout)
         self.assertFalse(state_path.exists())
 
-    def test_state_debug_reports_expired_running_writer_lease_as_informational(self):
+    def test_state_debug_reports_running_session_counts(self):
         with tempfile.TemporaryDirectory() as tmp:
             state_path = Path(tmp) / "state.json"
             env_file = Path(tmp) / ".env"
@@ -108,7 +108,7 @@ class ChannelNativeDebugScriptTests(unittest.TestCase):
                     sessions=sessions,
                     interactions=InteractionStore(now=lambda: 1000.0),
                     outbox=DurableOutbox(now=lambda: 1000.0),
-                    authz=AuthorizationStore(now=lambda: 1000.0),
+                    authz=AuthorizationStore(),
                     inbound_ledger=InboundLedger(now=lambda: 1000.0),
                 )
             )
@@ -128,12 +128,11 @@ class ChannelNativeDebugScriptTests(unittest.TestCase):
                 text=True,
             )
 
-        # ADR 0059: expired lease on a running session is normal (never
-        # renewed mid-turn) and no longer blocks submits — the count stays
-        # informational and must not fail the health gate.
         self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
-        self.assertIn('"expired_writer_leases": 1', result.stdout)
-        self.assertNotIn("expired writer lease", result.stdout)
+        self.assertIn('"active_sessions": 1', result.stdout)
+        # The writer lease was removed from the state model (write-only since
+        # ADR 0059); the state report no longer counts it.
+        self.assertNotIn("writer_lease", result.stdout)
 
     def test_state_repair_stops_unresumable_expired_error_session_with_backup(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -170,7 +169,7 @@ class ChannelNativeDebugScriptTests(unittest.TestCase):
                     sessions=sessions,
                     interactions=InteractionStore(now=lambda: 1000.0),
                     outbox=DurableOutbox(now=lambda: 1000.0),
-                    authz=AuthorizationStore(now=lambda: 1000.0),
+                    authz=AuthorizationStore(),
                     inbound_ledger=InboundLedger(now=lambda: 1000.0),
                 )
             )
@@ -238,7 +237,7 @@ class ChannelNativeDebugScriptTests(unittest.TestCase):
                     sessions=sessions,
                     interactions=InteractionStore(now=lambda: 1000.0),
                     outbox=DurableOutbox(now=lambda: 1000.0),
-                    authz=AuthorizationStore(now=lambda: 1000.0),
+                    authz=AuthorizationStore(),
                     inbound_ledger=InboundLedger(now=lambda: 1000.0),
                 )
             )
@@ -308,7 +307,7 @@ class ChannelNativeDebugScriptTests(unittest.TestCase):
                     sessions=sessions,
                     interactions=InteractionStore(now=lambda: 1000.0),
                     outbox=DurableOutbox(now=lambda: 1000.0),
-                    authz=AuthorizationStore(now=lambda: 1000.0),
+                    authz=AuthorizationStore(),
                     inbound_ledger=InboundLedger(now=lambda: 1000.0),
                 )
             )
@@ -338,7 +337,7 @@ class ChannelNativeDebugScriptTests(unittest.TestCase):
             self.assertEqual(repaired.stop_reason, "repaired_external_tui_stop_hook")
             self.assertTrue(list(Path(tmp).glob("state.json.bak-*")))
 
-    def test_state_debug_allows_idle_session_without_active_writer_lease(self):
+    def test_state_debug_counts_idle_session_as_active(self):
         with tempfile.TemporaryDirectory() as tmp:
             state_path = Path(tmp) / "state.json"
             env_file = Path(tmp) / ".env"
@@ -372,7 +371,7 @@ class ChannelNativeDebugScriptTests(unittest.TestCase):
                     sessions=sessions,
                     interactions=InteractionStore(now=lambda: 1000.0),
                     outbox=DurableOutbox(now=lambda: 1000.0),
-                    authz=AuthorizationStore(now=lambda: 1000.0),
+                    authz=AuthorizationStore(),
                     inbound_ledger=InboundLedger(now=lambda: 1000.0),
                 )
             )
@@ -393,9 +392,9 @@ class ChannelNativeDebugScriptTests(unittest.TestCase):
             )
 
         self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
-        self.assertIn('"expired_writer_leases": 0', result.stdout)
+        self.assertIn('"active_sessions": 1', result.stdout)
 
-    def test_state_debug_allows_external_observed_session_without_active_writer_lease(self):
+    def test_state_debug_counts_external_observed_session_as_active(self):
         with tempfile.TemporaryDirectory() as tmp:
             state_path = Path(tmp) / "state.json"
             env_file = Path(tmp) / ".env"
@@ -428,7 +427,7 @@ class ChannelNativeDebugScriptTests(unittest.TestCase):
                     sessions=sessions,
                     interactions=InteractionStore(now=lambda: 1000.0),
                     outbox=DurableOutbox(now=lambda: 1000.0),
-                    authz=AuthorizationStore(now=lambda: 1000.0),
+                    authz=AuthorizationStore(),
                     inbound_ledger=InboundLedger(now=lambda: 1000.0),
                 )
             )
@@ -449,7 +448,7 @@ class ChannelNativeDebugScriptTests(unittest.TestCase):
             )
 
         self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
-        self.assertIn('"expired_writer_leases": 0', result.stdout)
+        self.assertIn('"active_sessions": 1', result.stdout)
 
     def test_outbox_debug_runs_synthetic_dispatch_without_live_channel(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -516,7 +515,6 @@ class ChannelNativeDebugScriptTests(unittest.TestCase):
                 transport_kind="claude_headless",
                 transport_request_id="req-1",
                 native_method="can_use_tool",
-                native_params={},
                 prompt_kind="permission",
             )
             JsonFileStateStore(state_path).save(
@@ -524,7 +522,7 @@ class ChannelNativeDebugScriptTests(unittest.TestCase):
                     sessions=SessionRegistry(now=lambda: 1000.0),
                     interactions=InteractionStore(now=lambda: 1000.0),
                     outbox=outbox,
-                    authz=AuthorizationStore(now=lambda: 1000.0),
+                    authz=AuthorizationStore(),
                     inbound_ledger=InboundLedger(now=lambda: 1000.0),
                     hitls=hitls,
                 )

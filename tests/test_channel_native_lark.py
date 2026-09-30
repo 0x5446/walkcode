@@ -2,6 +2,7 @@ import asyncio
 import contextlib
 import io
 import json
+import time
 import tempfile
 import unittest
 from pathlib import Path
@@ -612,6 +613,49 @@ class _LarkRuntimeHarness(unittest.TestCase):
         }
 
 
+class DeferredHookSaveFailureTests(_LarkRuntimeHarness):
+    def test_hook_is_not_archived_while_the_state_save_keeps_failing(self):
+        # A disk that will not take the state file is not a bad event: the
+        # hook must stay queued past the bad-event budget and be consumed
+        # once saving works again.
+        from walkcode import channel_native_runtime as runtime_module
+        from walkcode.channel_native import SubmitResult
+
+        runtime, _api, _transport = self._runtime()
+        qdir = runtime._tui_hook_queue_dir
+        qdir.mkdir(parents=True, exist_ok=True)
+        hook = qdir / "00-hook.json"
+        hook.write_text(
+            json.dumps(
+                {
+                    "created_at": time.time(),
+                    "hook_type": "SessionStart",
+                    "agent": "claude",
+                    "payload": {"session_id": "11111111-2222-3333-4444-555555555555", "cwd": "/tmp"},
+                }
+            ),
+            encoding="utf-8",
+        )
+        disk_full = {"on": True}
+
+        async def process(*, hook_type, agent, payload):
+            if disk_full["on"]:
+                runtime.state_store.last_save_failed = True
+                raise OSError("disk full")
+            runtime.state_store.last_save_failed = False
+            return SubmitResult(True)
+
+        runtime.process_tui_hook = process
+        for _ in range(runtime_module.TUI_HOOK_MAX_ATTEMPTS + 3):
+            asyncio.run(runtime.drain_deferred_tui_hooks())
+        self.assertTrue(hook.exists())
+        self.assertFalse((qdir / "bad" / "00-hook.json").exists())
+
+        disk_full["on"] = False
+        asyncio.run(runtime.drain_deferred_tui_hooks())
+        self.assertFalse(hook.exists())
+
+
 class LarkInboxReliabilityTests(_LarkRuntimeHarness):
     def test_malformed_payload_is_archived_without_repeated_parse_failure(self):
         for payload in ({"event": {"message": None}}, [], {"event": None}):
@@ -748,6 +792,56 @@ class LarkInboxReliabilityTests(_LarkRuntimeHarness):
         loaded = runtime.state_store.load().outbox.to_dict()
         self.assertEqual(len(loaded["pending"]), 1)
         self.assertEqual(loaded["sent"], {})
+
+    def test_runtime_compaction_prunes_expired_stopped_sessions_and_persists(self):
+        from walkcode.channel_native import ActorRef, ChannelBinding
+
+        runtime, _, _ = self._runtime()
+        sessions = runtime.state.sessions
+        stale = sessions.create_observed_session(
+            session_id="tui-stale", binding=ChannelBinding("lark", "app-id", "oc_chat", "omt_1", "om_1"),
+            cwd=self._tmp.name, external_ref={"source": "native_tui_hook"}, owner=ActorRef("lark", "ou_owner"),
+        )
+        stale.status = "stopped"
+        stale.stop_reason = "external_tui_process_gone"
+        sessions._now = lambda: stale.last_progress_at + 8 * 86400.0
+
+        removed = runtime.compact_state()
+
+        self.assertEqual(removed["sessions"], {"sessions": 1})
+        self.assertEqual(runtime.state_store.load().sessions.to_dict()["sessions"], {})
+
+    def test_duplicate_tui_hook_keeps_its_queue_file_until_the_completion_is_saved(self):
+        # deep-review 2026-09-30: the first attempt completes the ledger entry
+        # in memory, then its save fails. The retry is judged a duplicate and
+        # "accepted" — which used to unlink the queue file while the event
+        # existed only in memory (lost if the process exited before the next
+        # successful save).
+        runtime, _, _ = self._runtime()
+        # A Stop for a session nobody observes: the only state change is the
+        # ledger completion, and the only save is the one after it.
+        runtime.defer_tui_hook(
+            hook_type="stop",
+            agent="claude",
+            payload={"session_id": "claude-session-1", "turn_id": "turn-1", "cwd": self._tmp.name},
+        )
+        queue_dir = Path(f"{runtime.state_store.path}.tui-hooks.d")
+        [queued] = list(queue_dir.glob("*.json"))
+        failing_write = mock.patch(
+            "walkcode.channel_native._atomic_write_json", side_effect=OSError("disk full")
+        )
+
+        with failing_write, contextlib.redirect_stderr(io.StringIO()):
+            asyncio.run(runtime.drain_deferred_tui_hooks())  # processed, save fails
+            asyncio.run(runtime.drain_deferred_tui_hooks())  # duplicate, save fails
+        self.assertTrue(queued.exists())
+        self.assertFalse(runtime.state_store.path.exists())
+
+        self.assertEqual(asyncio.run(runtime.drain_deferred_tui_hooks()), 1)
+
+        self.assertFalse(queued.exists())
+        completed = json.loads(runtime.state_store.path.read_text())["inbound_ledger"]["completed"]
+        self.assertEqual(len(completed), 1)
 
 
 class LarkRuntimeTests(_LarkRuntimeHarness):

@@ -52,6 +52,12 @@ The core model becomes:
 - `HitlDecision`: actor, action, native response payload, decided time, and
   delivery status.
 
+*Amended (v0.14.36, state slimming):* `HitlDecision` and the request's
+`native_params` / `channel_binding_key` were never read back and are no longer
+stored. `HitlStore` keeps request status (with `decided_at`); the answer and
+who gave it live on the linked `InteractionContext`. Old keys are dropped on
+the next save.
+
 `InteractionStore` can continue to provide short callback tokens and
 multi-step question state, but the transport-native server request must be
 persisted separately from the rendered Telegram message.

@@ -1,0 +1,424 @@
+{
+ "authz": {
+  "audit": [
+   {
+    "actor": "ou_owner",
+    "channel_kind": "lark",
+    "role": "owner",
+    "session_id": "sess-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "ts": 1790000000.0,
+    "type": "role_granted"
+   },
+   {
+    "actor": "ou_owner",
+    "channel_kind": "lark",
+    "role": "owner",
+    "session_id": "tui-claude-bbbbbbbbbbbb",
+    "ts": 1790000000.0,
+    "type": "role_granted"
+   },
+   {
+    "actor": "ou_owner",
+    "channel_kind": "lark",
+    "role": "owner",
+    "session_id": "tui-claude-bbbbbbbbbbbb",
+    "ts": 1790000001.0,
+    "type": "role_granted"
+   }
+  ],
+  "grants": [
+   {
+    "actor_id": "ou_owner",
+    "channel_kind": "lark",
+    "role": "owner",
+    "session_id": "sess-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+   },
+   {
+    "actor_id": "ou_owner",
+    "channel_kind": "lark",
+    "role": "owner",
+    "session_id": "tui-claude-bbbbbbbbbbbb"
+   }
+  ]
+ },
+ "hitls": {
+  "decided_retention": 86400.0,
+  "decisions": {
+   "hitl-eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee": {
+    "action": "answers",
+    "actor": {
+     "actor_id": "ou_owner",
+     "channel_kind": "lark",
+     "display_name": "Owner"
+    },
+    "decided_at": 1790000050.0,
+    "delivery_status": "sent",
+    "hitl_request_id": "hitl-eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "native_response": {
+     "0": "yes"
+    }
+   }
+  },
+  "request_ttl": 3600.0,
+  "requests": {
+   "hitl-eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee": {
+    "channel_binding_key": [
+     "lark",
+     "bot",
+     "oc_chat",
+     "omt_head",
+     "om_head_root"
+    ],
+    "created_at": 1790000040.0,
+    "expires_at": 1790003640.0,
+    "generation": 1,
+    "hitl_request_id": "hitl-eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "interaction_id": "int-ffffffffffffffffffffffffffffffff",
+    "native_method": "ask_user.requested",
+    "native_params": {
+     "native_method": "ask_user.requested",
+     "questions": [
+      {
+       "options": [
+        "yes",
+        "no"
+       ],
+       "prompt": "Proceed?"
+      }
+     ],
+     "rid": "rid-1"
+    },
+    "prompt_kind": "ask_user_question",
+    "session_id": "sess-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "status": "decided",
+    "transport_kind": "claude_headless",
+    "transport_request_id": "rid-1"
+   }
+  }
+ },
+ "inbound_ledger": {
+  "completed": {
+   "lark:evt-1": 1790003600.0
+  },
+  "in_progress": {},
+  "ttl": 3600.0
+ },
+ "interactions": {
+  "awaiting_other_by_binding": [],
+  "decided_retention": 86400.0,
+  "interactions": {
+   "int-ffffffffffffffffffffffffffffffff": {
+    "actions": [],
+    "answers": {
+     "0": "yes"
+    },
+    "awaiting_other": null,
+    "created_at": 1790000040.0,
+    "current_index": 0,
+    "decided_at": 1790000050.0,
+    "decided_by": {
+     "actor_id": "ou_owner",
+     "channel_kind": "lark",
+     "display_name": "Owner"
+    },
+    "decision": {
+     "action": "answers"
+    },
+    "expires_at": 1790000640.0,
+    "generation": 1,
+    "high_risk": false,
+    "hitl_request_id": "hitl-eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "interaction_id": "int-ffffffffffffffffffffffffffffffff",
+    "kind": "ask_user_question",
+    "questions": [
+     {
+      "allow_multiple": false,
+      "allow_other": true,
+      "header": "",
+      "options": [
+       "yes",
+       "no"
+      ],
+      "prompt": "Proceed?"
+     }
+    ],
+    "session_id": "sess-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "tool_input": {},
+    "tool_name": "",
+    "transport_request_id": "rid-1"
+   }
+  },
+  "token_ttl": 600.0,
+  "tokens": {}
+ },
+ "outbox": {
+  "base_retry_delay": 1.0,
+  "dead": {},
+  "dead_retention": 604800.0,
+  "max_attempts": 5,
+  "pending": {},
+  "sent": {
+   "dlv-1": {
+    "attempt_count": 1,
+    "channel_binding_key": [
+     "lark",
+     "bot",
+     "oc_chat",
+     "omt_head",
+     "om_head_root"
+    ],
+    "claim_owner": "",
+    "claim_until": 0.0,
+    "created_at": 1790000060.0,
+    "delivery_id": "dlv-1",
+    "finished_at": 1790000061.0,
+    "idempotency_key": "turn:1",
+    "last_error": "",
+    "message_id": "om_reply",
+    "next_attempt_at": 1790000060.0,
+    "seq": 1,
+    "view_model": {
+     "message": "done",
+     "type": "turn_completed"
+    }
+   }
+  },
+  "sent_retention": 86400.0,
+  "seq": 1
+ },
+ "schema_version": 1,
+ "sessions": {
+  "binding_to_session": {
+   "[\"lark\", \"bot\", \"oc_chat\", \"omt_head\", \"om_head_root\"]": "sess-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "[\"lark\", \"bot\", \"oc_chat\", \"omt_tui\", \"om_tui_root\"]": "tui-claude-bbbbbbbbbbbb"
+  },
+  "lease_ttl": 30.0,
+  "pending": {
+   "launch-1": {
+    "binding": {
+     "account_id": "bot",
+     "capabilities": {},
+     "channel_kind": "lark",
+     "chat_id": "oc_chat",
+     "health_message_id": "om_pending",
+     "last_message_id": "om_pending",
+     "root_message_id": "om_pending",
+     "subscribed": false,
+     "thread_id": ""
+    },
+    "created_at": 1790000000.0,
+    "cwd": "/tmp/project",
+    "pending_key": "launch-1"
+   }
+  },
+  "sessions": {
+   "sess-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa": {
+    "archive_reason": "",
+    "archived_at": 0.0,
+    "archived_by": "",
+    "background_tasks": [],
+    "blocked_inputs": {},
+    "cached_title": "synthetic title",
+    "channel_binding": {
+     "account_id": "bot",
+     "capabilities": {
+      "initial_title": "synthetic",
+      "native_topic": true,
+      "origin": "channel",
+      "status_card": true
+     },
+     "channel_kind": "lark",
+     "chat_id": "oc_chat",
+     "health_message_id": "om_head_root",
+     "last_message_id": "om_head_root",
+     "root_message_id": "om_head_root",
+     "subscribed": false,
+     "thread_id": "omt_head"
+    },
+    "created_at": 1790000000.0,
+    "cwd": "/tmp/project",
+    "generation": 1,
+    "interrupt_reason": "",
+    "last_event_seq": 4,
+    "last_progress_at": 1790000060.0,
+    "last_progress_event": "turn.completed",
+    "last_usage": {
+     "cache_creation": {
+      "ephemeral_1h_input_tokens": 0,
+      "ephemeral_5m_input_tokens": 10
+     },
+     "cache_creation_input_tokens": 10,
+     "cache_read_input_tokens": 1000,
+     "input_tokens": 3,
+     "iterations": [],
+     "output_tokens": 50,
+     "server_tool_use": {
+      "web_fetch_requests": 0,
+      "web_search_requests": 0
+     },
+     "service_tier": "standard"
+    },
+    "last_user_input_at": 1790000030.0,
+    "lifecycle_state": "IDLE",
+    "model": "claude-test-model",
+    "running_since": 1790000000.0,
+    "schema_version": 1,
+    "session_id": "sess-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "status": "running",
+    "stop_reason": "",
+    "title_refreshed_at": 1790000060.0,
+    "title_source": "initial_user_input",
+    "transport_kind": "claude_headless",
+    "transport_ref": {
+     "agent_session_id": "99999999-8888-7777-6666-555555555555",
+     "cwd": "/tmp/project",
+     "handle_id": "h-1",
+     "session_id": "sess-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    "writer_lease": {
+     "expires_at": 1790000030.0,
+     "generation": 1,
+     "heartbeat_at": 1790000000.0,
+     "holder_ref": {
+      "transport_kind": "claude_headless"
+     },
+     "lease_id": "lease-11111111111111111111111111111111",
+     "owner_kind": "orchestrator",
+     "session_id": "sess-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    "writer_owner": {
+     "acquired_at": 1790000000.0,
+     "actor_id": "ou_owner",
+     "external_ref": {},
+     "kind": "orchestrator",
+     "transport_kind": "claude_headless"
+    }
+   },
+   "tui-claude-bbbbbbbbbbbb": {
+    "archive_reason": "",
+    "archived_at": 0.0,
+    "archived_by": "",
+    "background_tasks": [],
+    "blocked_inputs": {
+     "blocked-cccccccccccccccccccccccccccccccc": {
+      "actor": {
+       "actor_id": "ou_owner",
+       "channel_kind": "lark",
+       "display_name": "Owner"
+      },
+      "attachments": [],
+      "blocked_input_id": "blocked-cccccccccccccccccccccccccccccccc",
+      "created_at": 1790000090.0,
+      "expires_at": 1790000690.0,
+      "idempotency_key": "blocked:blocked-cccccccccccccccccccccccccccccccc",
+      "session_id": "tui-claude-bbbbbbbbbbbb",
+      "state": "blocked",
+      "submit_after_takeover": true,
+      "text": "synthetic blocked message"
+     }
+    },
+    "cached_title": "synthetic title",
+    "channel_binding": {
+     "account_id": "bot",
+     "capabilities": {
+      "origin": "tui",
+      "readonly_topic": true,
+      "status_card": true
+     },
+     "channel_kind": "lark",
+     "chat_id": "oc_chat",
+     "health_message_id": "om_tui_root",
+     "last_message_id": "om_tui_root",
+     "root_message_id": "om_tui_root",
+     "subscribed": false,
+     "thread_id": "omt_tui"
+    },
+    "created_at": 1790000000.0,
+    "cwd": "/tmp/project",
+    "generation": 1,
+    "interrupt_reason": "",
+    "last_event_seq": 4,
+    "last_progress_at": 1790000060.0,
+    "last_progress_event": "turn.completed",
+    "last_usage": {
+     "cache_creation": {
+      "ephemeral_1h_input_tokens": 0,
+      "ephemeral_5m_input_tokens": 10
+     },
+     "cache_creation_input_tokens": 10,
+     "cache_read_input_tokens": 1000,
+     "input_tokens": 3,
+     "iterations": [],
+     "output_tokens": 50,
+     "server_tool_use": {
+      "web_fetch_requests": 0,
+      "web_search_requests": 0
+     },
+     "service_tier": "standard"
+    },
+    "last_user_input_at": 1790000030.0,
+    "lifecycle_state": "EXTERNAL_DETACHED_IMPORTABLE",
+    "model": "claude-test-model",
+    "running_since": 1790000000.0,
+    "schema_version": 1,
+    "session_id": "tui-claude-bbbbbbbbbbbb",
+    "status": "stopped",
+    "stop_reason": "external_tui_process_gone",
+    "title_refreshed_at": 1790000060.0,
+    "title_source": "initial_user_input",
+    "transport_kind": "external_tui",
+    "transport_ref": {
+     "agent": "claude",
+     "hook_type": "user-prompt-submit",
+     "resume_ref": {
+      "agent_session_id": "11111111-2222-3333-4444-555555555555",
+      "transport_kind": "claude_headless"
+     },
+     "source": "native_tui_hook",
+     "terminate_ref": {
+      "controller_kind": "process",
+      "process_ref": {
+       "allow_terminate": true,
+       "command": "claude",
+       "lstart": "Mon Sep 29 10:00:00 2026",
+       "pid": 424242,
+       "probe_state": "alive",
+       "recorded_at": 1790000000.0,
+       "source": "hook_parent"
+      }
+     }
+    },
+    "writer_lease": null,
+    "writer_owner": {
+     "acquired_at": 0.0,
+     "actor_id": "",
+     "external_ref": {},
+     "kind": "none",
+     "transport_kind": ""
+    }
+   }
+  },
+  "takeovers": {
+   "takeover-dddddddddddddddddddddddddddddddd": {
+    "approved_by": null,
+    "authorized_at": null,
+    "blocked_input_id": "blocked-cccccccccccccccccccccccccccccccc",
+    "completed_at": null,
+    "created_at": 1790000090.0,
+    "phase": "prompted",
+    "reason": "",
+    "requested_by": {
+     "actor_id": "ou_owner",
+     "channel_kind": "lark",
+     "display_name": "Owner"
+    },
+    "requested_generation": 1,
+    "resume_ref": null,
+    "session_id": "tui-claude-bbbbbbbbbbbb",
+    "takeover_id": "takeover-dddddddddddddddddddddddddddddddd",
+    "transport_kind": "",
+    "transport_ref": {}
+   }
+  }
+ }
+}

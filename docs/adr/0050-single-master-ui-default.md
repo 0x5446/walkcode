@@ -2,7 +2,11 @@
 
 Date: 2026-07-13
 
-Status: Accepted
+Status: Accepted; partly superseded by ADR 0068（2026-09-30）
+
+> **更正（ADR 0068）**：单 master UI 仍是唯一交互模型。第 1 条里"显式
+> `daemon` 仍可用"和第 4 条"daemon 附属机制不删除 / `DAEMON_MODE=off` 逃生口"
+> 已作废——daemon 模式整体退役，相关 env 键被忽略。
 
 ## Context
 

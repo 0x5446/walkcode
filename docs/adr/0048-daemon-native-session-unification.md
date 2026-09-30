@@ -2,7 +2,11 @@
 
 Date: 2026-07-07
 
-Status: Accepted; implemented 2026-07-07 — spawn 路径真机 E2E 通过（真 work
+> **Superseded（2026-09-30，ADR 0068）**：daemon spawn、list 收编、observer
+> attach、`WALKCODE_CLAUDE_SPAWN_MODE` / `LIST_ADOPT` 全部删除；旧 env 键被
+> 忽略。下文作为历史记录保留。
+
+Status: Superseded by ADR 0068. Originally: Accepted; implemented 2026-07-07 — spawn 路径真机 E2E 通过（真 work
 daemon：spawner 起 bg job → 首轮 daemon reply 注入 → turn 跑完 transcript
 验证 → kill 收尾）。飞书 Live E2E 已于同日在 work2 真实例完成（见下
 「飞书 Live E2E 记录」：主链路一次通过，暴露并修复一个 Critical——零

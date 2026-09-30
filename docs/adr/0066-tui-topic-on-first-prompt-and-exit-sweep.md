@@ -2,7 +2,7 @@
 
 Date: 2026-09-29
 
-Status: Accepted
+Status: Accepted; section 3 superseded by ADR 0068
 
 ## Context
 
@@ -62,6 +62,9 @@ daemon worker 保护（worker 还活着只记"已分离"）。
 退出）。已停止的会话不再检查，不会重复处理；每轮之间固定等待，不会空转。
 
 ### 3. daemon socket 连续缺失 60 秒即"worker 不在"
+
+> **已作废（ADR 0068）**：Claude daemon 模式退役后 `_claude_daemon_session_alive`
+> 与 socket 缺失计时一并删除，TUI 进程消失即按普通 TUI 会话收尾。
 
 探测失败（`job_alive` 返回未知）时，runtime 记下 daemon socket 文件**连续缺失**
 的起始时间：缺失不到 60 秒仍按未知处理、沿用旧标记（覆盖 daemon 重启时短暂删掉
