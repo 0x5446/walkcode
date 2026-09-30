@@ -17,6 +17,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import walkcode.channel_native as walkcode_channel_native
+import walkcode.channel_native.codex_transport as codex_transport_module
 from walkcode.channel_native import (
     EMPTY_TURN_PLACEHOLDER,
     ActorRef,
@@ -525,7 +526,7 @@ class CodexAppServerTransportTests(unittest.TestCase):
 
         transport = CodexAppServerTransport(client=_CountingClient(), event_silence_ceiling=0)
         handle = asyncio.run(transport.launch(LaunchSpec(cwd="/tmp/project", session_id="s1")))
-        with patch.object(walkcode_channel_native, "CODEX_STARTED_TURNS_LIMIT", 3):
+        with patch.object(codex_transport_module, "CODEX_STARTED_TURNS_LIMIT", 3):
             for n in range(4):
                 asyncio.run(transport.submit_turn(handle, TurnInput(text="hi"), f"idem-{n}"))
 
@@ -844,7 +845,7 @@ class CodexAppServerTransportTests(unittest.TestCase):
         # a whole class of "codex said it, nobody listened" stayed invisible.
         transport = CodexAppServerTransport(client=_FakeCodexClient())
         logged = []
-        with patch.object(walkcode_channel_native, "_log_degrade",
+        with patch.object(codex_transport_module, "_log_degrade",
                           lambda event, **kw: logged.append((event, kw))):
             for _ in range(3):
                 transport._convert_event({"method": "thread/tokenUsage/updated"}, thread_id="t")
@@ -2592,7 +2593,7 @@ class CodexEventRoutingTests(unittest.TestCase):
         # and every arrival wrote a degrade line.
         client = _ScriptedWireCodexStdioClient([])
         notice = {"jsonrpc": "2.0", "method": "account/rateLimits/updated", "params": {}}
-        with patch("walkcode.channel_native_runtime._log_degrade") as log:
+        with patch("walkcode.channel_native.codex_app_server._log_degrade") as log:
             for _ in range(client._BUFFERED_NOTIFICATIONS_MAX + 50):
                 client._dispatch(dict(notice))
 

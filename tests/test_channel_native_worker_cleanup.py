@@ -170,7 +170,7 @@ class WorkerExitVerificationTests(_WorkerCleanupBase):
         transport._session_last_worker["sess-1"] = "h1"
 
         broken = mock.Mock(return_value=mock.Mock(status="error", lstart="", command=""))
-        with mock.patch("walkcode.channel_native._probe_process", broken):
+        with mock.patch("walkcode.channel_native.claude_headless._probe_process", broken):
             asyncio.run(transport._disconnect_client("h1", None))
 
         self.assertIn("h1", transport._worker_procs)  # kept for a later retry
@@ -242,7 +242,7 @@ class ResumeBarrierTests(_WorkerCleanupBase):
 
         broken = mock.Mock(return_value=mock.Mock(status="error", lstart="", command=""))
         with (
-            mock.patch("walkcode.channel_native._probe_process", broken),
+            mock.patch("walkcode.channel_native.claude_headless._probe_process", broken),
             mock.patch.object(ClaudeHeadlessTransport, "_available", return_value=True),
         ):
             with self.assertRaises(TransportUnavailable):
@@ -339,7 +339,7 @@ class WorkerPidExtractionTests(unittest.TestCase):
         ok = mock.Mock(status="ok", lstart="Sun Jul 20 01:00:00 2026", command="claude --resume x")
         err = mock.Mock(status="error", lstart="", command="")
         with mock.patch(
-            "walkcode.channel_native._probe_process", mock.Mock(side_effect=[err, err, ok])
+            "walkcode.channel_native.claude_headless._probe_process", mock.Mock(side_effect=[err, err, ok])
         ):
             asyncio.run(transport._capture_worker_proc("h1", "sess-1", _FakeClient(4242)))
         self.assertIn("h1", transport._worker_procs)

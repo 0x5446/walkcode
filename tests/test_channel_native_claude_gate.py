@@ -10,7 +10,8 @@ import unittest
 from unittest import mock
 from pathlib import Path
 
-import walkcode.channel_native as channel_native_mod
+import walkcode.channel_native.config as channel_native_config
+import walkcode.channel_native.orchestrator as channel_native_orchestrator
 from walkcode.channel_native import (
     ActorRef,
     BlockedReason,
@@ -680,7 +681,7 @@ class GateDrainTests(unittest.TestCase):
             claude_gate.write_pending(state, self._pending_for_session())
             asyncio.run(runtime.drain_claude_gate_requests())
             claude_gate.cleanup_gate_files(state, "toolu_edit_1")
-            with mock.patch("walkcode.channel_native._log_degrade") as log:
+            with mock.patch("walkcode.channel_native.orchestrator._log_degrade") as log:
                 asyncio.run(runtime.drain_claude_gate_requests())
             self.assertEqual(log.call_args.args[0], "gate_card_retire_edit_failed")
             self.assertEqual(len(runtime.orchestrator.hitls.open_gate_cards()), 1)
@@ -741,7 +742,7 @@ class GateDrainTests(unittest.TestCase):
             claude_gate.write_pending(state, self._pending_for_session())
             asyncio.run(runtime.drain_claude_gate_requests())
             claude_gate.cleanup_gate_files(state, "toolu_edit_1")
-            with mock.patch("walkcode.channel_native._log_degrade"):
+            with mock.patch("walkcode.channel_native.orchestrator._log_degrade"):
                 asyncio.run(runtime.drain_claude_gate_requests())
             channel.edit_view = real_edit
 
@@ -1156,7 +1157,7 @@ class GateWithoutDaemonTests(unittest.TestCase):
         # Before ADR 0068, WALKCODE_CLAUDE_DAEMON_MODE=off silently turned the
         # TUI permission / AskUserQuestion cards off too.
         with tempfile.TemporaryDirectory() as tmp:
-            with mock.patch.object(channel_native_mod, "_retired_env_noticed", True):
+            with mock.patch.object(channel_native_config, "_retired_env_noticed", True):
                 runtime, _session, _api = _runtime_with_observed_session(
                     tmp, extra_env={"WALKCODE_CLAUDE_DAEMON_MODE": "off"}
                 )
@@ -1213,7 +1214,7 @@ class RetiredEnvKeysTests(unittest.TestCase):
         )
 
     def test_old_daemon_keys_are_ignored_with_one_notice(self):
-        with mock.patch.object(channel_native_mod, "_retired_env_noticed", False), mock.patch(
+        with mock.patch.object(channel_native_config, "_retired_env_noticed", False), mock.patch(
             "sys.stderr", new_callable=io.StringIO
         ) as err:
             cfg = self._config(self.RETIRED)
@@ -1227,7 +1228,7 @@ class RetiredEnvKeysTests(unittest.TestCase):
             self.assertIn(key, lines[0])
 
     def test_no_notice_without_old_keys(self):
-        with mock.patch.object(channel_native_mod, "_retired_env_noticed", False), mock.patch(
+        with mock.patch.object(channel_native_config, "_retired_env_noticed", False), mock.patch(
             "sys.stderr", new_callable=io.StringIO
         ) as err:
             self._config({})
@@ -1235,7 +1236,7 @@ class RetiredEnvKeysTests(unittest.TestCase):
 
     def test_old_spawn_mode_daemon_still_starts_headless(self):
         with tempfile.TemporaryDirectory() as tmp, mock.patch.object(
-            channel_native_mod, "_retired_env_noticed", True
+            channel_native_config, "_retired_env_noticed", True
         ):
             runtime, _session, _api = _runtime_with_observed_session(
                 tmp,
@@ -1289,7 +1290,7 @@ class LegacyDaemonStateTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             runtime, session, api = _runtime_with_observed_session(tmp)
             runtime.state.authz.grant(session.session_id, _actor("owner"), SessionRole.OWNER)
-            with mock.patch.object(channel_native_mod, "_log_degrade") as log:
+            with mock.patch.object(channel_native_orchestrator, "_log_degrade") as log:
                 result = asyncio.run(
                     runtime.orchestrator.submit_user_input(
                         session.session_id,

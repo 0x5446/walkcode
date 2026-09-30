@@ -312,10 +312,10 @@ class TakeoverOrchestratorTests(unittest.TestCase):
             callback={"token": "request_takeover", "data": "request_takeover"},
         )
 
-        import walkcode.channel_native as channel_native_module
+        import walkcode.channel_native.orchestrator as orchestrator_module
         from unittest.mock import patch
 
-        with patch.object(channel_native_module, "_log_degrade") as log_degrade:
+        with patch.object(orchestrator_module, "_log_degrade") as log_degrade:
             first = asyncio.run(
                 orchestrator.handle_inbound_event(
                     callback,

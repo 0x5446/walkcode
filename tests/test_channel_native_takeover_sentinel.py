@@ -45,6 +45,7 @@ from walkcode.channel_native import (
     _terminate_ref_session_id,
 )
 from walkcode import channel_native_runtime as runtime_module
+from walkcode.channel_native import process_control
 from walkcode.channel_native_runtime import (
     ChannelNativeRuntime,
     _enrich_terminate_ref,
@@ -480,12 +481,10 @@ class TerminateIdentityTests(unittest.TestCase):
         self.assertIsNone(live.poll())  # the stranger is untouched
 
     def test_terminate_refuses_on_probe_error(self):
-        import walkcode.channel_native as cn
-
         live = subprocess.Popen(["sleep", "60"])
         self.addCleanup(lambda: (live.kill(), live.wait(timeout=2.0)))
         controller = LocalProcessController(timeout=0.5)
-        with patch.object(cn, "_probe_process", return_value=_ProcProbe("error")):
+        with patch.object(process_control, "_probe_process", return_value=_ProcProbe("error")):
             result = asyncio.run(
                 controller.terminate(
                     {"pid": live.pid, "command": "claude", "allow_terminate": True},
@@ -552,7 +551,7 @@ class TerminateIdentityTests(unittest.TestCase):
 
         with (
             patch.object(cn.subprocess, "run", side_effect=fake_run),
-            patch.object(cn, "_probe_process", side_effect=fake_probe),
+            patch.object(process_control, "_probe_process", side_effect=fake_probe),
         ):
             status, triples = LocalProcessController._pids_for_session(SESSION_UUID)
         self.assertEqual(status, "ok")
@@ -572,8 +571,6 @@ class TerminateIdentityTests(unittest.TestCase):
         self.assertEqual(triples, [])
 
     def test_terminate_surfaces_scan_failure(self):
-        import walkcode.channel_native as cn
-
         live = subprocess.Popen(["sleep", "60"])
         self.addCleanup(lambda: (live.kill(), live.wait(timeout=2.0)))
         # recorded pid probes gone (already dead), but the session sweep errors
@@ -582,7 +579,7 @@ class TerminateIdentityTests(unittest.TestCase):
             return _ProcProbe("gone")
 
         with (
-            patch.object(cn, "_probe_process", side_effect=fake_probe),
+            patch.object(process_control, "_probe_process", side_effect=fake_probe),
             patch.object(
                 LocalProcessController,
                 "_pids_for_session",
@@ -706,7 +703,7 @@ class TerminateTargetGoneAndWaitTests(unittest.TestCase):
 
         with (
             patch.object(cn.subprocess, "run", side_effect=fake_run),
-            patch.object(cn, "_probe_process", side_effect=fake_probe),
+            patch.object(process_control, "_probe_process", side_effect=fake_probe),
             patch.object(LocalProcessController, "_kill_one", fake_kill_one),
         ):
             controller = LocalProcessController(timeout=0.5)
@@ -725,18 +722,14 @@ class TerminateTargetGoneAndWaitTests(unittest.TestCase):
         self.assertEqual(killed, [7001])  # only the swept worker, never 6000
 
     def test_wait_exited_error_is_not_exited(self):
-        import walkcode.channel_native as cn
-
         controller = LocalProcessController(timeout=0.2, poll_interval=0.02)
-        with patch.object(cn, "_probe_process", return_value=_ProcProbe("error")):
+        with patch.object(process_control, "_probe_process", return_value=_ProcProbe("error")):
             self.assertFalse(controller._wait_exited(4242, "L", "claude"))
 
     def test_wait_exited_identity_change_counts_as_exited(self):
-        import walkcode.channel_native as cn
-
         controller = LocalProcessController(timeout=0.5)
         with patch.object(
-            cn, "_probe_process", return_value=_ProcProbe("ok", "NEW", "vim")
+            process_control, "_probe_process", return_value=_ProcProbe("ok", "NEW", "vim")
         ):
             # expected identity differs -> original target gone, pid reused.
             self.assertTrue(controller._wait_exited(4242, "OLD", "claude"))
@@ -770,7 +763,7 @@ class TerminateTargetGoneAndWaitTests(unittest.TestCase):
         with (
             patch.object(cn.subprocess, "run", side_effect=fake_run),
             patch.object(
-                cn,
+                process_control,
                 "_probe_process",
                 lambda pid: _ProcProbe("ok", "L", "claude --resume 00000000-1111-2222-3333-444444444444"),
             ),

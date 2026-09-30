@@ -816,7 +816,7 @@ class LarkInboxReliabilityTests(_LarkRuntimeHarness):
         queue_dir = Path(f"{runtime.state_store.path}.tui-hooks.d")
         [queued] = list(queue_dir.glob("*.json"))
         failing_write = mock.patch(
-            "walkcode.channel_native._atomic_write_json", side_effect=OSError("disk full")
+            "walkcode.channel_native.stores._atomic_write_json", side_effect=OSError("disk full")
         )
 
         with failing_write, contextlib.redirect_stderr(io.StringIO()):
