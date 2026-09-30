@@ -961,6 +961,28 @@ class GateWithoutDaemonTests(unittest.TestCase):
             )
             self.assertFalse(late.accepted)
 
+    def test_decision_written_during_the_last_poll_sleep_is_honoured(self):
+        # The wait can time out just as a click lands: the decision is on disk
+        # but the wait returned None. Timing out over it (and deleting it)
+        # showed "approved" on the card while the terminal fell back.
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime, _session, _api = _runtime_with_observed_session(tmp)
+            state = runtime.state_store.path
+            claude_gate.touch_heartbeat(state)
+            payload = _pre_tool_payload("Edit", {"file_path": "/tmp/x"})
+            rid = payload["tool_use_id"]
+
+            def late_click(state_path, request_id, *, timeout):
+                claude_gate.write_decision(state_path, request_id, {"action": "deny"})
+                return None
+
+            with mock.patch.object(claude_gate, "wait_for_decision", late_click):
+                output = runtime.gate_tui_hook(hook_type="PreToolUse", payload=payload, agent="claude")
+
+            self.assertEqual(output["hookSpecificOutput"]["permissionDecision"], "deny")
+            self.assertIsNone(claude_gate.read_pending(state, rid))
+            self.assertIsNone(claude_gate.read_decision(state, rid))
+
     def test_retired_daemon_mode_off_no_longer_disables_the_gate(self):
         # Before ADR 0068, WALKCODE_CLAUDE_DAEMON_MODE=off silently turned the
         # TUI permission / AskUserQuestion cards off too.
