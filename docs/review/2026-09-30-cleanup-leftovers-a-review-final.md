@@ -16,4 +16,4 @@
 - `uninstall.sh --dry-run` 在真机运行：只列 6 个实例（跳过 3 个 tap）、各 profile 只删 WalkCode hook 并先备份、env/备份/workspace 保留；前后目录快照一致（无副作用）
 - 真实状态副本：work-claude 80 个长期空闲会话过期、2 个当场修剪；work-codex 6、work2-claude 2
 - 9/13 残留的半截状态临时文件（14.8MB）移入 ~/.walkcode/backups/orphans/
-- 全量 1128 passed / 9 skipped
+- 全量 1127 passed / 9 skipped
