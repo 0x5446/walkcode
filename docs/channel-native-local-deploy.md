@@ -654,13 +654,9 @@ Expected state gate before consuming IM updates:
 - `state_file.load_ok: True`
 - `write_probe.ok: True`
 
-`sessions.expired_writer_leases` is informational only (ADR 0059). The lease
-is stamped when a writer is acquired and never renewed while a turn runs, so
-any session mid-turn for longer than the lease TTL shows an "expired" lease —
-that is the normal shape of a healthy long-running turn, not a stale writer.
-Lease expiry no longer blocks submits and must not gate `serve --once`. To
-spot a genuinely wedged session, look at `last_progress_at` /
-`last_progress_event` staleness instead.
+Writer leases were removed (ADR 0059, v0.14.36), so `state` reports no lease
+counts. To spot a genuinely wedged session, look at `last_progress_at` /
+`last_progress_event` staleness.
 
 If state contains read-only external TUI observations whose recorded local
 process has already exited, repair them before private-chat E2E:

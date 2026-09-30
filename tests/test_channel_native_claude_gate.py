@@ -1,6 +1,7 @@
 """PreToolUse gate (ADR 0046 v2, ADR 0068) — decision spool, blocking hook, drain, decision transport."""
 
 import asyncio
+from dataclasses import replace
 import io
 import tempfile
 import threading
@@ -891,6 +892,74 @@ class GateWithoutDaemonTests(unittest.TestCase):
             self.assertEqual(result["output"]["hookSpecificOutput"]["permissionDecision"], "allow")
             self.assertIn((session.session_id, "Edit"), runtime._gate_always_allow)
             self.assertIsNone(claude_gate.read_pending(state, rid))
+
+    def test_gate_card_click_goes_through_the_real_callback_path(self):
+        # The ClaudeGateTransport split must be reachable from an actual card
+        # click: token resolution, authorization, _interaction_transport
+        # routing, decision delivery, and the card flip.
+        from walkcode.channel_native import InboundEvent
+
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime, session, api = _runtime_with_observed_session(tmp)
+            state = runtime.state_store.path
+            claude_gate.touch_heartbeat(state)
+            payload = _pre_tool_payload("Edit", {"file_path": "/tmp/x"})
+            rid = payload["tool_use_id"]
+            result = {}
+            thread = threading.Thread(
+                target=lambda: result.update(
+                    output=runtime.gate_tui_hook(hook_type="PreToolUse", payload=payload, agent="claude")
+                )
+            )
+            thread.start()
+            deadline = time.monotonic() + 5
+            while claude_gate.read_pending(state, rid) is None and time.monotonic() < deadline:
+                time.sleep(0.02)
+            asyncio.run(runtime.drain_claude_gate_requests())
+            card = next(
+                item.view_model
+                for item in runtime.orchestrator.outbox._sent.values()
+                if item.idempotency_key.endswith(f"gate:{rid}")
+            )
+            token = next(a["token"] for a in card["actions"] if a["action"] == "allow")
+            binding = session.channel_binding
+            # Production grants the configured allowlist when it observes the
+            # TUI session (_grant_tui_channel_owners); do the same here.
+            runtime.orchestrator.authz.grant(
+                session.session_id, ActorRef(binding.channel_kind, "owner", "Owner"), SessionRole.OWNER
+            )
+            click = InboundEvent(
+                event_id="cb-gate-1",
+                channel_kind=binding.channel_kind,
+                account_id=binding.account_id,
+                chat_id=binding.chat_id,
+                thread_id=binding.thread_id,
+                message_id="card-msg",
+                root_message_id=binding.root_message_id,
+                sender_id="owner",
+                sender_display="Owner",
+                text=f"cb:{token}",
+                callback={"token": token},
+            )
+            outcome = asyncio.run(
+                runtime.orchestrator.handle_inbound_event(
+                    click, agent_transport_kind="claude_headless", cwd=tmp
+                )
+            )
+            thread.join(timeout=5)
+
+            self.assertTrue(outcome.accepted, outcome)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(result["output"]["hookSpecificOutput"]["permissionDecision"], "allow")
+            self.assertEqual(runtime.orchestrator.hitls.pending_for_session(session.session_id), [])
+            self.assertTrue([m for m, _ in api.calls if m.startswith("edit")])  # card flipped
+            # A second click on the settled card is refused.
+            late = asyncio.run(
+                runtime.orchestrator.handle_inbound_event(
+                    replace(click, event_id="cb-gate-2"), agent_transport_kind="claude_headless", cwd=tmp
+                )
+            )
+            self.assertFalse(late.accepted)
 
     def test_retired_daemon_mode_off_no_longer_disables_the_gate(self):
         # Before ADR 0068, WALKCODE_CLAUDE_DAEMON_MODE=off silently turned the

@@ -51,6 +51,10 @@ expired` 分支），`LEASE_EXPIRED` 不再产生。理由：逐场景盘点后�
 "最后一次取得/重取写权的时刻"——中途提交不刷新它；最近输入水位看
 `last_user_input_at`）；不再用它否决提交。
 
+*补记（v0.14.36 状态瘦身）：* 账本记录此后也没有读者，`WriterLease`、
+`lease_ttl` 与 `LEASE_EXPIRED` 已删除；排查卡住的会话看 `last_progress_at` /
+`last_progress_event`。
+
 ## Alternatives considered
 
 - **给运行中的 turn 续租心跳**：修的是"租约会误过期"，不修"租约在单进程

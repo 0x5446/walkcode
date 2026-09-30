@@ -2,6 +2,7 @@ import asyncio
 import contextlib
 import io
 import json
+import time
 import tempfile
 import unittest
 from pathlib import Path
@@ -610,6 +611,49 @@ class _LarkRuntimeHarness(unittest.TestCase):
                 "sender": {"sender_id": {"open_id": sender}},
             },
         }
+
+
+class DeferredHookSaveFailureTests(_LarkRuntimeHarness):
+    def test_hook_is_not_archived_while_the_state_save_keeps_failing(self):
+        # A disk that will not take the state file is not a bad event: the
+        # hook must stay queued past the bad-event budget and be consumed
+        # once saving works again.
+        from walkcode import channel_native_runtime as runtime_module
+        from walkcode.channel_native import SubmitResult
+
+        runtime, _api, _transport = self._runtime()
+        qdir = runtime._tui_hook_queue_dir
+        qdir.mkdir(parents=True, exist_ok=True)
+        hook = qdir / "00-hook.json"
+        hook.write_text(
+            json.dumps(
+                {
+                    "created_at": time.time(),
+                    "hook_type": "SessionStart",
+                    "agent": "claude",
+                    "payload": {"session_id": "11111111-2222-3333-4444-555555555555", "cwd": "/tmp"},
+                }
+            ),
+            encoding="utf-8",
+        )
+        disk_full = {"on": True}
+
+        async def process(*, hook_type, agent, payload):
+            if disk_full["on"]:
+                runtime.state_store.last_save_failed = True
+                raise OSError("disk full")
+            runtime.state_store.last_save_failed = False
+            return SubmitResult(True)
+
+        runtime.process_tui_hook = process
+        for _ in range(runtime_module.TUI_HOOK_MAX_ATTEMPTS + 3):
+            asyncio.run(runtime.drain_deferred_tui_hooks())
+        self.assertTrue(hook.exists())
+        self.assertFalse((qdir / "bad" / "00-hook.json").exists())
+
+        disk_full["on"] = False
+        asyncio.run(runtime.drain_deferred_tui_hooks())
+        self.assertFalse(hook.exists())
 
 
 class LarkInboxReliabilityTests(_LarkRuntimeHarness):

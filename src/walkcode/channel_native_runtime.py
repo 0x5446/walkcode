@@ -3463,6 +3463,12 @@ class ChannelNativeRuntime:
                 self._archive_bad_tui_hook(path)
                 continue
             except Exception as exc:
+                if self.state_store.last_save_failed:
+                    # A disk that will not take the state file says nothing
+                    # about this hook: keep it queued and retry next tick
+                    # without spending its bad-event budget.
+                    print(f"deferred TUI hook waits for state save: {type(exc).__name__}: {exc}", file=sys.stderr)
+                    break
                 attempts = self._tui_hook_failures.get(path.name, 0) + 1
                 if attempts < TUI_HOOK_MAX_ATTEMPTS:
                     self._tui_hook_failures[path.name] = attempts
@@ -3615,6 +3621,11 @@ class ChannelNativeRuntime:
         started = time.monotonic()
         try:
             decision = claude_gate.wait_for_decision(state_path, rid, timeout=timeout)
+            if decision is None:
+                # A click that landed during the last poll sleep is already on
+                # disk: honour it instead of timing out over it. (Narrows, not
+                # closes, the window before the cleanup below.)
+                decision = claude_gate.read_decision(state_path, rid)
         finally:
             claude_gate.cleanup_gate_files(state_path, rid)
         if decision is None:
