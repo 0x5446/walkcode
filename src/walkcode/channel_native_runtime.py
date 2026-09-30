@@ -3306,15 +3306,26 @@ class ChannelNativeRuntime:
         # card whose edit was still being retried, survives a restart.
         for request in self.orchestrator.hitls.open_gate_cards():
             rid, session_id = request.transport_request_id, request.session_id
-            if request.status == "pending":
-                # live_rids only holds files that parsed; a read error must
-                # not look like the hook having returned.
-                if rid in live_rids or claude_gate.pending_path(state_path, rid).exists():
+            if not request.card_message_id:
+                # A card delivered by a background retry never passed through
+                # _remember_gate_card_message; pin its id while the outbox
+                # (a day of sent items) still has it.
+                self._remember_gate_card_message(session_id, rid)
+            # live_rids only holds files that parsed; a read error must not
+            # look like the hook having returned. Checked for every status: a
+            # gate timeout above the HITL expiry leaves an "expired" request
+            # whose hook is still waiting.
+            if rid in live_rids or claude_gate.pending_path(state_path, rid).exists():
+                continue
+            async with self._ingress_lock:
+                # An await below (another card's edit) lets a click decide
+                # this one meanwhile: re-check under the lock.
+                if not request.card_open:
                     continue
-                async with self._ingress_lock:
+                if request.status == "pending":
                     self.orchestrator.settle_timed_out_gate(request)
-                claude_gate.trace("settle_card_hook_gone", rid=rid)
-                self.save_state()
+                    claude_gate.trace("settle_card_hook_gone", rid=rid)
+                    self.save_state()
             outcome = await self.orchestrator.retire_gate_card(session_id, rid, request)
             if outcome == "queued":
                 # Waiting on delivery (possibly a long rate-limit backoff) is
@@ -3344,7 +3355,10 @@ class ChannelNativeRuntime:
         for request in self.orchestrator.hitls.open_gate_cards():
             if request.session_id == session_id and request.transport_request_id == rid:
                 key = f"{session_id}:{request.generation}:gate:{rid}"
-                request.card_message_id = self.orchestrator.outbox.sent_message_id(key)
+                message_id = self.orchestrator.outbox.sent_message_id(key)
+                if message_id and message_id != request.card_message_id:
+                    request.card_message_id = message_id
+                    self.save_state()
                 return
 
     def _claude_gate_session_id(self, request: dict[str, Any]) -> str | None:

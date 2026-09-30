@@ -659,6 +659,8 @@ class GateDrainTests(unittest.TestCase):
 
             self.assertEqual(len(self._edits(api)), 1)
             self.assertEqual(runtime.orchestrator.hitls.open_gate_cards(), [])
+            [request] = runtime.orchestrator.hitls._requests.values()
+            self.assertTrue(request.card_message_id)  # pinned though a retry sent it
 
     def test_failed_card_edit_is_logged_and_retried(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -749,6 +751,51 @@ class GateDrainTests(unittest.TestCase):
 
             self.assertEqual(len(self._edits(api)), 1)
             self.assertEqual(restarted.orchestrator.hitls.open_gate_cards(), [])
+
+    def test_card_is_kept_while_its_hook_waits_past_the_hitl_expiry(self):
+        # A gate timeout above the HITL expiry: compaction marks the request
+        # expired while the hook still waits — the card must stay usable.
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime, _session, api = _runtime_with_observed_session(tmp)
+            state = runtime.state_store.path
+            claude_gate.write_pending(state, self._pending_for_session())
+            asyncio.run(runtime.drain_claude_gate_requests())
+            [hitl] = runtime.orchestrator.hitls.pending_for_session("observed-1")
+            hitl.expires_at = time.time() - 1
+            runtime.compact_state()
+            self.assertEqual(hitl.status, "expired")
+
+            asyncio.run(runtime.drain_claude_gate_requests())  # pending still there
+
+            self.assertEqual(self._edits(api), [])
+            self.assertTrue(hitl.card_open)
+
+    def test_a_click_during_another_cards_retire_is_not_overwritten(self):
+        # Retiring card A awaits the channel; a click decides card B meanwhile.
+        # B must not then be retired as "moved to the terminal".
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime, _session, api = _runtime_with_observed_session(tmp)
+            state = runtime.state_store.path
+            claude_gate.write_pending(state, self._pending_for_session("toolu_a"))
+            claude_gate.write_pending(state, self._pending_for_session("toolu_b"))
+            asyncio.run(runtime.drain_claude_gate_requests())
+            hitls = {r.transport_request_id: r for r in runtime.orchestrator.hitls.open_gate_cards()}
+            claude_gate.cleanup_gate_files(state, "toolu_a")
+            claude_gate.cleanup_gate_files(state, "toolu_b")
+            real_retire = runtime.orchestrator.retire_gate_card
+            retired = []
+
+            async def retire_and_click(session_id, rid, request):
+                retired.append(rid)
+                if rid == "toolu_a":
+                    runtime.orchestrator.hitls.mark_decided(hitls["toolu_b"].hitl_request_id)
+                return await real_retire(session_id, rid, request)
+
+            runtime.orchestrator.retire_gate_card = retire_and_click
+            asyncio.run(runtime.drain_claude_gate_requests())
+
+            self.assertEqual(retired, ["toolu_a"])
+            self.assertEqual(hitls["toolu_b"].status, "decided")
 
     def test_card_decided_on_the_channel_is_not_retired(self):
         with tempfile.TemporaryDirectory() as tmp:
