@@ -408,9 +408,16 @@ class CodexAppServerTransportTests(unittest.TestCase):
 
         handle = asyncio.run(transport.launch(LaunchSpec(cwd="/tmp/project", session_id="s1")))
         asyncio.run(transport.submit_turn(handle, TurnInput(text="hello"), "idem-1"))
+        transport._thread_models["thread-1"] = "gpt-5.6-sol"
+        transport._thread_models["thread-2"] = "gpt-5.6-sol"
+        transport._turn_usage["turn-1"] = {"input_tokens": 1}
+        transport._turn_usage["turn-9"] = {"input_tokens": 9}
         result = asyncio.run(transport.shutdown(handle, "graceful"))
 
         self.assertTrue(result.accepted)
+        # Only the closed thread's caches go; other threads keep theirs.
+        self.assertEqual(transport._thread_models, {"thread-2": "gpt-5.6-sol"})
+        self.assertEqual(transport._turn_usage, {"turn-9": {"input_tokens": 9}})
         methods = [method for method, _params in client.requests]
         self.assertEqual(methods[-2:], ["turn/interrupt", "thread/unsubscribe"])
         self.assertEqual(
@@ -485,12 +492,14 @@ class CodexAppServerTransportTests(unittest.TestCase):
         handle = asyncio.run(transport.launch(LaunchSpec(cwd="/tmp/project", session_id="s1")))
         asyncio.run(transport.submit_turn(handle, TurnInput(text="hello"), "idem-1"))
         transport._thread_models["thread-1"] = "gpt-5.6-sol"
+        transport._turn_usage["turn-1"] = {"input_tokens": 1}
         transport.effective_sandbox["thread-1"] = "readOnly"
 
         asyncio.run(transport.restart_backend())
 
         self.assertEqual(client.restarts, 1)
         self.assertEqual(transport._thread_models, {})
+        self.assertEqual(transport._turn_usage, {})
         self.assertEqual(transport._active_turns, {})
         self.assertEqual(transport.effective_sandbox, {})
 
@@ -848,14 +857,14 @@ class CodexAppServerTransportTests(unittest.TestCase):
         with patch.object(codex_transport_module, "_log_degrade",
                           lambda event, **kw: logged.append((event, kw))):
             for _ in range(3):
-                transport._convert_event({"method": "thread/tokenUsage/updated"}, thread_id="t")
+                transport._convert_event({"method": "account/rateLimits/updated"}, thread_id="t")
             transport._convert_event(
                 {"type": "event_msg", "payload": {"type": "sub_agent_activity"}}, thread_id="t"
             )
 
         self.assertEqual(
             [kw["event_type"] for _, kw in logged],
-            ["thread/tokenUsage/updated", "event_msg/sub_agent_activity"],
+            ["account/rateLimits/updated", "event_msg/sub_agent_activity"],
         )
         self.assertTrue(all(name == "codex_event_type_unhandled" for name, _ in logged))
 
@@ -2916,6 +2925,166 @@ class CodexAppServerModelBackfillTests(unittest.TestCase):
         self.assertEqual(len(events), 2)
         self.assertEqual(events[0].payload["model"], "gpt-5.6-sol")
         self.assertEqual(events[1].payload["model"], "gpt-5.6-sol")
+
+    def _v2_turn(self):
+        return [
+            {"method": "item/agentMessage/delta", "params": {"threadId": "thread-1", "delta": "hi"}},
+            {
+                "method": "thread/tokenUsage/updated",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "tokenUsage": {
+                        "last": {"inputTokens": 21000, "cachedInputTokens": 20000, "outputTokens": 300},
+                        "total": {"inputTokens": 90000, "cachedInputTokens": 80000, "outputTokens": 900},
+                        "modelContextWindow": 272000,
+                    },
+                },
+            },
+            {"method": "turn/completed", "params": {"threadId": "thread-1", "turn": {"id": "turn-1"}}},
+        ]
+
+    def test_launch_response_model_and_token_usage_reach_turn_events(self):
+        # codex 0.157: the model only rides the thread/start response and usage
+        # only rides thread/tokenUsage/updated — the stream repeats neither.
+        client = _FakeCodexClient()
+        start = client.request
+
+        async def request(method, params):
+            result = await start(method, params)
+            if method == "thread/start":
+                result["model"] = "gpt-5.6-sol"
+            return result
+
+        client.request = request
+        client.event_batches["thread-1"] = self._v2_turn()
+        transport = CodexAppServerTransport(client=client, event_silence_ceiling=0)
+        handle = asyncio.run(transport.launch(LaunchSpec(cwd="/tmp/project", session_id="s1")))
+
+        events = _drain_events(transport, handle)
+
+        self.assertEqual([e.type for e in events], [AgentEventType.TURN_DELTA, AgentEventType.TURN_COMPLETED])
+        self.assertEqual(events[0].payload["model"], "gpt-5.6-sol")
+        self.assertEqual(events[1].payload["model"], "gpt-5.6-sol")
+        self.assertEqual(
+            events[1].payload["usage"],
+            {"input_tokens": 21000, "output_tokens": 300, "model_context_window": 272000},
+        )
+        self.assertNotIn("thread/tokenUsage/updated", transport._logged_unhandled_types)
+        self.assertEqual(transport._turn_usage, {})
+
+    def test_turn_without_usage_notification_never_inherits_a_previous_turns_usage(self):
+        client = _FakeCodexClient()
+        client.event_batches["thread-1"] = self._v2_turn()
+        transport = CodexAppServerTransport(client=client, event_silence_ceiling=0)
+        handle = asyncio.run(transport.launch(LaunchSpec(cwd="/tmp/project", session_id="s1")))
+        _drain_events(transport, handle)
+
+        client.event_batches["thread-1"] = [
+            {"method": "turn/completed", "params": {"threadId": "thread-1", "turn": {"id": "turn-2"}}},
+        ]
+        events = _drain_events(transport, handle)
+
+        self.assertEqual(events[-1].type, AgentEventType.TURN_COMPLETED)
+        self.assertEqual(events[-1].payload["usage"], {})
+
+    def test_late_finishing_drain_keeps_the_next_turns_model_and_usage(self):
+        # The old drain resumes only after its completion was consumed; by
+        # then the consumer may have resumed the thread and the next turn's
+        # usage may already be cached. Finishing late must not wipe either.
+        client = _FakeCodexClient()
+        start = client.request
+
+        async def request(method, params):
+            result = await start(method, params)
+            if method in {"thread/start", "thread/resume"}:
+                result["model"] = "gpt-5.6-sol"
+            return result
+
+        client.request = request
+        client.event_batches["thread-1"] = [
+            {"method": "turn/completed", "params": {"threadId": "thread-1", "turn": {"id": "turn-1"}}},
+        ]
+        transport = CodexAppServerTransport(client=client, event_silence_ceiling=0)
+        handle = asyncio.run(transport.launch(LaunchSpec(cwd="/tmp/project", session_id="s1")))
+
+        async def run():
+            old = transport.events(handle)
+            first = await old.__anext__()
+            self.assertEqual(first.type, AgentEventType.TURN_COMPLETED)
+            await transport.resume_thread("thread-1", cwd="/tmp/project")
+            transport._convert_event(self._v2_turn()[1], thread_id="thread-1")
+            with contextlib.suppress(StopAsyncIteration):
+                await old.__anext__()
+
+        asyncio.run(run())
+
+        self.assertEqual(transport._thread_models.get("thread-1"), "gpt-5.6-sol")
+        self.assertIn("turn-1", transport._turn_usage)
+
+    def test_broken_wire_drops_the_turn_usage_its_drain_cached(self):
+        client = _FakeCodexClient()
+        batches = [[self._v2_turn()[1]]]
+
+        async def events(thread_id):
+            if batches:
+                return batches.pop(0)
+            raise ConnectionError("app-server went away")
+
+        client.events = events
+        transport = CodexAppServerTransport(client=client, event_silence_ceiling=60)
+        handle = asyncio.run(transport.launch(LaunchSpec(cwd="/tmp/project", session_id="s1")))
+        asyncio.run(transport.submit_turn(handle, TurnInput(text="hello"), "idem-1"))
+
+        async def run():
+            async for _event in transport.events(handle):
+                pass
+
+        with self.assertRaises(ConnectionError):
+            asyncio.run(run())
+        self.assertEqual(transport._turn_usage, {})
+
+    def test_usage_cache_is_bounded_for_turns_no_drain_claims(self):
+        transport = CodexAppServerTransport(client=_FakeCodexClient())
+        notification = self._v2_turn()[1]
+        for n in range(codex_transport_module.CODEX_TURN_USAGE_LIMIT + 5):
+            notification["params"]["turnId"] = f"turn-{n}"
+            transport._convert_event(notification, thread_id="thread-1")
+
+        self.assertEqual(len(transport._turn_usage), codex_transport_module.CODEX_TURN_USAGE_LIMIT)
+        self.assertNotIn("turn-0", transport._turn_usage)
+
+    def test_silence_ceiling_drops_the_unclaimed_turn_usage(self):
+        client = _FakeCodexClient()
+        transport = CodexAppServerTransport(client=client, event_silence_ceiling=0)
+        handle = asyncio.run(transport.launch(LaunchSpec(cwd="/tmp/project", session_id="s1")))
+        asyncio.run(transport.submit_turn(handle, TurnInput(text="hello"), "idem-1"))
+        client.event_batches["thread-1"] = [self._v2_turn()[1]]
+
+        events = _drain_events(transport, handle)
+
+        self.assertEqual(events[-1].type, AgentEventType.TURN_COMPLETED)
+        self.assertEqual(transport._turn_usage, {})
+
+    def test_resume_response_model_backfills_turn_events(self):
+        client = _FakeCodexClient()
+        resume = client.request
+
+        async def request(method, params):
+            result = await resume(method, params)
+            if method == "thread/resume":
+                result["model"] = "gpt-5.6-sol"
+            return result
+
+        client.request = request
+        client.event_batches["thread-1"] = self._v2_turn()
+        transport = CodexAppServerTransport(client=client, event_silence_ceiling=0)
+        handle = asyncio.run(transport.resume_thread("thread-1", cwd="/tmp/project"))
+
+        events = _drain_events(transport, handle)
+
+        self.assertEqual(events[-1].type, AgentEventType.TURN_COMPLETED)
+        self.assertEqual(events[-1].payload["model"], "gpt-5.6-sol")
 
 
 _CODEX_LIVE_FLAG = "WALKCODE_E2E_CODEX_APP_SERVER"

@@ -68,6 +68,9 @@ def _codex_message_turn_id(message: Any) -> str:
 # ownership. Only turns whose hooks are still queued matter, so a few hundred
 # is generous; the cap keeps a long-lived runtime from growing without bound.
 CODEX_STARTED_TURNS_LIMIT = 1024
+# Usage entries live only while their turn's drain does (see events()); the
+# cap is the backstop for turns no drain ever claims.
+CODEX_TURN_USAGE_LIMIT = 256
 
 
 class CodexAppServerTransport:
@@ -141,13 +144,25 @@ class CodexAppServerTransport:
         # writer reacquisition resumes the same thread over and over, and
         # without this mark every resume would re-inject the preamble.
         self._env_context_delivered: set[str] = set()
-        # Last model seen per thread. The app-server event stream carries the
-        # model on thread_settings_applied / turn_context event_msg records,
-        # NOT on agent_message / task_complete — so /status showed 模型: — for
-        # every channel-launched codex session. We cache it here and backfill
-        # it onto the converted events; _record_session_progress then writes
-        # session.model from event.payload["model"].
+        # Last model seen per thread. thread/start and thread/resume responses
+        # always carry it (a required field); the stream only repeats it on a
+        # settings change (thread/settings/updated, or the legacy
+        # thread_settings_applied / turn_context records), never on
+        # agent_message / turn completion. We cache it here and backfill it
+        # onto the converted events; _record_session_progress then writes
+        # session.model from event.payload["model"]. Lives as long as the
+        # thread (dropped on close/restart, like effective_sandbox), not the
+        # turn: the next turn on a live thread never re-announces the model,
+        # and a drain finishing late would wipe a fresh resume's value.
         self._thread_models: dict[str, str] = {}
+        # Last token usage per turn, from thread/tokenUsage/updated. The v2
+        # turn/completed notification carries no usage, so without this the
+        # status card's 上下文 stayed "—" for every channel-launched session.
+        # Keyed by turn, not thread: a turn's completion can only ever pick up
+        # its own usage, never a previous turn's, and an old drain finishing
+        # late cannot wipe the next turn's entry. Dropped when the turn's
+        # drain ends, however it ends; bounded by CODEX_TURN_USAGE_LIMIT.
+        self._turn_usage: dict[str, dict[str, Any]] = {}
         # Live turn per thread, from the turn/start response. turn/interrupt
         # needs it, and without it an explicit close could only stop WalkCode
         # from listening while the agent kept running server-side.
@@ -368,6 +383,11 @@ class CodexAppServerTransport:
                     effective=effective,
                 )
 
+    def _remember_thread_model(self, result: Any, thread_id: str) -> None:
+        model = str(result.get("model", "") or "") if isinstance(result, dict) else ""
+        if model and thread_id:
+            self._thread_models[thread_id] = model
+
     async def launch(self, spec: LaunchSpec) -> TransportHandle:
         params = self._with_sandbox_override(
             {
@@ -380,6 +400,7 @@ class CodexAppServerTransport:
         thread_id = _codex_thread_id(result)
         self._released_threads.discard(thread_id)
         self._apply_effective_sandbox(result, thread_id, method="thread/start")
+        self._remember_thread_model(result, thread_id)
         if self.environment_context and thread_id:
             self._env_context_pending.add(thread_id)
         return TransportHandle(
@@ -398,6 +419,7 @@ class CodexAppServerTransport:
         # next drain quit on its first batch boundary.
         self._released_threads.discard(resumed)
         self._apply_effective_sandbox(result, resumed, method="thread/resume")
+        self._remember_thread_model(result, resumed)
         if self.environment_context and resumed not in self._env_context_delivered:
             self._env_context_pending.add(resumed)
         return TransportHandle(
@@ -470,11 +492,16 @@ class CodexAppServerTransport:
         let the rest of those turns route directly.
         """
         thread_id = str(handle.ref.get("thread_id", "") or "")
+        own_turn = self._active_turns.get(thread_id, "")
         self._draining[thread_id] = self._draining.get(thread_id, 0) + 1
         try:
             async for event in self._listen_own_turn(handle):
                 yield event
         finally:
+            # However the drain ends — completion, silence ceiling, close, a
+            # broken wire — its turn's usage goes with it; turn/completed
+            # already claimed it on the normal path.
+            self._turn_usage.pop(own_turn, None)
             remaining = self._draining.get(thread_id, 1) - 1
             if remaining > 0:
                 self._draining[thread_id] = remaining
@@ -572,11 +599,6 @@ class CodexAppServerTransport:
                 if event.type == AgentEventType.TURN_COMPLETED:
                     turn_closed = True
             if turn_closed and thread_id:
-                # The turn is over: this thread's model is now baked into the
-                # session record (via the TURN_COMPLETED payload above). Drop
-                # the cache entry so a long-lived runtime cannot accumulate
-                # one ~100B mapping per finished thread forever.
-                self._thread_models.pop(thread_id, None)
                 # Only if it is still the turn that just closed: the consumer
                 # may have submitted the next turn while the completion was
                 # yielded, and that turn's id must survive for its drain.
@@ -700,6 +722,7 @@ class CodexAppServerTransport:
         self._env_context_pending.discard(thread_id)
         self._env_context_delivered.discard(thread_id)
         self._thread_models.pop(thread_id, None)
+        self._turn_usage.pop(turn_id, None)
         self.effective_sandbox.pop(thread_id, None)
         self.unsubscribe_foreign_mirror(thread_id)
         if not thread_id:
@@ -754,6 +777,7 @@ class CodexAppServerTransport:
             )
         await _maybe_await(restart())
         self._thread_models.clear()
+        self._turn_usage.clear()
         self._foreign_sinks.clear()
         self._foreign_direct.clear()
         self._pending_starts.clear()
@@ -858,6 +882,14 @@ class CodexAppServerTransport:
                 model = str(settings.get("model", "") or "")
                 if model and thread_id:
                     self._thread_models[thread_id] = model
+        if event_type == "thread/tokenUsage/updated":
+            usage = _codex_thread_token_usage(payload.get("tokenUsage"))
+            turn_id = str(payload.get("turnId", "") or "")
+            if usage and turn_id:
+                self._turn_usage[turn_id] = usage
+                if len(self._turn_usage) > CODEX_TURN_USAGE_LIMIT:
+                    del self._turn_usage[next(iter(self._turn_usage))]
+            return None
         model = self._thread_models.get(thread_id, "") if thread_id else ""
         if event_type == "item/agentMessage/delta":
             payload_out: dict[str, Any] = {"text": str(payload.get("delta", ""))}
@@ -869,9 +901,10 @@ class CodexAppServerTransport:
             return tool_event
         item_type = _codex_item_type(payload)
         if event_type == "turn/completed":
+            turn_usage = self._turn_usage.pop(_codex_message_turn_id(event), {})
             payload_out = {
                 "message": str(payload.get("message", "")),
-                "usage": payload.get("usage", {}),
+                "usage": payload.get("usage") or turn_usage,
                 "status": payload.get("status", "completed"),
             }
             if model:
@@ -1601,6 +1634,35 @@ def _codex_item_type(payload: dict[str, Any]) -> str:
     if not isinstance(item, dict):
         return ""
     return str(item.get("type", "") or "")
+
+
+def _codex_thread_token_usage(token_usage: Any) -> dict[str, Any]:
+    """Shape a v2 ThreadTokenUsage into the shared usage dict.
+
+    Same contract as tui_hooks._codex_token_count_usage (the rollout's
+    token_count record): input/output of the last model call — the current
+    context size, unlike the thread-cumulative ``total`` — plus the explicit
+    window for the status card's limit. cachedInputTokens is a subset of
+    inputTokens, so it is not carried.
+    """
+    if not isinstance(token_usage, dict):
+        return {}
+    last = token_usage.get("last")
+    if not isinstance(last, dict) or not last:
+        return {}
+    try:
+        usage: dict[str, Any] = {
+            "input_tokens": int(last.get("inputTokens", 0) or 0),
+            "output_tokens": int(last.get("outputTokens", 0) or 0),
+        }
+        window = int(token_usage.get("modelContextWindow", 0) or 0)
+    except (TypeError, ValueError):
+        return {}
+    if not usage["input_tokens"] and not usage["output_tokens"]:
+        return {}
+    if window:
+        usage["model_context_window"] = window
+    return usage
 
 
 def _codex_thread_id(result: dict[str, Any]) -> str:
