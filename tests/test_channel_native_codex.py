@@ -848,14 +848,14 @@ class CodexAppServerTransportTests(unittest.TestCase):
         with patch.object(codex_transport_module, "_log_degrade",
                           lambda event, **kw: logged.append((event, kw))):
             for _ in range(3):
-                transport._convert_event({"method": "thread/tokenUsage/updated"}, thread_id="t")
+                transport._convert_event({"method": "account/rateLimits/updated"}, thread_id="t")
             transport._convert_event(
                 {"type": "event_msg", "payload": {"type": "sub_agent_activity"}}, thread_id="t"
             )
 
         self.assertEqual(
             [kw["event_type"] for _, kw in logged],
-            ["thread/tokenUsage/updated", "event_msg/sub_agent_activity"],
+            ["account/rateLimits/updated", "event_msg/sub_agent_activity"],
         )
         self.assertTrue(all(name == "codex_event_type_unhandled" for name, _ in logged))
 
@@ -2916,6 +2916,72 @@ class CodexAppServerModelBackfillTests(unittest.TestCase):
         self.assertEqual(len(events), 2)
         self.assertEqual(events[0].payload["model"], "gpt-5.6-sol")
         self.assertEqual(events[1].payload["model"], "gpt-5.6-sol")
+
+    def _v2_turn(self):
+        return [
+            {"method": "item/agentMessage/delta", "params": {"threadId": "thread-1", "delta": "hi"}},
+            {
+                "method": "thread/tokenUsage/updated",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "tokenUsage": {
+                        "last": {"inputTokens": 21000, "cachedInputTokens": 20000, "outputTokens": 300},
+                        "total": {"inputTokens": 90000, "cachedInputTokens": 80000, "outputTokens": 900},
+                        "modelContextWindow": 272000,
+                    },
+                },
+            },
+            {"method": "turn/completed", "params": {"threadId": "thread-1", "turn": {"id": "turn-1"}}},
+        ]
+
+    def test_launch_response_model_and_token_usage_reach_turn_events(self):
+        # codex 0.157: the model only rides the thread/start response and usage
+        # only rides thread/tokenUsage/updated — the stream repeats neither.
+        client = _FakeCodexClient()
+        start = client.request
+
+        async def request(method, params):
+            result = await start(method, params)
+            if method == "thread/start":
+                result["model"] = "gpt-5.6-sol"
+            return result
+
+        client.request = request
+        client.event_batches["thread-1"] = self._v2_turn()
+        transport = CodexAppServerTransport(client=client, event_silence_ceiling=0)
+        handle = asyncio.run(transport.launch(LaunchSpec(cwd="/tmp/project", session_id="s1")))
+
+        events = _drain_events(transport, handle)
+
+        self.assertEqual([e.type for e in events], [AgentEventType.TURN_DELTA, AgentEventType.TURN_COMPLETED])
+        self.assertEqual(events[0].payload["model"], "gpt-5.6-sol")
+        self.assertEqual(events[1].payload["model"], "gpt-5.6-sol")
+        self.assertEqual(
+            events[1].payload["usage"],
+            {"input_tokens": 21000, "output_tokens": 300, "model_context_window": 272000},
+        )
+        self.assertNotIn("thread/tokenUsage/updated", transport._logged_unhandled_types)
+
+    def test_resume_response_model_backfills_turn_events(self):
+        client = _FakeCodexClient()
+        resume = client.request
+
+        async def request(method, params):
+            result = await resume(method, params)
+            if method == "thread/resume":
+                result["model"] = "gpt-5.6-sol"
+            return result
+
+        client.request = request
+        client.event_batches["thread-1"] = self._v2_turn()
+        transport = CodexAppServerTransport(client=client, event_silence_ceiling=0)
+        handle = asyncio.run(transport.resume_thread("thread-1", cwd="/tmp/project"))
+
+        events = _drain_events(transport, handle)
+
+        self.assertEqual(events[-1].type, AgentEventType.TURN_COMPLETED)
+        self.assertEqual(events[-1].payload["model"], "gpt-5.6-sol")
 
 
 _CODEX_LIVE_FLAG = "WALKCODE_E2E_CODEX_APP_SERVER"
