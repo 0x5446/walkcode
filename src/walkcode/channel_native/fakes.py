@@ -109,6 +109,8 @@ class FakeAgentTransport:
         self.model_calls: list[str] = []
         self.permission_approval_calls: list[tuple[str, dict[str, Any]]] = []
         self.question_answer_calls: list[tuple[str, dict[str, Any]]] = []
+        # Model reported on every handle this fake opens ("" = none).
+        self.handle_model = ""
 
     def capabilities(self) -> TransportCapabilities:
         return self._capabilities
@@ -118,6 +120,7 @@ class FakeAgentTransport:
             handle_id=f"handle-{uuid.uuid4().hex}",
             transport_kind=self.kind,
             ref={"session_id": spec.session_id, "cwd": spec.cwd},
+            model=self.handle_model,
         )
         self.handles.append(handle)
         return handle
@@ -130,6 +133,7 @@ class FakeAgentTransport:
             handle_id=str(ref.get("handle_id", "")) or f"handle-{uuid.uuid4().hex}",
             transport_kind=self.kind,
             ref={key: value for key, value in ref.items() if key not in {"transport_kind", "kind"}},
+            model=self.handle_model,
         )
         self.handles.append(handle)
         return handle

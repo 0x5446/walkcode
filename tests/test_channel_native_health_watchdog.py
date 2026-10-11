@@ -74,6 +74,17 @@ def _orchestrator(clock: _Clock, transport: FakeAgentTransport):
 
 
 class HealthWatchdogTests(unittest.TestCase):
+    def test_status_shows_the_model_before_the_first_reply(self):
+        # The transport reports the model when the handle opens; the card
+        # must not wait for the first turn's output to show it.
+        clock = _Clock()
+        transport = FakeAgentTransport("fake-transport", _transport_caps())
+        transport.handle_model = "gpt-6-luna"
+
+        orchestrator, _channel, session = _orchestrator(clock, transport)
+
+        self.assertEqual(orchestrator.sessions.get(session.session_id).model, "gpt-6-luna")
+
     def test_progress_events_update_health_metadata_and_idle_state(self):
         clock = _Clock()
         transport = FakeAgentTransport(

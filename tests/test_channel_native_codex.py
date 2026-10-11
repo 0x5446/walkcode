@@ -2944,7 +2944,7 @@ class CodexAppServerModelBackfillTests(unittest.TestCase):
             {"method": "turn/completed", "params": {"threadId": "thread-1", "turn": {"id": "turn-1"}}},
         ]
 
-    def test_launch_response_model_and_token_usage_reach_turn_events(self):
+    def test_launch_reports_the_model_on_the_handle_and_usage_on_completion(self):
         # codex 0.157: the model only rides the thread/start response and usage
         # only rides thread/tokenUsage/updated — the stream repeats neither.
         client = _FakeCodexClient()
@@ -2963,9 +2963,8 @@ class CodexAppServerModelBackfillTests(unittest.TestCase):
 
         events = _drain_events(transport, handle)
 
+        self.assertEqual(handle.model, "gpt-5.6-sol")
         self.assertEqual([e.type for e in events], [AgentEventType.TURN_DELTA, AgentEventType.TURN_COMPLETED])
-        self.assertEqual(events[0].payload["model"], "gpt-5.6-sol")
-        self.assertEqual(events[1].payload["model"], "gpt-5.6-sol")
         self.assertEqual(
             events[1].payload["usage"],
             {"input_tokens": 21000, "output_tokens": 300, "model_context_window": 272000},
@@ -3013,6 +3012,13 @@ class CodexAppServerModelBackfillTests(unittest.TestCase):
             first = await old.__anext__()
             self.assertEqual(first.type, AgentEventType.TURN_COMPLETED)
             await transport.resume_thread("thread-1", cwd="/tmp/project")
+            transport._convert_event(
+                {
+                    "method": "thread/settings/updated",
+                    "params": {"threadId": "thread-1", "threadSettings": {"model": "gpt-5.6-sol"}},
+                },
+                thread_id="thread-1",
+            )
             transport._convert_event(self._v2_turn()[1], thread_id="thread-1")
             with contextlib.suppress(StopAsyncIteration):
                 await old.__anext__()
@@ -3066,7 +3072,7 @@ class CodexAppServerModelBackfillTests(unittest.TestCase):
         self.assertEqual(events[-1].type, AgentEventType.TURN_COMPLETED)
         self.assertEqual(transport._turn_usage, {})
 
-    def test_resume_response_model_backfills_turn_events(self):
+    def test_resume_reports_the_model_on_the_handle(self):
         client = _FakeCodexClient()
         resume = client.request
 
@@ -3077,14 +3083,10 @@ class CodexAppServerModelBackfillTests(unittest.TestCase):
             return result
 
         client.request = request
-        client.event_batches["thread-1"] = self._v2_turn()
         transport = CodexAppServerTransport(client=client, event_silence_ceiling=0)
         handle = asyncio.run(transport.resume_thread("thread-1", cwd="/tmp/project"))
 
-        events = _drain_events(transport, handle)
-
-        self.assertEqual(events[-1].type, AgentEventType.TURN_COMPLETED)
-        self.assertEqual(events[-1].payload["model"], "gpt-5.6-sol")
+        self.assertEqual(handle.model, "gpt-5.6-sol")
 
 
 _CODEX_LIVE_FLAG = "WALKCODE_E2E_CODEX_APP_SERVER"
