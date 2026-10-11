@@ -68,6 +68,9 @@ def _codex_message_turn_id(message: Any) -> str:
 # ownership. Only turns whose hooks are still queued matter, so a few hundred
 # is generous; the cap keeps a long-lived runtime from growing without bound.
 CODEX_STARTED_TURNS_LIMIT = 1024
+# Usage entries live only while their turn's drain does (see events()); the
+# cap is the backstop for turns no drain ever claims.
+CODEX_TURN_USAGE_LIMIT = 256
 
 
 class CodexAppServerTransport:
@@ -157,7 +160,8 @@ class CodexAppServerTransport:
         # status card's 上下文 stayed "—" for every channel-launched session.
         # Keyed by turn, not thread: a turn's completion can only ever pick up
         # its own usage, never a previous turn's, and an old drain finishing
-        # late cannot wipe the next turn's entry. Popped when the turn ends.
+        # late cannot wipe the next turn's entry. Dropped when the turn's
+        # drain ends, however it ends; bounded by CODEX_TURN_USAGE_LIMIT.
         self._turn_usage: dict[str, dict[str, Any]] = {}
         # Live turn per thread, from the turn/start response. turn/interrupt
         # needs it, and without it an explicit close could only stop WalkCode
@@ -488,11 +492,16 @@ class CodexAppServerTransport:
         let the rest of those turns route directly.
         """
         thread_id = str(handle.ref.get("thread_id", "") or "")
+        own_turn = self._active_turns.get(thread_id, "")
         self._draining[thread_id] = self._draining.get(thread_id, 0) + 1
         try:
             async for event in self._listen_own_turn(handle):
                 yield event
         finally:
+            # However the drain ends — completion, silence ceiling, close, a
+            # broken wire — its turn's usage goes with it; turn/completed
+            # already claimed it on the normal path.
+            self._turn_usage.pop(own_turn, None)
             remaining = self._draining.get(thread_id, 1) - 1
             if remaining > 0:
                 self._draining[thread_id] = remaining
@@ -630,9 +639,6 @@ class CodexAppServerTransport:
                 ceiling_seconds=self.event_silence_ceiling,
                 parked_on_human=parked_on_human,
             )
-            if not parked_on_human:
-                # The turn ends here without a turn/completed to claim it.
-                self._turn_usage.pop(own_turn, None)
             if parked_on_human:
                 # Waiting on a person, not on a stalled agent. Say so, and do
                 # NOT synthesize a completion: the turn is genuinely unfinished
@@ -881,6 +887,8 @@ class CodexAppServerTransport:
             turn_id = str(payload.get("turnId", "") or "")
             if usage and turn_id:
                 self._turn_usage[turn_id] = usage
+                if len(self._turn_usage) > CODEX_TURN_USAGE_LIMIT:
+                    del self._turn_usage[next(iter(self._turn_usage))]
             return None
         model = self._thread_models.get(thread_id, "") if thread_id else ""
         if event_type == "item/agentMessage/delta":

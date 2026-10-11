@@ -3022,6 +3022,38 @@ class CodexAppServerModelBackfillTests(unittest.TestCase):
         self.assertEqual(transport._thread_models.get("thread-1"), "gpt-5.6-sol")
         self.assertIn("turn-1", transport._turn_usage)
 
+    def test_broken_wire_drops_the_turn_usage_its_drain_cached(self):
+        client = _FakeCodexClient()
+        batches = [[self._v2_turn()[1]]]
+
+        async def events(thread_id):
+            if batches:
+                return batches.pop(0)
+            raise ConnectionError("app-server went away")
+
+        client.events = events
+        transport = CodexAppServerTransport(client=client, event_silence_ceiling=60)
+        handle = asyncio.run(transport.launch(LaunchSpec(cwd="/tmp/project", session_id="s1")))
+        asyncio.run(transport.submit_turn(handle, TurnInput(text="hello"), "idem-1"))
+
+        async def run():
+            async for _event in transport.events(handle):
+                pass
+
+        with self.assertRaises(ConnectionError):
+            asyncio.run(run())
+        self.assertEqual(transport._turn_usage, {})
+
+    def test_usage_cache_is_bounded_for_turns_no_drain_claims(self):
+        transport = CodexAppServerTransport(client=_FakeCodexClient())
+        notification = self._v2_turn()[1]
+        for n in range(codex_transport_module.CODEX_TURN_USAGE_LIMIT + 5):
+            notification["params"]["turnId"] = f"turn-{n}"
+            transport._convert_event(notification, thread_id="thread-1")
+
+        self.assertEqual(len(transport._turn_usage), codex_transport_module.CODEX_TURN_USAGE_LIMIT)
+        self.assertNotIn("turn-0", transport._turn_usage)
+
     def test_silence_ceiling_drops_the_unclaimed_turn_usage(self):
         client = _FakeCodexClient()
         transport = CodexAppServerTransport(client=client, event_silence_ceiling=0)
