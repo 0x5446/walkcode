@@ -3088,6 +3088,18 @@ class CodexAppServerModelBackfillTests(unittest.TestCase):
 
         self.assertEqual(handle.model, "gpt-5.6-sol")
 
+    def test_resume_drops_a_stale_stream_model_so_replies_keep_the_new_one(self):
+        transport = CodexAppServerTransport(client=_FakeCodexClient(), event_silence_ceiling=0)
+        transport._thread_models["thread-1"] = "model-old"
+
+        asyncio.run(transport.resume_thread("thread-1", cwd="/tmp/project"))
+        event = transport._convert_event(
+            {"method": "item/agentMessage/delta", "params": {"threadId": "thread-1", "delta": "hi"}},
+            thread_id="thread-1",
+        )
+
+        self.assertNotIn("model", event.payload)
+
 
 _CODEX_LIVE_FLAG = "WALKCODE_E2E_CODEX_APP_SERVER"
 

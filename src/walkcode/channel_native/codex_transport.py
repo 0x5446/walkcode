@@ -413,6 +413,10 @@ class CodexAppServerTransport:
         # next drain quit on its first batch boundary.
         self._released_threads.discard(resumed)
         self._apply_effective_sandbox(result, resumed, method="thread/resume")
+        # The response's model (on the handle) is newer than anything the
+        # stream announced before; a stale entry would overwrite it on the
+        # next reply.
+        self._thread_models.pop(resumed, None)
         if self.environment_context and resumed not in self._env_context_delivered:
             self._env_context_pending.add(resumed)
         return TransportHandle(
