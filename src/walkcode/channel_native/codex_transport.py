@@ -147,12 +147,18 @@ class CodexAppServerTransport:
         # thread_settings_applied / turn_context records), never on
         # agent_message / turn completion. We cache it here and backfill it
         # onto the converted events; _record_session_progress then writes
-        # session.model from event.payload["model"].
+        # session.model from event.payload["model"]. Lives as long as the
+        # thread (dropped on close/restart, like effective_sandbox), not the
+        # turn: the next turn on a live thread never re-announces the model,
+        # and a drain finishing late would wipe a fresh resume's value.
         self._thread_models: dict[str, str] = {}
-        # Last token usage per thread, from thread/tokenUsage/updated. The v2
+        # Last token usage per turn, from thread/tokenUsage/updated. The v2
         # turn/completed notification carries no usage, so without this the
         # status card's 上下文 stayed "—" for every channel-launched session.
-        self._thread_usage: dict[str, dict[str, Any]] = {}
+        # Keyed by turn, not thread: a turn's completion can only ever pick up
+        # its own usage, never a previous turn's, and an old drain finishing
+        # late cannot wipe the next turn's entry. Popped when the turn ends.
+        self._turn_usage: dict[str, dict[str, Any]] = {}
         # Live turn per thread, from the turn/start response. turn/interrupt
         # needs it, and without it an explicit close could only stop WalkCode
         # from listening while the agent kept running server-side.
@@ -584,12 +590,6 @@ class CodexAppServerTransport:
                 if event.type == AgentEventType.TURN_COMPLETED:
                     turn_closed = True
             if turn_closed and thread_id:
-                # The turn is over: this thread's model is now baked into the
-                # session record (via the TURN_COMPLETED payload above). Drop
-                # the cache entry so a long-lived runtime cannot accumulate
-                # one ~100B mapping per finished thread forever.
-                self._thread_models.pop(thread_id, None)
-                self._thread_usage.pop(thread_id, None)
                 # Only if it is still the turn that just closed: the consumer
                 # may have submitted the next turn while the completion was
                 # yielded, and that turn's id must survive for its drain.
@@ -630,6 +630,9 @@ class CodexAppServerTransport:
                 ceiling_seconds=self.event_silence_ceiling,
                 parked_on_human=parked_on_human,
             )
+            if not parked_on_human:
+                # The turn ends here without a turn/completed to claim it.
+                self._turn_usage.pop(own_turn, None)
             if parked_on_human:
                 # Waiting on a person, not on a stalled agent. Say so, and do
                 # NOT synthesize a completion: the turn is genuinely unfinished
@@ -713,7 +716,7 @@ class CodexAppServerTransport:
         self._env_context_pending.discard(thread_id)
         self._env_context_delivered.discard(thread_id)
         self._thread_models.pop(thread_id, None)
-        self._thread_usage.pop(thread_id, None)
+        self._turn_usage.pop(turn_id, None)
         self.effective_sandbox.pop(thread_id, None)
         self.unsubscribe_foreign_mirror(thread_id)
         if not thread_id:
@@ -768,7 +771,7 @@ class CodexAppServerTransport:
             )
         await _maybe_await(restart())
         self._thread_models.clear()
-        self._thread_usage.clear()
+        self._turn_usage.clear()
         self._foreign_sinks.clear()
         self._foreign_direct.clear()
         self._pending_starts.clear()
@@ -875,8 +878,9 @@ class CodexAppServerTransport:
                     self._thread_models[thread_id] = model
         if event_type == "thread/tokenUsage/updated":
             usage = _codex_thread_token_usage(payload.get("tokenUsage"))
-            if usage and thread_id:
-                self._thread_usage[thread_id] = usage
+            turn_id = str(payload.get("turnId", "") or "")
+            if usage and turn_id:
+                self._turn_usage[turn_id] = usage
             return None
         model = self._thread_models.get(thread_id, "") if thread_id else ""
         if event_type == "item/agentMessage/delta":
@@ -889,9 +893,10 @@ class CodexAppServerTransport:
             return tool_event
         item_type = _codex_item_type(payload)
         if event_type == "turn/completed":
+            turn_usage = self._turn_usage.pop(_codex_message_turn_id(event), {})
             payload_out = {
                 "message": str(payload.get("message", "")),
-                "usage": payload.get("usage") or self._thread_usage.get(thread_id, {}),
+                "usage": payload.get("usage") or turn_usage,
                 "status": payload.get("status", "completed"),
             }
             if model:
