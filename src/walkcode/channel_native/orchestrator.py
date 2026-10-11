@@ -489,6 +489,7 @@ class Orchestrator:
             cwd=cwd,
             owner=owner,
         )
+        self._adopt_handle_model(session, handle)
         initial_title = str(binding.capabilities.get("initial_title", "") or "").strip()
         if initial_title:
             session.cached_title = initial_title
@@ -815,12 +816,20 @@ class Orchestrator:
                 error=exc,
             )
             return SubmitResult(False, "resume_failed")
+        self._adopt_handle_model(session, handle)
         return self.sessions.acquire_structured_writer(
             session.session_id,
             transport_kind=session.transport_kind,
             transport_ref={"handle_id": handle.handle_id, **dict(handle.ref)},
             owner=actor,
         )
+
+    @staticmethod
+    def _adopt_handle_model(session: Session, handle: TransportHandle) -> None:
+        # The model is known the moment the handle opens; waiting for the
+        # first reply left the status card at "模型: —" for a whole first turn.
+        if handle.model:
+            session.model = handle.model
 
     def _record_turn_submitted(self, session: Session) -> None:
         session.last_progress_at = self._now()
@@ -2423,6 +2432,7 @@ class Orchestrator:
                 transport_ref={"handle_id": resumed_handle.handle_id, **dict(resumed_handle.ref)},
             )
             updated = self.sessions.get(session.session_id)
+            self._adopt_handle_model(updated, resumed_handle)
             stale_requests = await self._mark_pre_takeover_hitls_stale(
                 updated,
                 through_generation=ctx.generation,

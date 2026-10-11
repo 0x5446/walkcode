@@ -485,6 +485,47 @@ class ChannelNativeCoreContractTests(unittest.TestCase):
         self.assertEqual(updated.lifecycle_state, "IDLE")
         self.assertEqual(updated.last_progress_event, AgentEventType.TURN_COMPLETED)
 
+    def _resume_with_handle_model(self, handle_model: str) -> str:
+        clock = _Clock()
+        sessions = SessionRegistry(now=clock)
+        transport = FakeAgentTransport(
+            "claude_headless",
+            _transport_caps(),
+            scripted_events=[AgentEvent(AgentEventType.TURN_COMPLETED, {"message": "ok"})],
+        )
+        orchestrator = Orchestrator(
+            sessions=sessions,
+            interactions=InteractionStore(now=clock),
+            outbox=DurableOutbox(now=clock),
+            channels={"fake": FakeChannelAdapter("fake", _channel_caps())},
+            transports={"claude_headless": transport},
+            now=clock,
+        )
+        session = asyncio.run(
+            orchestrator.start_session(_binding(), "claude_headless", "/tmp/project", _actor())
+        )
+        session.transport_ref["agent_session_id"] = "agent-session-1"
+        session.model = "model-old"
+        session.lifecycle_state = "ERROR_RECOVERABLE"
+        transport.handle_model = handle_model
+        clock.now += 60.0
+
+        result = asyncio.run(
+            orchestrator.submit_user_input(
+                session.session_id, TurnInput(text="again"), actor=_actor(), generation=session.generation
+            )
+        )
+
+        self.assertTrue(result.accepted)
+        self.assertEqual(transport.call_log, ["resume", "submit_turn"])
+        return sessions.get(session.session_id).model
+
+    def test_writer_resume_adopts_the_model_the_handle_reports(self):
+        self.assertEqual(self._resume_with_handle_model("model-new"), "model-new")
+
+    def test_writer_resume_keeps_the_model_when_the_handle_reports_none(self):
+        self.assertEqual(self._resume_with_handle_model(""), "model-old")
+
     def test_interaction_decision_is_write_once_and_stale_generation_is_rejected(self):
         store = InteractionStore(now=_Clock())
         ctx = store.register_permission(

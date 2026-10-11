@@ -144,16 +144,15 @@ class CodexAppServerTransport:
         # writer reacquisition resumes the same thread over and over, and
         # without this mark every resume would re-inject the preamble.
         self._env_context_delivered: set[str] = set()
-        # Last model seen per thread. thread/start and thread/resume responses
-        # always carry it (a required field); the stream only repeats it on a
-        # settings change (thread/settings/updated, or the legacy
-        # thread_settings_applied / turn_context records), never on
-        # agent_message / turn completion. We cache it here and backfill it
-        # onto the converted events; _record_session_progress then writes
-        # session.model from event.payload["model"]. Lives as long as the
-        # thread (dropped on close/restart, like effective_sandbox), not the
-        # turn: the next turn on a live thread never re-announces the model,
-        # and a drain finishing late would wipe a fresh resume's value.
+        # Model announced on the stream per thread. thread/start and
+        # thread/resume report the model up front (TransportHandle.model);
+        # the stream only repeats it on a settings change
+        # (thread/settings/updated, or the legacy thread_settings_applied /
+        # turn_context records). We cache that here and backfill it onto the
+        # converted events; _record_session_progress then writes session.model
+        # from event.payload["model"]. Lives as long as the thread (dropped on
+        # close/restart, like effective_sandbox), not the turn: a live thread
+        # does not re-announce it, and a drain finishing late must not wipe it.
         self._thread_models: dict[str, str] = {}
         # Last token usage per turn, from thread/tokenUsage/updated. The v2
         # turn/completed notification carries no usage, so without this the
@@ -383,11 +382,6 @@ class CodexAppServerTransport:
                     effective=effective,
                 )
 
-    def _remember_thread_model(self, result: Any, thread_id: str) -> None:
-        model = str(result.get("model", "") or "") if isinstance(result, dict) else ""
-        if model and thread_id:
-            self._thread_models[thread_id] = model
-
     async def launch(self, spec: LaunchSpec) -> TransportHandle:
         params = self._with_sandbox_override(
             {
@@ -400,13 +394,13 @@ class CodexAppServerTransport:
         thread_id = _codex_thread_id(result)
         self._released_threads.discard(thread_id)
         self._apply_effective_sandbox(result, thread_id, method="thread/start")
-        self._remember_thread_model(result, thread_id)
         if self.environment_context and thread_id:
             self._env_context_pending.add(thread_id)
         return TransportHandle(
             handle_id=f"codex-{uuid.uuid4().hex}",
             transport_kind=self.kind,
             ref={"thread_id": thread_id, "cwd": spec.cwd},
+            model=_codex_model(result),
         )
 
     async def resume_thread(self, thread_id: str, *, cwd: str) -> TransportHandle:
@@ -419,13 +413,17 @@ class CodexAppServerTransport:
         # next drain quit on its first batch boundary.
         self._released_threads.discard(resumed)
         self._apply_effective_sandbox(result, resumed, method="thread/resume")
-        self._remember_thread_model(result, resumed)
+        # The response's model (on the handle) is newer than anything the
+        # stream announced before; a stale entry would overwrite it on the
+        # next reply.
+        self._thread_models.pop(resumed, None)
         if self.environment_context and resumed not in self._env_context_delivered:
             self._env_context_pending.add(resumed)
         return TransportHandle(
             handle_id=f"codex-{uuid.uuid4().hex}",
             transport_kind=self.kind,
             ref={"thread_id": resumed, "cwd": cwd},
+            model=_codex_model(result),
         )
 
     async def resume(self, spec: ResumeSpec) -> TransportHandle:
@@ -1663,6 +1661,11 @@ def _codex_thread_token_usage(token_usage: Any) -> dict[str, Any]:
     if window:
         usage["model_context_window"] = window
     return usage
+
+
+def _codex_model(result: Any) -> str:
+    """Model from a thread/start or thread/resume response (a required field)."""
+    return str(result.get("model", "") or "") if isinstance(result, dict) else ""
 
 
 def _codex_thread_id(result: dict[str, Any]) -> str:

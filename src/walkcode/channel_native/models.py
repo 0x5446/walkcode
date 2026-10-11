@@ -252,6 +252,10 @@ class TransportHandle:
     handle_id: str
     transport_kind: str
     ref: dict[str, Any] = field(default_factory=dict)
+    # Model the agent reported when this handle was opened ("" = not
+    # reported). Kept out of ref: ref is the durable resume reference, and a
+    # model persisted there would go stale on the next switch.
+    model: str = ""
 
 
 @dataclass

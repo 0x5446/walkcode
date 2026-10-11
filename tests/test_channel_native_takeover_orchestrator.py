@@ -560,6 +560,7 @@ class TakeoverOrchestratorTests(unittest.TestCase):
             )
         )
         token = _takeover_token(channel)
+        transport.handle_model = "model-new"
 
         first = asyncio.run(
             orchestrator.handle_inbound_event(
@@ -583,6 +584,7 @@ class TakeoverOrchestratorTests(unittest.TestCase):
         self.assertEqual(updated.writer_owner.kind, "orchestrator")
         self.assertEqual(updated.transport_kind, "fake-transport")
         self.assertEqual(updated.generation, 1)
+        self.assertEqual(updated.model, "model-new")
         self.assertEqual([turn.text for turn in transport.submitted_turns], ["run tests"])
         # The thread must end in a terminal state: submitting... followed by
         # the green "message sent" card once submit_turn returns.
