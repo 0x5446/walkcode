@@ -639,6 +639,7 @@ class ChannelNativeRuntime:
         env: dict[str, str] | None = None,
         *,
         lark_api: LarkBotApi | None = None,
+        slack_api: Any | None = None,
         transports: dict[str, AgentTransport] | None = None,
         now=time.time,
     ) -> "ChannelNativeRuntime":
@@ -646,6 +647,7 @@ class ChannelNativeRuntime:
         return cls.from_config(
             ChannelNativeConfig.from_env(source),
             lark_api=lark_api,
+            slack_api=slack_api,
             transports=transports,
             e2e_gates=_describe_e2e_gates(ChannelNativeE2EGates.from_env(source)),
             now=now,
@@ -657,6 +659,7 @@ class ChannelNativeRuntime:
         config: ChannelNativeConfig,
         *,
         lark_api: LarkBotApi | None = None,
+        slack_api: Any | None = None,
         transports: dict[str, AgentTransport] | None = None,
         external_tui_controllers: dict[str, Any] | None = None,
         e2e_gates: dict[str, dict[str, Any]] | None = None,
@@ -664,7 +667,7 @@ class ChannelNativeRuntime:
     ) -> "ChannelNativeRuntime":
         state_store = JsonFileStateStore(config.state_path, now=now)
         state = _load_or_create_state(state_store, now=now)
-        channels = _build_channels(config, lark_api=lark_api)
+        channels = _build_channels(config, lark_api=lark_api, slack_api=slack_api)
         transport_map = transports or _build_transports(config)
         save_state = lambda: state_store.save(state)
         outbox_dispatcher = OutboxDispatcher(
@@ -784,6 +787,34 @@ class ChannelNativeRuntime:
                 "installed": False,
                 "hint": "reinstall walkcode with the lark extra (uv tool install walkcode --with lark-oapi)",
             }
+        return report
+
+    async def diagnose_slack_ingress(self) -> dict[str, Any]:
+        endpoint = self.config.channel
+        if endpoint.kind != "slack":
+            raise ChannelConfigError("Slack channel is not configured for channel-native runtime")
+        channel = self._ingress_channel()
+        report: dict[str, Any] = {
+            "channel": self._describe_channel("slack", endpoint),
+            "allowed_chat_ids": [str(item) for item in endpoint.options.get("allowed_chat_ids", ()) if item],
+            "allowed_sender_ids": [str(item) for item in endpoint.options.get("allowed_sender_ids", ()) if item],
+        }
+        try:
+            data = await channel.api.call("auth.test", {})
+            report["bot"] = {
+                "ok": True,
+                "team": data.get("team", ""),
+                "team_id": data.get("team_id", ""),
+                "bot_user_id": data.get("user_id", ""),
+                "bot_name": data.get("user", ""),
+            }
+        except Exception as exc:
+            report["bot"] = {"ok": False, "reason": f"{type(exc).__name__}: {exc}"}
+        try:
+            data = await asyncio.to_thread(_slack_app_token_self_check, endpoint.credentials.get("app_token", ""))
+            report["socket_mode"] = data
+        except Exception as exc:
+            report["socket_mode"] = {"ok": False, "reason": f"{type(exc).__name__}: {exc}"}
         return report
 
     async def _handle_bot_command(
@@ -1132,7 +1163,9 @@ class ChannelNativeRuntime:
             return inbound
         try:
             items = await channel.fetch_thread_messages(
-                inbound.root_message_id, limit=THREAD_CONTEXT_MESSAGE_LIMIT
+                inbound.root_message_id,
+                limit=THREAD_CONTEXT_MESSAGE_LIMIT,
+                chat_id=inbound.chat_id,
             )
         except Exception as exc:
             _log_degrade(
@@ -1191,9 +1224,24 @@ class ChannelNativeRuntime:
                 is_callback=inbound.callback is not None,
             )
             return SubmitResult(False, BlockedReason.DUPLICATE_INBOUND)
+        if inbound.callback is not None and inbound.sender_id and not self._sender_allowed(inbound.sender_id):
+            # A card button is as powerful as a message: "allow" runs a tool.
+            # Whoever may not talk to the agent may not click for it either.
+            try:
+                await channel.notify_private(inbound, "你不在这个 bot 的白名单里，这次点击没有生效。")
+            except Exception as exc:
+                _log_degrade("unauthorized_click_notice_failed", channel=inbound.channel_kind, error=exc)
+            return SubmitResult(False, BlockedReason.UNAUTHORIZED)
         if inbound.callback is None:
             if not self._sender_allowed(inbound.sender_id):
                 return SubmitResult(False, BlockedReason.UNAUTHORIZED)
+            if not inbound.addressed:
+                # Chatter in a channel thread the bot does not own: it may only
+                # continue a session already bound to this thread.
+                resolution = self.state.sessions.resolve_active_binding(inbound.binding_key())
+                if not (resolution.session_id or resolution.reason):
+                    self._complete_local_inbound(inbound)
+                    return SubmitResult(False, "not_addressed")
             # After the authz gates on purpose: expanding costs an API call,
             # and an unauthorized sender must not be able to spend it.
             inbound = await channel.expand_inbound(inbound)
@@ -3427,6 +3475,8 @@ class ChannelNativeRuntime:
     def _channel_live_ingress(kind: str, endpoint: ChannelEndpointConfig) -> str:
         if kind == "lark":
             return "websocket"
+        if kind == "slack":
+            return "socket_mode"
         return "not_wired"
 
     @staticmethod
@@ -3470,6 +3520,13 @@ def run_native_cli(args) -> None:
                 print(json.dumps(report, indent=2, sort_keys=True))
             else:
                 print(_format_lark_diagnosis(report))
+            return
+        if module == "slack":
+            report = asyncio.run(runtime.diagnose_slack_ingress())
+            if getattr(args, "json", False):
+                print(json.dumps(report, indent=2, sort_keys=True))
+            else:
+                print(_format_slack_diagnosis(report))
             return
         raise ChannelConfigError(f"unknown native debug module: {module}")
     if args.native_command == "hook":
@@ -3585,6 +3642,19 @@ def _ingress_bridge_factory(endpoint: ChannelEndpointConfig, channel: ChannelAda
             )
 
         return build_lark
+    if endpoint.kind == "slack":
+        from .channel_native.slack_live import SlackIngressBridge
+
+        def build_slack(*, loop, queue, persist_event):
+            return SlackIngressBridge(
+                endpoint.credentials,
+                loop=loop,
+                queue=queue,
+                persist_event=persist_event,
+                api=getattr(channel, "api", None),
+            )
+
+        return build_slack
     raise ChannelConfigError(f"no live ingress for channel: {endpoint.kind}")
 
 
@@ -3592,6 +3662,7 @@ def _build_channels(
     config: ChannelNativeConfig,
     *,
     lark_api: LarkBotApi | None = None,
+    slack_api: Any | None = None,
 ) -> dict[str, ChannelAdapter]:
     channels: dict[str, ChannelAdapter] = {}
     endpoint = config.channel
@@ -3607,6 +3678,11 @@ def _build_channels(
             # bridge and ack_callback share the same future map.
             lark_api.ack_registry = ack_registry
         channels[endpoint.kind] = LarkChannelAdapter(lark_api)
+    elif endpoint.kind == "slack":
+        from .channel_native.slack_adapter import SlackChannelAdapter
+        from .channel_native.slack_live import build_slack_live_api
+
+        channels[endpoint.kind] = SlackChannelAdapter(slack_api or build_slack_live_api(endpoint.credentials))
     return channels
 
 
@@ -4399,6 +4475,37 @@ def _lark_tenant_token_self_check(app_id: str, app_secret: str, domain: str) -> 
     if code != 0:
         return {"ok": False, "reason": f"lark_code_{code}: {payload.get('msg', '')}"}
     return {"ok": True, "expire_in": payload.get("expire", 0)}
+
+
+def _slack_app_token_self_check(app_token: str) -> dict[str, Any]:
+    """Ask Slack for a Socket Mode URL without connecting to it.
+
+    apps.connections.open is the exact call the ingress bridge makes first;
+    success proves the app token, its connections:write scope, and that
+    Socket Mode is enabled for the app.
+    """
+    from slack_sdk import WebClient
+    from slack_sdk.errors import SlackApiError
+
+    try:
+        WebClient(token=app_token).apps_connections_open(app_token=app_token)
+    except SlackApiError as exc:
+        return {"ok": False, "reason": str((exc.response.data or {}).get("error", "") or exc)}
+    return {"ok": True}
+
+
+def _format_slack_diagnosis(report: dict[str, Any]) -> str:
+    bot = report.get("bot", {})
+    socket = report.get("socket_mode", {})
+    lines = [
+        "slack ingress diagnosis",
+        f"  bot: {'ok' if bot.get('ok') else 'FAILED'} "
+        + (f"team={bot.get('team')} ({bot.get('team_id')}) bot={bot.get('bot_name')} ({bot.get('bot_user_id')})" if bot.get("ok") else str(bot.get("reason", ""))),
+        f"  socket_mode: {'ok' if socket.get('ok') else 'FAILED ' + str(socket.get('reason', ''))}",
+        f"  allowed_chat_ids: {', '.join(report.get('allowed_chat_ids') or []) or '(any)'}",
+        f"  allowed_sender_ids: {', '.join(report.get('allowed_sender_ids') or []) or '(none)'}",
+    ]
+    return "\n".join(lines)
 
 
 def _format_lark_diagnosis(report: dict[str, Any]) -> str:

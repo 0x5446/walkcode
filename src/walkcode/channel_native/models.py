@@ -214,6 +214,10 @@ class InboundEvent:
     raw: dict[str, Any] = field(default_factory=dict)
     # 渠道侧消息产生时刻（秒，飞书服务端时钟）；0=未知（回调等无此概念）。
     created_at: float = 0.0
+    # False when the message was not addressed to the bot (a Slack channel
+    # message without an @-mention). Such a message only continues a session
+    # that already owns its thread; it never starts one (ADR 0070).
+    addressed: bool = True
 
     def binding_key(self) -> BindingKey:
         return (

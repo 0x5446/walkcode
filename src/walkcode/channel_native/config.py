@@ -158,6 +158,11 @@ class ChannelNativeE2EGates:
             flag="WALKCODE_E2E_LARK",
             required_env=("LARK_APP_ID", "LARK_APP_SECRET", "WALKCODE_E2E_LARK_CHAT_ID"),
         ),
+        "slack": E2EGateSpec(
+            name="slack",
+            flag="WALKCODE_E2E_SLACK",
+            required_env=("SLACK_BOT_TOKEN", "SLACK_APP_TOKEN", "WALKCODE_E2E_SLACK_CHANNEL_ID"),
+        ),
         "claude_headless": E2EGateSpec(
             name="claude_headless",
             flag="WALKCODE_E2E_CLAUDE_HEADLESS",
@@ -469,16 +474,53 @@ def _lark_config_from_env(source: Any) -> ChannelEndpointConfig:
     )
 
 
+def _slack_config_from_env(source: Any) -> ChannelEndpointConfig:
+    bot_token = str(source.get("SLACK_BOT_TOKEN", "") or "").strip()
+    app_token = str(source.get("SLACK_APP_TOKEN", "") or "").strip()
+    missing = [key for key, value in (("SLACK_BOT_TOKEN", bot_token), ("SLACK_APP_TOKEN", app_token)) if not value]
+    if missing:
+        raise ChannelConfigError(f"missing {', '.join(missing)} for slack channel")
+    if not bot_token.startswith("xoxb-"):
+        raise ChannelConfigError("SLACK_BOT_TOKEN must be a bot token (xoxb-...)")
+    if not app_token.startswith("xapp-"):
+        raise ChannelConfigError("SLACK_APP_TOKEN must be an app-level token (xapp-...) with connections:write")
+    allowed_sender_ids = tuple(_split_csv(source.get("SLACK_ALLOWED_USER_IDS", "")))
+    if not allowed_sender_ids:
+        # Unlike a Lark bot, a Slack app is visible to the whole workspace and
+        # anyone can DM it, so "empty allowlist = everyone" is not a safe
+        # bootstrap here: the agent runs on this machine with its credentials.
+        raise ChannelConfigError(
+            "SLACK_ALLOWED_USER_IDS is required for the slack channel "
+            "(comma-separated Slack user ids, e.g. U0123ABCD)"
+        )
+    allowed_chat_ids = tuple(_split_csv(source.get("SLACK_ALLOWED_CHANNEL_IDS", "")))
+    if not allowed_chat_ids:
+        e2e_channel = str(source.get("WALKCODE_E2E_SLACK_CHANNEL_ID", "") or "").strip()
+        if e2e_channel:
+            allowed_chat_ids = (e2e_channel,)
+    return ChannelEndpointConfig(
+        kind="slack",
+        credentials={"bot_token": bot_token, "app_token": app_token},
+        options={
+            "allowed_chat_ids": allowed_chat_ids,
+            "allowed_sender_ids": allowed_sender_ids,
+            "tui_chat_id": str(source.get("WALKCODE_SLACK_TUI_CHANNEL_ID", "") or "").strip(),
+        },
+    )
+
+
 # One config parser per channel (ADR 0070). Each parser owns its channel's env
 # keys and normalizes them onto the shared option names: allowed_chat_ids,
 # allowed_sender_ids, tui_chat_id.
 _CHANNEL_CONFIG_PARSERS = {
     "lark": _lark_config_from_env,
+    "slack": _slack_config_from_env,
 }
 
 # (explicit TUI chat env key, chat allowlist env key) per channel, for errors.
 _CHANNEL_TUI_CHAT_ENV = {
     "lark": ("WALKCODE_LARK_TUI_CHAT_ID", "LARK_ALLOWED_CHAT_IDS"),
+    "slack": ("WALKCODE_SLACK_TUI_CHANNEL_ID", "SLACK_ALLOWED_CHANNEL_IDS"),
 }
 
 
@@ -497,6 +539,7 @@ Interaction context (important): The user is talking to you through {channel} ch
 
 _CHANNEL_DISPLAY_NAMES = {
     "lark": "Feishu (Lark)",
+    "slack": "Slack",
 }
 
 

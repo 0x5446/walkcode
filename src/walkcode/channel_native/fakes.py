@@ -44,6 +44,7 @@ class FakeChannelAdapter:
         self.acknowledged_callbacks: list[str] = []
         self.deleted_messages: list[dict[str, Any]] = []
         self.reactions: list[dict[str, Any]] = []
+        self.private_notices: list[dict[str, Any]] = []
 
     def capabilities(self) -> ChannelCapabilities:
         return self._capabilities
@@ -55,7 +56,12 @@ class FakeChannelAdapter:
     async def expand_inbound(self, inbound: InboundEvent) -> InboundEvent:
         return inbound
 
-    async def fetch_thread_messages(self, root_message_id: str, *, limit: int) -> list[dict[str, Any]]:
+    async def notify_private(self, inbound: InboundEvent, text: str) -> None:
+        self.private_notices.append({"sender_id": inbound.sender_id, "text": text})
+
+    async def fetch_thread_messages(
+        self, root_message_id: str, *, limit: int, chat_id: str = ""
+    ) -> list[dict[str, Any]]:
         return []
 
     def render_message_log(self, items: list[dict[str, Any]], *, skip_message_id: str = "") -> str:

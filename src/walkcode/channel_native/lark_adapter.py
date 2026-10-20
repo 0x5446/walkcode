@@ -65,6 +65,11 @@ class LarkChannelAdapter:
         )
         return bool(result.get("ok", True)) if isinstance(result, dict) else True
 
+    async def notify_private(self, inbound: InboundEvent, text: str) -> None:
+        # The card callback's toast is the only private surface, and it is
+        # answered before the runtime decides; nothing to send here.
+        return None
+
     async def expand_inbound(self, inbound: InboundEvent) -> InboundEvent:
         """Replace a forwarded chat log's placeholder title with its content.
 
@@ -297,7 +302,7 @@ class LarkChannelAdapter:
         return [item for item in items if isinstance(item, dict)]
 
     async def fetch_thread_messages(
-        self, root_message_id: str, *, limit: int = 50
+        self, root_message_id: str, *, limit: int = 50, chat_id: str = ""
     ) -> list[dict[str, Any]]:
         """Read a topic's replies oldest-first, capped at `limit` messages."""
         if not str(root_message_id or "").strip():

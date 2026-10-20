@@ -7,7 +7,7 @@ class ChannelNativeE2EGateTests(unittest.TestCase):
     def test_all_gates_are_closed_by_default_with_actionable_reasons(self):
         gates = ChannelNativeE2EGates.from_env({})
 
-        self.assertEqual(set(gates.all()), {"lark", "claude_headless", "codex_app_server"})
+        self.assertEqual(set(gates.all()), {"lark", "slack", "claude_headless", "codex_app_server"})
         for name in ("lark", "claude_headless", "codex_app_server"):
             result = gates.evaluate(name)
             self.assertFalse(result.enabled)

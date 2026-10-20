@@ -11,12 +11,12 @@ WalkCode V3 是 channel-native 的 Coding Agent runtime。它把 IM 当成一等
 ```
 
 - Profile 使用 `WALKCODE_PROFILE=work|personal` 命名实例，派生默认 state 路径和 launchd label；每个 profile 通过 `WALKCODE_CLAUDE_CONFIG_DIR` / `WALKCODE_CODEX_HOME` 完全隔离 agent 的凭证与配置（codex 每个 profile 一个独立 app-server daemon）。
-- Channel 固定为 `WALKCODE_CHANNEL=lark`（飞书/Lark 是唯一渠道；Telegram 已于 ADR 0069 删除，设成 `telegram` 会直接报配置错误）。
+- Channel 二选一：`WALKCODE_CHANNEL=lark`（飞书/Lark）或 `slack`（ADR 0070，部署见 [docs/slack-profile-deploy.md](docs/slack-profile-deploy.md)）。Telegram 已于 ADR 0069 删除，设成 `telegram` 会直接报配置错误。
 - Coding Agent 使用 `WALKCODE_AGENT=claude|codex` 显式绑定。
 - 显式设置 `WALKCODE_ENV_FILE` 时，该 env 文件里的身份优先；hook 命令必须显式携带 `WALKCODE_ENV_FILE`（无隐式默认）。
 - Claude Code 和 Codex 必须使用两个 bot、两个 env、两个 state、两个 runtime。
 - 同一个 bot 里不支持 `/claude`、`/codex` 切 agent；这些命令会被拒绝。
-- **Lark/飞书是唯一渠道**：同一个 adapter 通过 `LARK_OPENAPI_DOMAIN` 同时支持公司飞书（open.feishu.cn）和 Lark（open.larksuite.com）；会话按话题 reply-chain 放置，卡片体系移植自 V2 已验证的飞书 UI（权限三按钮卡、AskUserQuestion 三模式、健康卡）。
+- **飞书/Lark**：同一个 adapter 通过 `LARK_OPENAPI_DOMAIN` 同时支持公司飞书（open.feishu.cn）和 Lark（open.larksuite.com）；会话按话题 reply-chain 放置，卡片体系移植自 V2 已验证的飞书 UI（权限三按钮卡、AskUserQuestion 三模式、健康卡）。
 
 标准本地部署是 {work, personal} × {claude, codex} 的实例矩阵（可为不同模型路由
 加更多 profile），见 [docs/lark-profile-deploy.md](docs/lark-profile-deploy.md)。
