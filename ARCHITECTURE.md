@@ -76,8 +76,9 @@ the whole runtime.
 
 ## Channels
 
-Lark/Feishu is the only channel (ADR 0044; Telegram was removed in ADR 0069
-and `WALKCODE_CHANNEL=telegram` is a config error). One
+Two channels exist, one per runtime: Lark/Feishu (ADR 0044) and Slack
+(ADR 0070, see "Slack" below). Telegram was removed in ADR 0069 and
+`WALKCODE_CHANNEL=telegram` is a config error. One
 `LarkChannelAdapter` serves both tenants; `LARK_OPENAPI_DOMAIN` selects
 open.feishu.cn (work) or open.larksuite.com (personal). Ingress is the
 lark-oapi WebSocket client bridged from its callback thread into the asyncio
@@ -149,6 +150,29 @@ Both reads require the bot to hold `im:message` or `im:message:readonly`
 chat. Without them the fetch raises and the inbound degrades to exactly what
 shipped before — the placeholder title, or the bare mention — so a missing
 scope costs context, never the turn.
+
+### Slack
+
+`SlackChannelAdapter` (`slack_adapter.py`), `slack_live.py` (Web API client
+with error classification, Socket Mode ingress bridge) and `slack_blocks.py`
+(Block Kit / `markdown` block renderers) mirror the three Lark modules. A
+Slack thread is a session, rooted on a bot-posted status card exactly like a
+Lark topic; binding identity is `team_id / channel / thread ts`. Differences
+the core does not see:
+
+- ingress filters the bot's own messages, edits, other organizations and
+  channel chatter outside threads before the inbox write, then acks the
+  envelope; `message` and `app_mention` for one post share the event id
+  `slack:<team>:<channel>:<ts>`, so the ledger drops the second;
+- a thread reply without an @-mention is `addressed=False`: it continues a
+  session bound to that thread and is otherwise ignored;
+- `!cmd` becomes `/cmd` in `parse_event`;
+- prose is sent as `markdown` blocks, split at 12k characters on paragraph
+  boundaries with code fences re-balanced — never truncated;
+- `chat.postMessage` has no idempotency key, so a send whose outcome is
+  uncertain (timeout, 5xx) is looked up in the thread before it is retried;
+- the status card is mirrored onto Slack's native agent session
+  (`agents.sessions.setStatus`), best effort.
 
 ## Session titles
 

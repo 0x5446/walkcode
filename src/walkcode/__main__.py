@@ -124,6 +124,8 @@ def main() -> None:
     dbgsub = dbg.add_subparsers(dest="debug_module", required=True)
     dlk = dbgsub.add_parser("lark", help="Check Lark credentials, domain, and SDK availability")
     dlk.add_argument("--json", action="store_true", help="Print machine-readable JSON")
+    dsl = dbgsub.add_parser("slack", help="Check Slack tokens, bot identity, and SDK availability")
+    dsl.add_argument("--json", action="store_true", help="Print machine-readable JSON")
 
     nsub.add_parser("serve", help="Run channel-native V3 runtime")
 

@@ -97,14 +97,25 @@ scripts; orchestration and gates live in the skill.
   unrelated switch is how `WALKCODE_CLAUDE_DAEMON_MODE=off` used to kill every TUI
   card silently. The Claude daemon mode is gone; its env keys are ignored, not
   rejected, because deployed env files still set them.
-- **Lark/Feishu is the only channel (ADR 0069)**: the Telegram channel is gone —
+- **Two channels, one per runtime (ADR 0070)**: `WALKCODE_CHANNEL=lark` or `slack`.
+  Shared code (runtime, orchestrator, stores) never tests `channel_kind == ...`;
+  channel differences live on the adapter (`display_name`, `locale`,
+  `account_id`, `ack_reactions`, `expand_inbound`, `notify_private`,
+  `ChannelCapabilities.topic_sessions`) or in the per-channel dispatch points
+  (`_CHANNEL_CONFIG_PARSERS`, `_build_channels`, `_ingress_bridge_factory`,
+  `native debug <kind>`). Slack specifics: `!cmd` is rewritten to `/cmd` in
+  `parse_event` (Slack intercepts `/` and custom slash commands cannot run in
+  threads); `SLACK_ALLOWED_USER_IDS` is mandatory; Socket Mode envelopes are
+  persisted before `envelope_id` is acked.
+- **Telegram stays retired (ADR 0069)**: the Telegram channel is gone —
   adapter, polling, config, CLI flags (`native debug telegram`, `serve --once /
   --poll-timeout / --limit`), E2E gate and deploy recipe. `WALKCODE_CHANNEL=telegram`
   must keep failing with a config error that names ADR 0069, and state files that
   still hold `channel_kind: "telegram"` bindings must keep loading. The command and
   maintenance helpers the Lark path shares were renamed to neutral names
   (`_handle_bot_command`, `_parse_bot_command`, `_start_maintenance_tasks`, …);
-  keep new shared code channel-neutral and put Lark specifics behind `lark` names.
+  keep new shared code channel-neutral and put Lark/Slack specifics behind
+  `lark` / `slack` names.
 - Legacy remnants are blockers for upgrade and real E2E: old LaunchAgents,
   `walkcode hook` configs, shell wrapper source lines, and `FEISHU_*` env must be
   cleaned first.

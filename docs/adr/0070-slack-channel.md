@@ -2,7 +2,7 @@
 
 Date: 2026-10-20
 
-Status: Proposed
+Status: Accepted; 第 0 期已发布（v0.14.44），第 1 期实现中
 
 修订 ADR 0069 第 3 条（"飞书是唯一渠道"改为"飞书和 Slack 两个渠道，一个实例仍只跑一个"）。
 ADR 0044 的会话放置规则（一个话题一个会话，根消息是状态卡）原样沿用到 Slack。
@@ -207,3 +207,26 @@ WalkCode 命令、未知命令转交 agent、`//` 转义——原样复用，核
 - https://cursor.com/docs/integrations/slack
 - https://github.com/vercel/chat
 - https://github.com/openclaw/openclaw/tree/main/extensions/slack/src
+
+## 实现记录（第 1 期，2026-10-20）
+
+与上文设计的出入，以这里为准：
+
+1. **用户白名单必填**：`SLACK_ALLOWED_USER_IDS` 为空时拒绝启动。Slack app 对整个工作区
+   可见、谁都能私信，"白名单留空 = 所有人"的引导方式不安全。
+2. **按钮点击也过发送者白名单**（共享代码，飞书同样生效）：名单外的人点卡片，回调被拒，
+   Slack 用 `chat.postEphemeral` 只给他看提示，飞书无提示。飞书白名单为空时行为不变。
+   这是一处有意的收紧：按钮能批准工具执行，和发消息同等权力。
+3. **外部组织**：Slack Connect 里其他组织的人的消息和点击在入站桥直接丢弃（不落盘）。
+4. **频道里的非 @ 消息**：`InboundEvent.addressed=False`，只能续接已绑定该 thread 的会话，
+   否则静默丢弃并记账；飞书永远是 `True`，行为不变。
+5. **Stop 按钮、Slack 内改标题暂不接**：核心没有"中断当前回合"的渠道入口，
+   `agent_session_stopped` / `agent_session_title_changed` 订阅保留但入站桥不落盘。
+   会话原生状态（processing/suspended/active/closed）和标题已同步。
+6. **"可能已生效"的发送**：没有用 `metadata` 幂等键（不想让每条消息多带元数据），
+   改为在适配器内存里记住超时/5xx 的发送，重试前到 thread（或频道最近 20 条）里找同文本的
+   bot 消息，找到就直接用它的 ts。进程重启后这段记忆丢失，极端情况下可能重复一条。
+7. **三个 app**（`docs/slack-profile-deploy.md`）：`cc_tf`（订阅 Claude Code）、
+   `ccp_tf`（llm-proxy Claude Code）、`cx_tf`（Codex），各对应一个飞书实例并沿用其
+   agent 配置目录；profile 名 `<飞书 profile>-slack`。
+
