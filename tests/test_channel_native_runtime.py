@@ -149,8 +149,8 @@ class _IdleBridge:
 
 
 async def _serve_lark_until(runtime, predicate, *, attempts=200, interval=0.01) -> bool:
-    """Run serve_lark_ws with idle ingress until ``predicate()`` holds."""
-    task = asyncio.create_task(runtime.serve_lark_ws(bridge_factory=lambda **_: _IdleBridge()))
+    """Run serve_channel with idle ingress until ``predicate()`` holds."""
+    task = asyncio.create_task(runtime.serve_channel(bridge_factory=lambda **_: _IdleBridge()))
     try:
         for _ in range(attempts):
             if predicate():
@@ -197,7 +197,7 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
                 transports={"claude_headless": transport},
             )
 
-            result = asyncio.run(runtime.process_lark_event(_lark_message()))
+            result = asyncio.run(runtime.process_channel_event(_lark_message()))
 
             self.assertTrue(result.accepted)
             self.assertEqual([turn.text for turn in transport.submitted_turns], ["ship it"])
@@ -235,7 +235,7 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
                 cfg, lark_api=api, transports={"claude_headless": transport}
             )
 
-            result = asyncio.run(runtime.process_lark_event(_lark_file_message()))
+            result = asyncio.run(runtime.process_channel_event(_lark_file_message()))
 
             self.assertFalse(result.accepted)
             self.assertEqual(result.reason, "attachment_download_failed")
@@ -279,7 +279,7 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
                 cfg, lark_api=api, transports={"claude_headless": transport}
             )
 
-            result = asyncio.run(runtime.process_lark_event(_lark_file_message()))
+            result = asyncio.run(runtime.process_channel_event(_lark_file_message()))
 
             self.assertTrue(result.accepted)
             methods = [m for m, _ in api.calls]
@@ -318,7 +318,7 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
                 transports={"claude_headless": claude, "codex_app_server": codex},
             )
 
-            result = asyncio.run(runtime.process_lark_event(_lark_message(10, text="selected agent")))
+            result = asyncio.run(runtime.process_channel_event(_lark_message(10, text="selected agent")))
 
             self.assertTrue(result.accepted)
             self.assertEqual(claude.submitted_turns, [])
@@ -349,7 +349,7 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
                 transports={"claude_headless": transport},
             )
 
-            result = asyncio.run(runtime.process_lark_event(_lark_message(10, text="")))
+            result = asyncio.run(runtime.process_channel_event(_lark_message(10, text="")))
 
             self.assertTrue(result.accepted)
             self.assertEqual(result.reason, "empty_message_ignored")
@@ -379,9 +379,9 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
                 transports={"claude_headless": transport},
             )
 
-            first = asyncio.run(runtime.process_lark_event(_lark_message(10, text="ship it")))
+            first = asyncio.run(runtime.process_channel_event(_lark_message(10, text="ship it")))
             result = asyncio.run(
-                runtime.process_lark_event(
+                runtime.process_channel_event(
                     _lark_message(11, text="/status", root_id=_first_card(api))
                 )
             )
@@ -417,14 +417,14 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
                 transports={"claude_headless": transport},
             )
 
-            asyncio.run(runtime.process_lark_event(_lark_message(10, text="ship it")))
+            asyncio.run(runtime.process_channel_event(_lark_message(10, text="ship it")))
             _settle_session(runtime)
             session_id = runtime.state.sessions.list_sessions(channel_kind="lark")[0].session_id
             for state in ("ACTIVE", "WAITING_PERMISSION", "WAITING_USER"):
                 with self.subTest(state=state):
                     runtime.state.sessions.get(session_id).lifecycle_state = state
                     asyncio.run(
-                        runtime.process_lark_event(
+                        runtime.process_channel_event(
                             _lark_message(11, text="/reload", root_id=_first_card(api))
                         )
                     )
@@ -457,10 +457,10 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
                 transports={"claude_headless": transport},
             )
 
-            asyncio.run(runtime.process_lark_event(_lark_message(10, text="ship it")))
+            asyncio.run(runtime.process_channel_event(_lark_message(10, text="ship it")))
             _settle_session(runtime, resume_ref=False)
             asyncio.run(
-                runtime.process_lark_event(
+                runtime.process_channel_event(
                     _lark_message(11, text="/reload", root_id=_first_card(api))
                 )
             )
@@ -497,10 +497,10 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
                 transports={"claude_headless": transport},
             )
 
-            asyncio.run(runtime.process_lark_event(_lark_message(10, text="ship it")))
+            asyncio.run(runtime.process_channel_event(_lark_message(10, text="ship it")))
             _settle_session(runtime)
             result = asyncio.run(
-                runtime.process_lark_event(
+                runtime.process_channel_event(
                     _lark_message(11, text="/reload", root_id=_first_card(api))
                 )
             )
@@ -538,16 +538,16 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
                 transports={"claude_headless": transport},
             )
 
-            asyncio.run(runtime.process_lark_event(_lark_message(10, text="ship it")))
+            asyncio.run(runtime.process_channel_event(_lark_message(10, text="ship it")))
             _settle_session(runtime)
             before = runtime.state.sessions.list_sessions(channel_kind="lark")[0].session_id
             asyncio.run(
-                runtime.process_lark_event(
+                runtime.process_channel_event(
                     _lark_message(11, text="/reload", root_id=_first_card(api))
                 )
             )
             after_reload = asyncio.run(
-                runtime.process_lark_event(
+                runtime.process_channel_event(
                     _lark_message(12, text="carry on", root_id=_first_card(api))
                 )
             )
@@ -605,7 +605,7 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
             )
 
             result = asyncio.run(
-                runtime.process_lark_event(
+                runtime.process_channel_event(
                     _lark_message(10, text="/reload", root_id="om_tui_root")
                 )
             )
@@ -636,7 +636,7 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
             )
 
             result = asyncio.run(
-                runtime.process_lark_event(_lark_message(10, text="/reload"))
+                runtime.process_channel_event(_lark_message(10, text="/reload"))
             )
 
             self.assertTrue(result.accepted)
@@ -677,9 +677,9 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
                 transports={"codex_app_server": transport},
             )
 
-            asyncio.run(runtime.process_lark_event(_lark_message(10, text="start")))
+            asyncio.run(runtime.process_channel_event(_lark_message(10, text="start")))
             result = asyncio.run(
-                runtime.process_lark_event(
+                runtime.process_channel_event(
                     _lark_message(11, text="/model gpt-5", root_id=_first_card(api))
                 )
             )
@@ -726,9 +726,9 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
                 transports={"claude_headless": transport},
             )
 
-            asyncio.run(runtime.process_lark_event(_lark_message(10, text="start")))
+            asyncio.run(runtime.process_channel_event(_lark_message(10, text="start")))
             result = asyncio.run(
-                runtime.process_lark_event(
+                runtime.process_channel_event(
                     _lark_message(11, text="/model", root_id=_first_card(api))
                 )
             )
@@ -809,9 +809,9 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
                 transports={"codex_app_server": transport},
             )
 
-            asyncio.run(runtime.process_lark_event(_lark_message(10, text="start")))
+            asyncio.run(runtime.process_channel_event(_lark_message(10, text="start")))
             result = asyncio.run(
-                runtime.process_lark_event(
+                runtime.process_channel_event(
                     _lark_message(11, text="/model", root_id=_first_card(api))
                 )
             )
@@ -844,7 +844,7 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
                 transports={"claude_headless": transport},
             )
 
-            result = asyncio.run(runtime.process_lark_event(_lark_message(10, text="/codex")))
+            result = asyncio.run(runtime.process_channel_event(_lark_message(10, text="/codex")))
 
             self.assertTrue(result.accepted)
             self.assertEqual(result.reason, "agent_selector_rejected")
@@ -874,10 +874,10 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
                 transports={"claude_headless": transport},
             )
 
-            result = asyncio.run(runtime.process_lark_event(_lark_message(10, text="/compact")))
+            result = asyncio.run(runtime.process_channel_event(_lark_message(10, text="/compact")))
 
             self.assertTrue(result.accepted)
-            self.assertEqual(result.reason, "lark_unknown_slash_command")
+            self.assertEqual(result.reason, "unknown_slash_command")
             self.assertEqual(transport.submitted_turns, [])
             sent = _sent(api)
             self.assertIn("已有会话话题", sent[-1]["text"])
@@ -902,9 +902,9 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
                 transports={"claude_headless": transport},
             )
 
-            asyncio.run(runtime.process_lark_event(_lark_message(10, text="start")))
+            asyncio.run(runtime.process_channel_event(_lark_message(10, text="start")))
             result = asyncio.run(
-                runtime.process_lark_event(
+                runtime.process_channel_event(
                     _lark_message(11, text="/compact", root_id=_first_card(api))
                 )
             )
@@ -932,9 +932,9 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
                 transports={"claude_headless": transport},
             )
 
-            asyncio.run(runtime.process_lark_event(_lark_message(10, text="start")))
+            asyncio.run(runtime.process_channel_event(_lark_message(10, text="start")))
             result = asyncio.run(
-                runtime.process_lark_event(
+                runtime.process_channel_event(
                     _lark_message(11, text="/add_dir /tmp/extra", root_id=_first_card(api))
                 )
             )
@@ -1369,7 +1369,7 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
             clock.now += 31.0
 
             result = asyncio.run(
-                runtime.process_lark_event(_lark_message(41, text="follow up", root_id="om_root"))
+                runtime.process_channel_event(_lark_message(41, text="follow up", root_id="om_root"))
             )
 
             self.assertTrue(result.accepted)
@@ -1421,7 +1421,7 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
             # sweep skips it.
             runtime._orphan_sweep_done = True
 
-            result = asyncio.run(runtime.process_lark_event(_lark_message(41, root_id="om_root")))
+            result = asyncio.run(runtime.process_channel_event(_lark_message(41, root_id="om_root")))
 
             self.assertTrue(result.accepted)
             self.assertEqual([turn.text for turn in transport.submitted_turns], ["ship it"])
@@ -2850,7 +2850,7 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
             )
 
         class _HealHost:
-            _heal_rootless_lark_tui_binding = ChannelNativeRuntime._heal_rootless_lark_tui_binding
+            _heal_rootless_tui_binding = ChannelNativeRuntime._heal_rootless_tui_binding
 
         class _Cfg:
             agent = "claude"
@@ -2898,7 +2898,7 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
         rootless_key = session.channel_binding.key()
         registry = _register(session)
         host.state = SimpleNamespace(sessions=registry)
-        self.assertEqual(asyncio.run(host._heal_rootless_lark_tui_binding(session)), "healed")
+        self.assertEqual(asyncio.run(host._heal_rootless_tui_binding(session)), "healed")
         healed_binding = registry.get(session.session_id).channel_binding
         self.assertEqual(healed_binding.root_message_id, "msg-1")
         self.assertEqual(healed_binding.thread_id, "msg-1")
@@ -2915,10 +2915,10 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
         self.assertEqual(notice.get("type"), "health")
         self.assertIn("TUI", notice.get("title", ""))
         # Already-rooted binding is left alone.
-        self.assertEqual(asyncio.run(host._heal_rootless_lark_tui_binding(session)), "")
+        self.assertEqual(asyncio.run(host._heal_rootless_tui_binding(session)), "")
         # Stopped sessions never send heal notices for dead threads.
         self.assertEqual(
-            asyncio.run(host._heal_rootless_lark_tui_binding(_rootless_session(status="stopped"))), ""
+            asyncio.run(host._heal_rootless_tui_binding(_rootless_session(status="stopped"))), ""
         )
 
         # A failing channel reports "retry" and leaves the binding rootless.
@@ -2929,7 +2929,7 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
         host.channels = {"lark": _FailingChannel("lark", _channel_caps())}
         broken = _rootless_session()
         host.state = SimpleNamespace(sessions=_register(broken))
-        self.assertEqual(asyncio.run(host._heal_rootless_lark_tui_binding(broken)), "retry")
+        self.assertEqual(asyncio.run(host._heal_rootless_tui_binding(broken)), "retry")
         self.assertEqual(broken.channel_binding.root_message_id, "")
 
         # A permanent failure (bot not in chat, monthly quota spent) gives up
@@ -2946,11 +2946,11 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
         host.channels = {"lark": _RejectingChannel("lark", _channel_caps())}
         rejected = _rootless_session()
         host.state = SimpleNamespace(sessions=_register(rejected))
-        self.assertEqual(asyncio.run(host._heal_rootless_lark_tui_binding(rejected)), "")
+        self.assertEqual(asyncio.run(host._heal_rootless_tui_binding(rejected)), "")
         self.assertEqual(rejected.channel_binding.root_message_id, "")
         # Remembered: another session's transient failure keeps the load
         # pass retrying, and this one must not be re-sent on those ticks.
-        self.assertEqual(asyncio.run(host._heal_rootless_lark_tui_binding(rejected)), "")
+        self.assertEqual(asyncio.run(host._heal_rootless_tui_binding(rejected)), "")
         self.assertEqual(len(sends), 1)
 
     def test_rootless_heal_send_failure_keeps_load_pass_retryable(self):
@@ -3007,7 +3007,7 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
             _refresh_loaded_tui_observed_bindings = (
                 ChannelNativeRuntime._refresh_loaded_tui_observed_bindings
             )
-            _heal_rootless_lark_tui_binding = ChannelNativeRuntime._heal_rootless_lark_tui_binding
+            _heal_rootless_tui_binding = ChannelNativeRuntime._heal_rootless_tui_binding
             _ensure_tui_observed_binding_capabilities = staticmethod(
                 ChannelNativeRuntime._ensure_tui_observed_binding_capabilities
             )
@@ -3028,6 +3028,7 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
 
         class _Cfg:
             agent = "claude"
+            channel = SimpleNamespace(kind="lark")
 
         class _Orch:
             async def refresh_session_status_card(self, session):
@@ -5178,13 +5179,13 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
                     )
                 )
                 blocked = asyncio.run(
-                    runtime.process_lark_event(
+                    runtime.process_channel_event(
                         _lark_message(50, text="please take over", root_id="om_root")
                     )
                 )
                 take_over_token = _latest_callback_token(api, "Take over and send")
                 confirmed = asyncio.run(
-                    runtime.process_lark_event(
+                    runtime.process_channel_event(
                         _lark_callback(51, token=take_over_token, root_id="om_root")
                     )
                 )
@@ -5577,7 +5578,7 @@ class OrphanHeadlessSweepTests(unittest.TestCase):
                 lark_api=api,
                 transports={"claude_headless": transport},
             )
-            result = asyncio.run(runtime.process_lark_event(_lark_message()))
+            result = asyncio.run(runtime.process_channel_event(_lark_message()))
             self.assertTrue(result.accepted)
             session = next(runtime.state.sessions.iter_sessions())
             self.assertEqual(session.status, "running")
@@ -5890,9 +5891,9 @@ class CodexSandboxConfigTests(unittest.TestCase):
             return _CEC(kind="lark", credentials={}, options=options)
 
         self.assertFalse(_detect(endpoint()))
-        self.assertFalse(_detect(endpoint(allowed_chat_ids=(), allowed_open_ids=())))
+        self.assertFalse(_detect(endpoint(allowed_chat_ids=(), allowed_sender_ids=())))
         self.assertTrue(_detect(endpoint(allowed_chat_ids=("oc_1",))))
-        self.assertTrue(_detect(endpoint(allowed_open_ids=("ou_1",))))
+        self.assertTrue(_detect(endpoint(allowed_sender_ids=("ou_1",))))
 
 
 class TuiHookToolEventDedupKeyTests(unittest.TestCase):

@@ -785,7 +785,7 @@ class BridgeBypassAndStaleWorkerTests(PermissionBridgeOrchestratorTests):
         async def scenario():
             transport, channel, orch = self._build(_client_class())
             # Pin the pool to one reaction so the assertion is deterministic.
-            orch._ACK_REACTIONS = {**Orchestrator._ACK_REACTIONS, "lark": ("👍",)}
+            channel.ack_reactions = ("👍",)
             owner = ActorRef("lark", "owner", "Owner")
             binding = ChannelBinding("lark", "bot", "chat", "topic", "root")
             session = await orch.start_session(binding, "claude_headless", "/tmp/project", owner)

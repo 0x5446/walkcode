@@ -43,7 +43,7 @@ class _FakeRuntime:
             "cwd": "/tmp/project",
         }
 
-    async def serve_lark_ws(self):
+    async def serve_channel(self):
         self.served.append("lark_ws")
 
     async def process_tui_hook(self, *, hook_type, payload, agent=""):
@@ -79,7 +79,7 @@ class ChannelNativeCliTests(unittest.TestCase):
             main.main()
 
         self.assertEqual(runtime.served, ["lark_ws"])
-        self.assertIn("listening via Lark WebSocket", stdout.getvalue())
+        self.assertIn("listening via lark websocket", stdout.getvalue())
 
     def test_native_serve_rejects_retired_polling_flags(self):
         for flag in (["--once"], ["--poll-timeout", "1"], ["--limit", "1"]):

@@ -170,7 +170,13 @@ The throttle watermark (`Session.title_refreshed_at`) is persisted on the
 session rather than the transport, because one codex thread hops between TUI
 and app-server across takeover/handback.
 
-The core stays channel-neutral: `ChannelAdapter` is still the seam, and
+The core stays channel-neutral (ADR 0070): the runtime picks the adapter,
+config parser (`_CHANNEL_CONFIG_PARSERS`) and live ingress bridge
+(`_ingress_bridge_factory`) by `WALKCODE_CHANNEL`; `serve_channel` /
+`process_channel_event` and the inbox spool are shared. Channel differences
+live on the adapter (`display_name`, `locale`, `account_id`, `ack_reactions`,
+`expand_inbound`, `ChannelCapabilities.topic_sessions`), never as a
+`channel_kind == ...` test in shared code. `ChannelAdapter` is still the seam, and
 `channel_kind` is still part of every binding key, so a future channel is a new
 adapter rather than a core change. Persisted bindings of a removed channel
 (old `channel_kind: "telegram"` sessions) load normally; the runtime simply
@@ -263,8 +269,8 @@ boundaries:
 - session health/watchdog views;
 - takeover confirmation with single-writer protection.
 
-Lark callbacks persist each normalized event in `<state>.lark-inbox.d` before
-returning to the SDK. A `.json` file is pending; the runtime renames it to
+Channel ingress persists each normalized event in `<state>.<kind>-inbox.d`
+(`lark-inbox.d` for Lark) before acknowledging it to the platform SDK. A `.json` file is pending; the runtime renames it to
 `.processing` before any side effects and deletes it after processing and state
 save succeed. Pending files resume at startup. Exceptions and interrupted
 `.processing` files produce a durable channel notice and remain as `.failed`

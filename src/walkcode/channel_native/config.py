@@ -74,10 +74,10 @@ class ChannelNativeConfig:
                 "WALKCODE_CHANNEL=telegram is no longer supported: the Telegram channel "
                 "was retired (ADR 0069). Use WALKCODE_CHANNEL=lark"
             )
-        if channel_kind == "lark":
-            channel = _lark_config_from_env(source)
-        else:
+        parser = _CHANNEL_CONFIG_PARSERS.get(channel_kind)
+        if parser is None:
             raise ChannelConfigError(f"unknown channel configured: {channel_kind}")
+        channel = parser(source)
 
         agent = _configured_agent(source)
         supported_agent_names = ("claude", "codex")
@@ -215,7 +215,9 @@ def _configured_channel_kind(source: Any) -> str:
     explicit = str(source.get("WALKCODE_CHANNEL", "") or "").strip()
     if explicit:
         if "," in explicit:
-            raise ChannelConfigError("WALKCODE_CHANNEL accepts exactly one channel: lark")
+            raise ChannelConfigError(
+                "WALKCODE_CHANNEL accepts exactly one channel: " + " or ".join(_CHANNEL_CONFIG_PARSERS)
+            )
         return explicit
     return ""
 
@@ -461,10 +463,27 @@ def _lark_config_from_env(source: Any) -> ChannelEndpointConfig:
             "receive_id_type": source.get("LARK_RECEIVE_ID_TYPE", "open_id"),
             "openapi_domain": source.get("LARK_OPENAPI_DOMAIN", "https://open.feishu.cn").rstrip("/"),
             "allowed_chat_ids": allowed_chat_ids,
-            "allowed_open_ids": tuple(_split_csv(source.get("LARK_ALLOWED_OPEN_IDS", ""))),
+            "allowed_sender_ids": tuple(_split_csv(source.get("LARK_ALLOWED_OPEN_IDS", ""))),
             "tui_chat_id": str(source.get("WALKCODE_LARK_TUI_CHAT_ID", "") or "").strip(),
         },
     )
+
+
+# One config parser per channel (ADR 0070). Each parser owns its channel's env
+# keys and normalizes them onto the shared option names: allowed_chat_ids,
+# allowed_sender_ids, tui_chat_id.
+_CHANNEL_CONFIG_PARSERS = {
+    "lark": _lark_config_from_env,
+}
+
+# (explicit TUI chat env key, chat allowlist env key) per channel, for errors.
+_CHANNEL_TUI_CHAT_ENV = {
+    "lark": ("WALKCODE_LARK_TUI_CHAT_ID", "LARK_ALLOWED_CHAT_IDS"),
+}
+
+
+def _channel_tui_chat_env(channel_kind: str) -> tuple[str, str]:
+    return _CHANNEL_TUI_CHAT_ENV.get(channel_kind, ("the TUI chat id", "allowed chat id"))
 
 
 _CHANNEL_ENVIRONMENT_CONTEXT_TEMPLATE = """<environment_context>
@@ -492,7 +511,7 @@ def _channel_allowlist_configured(channel: ChannelEndpointConfig) -> bool:
     """True when this channel restricts who may drive the agent.
 
     Every allowlist option is "empty means allow everyone" (see
-    `_lark_chat_allowed` / `_lark_sender_allowed`), which is a reasonable
+    `_chat_allowed` / `_sender_allowed`), which is a reasonable
     bootstrap default on its own but not in combination with an unsandboxed
     agent. Any one list being non-empty counts as restricted: the channel
     applies chat-level and sender-level lists independently, so requiring both
@@ -501,5 +520,5 @@ def _channel_allowlist_configured(channel: ChannelEndpointConfig) -> bool:
     options = channel.options or {}
     return any(
         bool(options.get(key))
-        for key in ("allowed_chat_ids", "allowed_open_ids")
+        for key in ("allowed_chat_ids", "allowed_sender_ids")
     )

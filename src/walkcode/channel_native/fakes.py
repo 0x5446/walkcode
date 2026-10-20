@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import uuid
 
+from dataclasses import replace
+
 from typing import Any
 
 from .models import (
@@ -25,6 +27,17 @@ from .views import render_view_text
 class FakeChannelAdapter:
     def __init__(self, kind: str, capabilities: ChannelCapabilities):
         self.kind = kind
+        # A fake "lark" stands in for the real Lark adapter: same topic
+        # placement, receipts and notice language.
+        mimics_lark = kind == "lark"
+        self.display_name = "飞书" if mimics_lark else kind
+        self.locale = "zh" if mimics_lark else "en"
+        self.account_id = "bot"
+        self.ack_reactions: tuple[str, ...] = (
+            ("DONE", "OK", "THUMBSUP", "MUSCLE", "APPLAUSE") if mimics_lark else ()
+        )
+        if mimics_lark and not capabilities.topic_sessions:
+            capabilities = replace(capabilities, topic_sessions=True)
         self._capabilities = capabilities
         self.sent_views: list[dict[str, Any]] = []
         self.downloaded_attachments: list[str] = []
@@ -38,6 +51,15 @@ class FakeChannelAdapter:
     async def react_to_message(self, binding: ChannelBinding, message_id: str, emoji: str = "DONE") -> bool:
         self.reactions.append({"binding": binding.key(), "message_id": str(message_id), "emoji": emoji})
         return True
+
+    async def expand_inbound(self, inbound: InboundEvent) -> InboundEvent:
+        return inbound
+
+    async def fetch_thread_messages(self, root_message_id: str, *, limit: int) -> list[dict[str, Any]]:
+        return []
+
+    def render_message_log(self, items: list[dict[str, Any]], *, skip_message_id: str = "") -> str:
+        return ""
 
     async def send_view(self, binding: ChannelBinding, view_model: dict[str, Any]) -> str:
         self.sent_views.append({"binding": binding.key(), "view": dict(view_model)})

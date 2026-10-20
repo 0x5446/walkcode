@@ -50,6 +50,7 @@ from .channel_native import (
     SHARED_APP_SERVER_CONTROLLER,
     _atomic_write_json,
     _channel_allowlist_configured,
+    _channel_tui_chat_env,
     _channel_environment_context,
     _codex_message_turn_id,
     _codex_tool_event,
@@ -119,7 +120,7 @@ from .channel_native.tui_hooks import (
     _tui_hook_queue_dir,
     _tui_hook_text,
     _tui_hook_tool_event,
-    _tui_lark_chat_id,
+    _tui_chat_id,
     _tui_resume_ref,
     _tui_terminate_ref,
 )
@@ -157,7 +158,7 @@ TUI_BINDING_REFRESH_INTERVAL_SECONDS = 5.0
 TUI_EXIT_SWEEP_INTERVAL_SECONDS = 30.0
 # 被 @ 进别人的飞书话题时，最多读回多少条既有讨论作为首轮上下文。够覆盖一场
 # 有来有回的讨论，又不至于让一个长话题把整个回合的输入撑爆。
-LARK_THREAD_CONTEXT_MESSAGE_LIMIT = 50
+THREAD_CONTEXT_MESSAGE_LIMIT = 50
 # codex-cli (verified against 0.144.5) only emits session_start, session_end,
 # user_prompt_submit, pre_tool_use, post_tool_use, permission_request and
 # stop; MessageDisplay / PostToolUseFailure are Claude-only event names that
@@ -593,14 +594,16 @@ class ChannelNativeRuntime:
         self.outbox_dispatcher = outbox_dispatcher
         self.e2e_gates = e2e_gates or {}
         self._now = now
-        self.last_lark_event_error = ""
+        self.last_channel_event_error = ""
         self._tui_hook_queue_dir = _tui_hook_queue_dir(self.state_store.path)
         self._tui_hook_failures: dict[str, int] = {}
         # Sessions whose rootless heal failed permanently; skipped until
         # restart. A per-call "give up" is not enough: any other session's
         # transient failure keeps the whole load pass retrying every tick.
         self._rootless_heal_given_up: set[str] = set()
-        self._lark_inbox_dir = self.state_store.path.with_name(f"{self.state_store.path.name}.lark-inbox.d")
+        self._inbox_dir = self.state_store.path.with_name(
+            f"{self.state_store.path.name}.{config.channel.kind}-inbox.d"
+        )
         self._ingress_lock = asyncio.Lock()
         self._drain_lock = asyncio.Lock()
         # ADR 0055: per-session transcript read cursor (path, byte offset,
@@ -762,8 +765,8 @@ class ChannelNativeRuntime:
             "allowed_chat_ids": [
                 str(item) for item in endpoint.options.get("allowed_chat_ids", ()) if item
             ],
-            "allowed_open_ids": [
-                str(item) for item in endpoint.options.get("allowed_open_ids", ()) if item
+            "allowed_sender_ids": [
+                str(item) for item in endpoint.options.get("allowed_sender_ids", ()) if item
             ],
         }
         report["tenant_token"] = await asyncio.to_thread(
@@ -905,8 +908,8 @@ class ChannelNativeRuntime:
             )
             return SubmitResult(True, "repo_command_usage")
         task_inbound = replace(inbound, text=task_text)
-        if inbound.channel_kind == "lark":
-            task_inbound = await self._place_lark_new_session(channel, task_inbound)
+        if channel.capabilities().topic_sessions:
+            task_inbound = await self._place_new_session(channel, task_inbound)
         result = await self.orchestrator.handle_inbound_event(
             task_inbound,
             agent_transport_kind=self.config.agent_transport_kind,
@@ -958,7 +961,7 @@ class ChannelNativeRuntime:
         session (ADR 0054) onto a freshly started backend — new config, same
         conversation.
         """
-        zh = str(getattr(inbound, "channel_kind", "")) == "lark"
+        zh = getattr(channel, "locale", "") == "zh"
         binding = self._command_reply_binding(inbound, session)
 
         async def _reply(text: str) -> None:
@@ -1091,10 +1094,8 @@ class ChannelNativeRuntime:
             {"type": "text", "text": f"Model switch failed: {result.reason}"},
         )
 
-    def _lark_chat_allowed(self, chat_id: str, *, is_callback: bool = False) -> bool:
+    def _chat_allowed(self, chat_id: str, *, is_callback: bool = False) -> bool:
         endpoint = self.config.channel
-        if endpoint.kind != "lark":
-            return False
         if is_callback and not chat_id:
             # Card callbacks may omit the chat context; the callback token
             # (single-use, TTL, generation-checked) is the real gate there.
@@ -1104,57 +1105,17 @@ class ChannelNativeRuntime:
             return True
         return str(chat_id) in allowed
 
-    def _lark_sender_allowed(self, sender_id: str) -> bool:
+    def _sender_allowed(self, sender_id: str) -> bool:
         allowed = tuple(
             str(item)
-            for item in self.config.channel.options.get("allowed_open_ids", ())
+            for item in self.config.channel.options.get("allowed_sender_ids", ())
             if item
         )
         if not allowed:
             return True
         return str(sender_id) in allowed
 
-    @staticmethod
-    def _lark_message_type(inbound) -> str:
-        raw = inbound.raw if isinstance(inbound.raw, dict) else {}
-        event = raw.get("event", {}) if isinstance(raw.get("event"), dict) else {}
-        message = event.get("message", {}) if isinstance(event.get("message"), dict) else {}
-        return str(message.get("message_type", "") or message.get("msg_type", "") or "")
-
-    async def _expand_lark_merge_forward(self, channel, inbound):
-        """Replace a forwarded chat log's placeholder title with its content.
-
-        A merge_forward message's content is only ``{"title": ...,
-        "message_id_list": [...]}``, so the inbound text parser falls through
-        to the title — the agent receives "群聊的聊天记录" and none of the
-        conversation. Reading the message back returns the forward plus every
-        child in one call, which is what actually gets rendered in.
-
-        Failure keeps the original inbound: a forward that reaches the agent
-        as its title is what happens today, so a degraded fetch must not also
-        drop the turn.
-        """
-        if self._lark_message_type(inbound) != "merge_forward":
-            return inbound
-        try:
-            items = await channel.fetch_message(inbound.message_id)
-        except Exception as exc:
-            _log_degrade(
-                "lark_merge_forward_fetch_failed",
-                message_id=inbound.message_id,
-                chat_id=inbound.chat_id,
-                error=exc,
-                fallback="placeholder_title_only",
-            )
-            return inbound
-        log = channel.render_message_log(items, skip_message_id=inbound.message_id)
-        if not log:
-            return inbound
-        title = " ".join(str(inbound.text or "").split())
-        header = f"[合并转发：{title}]" if title else "[合并转发]"
-        return replace(inbound, text=f"{header}\n{log}")
-
-    async def _maybe_seed_lark_thread_context(self, channel, inbound):
+    async def _maybe_seed_thread_context(self, channel, inbound):
         """Prepend an existing topic's discussion when the bot is first @-ed in.
 
         Being mentioned inside somebody else's thread used to deliver exactly
@@ -1171,11 +1132,12 @@ class ChannelNativeRuntime:
             return inbound
         try:
             items = await channel.fetch_thread_messages(
-                inbound.root_message_id, limit=LARK_THREAD_CONTEXT_MESSAGE_LIMIT
+                inbound.root_message_id, limit=THREAD_CONTEXT_MESSAGE_LIMIT
             )
         except Exception as exc:
             _log_degrade(
-                "lark_thread_context_fetch_failed",
+                "thread_context_fetch_failed",
+                channel=inbound.channel_kind,
                 root_message_id=inbound.root_message_id,
                 chat_id=inbound.chat_id,
                 error=exc,
@@ -1191,32 +1153,38 @@ class ChannelNativeRuntime:
             text=f"[话题已有讨论]\n{log}\n\n[本次请求]\n{request}" if request else f"[话题已有讨论]\n{log}",
         )
 
-    async def process_lark_event(self, payload: dict[str, Any]) -> SubmitResult:
-        channel = self.channels.get("lark")
-        if not isinstance(channel, LarkChannelAdapter):
-            raise ChannelConfigError("Lark channel is not configured for channel-native runtime")
+    def _ingress_channel(self) -> ChannelAdapter:
+        kind = self.config.channel.kind
+        channel = self.channels.get(kind)
+        if channel is None:
+            raise ChannelConfigError(f"{kind} channel is not configured for channel-native runtime")
+        return channel
+
+    async def process_channel_event(self, payload: dict[str, Any]) -> SubmitResult:
+        channel = self._ingress_channel()
         inbound = channel.parse_event(payload)
-        if not self._lark_chat_allowed(inbound.chat_id, is_callback=inbound.callback is not None):
+        if not self._chat_allowed(inbound.chat_id, is_callback=inbound.callback is not None):
             return SubmitResult(False, BlockedReason.UNAUTHORIZED)
-        # Feishu re-pushes un-acked events with the same event_id (e.g. when
-        # the WS connection dies before the ack goes out). The orchestrator's
+        # Channels re-push un-acked events with the same event_id (e.g. when
+        # the connection dies before the ack goes out). The orchestrator's
         # ledger check inside handle_inbound_event runs too late for this
         # handler: the new-session root card, the echo reply and the command
         # branches below all fire first, so a redelivery would leave a zombie
         # topic card stuck at "starting". Drop known event_ids before any
-        # side effect. "lark:" is the degenerate id of a payload without an
+        # side effect. "<kind>:" is the degenerate id of a payload without an
         # event_id — never treat those as duplicates of each other.
         ledger = self.state.inbound_ledger
         if (
             ledger is not None
-            and inbound.event_id != "lark:"
+            and not _is_degenerate_event_id(inbound)
             and ledger.seen(inbound.event_id)
         ):
             # Dropped silently toward the user (a duplicate needs no reply),
             # but never silently toward the operator: redeliveries are the
             # symptom of the WS drop/ack loss this dedup exists for.
             _log_degrade(
-                "lark_duplicate_inbound_dropped",
+                "duplicate_inbound_dropped",
+                channel=inbound.channel_kind,
                 event_id=inbound.event_id,
                 chat_id=inbound.chat_id,
                 message_id=inbound.message_id,
@@ -1224,11 +1192,11 @@ class ChannelNativeRuntime:
             )
             return SubmitResult(False, BlockedReason.DUPLICATE_INBOUND)
         if inbound.callback is None:
-            if not self._lark_sender_allowed(inbound.sender_id):
+            if not self._sender_allowed(inbound.sender_id):
                 return SubmitResult(False, BlockedReason.UNAUTHORIZED)
             # After the authz gates on purpose: expanding costs an API call,
             # and an unauthorized sender must not be able to spend it.
-            inbound = await self._expand_lark_merge_forward(channel, inbound)
+            inbound = await channel.expand_inbound(inbound)
             reply_binding = _inbound_reply_binding(inbound)
             if str(inbound.text or "").lstrip().startswith("//"):
                 # Escape hatch for agent-native commands shadowed by WalkCode
@@ -1254,11 +1222,11 @@ class ChannelNativeRuntime:
                         try:
                             await channel.send_view(
                                 reply_binding,
-                                {"type": "text", "text": _LARK_REJECTION_NOTES["stale_inbound"]},
+                                {"type": "text", "text": _REJECTION_NOTES["stale_inbound"]},
                             )
                         except Exception:
                             pass
-                    self._complete_lark_local_inbound(inbound)
+                    self._complete_local_inbound(inbound)
                     self.save_state()
                     return result
                 selector = _agent_selector_command(inbound)
@@ -1273,7 +1241,7 @@ class ChannelNativeRuntime:
                             ),
                         },
                     )
-                    self._complete_lark_local_inbound(inbound)
+                    self._complete_local_inbound(inbound)
                     self.save_state()
                     return SubmitResult(True, "agent_selector_rejected")
                 unknown_slash = _unknown_slash_command(inbound)
@@ -1287,9 +1255,9 @@ class ChannelNativeRuntime:
                             ),
                         },
                     )
-                    self._complete_lark_local_inbound(inbound)
+                    self._complete_local_inbound(inbound)
                     self.save_state()
-                    return SubmitResult(True, "lark_unknown_slash_command")
+                    return SubmitResult(True, "unknown_slash_command")
                 if unknown_slash:
                     inbound = replace(
                         inbound, text=_agent_command_text(self.config.agent, inbound.text)
@@ -1300,10 +1268,11 @@ class ChannelNativeRuntime:
             # after it left a card stuck at "starting", an idle session behind
             # it, and the failure notice in a second topic on the user's message.
             try:
-                inbound = await self._download_lark_attachments(channel, inbound)
+                inbound = await self._download_attachments(channel, inbound)
             except (TransientDeliveryError, PermanentDeliveryError) as exc:
                 _log_degrade(
-                    "lark_attachment_download_failed",
+                    "attachment_download_failed",
+                    channel=inbound.channel_kind,
                     chat_id=inbound.chat_id,
                     message_id=inbound.message_id,
                     error=exc,
@@ -1314,10 +1283,10 @@ class ChannelNativeRuntime:
                         f"附件下载失败，这条消息没有交给 agent：{exc}。请稍后重发。"
                     )},
                 )
-                self._complete_lark_local_inbound(inbound)
+                self._complete_local_inbound(inbound)
                 self.save_state()
                 return SubmitResult(False, "attachment_download_failed")
-            inbound = await self._place_lark_new_session(channel, inbound)
+            inbound = await self._place_new_session(channel, inbound)
         result = await self.orchestrator.handle_inbound_event(
             inbound,
             agent_transport_kind=self.config.agent_transport_kind,
@@ -1328,7 +1297,7 @@ class ChannelNativeRuntime:
         # guessing (readonly/ambiguous cases already send their own cards;
         # allowlist rejections above stay deliberately silent).
         if not result.accepted and inbound.callback is None:
-            note = _LARK_REJECTION_NOTES.get(str(result.reason or ""), "")
+            note = _REJECTION_NOTES.get(str(result.reason or ""), "")
             if note:
                 try:
                     await channel.send_view(
@@ -1337,7 +1306,7 @@ class ChannelNativeRuntime:
                     )
                 except Exception as exc:
                     _log_degrade(
-                        "lark_rejection_note_send_failed",
+                        "rejection_note_send_failed",
                         reason=str(result.reason or ""),
                         chat_id=inbound.chat_id,
                         message_id=inbound.message_id,
@@ -1346,8 +1315,8 @@ class ChannelNativeRuntime:
                     )
         return result
 
-    def _complete_lark_local_inbound(self, inbound) -> None:
-        """Record a locally-terminal Lark event in the inbound ledger.
+    def _complete_local_inbound(self, inbound) -> None:
+        """Record a locally-terminal channel event in the inbound ledger.
 
         Command/selector/unknown-slash branches reply and return without ever
         reaching the orchestrator's start/complete lifecycle, so a Feishu
@@ -1357,11 +1326,11 @@ class ChannelNativeRuntime:
         redelivery — the user resends the command instead.
         """
         ledger = self.state.inbound_ledger
-        if ledger is not None and inbound.event_id != "lark:":
+        if ledger is not None and not _is_degenerate_event_id(inbound):
             ledger.record(inbound.event_id)
 
     @staticmethod
-    async def _download_lark_attachments(channel, inbound):
+    async def _download_attachments(channel, inbound):
         if not inbound.attachments:
             return inbound
         attachments = [
@@ -1370,8 +1339,8 @@ class ChannelNativeRuntime:
         ]
         return replace(inbound, attachments=attachments)
 
-    async def _place_lark_new_session(self, channel, inbound):
-        """Root new Lark sessions at a bot-sent status card (V2 UX parity).
+    async def _place_new_session(self, channel, inbound):
+        """Root new topic sessions at a bot-sent status card (V2 UX parity).
 
         The card becomes the thread root and is registered as the session's
         status card, so lifecycle refreshes patch the root card in place. The
@@ -1384,7 +1353,7 @@ class ChannelNativeRuntime:
             # A reply inside an existing topic. Either it belongs to one of our
             # sessions (nothing to do) or the bot has just been pulled into
             # somebody else's discussion, where the history is the whole point.
-            return await self._maybe_seed_lark_thread_context(channel, inbound)
+            return await self._maybe_seed_thread_context(channel, inbound)
         resolution = self.state.sessions.resolve_active_binding(inbound.binding_key())
         if resolution.session_id or resolution.reason:
             return inbound
@@ -1412,7 +1381,7 @@ class ChannelNativeRuntime:
             )
         except Exception as exc:
             print(
-                f"lark session root card failed; falling back to message-rooted thread: "
+                f"{inbound.channel_kind} session root card failed; falling back to message-rooted thread: "
                 f"{type(exc).__name__}: {exc}",
                 file=sys.stderr,
             )
@@ -1439,37 +1408,30 @@ class ChannelNativeRuntime:
             raw=raw,
         )
 
-    async def serve_lark_ws(
+    async def serve_channel(
         self,
         *,
         max_events: int | None = None,
         bridge_factory=None,
     ) -> None:
-        channel = self.channels.get("lark")
-        if not isinstance(channel, LarkChannelAdapter):
-            raise ChannelConfigError("Lark channel is not configured for channel-native runtime")
+        channel = self._ingress_channel()
         queue: asyncio.Queue = asyncio.Queue()
-        ack_registry = getattr(channel.api, "ack_registry", None) or AckRegistry()
         loop = asyncio.get_running_loop()
         if bridge_factory is None:
-            bridge = LarkIngressBridge(
-                self.config.channel.credentials,
-                self.config.channel.options,
-                loop=loop,
-                queue=queue,
-                ack_registry=ack_registry,
-                persist_event=self._persist_lark_event,
-            )
-        else:
-            bridge = bridge_factory(loop=loop, queue=queue, ack_registry=ack_registry)
+            bridge_factory = _ingress_bridge_factory(self.config.channel, channel)
+        bridge = bridge_factory(
+            loop=loop,
+            queue=queue,
+            persist_event=self._persist_channel_event,
+        )
         # Settle zombies from the previous process BEFORE ingress starts: the
         # first inbound message must not race the sweep into a dead worker
         # handle, and the sweep must never see sessions this process created.
         await self._settle_orphan_headless_sessions_once()
         # Unclaimed messages may be replayed. A claimed message may already
         # have reached an agent: report uncertainty instead of resubmitting it.
-        if self._lark_inbox_dir.exists():
-            for path in sorted(self._lark_inbox_dir.iterdir()):
+        if self._inbox_dir.exists():
+            for path in sorted(self._inbox_dir.iterdir()):
                 if path.suffix in {".json", ".processing"}:
                     queue.put_nowait(path)
         bridge.start()
@@ -1484,11 +1446,11 @@ class ChannelNativeRuntime:
                 try:
                     async with self._ingress_lock:
                         # Custom bridges retain the dict seam used by tests.
-                        path = item if isinstance(item, Path) else self._persist_lark_event(item)
-                        await self._process_lark_inbox_item(path)
+                        path = item if isinstance(item, Path) else self._persist_channel_event(item)
+                        await self._process_inbox_item(path)
                 except Exception as exc:
-                    self.last_lark_event_error = f"{type(exc).__name__}: {exc}"
-                    _log_degrade("lark_inbox_processing_failed", error=exc)
+                    self.last_channel_event_error = f"{type(exc).__name__}: {exc}"
+                    _log_degrade("inbox_processing_failed", channel=self.config.channel.kind, error=exc)
                     # Recovery itself failed. Restart the consumer so retained
                     # inbox files are recovered, rather than silently parked.
                     raise
@@ -1498,17 +1460,17 @@ class ChannelNativeRuntime:
             await self._stop_maintenance_tasks(maintenance_tasks)
             self.orchestrator.defer_event_drain = previous_defer_event_drain
 
-    def _persist_lark_event(self, payload: dict[str, Any]) -> Path:
-        path = self._lark_inbox_dir / f"{time.time_ns():019d}-{uuid.uuid4().hex}.json"
+    def _persist_channel_event(self, payload: dict[str, Any]) -> Path:
+        path = self._inbox_dir / f"{time.time_ns():019d}-{uuid.uuid4().hex}.json"
         _atomic_write_json(path, payload)
         return path
 
-    async def _process_lark_inbox_item(self, path: Path) -> None:
+    async def _process_inbox_item(self, path: Path) -> None:
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
         except (ValueError, UnicodeError) as exc:
-            self.last_lark_event_error = f"{type(exc).__name__}: {exc}"
-            _log_degrade("lark_inbox_invalid_json", path=str(path), error=exc)
+            self.last_channel_event_error = f"{type(exc).__name__}: {exc}"
+            _log_degrade("inbox_invalid_json", path=str(path), error=exc)
             path.rename(path.with_suffix(".failed"))
             return
         interrupted = path.suffix == ".processing"
@@ -1518,32 +1480,32 @@ class ChannelNativeRuntime:
         try:
             if interrupted:
                 raise RuntimeError("runtime stopped while handling this event; outcome unknown")
-            await self.process_lark_event(payload)
+            await self.process_channel_event(payload)
             self.save_state()
         except Exception as exc:
-            self.last_lark_event_error = f"{type(exc).__name__}: {exc}"
-            _log_degrade("lark_inbound_failed", path=str(claimed), error=exc)
+            self.last_channel_event_error = f"{type(exc).__name__}: {exc}"
+            _log_degrade("inbound_failed", path=str(claimed), error=exc)
             # Keep the claimed payload if even persisting the notice fails.
             # On restart it gets another notice attempt, never an agent replay.
-            await self._report_lark_inbound_failure(payload)
+            await self._report_inbound_failure(payload)
             claimed.rename(claimed.with_suffix(".failed"))
             if isinstance(exc, ChannelConfigError):
                 raise
         else:
             claimed.unlink()
 
-    async def _report_lark_inbound_failure(self, payload: dict[str, Any]) -> None:
-        channel = self.channels["lark"]
+    async def _report_inbound_failure(self, payload: dict[str, Any]) -> None:
+        channel = self._ingress_channel()
         try:
             inbound = channel.parse_event(payload)
         except (AttributeError, TypeError, ValueError) as exc:
             # Invalid input has no trustworthy recipient. Retain it as failed;
             # retrying the same parser cannot make a channel notice possible.
-            _log_degrade("lark_inbound_failure_unaddressable", error=exc)
+            _log_degrade("inbound_failure_unaddressable", error=exc)
             return
-        if not self._lark_chat_allowed(inbound.chat_id, is_callback=inbound.callback is not None):
+        if not self._chat_allowed(inbound.chat_id, is_callback=inbound.callback is not None):
             return
-        if inbound.callback is None and not self._lark_sender_allowed(inbound.sender_id):
+        if inbound.callback is None and not self._sender_allowed(inbound.sender_id):
             return
         self.state.inbound_ledger.complete(inbound.event_id)
         binding = ChannelBinding(
@@ -2898,7 +2860,7 @@ class ChannelNativeRuntime:
         heal_retry_needed = False
         summaries = [
             summary
-            for summary in self.state.sessions.list_sessions(channel_kind="lark")
+            for summary in self.state.sessions.list_sessions(channel_kind=self.config.channel.kind)
         ]
         for summary in summaries:
             session = self.state.sessions.get(summary.session_id)
@@ -2910,7 +2872,7 @@ class ChannelNativeRuntime:
             # Rootless heal runs BEFORE the writer filter: a taken-over
             # session (writer=orchestrator) with an observation-born rootless
             # binding sprays the main chat just the same.
-            heal = await self._heal_rootless_lark_tui_binding(session)
+            heal = await self._heal_rootless_tui_binding(session)
             if heal == "healed":
                 changed = True
                 await self.orchestrator.refresh_session_status_card(session)
@@ -2939,10 +2901,10 @@ class ChannelNativeRuntime:
         if changed:
             self.save_state()
 
-    async def _heal_rootless_lark_tui_binding(self, session) -> str:
-        """Re-root a Lark observation binding whose root message never sent.
+    async def _heal_rootless_tui_binding(self, session) -> str:
+        """Re-root an observation binding whose root message never sent.
 
-        _create_lark_tui_observed_binding degrades to an EMPTY root when the
+        _create_tui_observed_binding degrades to an EMPTY root when the
         notice send fails (e.g. the 2026-07-24/25 bare-venv outage windows),
         and a rootless binding never healed afterwards — every mirrored
         message landed in the main chat forever. Creation-time failure means
@@ -2956,7 +2918,6 @@ class ChannelNativeRuntime:
         binding = session.channel_binding
         if (
             binding is None
-            or binding.channel_kind != "lark"
             or binding.capabilities.get("origin") != "external_tui"
             or binding.root_message_id
             or binding.thread_id
@@ -2964,7 +2925,7 @@ class ChannelNativeRuntime:
             or session.session_id in self._rootless_heal_given_up
         ):
             return ""
-        channel = self.channels.get("lark")
+        channel = self.channels.get(binding.channel_kind)
         if channel is None:
             return ""
         transport_ref = session.transport_ref if isinstance(session.transport_ref, dict) else {}
@@ -2978,7 +2939,7 @@ class ChannelNativeRuntime:
         try:
             root_id = await channel.send_view(
                 ChannelBinding(
-                    channel_kind="lark",
+                    channel_kind=binding.channel_kind,
                     account_id=binding.account_id,
                     chat_id=binding.chat_id,
                     thread_id="",
@@ -3003,7 +2964,7 @@ class ChannelNativeRuntime:
         except Exception as exc:
             permanent = isinstance(exc, PermanentDeliveryError)
             _log_degrade(
-                "lark_tui_root_heal_failed",
+                "tui_root_heal_failed",
                 session_id=session.session_id,
                 chat_id=binding.chat_id,
                 agent=agent,
@@ -3019,7 +2980,7 @@ class ChannelNativeRuntime:
             return "retry"
         if not root_id:
             _log_degrade(
-                "lark_tui_root_heal_failed",
+                "tui_root_heal_failed",
                 session_id=session.session_id,
                 chat_id=binding.chat_id,
                 agent=agent,
@@ -3105,9 +3066,7 @@ class ChannelNativeRuntime:
     @staticmethod
     def _ensure_tui_observed_binding_capabilities(session) -> bool:
         binding = session.channel_binding
-        if binding is None or binding.channel_kind != "lark":
-            return False
-        if not binding.thread_id:
+        if binding is None or not binding.thread_id:
             return False
         changed = False
         for key in ("status_card", "readonly_topic"):
@@ -3143,24 +3102,17 @@ class ChannelNativeRuntime:
             agent_name,
             f"TUI {agent_session_id(transport_kind, resume_ref)}",
         )
-        channel_kind = self.config.channel.kind
-        if channel_kind != "lark":
-            raise ChannelConfigError(
-                f"TUI observed session ingress is not supported for channel: {channel_kind}"
-            )
-        return await self._create_lark_tui_observed_binding(title)
-
-    async def _create_lark_tui_observed_binding(self, title: str) -> ChannelBinding:
-        chat_id = _tui_lark_chat_id(self.config.channel)
+        chat_id = _tui_chat_id(self.config.channel)
         if not chat_id:
+            tui_env, allowlist_env = _channel_tui_chat_env(self.config.channel.kind)
             raise ChannelConfigError(
-                "missing Lark chat for TUI observation; set WALKCODE_LARK_TUI_CHAT_ID "
-                "or exactly one LARK_ALLOWED_CHAT_IDS"
+                f"missing {self.config.channel.kind} chat for TUI observation; "
+                f"set {tui_env} or exactly one {allowlist_env}"
             )
-        channel = self.channels["lark"]
-        # Lark has no topic-creation API; the observation thread is rooted at a
-        # bot-sent message so the session's transcript lands in one reply chain
-        # instead of the chat root.
+        channel = self._ingress_channel()
+        # Channels have no topic-creation API; the observation thread is rooted
+        # at a bot-sent message so the session's transcript lands in one reply
+        # chain instead of the chat root.
         #
         # That root is a health CARD, not text, and doubles as the session's
         # status card. Two reasons it cannot be text: Lark only lets a bot edit
@@ -3169,14 +3121,13 @@ class ChannelNativeRuntime:
         # card patches are uncapped; and the thread's collapsed view shows the
         # root, so a text root would pin the raw session uuid there forever.
         # Channel-originated sessions already root on a card
-        # (_ensure_lark_session_root_card) — this puts the observed path on the
-        # same footing.
+        # (_place_new_session) — this puts the observed path on the same footing.
         root_id = ""
         try:
             root_id = await channel.send_view(
                 ChannelBinding(
-                    channel_kind="lark",
-                    account_id="bot",
+                    channel_kind=channel.kind,
+                    account_id=channel.account_id,
                     chat_id=chat_id,
                     thread_id="",
                     root_message_id="",
@@ -3196,20 +3147,20 @@ class ChannelNativeRuntime:
             )
         except Exception as exc:
             print(
-                f"lark TUI observation root card failed; falling back to chat root: "
+                f"{channel.kind} TUI observation root card failed; falling back to chat root: "
                 f"{type(exc).__name__}: {exc}",
                 file=sys.stderr,
             )
         return ChannelBinding(
-            channel_kind="lark",
-            account_id="bot",
+            channel_kind=channel.kind,
+            account_id=channel.account_id,
             chat_id=chat_id,
             thread_id=root_id,
             root_message_id=root_id,
             # The root IS the status card: refreshes patch it in place instead
             # of sending a second card into the thread.
             health_message_id=root_id,
-            # No static_status_card: Lark card patches are uncapped, so the
+            # No static_status_card: card edits are uncapped, so the
             # observation card keeps refreshing (e.g. drops the Take over
             # button once the session is taken over).
             capabilities={
@@ -3222,12 +3173,12 @@ class ChannelNativeRuntime:
     def _grant_tui_channel_owners(self, session_id: str, binding: ChannelBinding) -> None:
         if self.state.authz is None:
             return
-        if binding.channel_kind != "lark":
+        if binding.channel_kind != self.config.channel.kind:
             return
-        # Lark actors are open_ids (ou_...), never the chat id (oc_...);
-        # without this grant an observed session silently rejects every
-        # takeover request from the chat.
-        actor_ids = list(self.config.channel.options.get("allowed_open_ids", ()) or ())
+        # Actors are sender ids (Lark open_id ou_..., Slack user U...), never
+        # the chat id; without this grant an observed session silently rejects
+        # every takeover request from the chat.
+        actor_ids = list(self.config.channel.options.get("allowed_sender_ids", ()) or ())
         for actor_id in dict.fromkeys(str(item) for item in actor_ids if item):
             self.state.authz.grant(
                 session_id,
@@ -3583,8 +3534,12 @@ def run_native_cli(args) -> None:
         # 只有 serve 会派生 worker，也只有它需要向会话内暴露驱动者身份。
         _export_driver_label(runtime.config)
         print(_format_status(runtime.describe()))
-        print("channel-native V3 runtime listening via Lark WebSocket")
-        asyncio.run(runtime.serve_lark_ws())
+        kind = runtime.config.channel.kind
+        print(
+            f"channel-native V3 runtime listening via {kind} "
+            f"{ChannelNativeRuntime._channel_live_ingress(kind, runtime.config.channel)}"
+        )
+        asyncio.run(runtime.serve_channel())
         return
     raise ChannelConfigError(f"unknown native command: {args.native_command}")
 
@@ -3607,6 +3562,32 @@ def _new_interaction_store(*, now=time.time):
     return InteractionStore(now=now)
 
 
+def _is_degenerate_event_id(inbound: Any) -> bool:
+    """True for "<kind>:" — the id parse_event gives a payload without one."""
+    return str(inbound.event_id or "") == f"{inbound.channel_kind}:"
+
+
+def _ingress_bridge_factory(endpoint: ChannelEndpointConfig, channel: ChannelAdapter):
+    """Build the channel's live ingress bridge: a thread that persists each
+    event via ``persist_event`` before acknowledging it to the platform, then
+    hands the inbox path to ``queue`` on the serve loop."""
+    if endpoint.kind == "lark":
+        ack_registry = getattr(channel.api, "ack_registry", None) or AckRegistry()
+
+        def build_lark(*, loop, queue, persist_event):
+            return LarkIngressBridge(
+                endpoint.credentials,
+                endpoint.options,
+                loop=loop,
+                queue=queue,
+                ack_registry=ack_registry,
+                persist_event=persist_event,
+            )
+
+        return build_lark
+    raise ChannelConfigError(f"no live ingress for channel: {endpoint.kind}")
+
+
 def _build_channels(
     config: ChannelNativeConfig,
     *,
@@ -3622,7 +3603,7 @@ def _build_channels(
                 endpoint.options,
                 ack_registry=ack_registry,
             )
-            # serve_lark_ws picks the registry up from the api so the WS
+            # serve_channel picks the registry up from the api so the WS
             # bridge and ack_callback share the same future map.
             lark_api.ack_registry = ack_registry
         channels[endpoint.kind] = LarkChannelAdapter(lark_api)
@@ -3793,7 +3774,7 @@ def _repo_usage_text(roots: tuple[str, ...]) -> str:
 # (ADR 0059): the old "redelivery retries once the lease recovers" bet never
 # paid off on the Lark WS ingress, whose ack is fire-and-forget — the message
 # was silently dropped instead.
-_LARK_REJECTION_NOTES = {
+_REJECTION_NOTES = {
     BlockedReason.UNAUTHORIZED: "⛔ 这条消息没有提交：你没有操作这个会话的权限。",
     BlockedReason.SESSION_STOPPED: "⚪ 这条消息没有提交：会话已结束。到根会话发新消息即可开新任务。",
     # ADR 0056：上一个 worker 进程尚未确认退出时拒绝拉新（防双写）；
@@ -4432,7 +4413,7 @@ def _format_lark_diagnosis(report: dict[str, Any]) -> str:
         + (f" reason={token.get('reason')}" if not token.get("ok") else ""),
         f"sdk_installed: {sdk.get('installed')}",
         f"allowed_chat_ids: {','.join(report.get('allowed_chat_ids', [])) or '-'}",
-        f"allowed_open_ids: {','.join(report.get('allowed_open_ids', [])) or '-'}",
+        f"allowed_sender_ids: {','.join(report.get('allowed_sender_ids', [])) or '-'}",
     ]
     hint = sdk.get("hint", "")
     if hint:

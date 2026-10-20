@@ -347,10 +347,10 @@ class WorkerPidExtractionTests(unittest.TestCase):
     def test_lark_has_feedback_for_refused_resume(self):
         # A refused spawn (previous worker not confirmed dead) must not drop
         # the user's message silently (deep-review R3).
-        from walkcode.channel_native_runtime import _LARK_REJECTION_NOTES
+        from walkcode.channel_native_runtime import _REJECTION_NOTES
 
-        self.assertIn("resume_failed", _LARK_REJECTION_NOTES)
-        self.assertIn("再发一次", _LARK_REJECTION_NOTES["resume_failed"])
+        self.assertIn("resume_failed", _REJECTION_NOTES)
+        self.assertIn("再发一次", _REJECTION_NOTES["resume_failed"])
 
     def test_pid_extraction_rejects_garbage(self):
         self.assertEqual(ClaudeHeadlessTransport._client_worker_pid(object()), 0)

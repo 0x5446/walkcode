@@ -649,8 +649,8 @@ class LarkInboxReliabilityTests(_LarkRuntimeHarness):
         for payload in ({"event": {"message": None}}, [], {"event": None}):
             with self.subTest(payload=payload):
                 runtime, api, transport = self._runtime()
-                path = runtime._persist_lark_event(payload)
-                asyncio.run(runtime._process_lark_inbox_item(path))
+                path = runtime._persist_channel_event(payload)
+                asyncio.run(runtime._process_inbox_item(path))
                 self.assertEqual(json.loads(path.with_suffix(".failed").read_text()), payload)
                 self.assertFalse(path.with_suffix(".processing").exists())
                 self.assertEqual(transport.submitted_turns, [])
@@ -658,19 +658,19 @@ class LarkInboxReliabilityTests(_LarkRuntimeHarness):
 
     def test_corrupt_inbox_file_is_archived_without_agent_submission(self):
         runtime, _, transport = self._runtime()
-        path = runtime._persist_lark_event(self._message_payload())
+        path = runtime._persist_channel_event(self._message_payload())
         path.write_bytes(b'{"event":\xff')
-        asyncio.run(runtime._process_lark_inbox_item(path))
+        asyncio.run(runtime._process_inbox_item(path))
         self.assertEqual(path.with_suffix(".failed").read_bytes(), b'{"event":\xff')
         self.assertEqual(transport.submitted_turns, [])
 
     def test_disk_read_failure_stops_consumer_and_retains_pending_inbox(self):
         runtime, _, transport = self._runtime()
-        path = runtime._persist_lark_event(self._message_payload())
+        path = runtime._persist_channel_event(self._message_payload())
         bridge = mock.Mock()
         with mock.patch.object(Path, "read_text", side_effect=OSError("disk unavailable")):
             with self.assertRaisesRegex(OSError, "disk unavailable"):
-                asyncio.run(runtime.serve_lark_ws(max_events=1, bridge_factory=lambda **_: bridge))
+                asyncio.run(runtime.serve_channel(max_events=1, bridge_factory=lambda **_: bridge))
         bridge.stop.assert_called_once()
         self.assertTrue(path.exists())
         self.assertEqual(transport.submitted_turns, [])
@@ -678,47 +678,47 @@ class LarkInboxReliabilityTests(_LarkRuntimeHarness):
     def test_inbox_failure_is_retained_and_not_resubmitted_on_restart(self):
         runtime, api, transport = self._runtime()
         payload = self._message_payload()
-        path = runtime._persist_lark_event(payload)
+        path = runtime._persist_channel_event(payload)
         self.assertEqual(path.stat().st_mode & 0o777, 0o600)
-        with mock.patch.object(runtime, "process_lark_event", side_effect=OSError("agent result unknown")) as process:
-            asyncio.run(runtime._process_lark_inbox_item(path))
+        with mock.patch.object(runtime, "process_channel_event", side_effect=OSError("agent result unknown")) as process:
+            asyncio.run(runtime._process_inbox_item(path))
         self.assertEqual(process.call_count, 1)
         self.assertEqual(json.loads(path.with_suffix(".failed").read_text()), payload)
         self.assertIn("结果未能确认", _sent_text(runtime.channels["lark"].api))
-        self.assertIn("agent result unknown", runtime.last_lark_event_error)
+        self.assertIn("agent result unknown", runtime.last_channel_event_error)
         self.assertTrue(runtime.state.inbound_ledger.seen("lark:" + payload["event_id"]))
         self.assertEqual(transport.submitted_turns, [])
 
     def test_interrupted_inbox_is_reported_without_agent_replay(self):
         runtime, _, transport = self._runtime()
-        path = runtime._persist_lark_event(self._message_payload())
+        path = runtime._persist_channel_event(self._message_payload())
         claimed = path.with_suffix(".processing")
         path.rename(claimed)
-        with mock.patch.object(runtime, "process_lark_event") as process:
-            asyncio.run(runtime._process_lark_inbox_item(claimed))
+        with mock.patch.object(runtime, "process_channel_event") as process:
+            asyncio.run(runtime._process_inbox_item(claimed))
         process.assert_not_called()
         self.assertTrue(path.with_suffix(".failed").exists())
         self.assertEqual(transport.submitted_turns, [])
 
     def test_inbox_keeps_claimed_payload_when_notice_cannot_be_saved(self):
         runtime, _, _ = self._runtime()
-        path = runtime._persist_lark_event(self._message_payload())
-        with mock.patch.object(runtime, "process_lark_event", side_effect=OSError("submit")), \
+        path = runtime._persist_channel_event(self._message_payload())
+        with mock.patch.object(runtime, "process_channel_event", side_effect=OSError("submit")), \
              mock.patch.object(runtime, "save_state", side_effect=OSError("disk")):
             with self.assertRaises(OSError):
-                asyncio.run(runtime._process_lark_inbox_item(path))
+                asyncio.run(runtime._process_inbox_item(path))
         self.assertTrue(path.with_suffix(".processing").exists())
         self.assertFalse(path.with_suffix(".failed").exists())
 
     def test_notice_serialization_failure_stops_consumer_and_retains_claim(self):
         runtime, _, transport = self._runtime()
-        path = runtime._persist_lark_event(self._message_payload())
+        path = runtime._persist_channel_event(self._message_payload())
         bridge = mock.Mock()
-        with mock.patch.object(runtime, "process_lark_event", side_effect=RuntimeError("unknown outcome")), \
+        with mock.patch.object(runtime, "process_channel_event", side_effect=RuntimeError("unknown outcome")), \
              mock.patch.object(runtime, "save_state", side_effect=TypeError("not serializable")), \
              mock.patch.object(runtime, "_start_maintenance_tasks", return_value=[]):
             with self.assertRaisesRegex(TypeError, "not serializable"):
-                asyncio.run(runtime.serve_lark_ws(max_events=1, bridge_factory=lambda **_: bridge))
+                asyncio.run(runtime.serve_channel(max_events=1, bridge_factory=lambda **_: bridge))
         bridge.stop.assert_called_once()
         self.assertTrue(path.with_suffix(".processing").exists())
         self.assertFalse(path.with_suffix(".failed").exists())
@@ -726,14 +726,14 @@ class LarkInboxReliabilityTests(_LarkRuntimeHarness):
 
     def test_notice_flush_timeout_retains_saved_outbox_and_finishes_inbox(self):
         runtime, _, _ = self._runtime()
-        path = runtime._persist_lark_event(self._message_payload())
+        path = runtime._persist_channel_event(self._message_payload())
 
         async def timeout_flush():
             raise asyncio.TimeoutError()
 
-        with mock.patch.object(runtime, "process_lark_event", side_effect=RuntimeError("unknown outcome")), \
+        with mock.patch.object(runtime, "process_channel_event", side_effect=RuntimeError("unknown outcome")), \
              mock.patch.object(runtime.outbox_dispatcher, "flush_once", side_effect=timeout_flush):
-            asyncio.run(runtime._process_lark_inbox_item(path))
+            asyncio.run(runtime._process_inbox_item(path))
         self.assertTrue(path.with_suffix(".failed").exists())
         saved = runtime.state_store.load().outbox.to_dict()
         self.assertEqual(len(saved["pending"]), 1)
@@ -745,24 +745,24 @@ class LarkInboxReliabilityTests(_LarkRuntimeHarness):
             "message_id": "om_card", "chat_id": "oc_chat", "open_id": "ou_member",
             "action": {"value": {"token": "short-token", "action": "allow"}},
         }}
-        asyncio.run(runtime._report_lark_inbound_failure(payload))
+        asyncio.run(runtime._report_inbound_failure(payload))
         self.assertIn("结果未能确认", _sent_text(runtime.channels["lark"].api))
         self.assertTrue(runtime.state.inbound_ledger.seen("lark:callback-failed"))
         self.assertEqual(transport.submitted_turns, [])
 
     def test_unauthorized_plain_message_gets_no_failure_notice(self):
         runtime, api, _ = self._runtime(env_extra={"LARK_ALLOWED_OPEN_IDS": "ou_owner"})
-        asyncio.run(runtime._report_lark_inbound_failure(self._message_payload(sender="ou_member")))
+        asyncio.run(runtime._report_inbound_failure(self._message_payload(sender="ou_member")))
         self.assertEqual(api.calls, [])
         self.assertFalse(runtime.state.inbound_ledger.seen("lark:evt-1"))
 
     def test_pending_inbox_replays_after_restart_and_is_removed_after_save(self):
         runtime, _, transport = self._runtime()
-        path = runtime._persist_lark_event(self._message_payload())
+        path = runtime._persist_channel_event(self._message_payload())
         class Bridge:
             def start(self):
                 pass
-        asyncio.run(runtime.serve_lark_ws(max_events=1, bridge_factory=lambda **_: Bridge()))
+        asyncio.run(runtime.serve_channel(max_events=1, bridge_factory=lambda **_: Bridge()))
         self.assertEqual([turn.text for turn in transport.submitted_turns], ["run tests"])
         self.assertEqual(list(path.parent.iterdir()), [])
 
@@ -836,7 +836,7 @@ class LarkRuntimeTests(_LarkRuntimeHarness):
     def test_plain_message_creates_session_rooted_at_status_card(self):
         runtime, api, transport = self._runtime()
 
-        result = asyncio.run(runtime.process_lark_event(self._message_payload()))
+        result = asyncio.run(runtime.process_channel_event(self._message_payload()))
 
         self.assertTrue(result.accepted)
         self.assertEqual([turn.text for turn in transport.submitted_turns], ["run tests"])
@@ -891,7 +891,7 @@ class LarkRuntimeTests(_LarkRuntimeHarness):
         with mock.patch.dict(
             "os.environ", {"WALKCODE_DOWNLOAD_DIR": str(Path(self._tmp.name) / "downloads")}
         ):
-            result = asyncio.run(runtime.process_lark_event(payload))
+            result = asyncio.run(runtime.process_channel_event(payload))
 
         self.assertTrue(result.accepted)
         self.assertNotEqual(result.reason, "empty_message_ignored")
@@ -933,7 +933,7 @@ class LarkRuntimeTests(_LarkRuntimeHarness):
         with mock.patch.dict(
             "os.environ", {"WALKCODE_DOWNLOAD_DIR": str(Path(self._tmp.name) / "downloads")}
         ):
-            result = asyncio.run(runtime.process_lark_event(payload))
+            result = asyncio.run(runtime.process_channel_event(payload))
 
         self.assertTrue(result.accepted)
         self.assertEqual([turn.text for turn in transport.submitted_turns], ["看下这段视频"])
@@ -961,7 +961,7 @@ class LarkRuntimeTests(_LarkRuntimeHarness):
 
         stderr = io.StringIO()
         with contextlib.redirect_stderr(stderr):
-            result = asyncio.run(runtime.process_lark_event(payload))
+            result = asyncio.run(runtime.process_channel_event(payload))
 
         self.assertTrue(result.accepted)
         self.assertEqual(result.reason, "empty_message_ignored")
@@ -980,10 +980,10 @@ class LarkRuntimeTests(_LarkRuntimeHarness):
                 )
             ]
         )
-        asyncio.run(runtime.process_lark_event(self._message_payload()))
+        asyncio.run(runtime.process_channel_event(self._message_payload()))
 
         result = asyncio.run(
-            runtime.process_lark_event(
+            runtime.process_channel_event(
                 self._message_payload(
                     event_id="evt-2",
                     message_id="om_reply",
@@ -1006,9 +1006,9 @@ class LarkRuntimeTests(_LarkRuntimeHarness):
         # topic card stuck at "starting" with no session behind it.
         runtime, api, transport = self._runtime()
 
-        first = asyncio.run(runtime.process_lark_event(self._message_payload()))
+        first = asyncio.run(runtime.process_channel_event(self._message_payload()))
         cards_after_first = len([m for m, _ in api.calls if m == "sendCard"])
-        redelivery = asyncio.run(runtime.process_lark_event(self._message_payload()))
+        redelivery = asyncio.run(runtime.process_channel_event(self._message_payload()))
 
         self.assertTrue(first.accepted)
         self.assertFalse(redelivery.accepted)
@@ -1025,7 +1025,7 @@ class LarkRuntimeTests(_LarkRuntimeHarness):
         )
 
         result = asyncio.run(
-            runtime.process_lark_event(self._message_payload(chat_id="oc_other"))
+            runtime.process_channel_event(self._message_payload(chat_id="oc_other"))
         )
 
         self.assertFalse(result.accepted)
@@ -1038,7 +1038,7 @@ class LarkRuntimeTests(_LarkRuntimeHarness):
         )
 
         result = asyncio.run(
-            runtime.process_lark_event(self._message_payload(sender="ou_stranger"))
+            runtime.process_channel_event(self._message_payload(sender="ou_stranger"))
         )
 
         self.assertFalse(result.accepted)
@@ -1049,9 +1049,9 @@ class LarkRuntimeTests(_LarkRuntimeHarness):
             env_extra={"WALKCODE_E2E_LARK_CHAT_ID": "oc_e2e"}
         )
 
-        blocked = asyncio.run(runtime.process_lark_event(self._message_payload(chat_id="oc_other")))
+        blocked = asyncio.run(runtime.process_channel_event(self._message_payload(chat_id="oc_other")))
         allowed = asyncio.run(
-            runtime.process_lark_event(self._message_payload(event_id="evt-2", chat_id="oc_e2e"))
+            runtime.process_channel_event(self._message_payload(event_id="evt-2", chat_id="oc_e2e"))
         )
 
         self.assertFalse(blocked.accepted)
@@ -1061,7 +1061,7 @@ class LarkRuntimeTests(_LarkRuntimeHarness):
         runtime, api, transport = self._runtime()
 
         result = asyncio.run(
-            runtime.process_lark_event(self._message_payload(text="/status"))
+            runtime.process_channel_event(self._message_payload(text="/status"))
         )
 
         self.assertTrue(result.accepted)
@@ -1084,10 +1084,10 @@ class LarkRuntimeTests(_LarkRuntimeHarness):
     def test_reload_command_cycles_the_backend_and_answers_in_chinese(self):
         runtime, api, transport = self._runtime()
 
-        asyncio.run(runtime.process_lark_event(self._message_payload()))
+        asyncio.run(runtime.process_channel_event(self._message_payload()))
         self._settle_session(runtime)
         result = asyncio.run(
-            runtime.process_lark_event(
+            runtime.process_channel_event(
                 self._message_payload(
                     event_id="evt-reload",
                     text="/reload",
@@ -1114,10 +1114,10 @@ class LarkRuntimeTests(_LarkRuntimeHarness):
     def test_restart_is_an_alias_for_reload(self):
         runtime, api, transport = self._runtime()
 
-        asyncio.run(runtime.process_lark_event(self._message_payload()))
+        asyncio.run(runtime.process_channel_event(self._message_payload()))
         self._settle_session(runtime)
         asyncio.run(
-            runtime.process_lark_event(
+            runtime.process_channel_event(
                 self._message_payload(
                     event_id="evt-restart",
                     text="/restart",
@@ -1136,11 +1136,11 @@ class LarkRuntimeTests(_LarkRuntimeHarness):
     def test_message_after_reload_revives_the_same_lark_session(self):
         runtime, api, transport = self._runtime()
 
-        asyncio.run(runtime.process_lark_event(self._message_payload()))
+        asyncio.run(runtime.process_channel_event(self._message_payload()))
         self._settle_session(runtime)
         before = runtime.state.sessions.list_sessions(channel_kind="lark")[0].session_id
         asyncio.run(
-            runtime.process_lark_event(
+            runtime.process_channel_event(
                 self._message_payload(
                     event_id="evt-reload2",
                     text="/reload",
@@ -1150,7 +1150,7 @@ class LarkRuntimeTests(_LarkRuntimeHarness):
             )
         )
         after = asyncio.run(
-            runtime.process_lark_event(
+            runtime.process_channel_event(
                 self._message_payload(
                     event_id="evt-after",
                     text="继续",
@@ -1173,11 +1173,11 @@ class LarkRuntimeTests(_LarkRuntimeHarness):
         runtime, api, transport = self._runtime()
 
         first = asyncio.run(
-            runtime.process_lark_event(self._message_payload(text="/status"))
+            runtime.process_channel_event(self._message_payload(text="/status"))
         )
         calls_after_first = len(api.calls)
         redelivery = asyncio.run(
-            runtime.process_lark_event(self._message_payload(text="/status"))
+            runtime.process_channel_event(self._message_payload(text="/status"))
         )
 
         self.assertTrue(first.accepted)
@@ -1189,18 +1189,18 @@ class LarkRuntimeTests(_LarkRuntimeHarness):
         runtime, api, transport = self._runtime()
 
         result = asyncio.run(
-            runtime.process_lark_event(self._message_payload(text="/compact"))
+            runtime.process_channel_event(self._message_payload(text="/compact"))
         )
 
         self.assertTrue(result.accepted)
-        self.assertEqual(result.reason, "lark_unknown_slash_command")
+        self.assertEqual(result.reason, "unknown_slash_command")
         self.assertEqual(transport.submitted_turns, [])
 
     def test_agent_selector_command_is_rejected(self):
         runtime, api, transport = self._runtime()
 
         result = asyncio.run(
-            runtime.process_lark_event(self._message_payload(text="/codex do this"))
+            runtime.process_channel_event(self._message_payload(text="/codex do this"))
         )
 
         self.assertTrue(result.accepted)
@@ -1212,14 +1212,14 @@ class LarkRuntimeTests(_LarkRuntimeHarness):
         payload = self._message_payload()
 
         class _FakeBridge:
-            def __init__(self, *, loop, queue, ack_registry):
+            def __init__(self, *, loop, queue, persist_event):
                 self.queue = queue
 
             def start(self):
                 self.queue.put_nowait(payload)
 
         asyncio.run(
-            runtime.serve_lark_ws(
+            runtime.serve_channel(
                 max_events=1,
                 bridge_factory=lambda **kwargs: _FakeBridge(**kwargs),
             )
@@ -1303,7 +1303,7 @@ class RepoCommandTests(_LarkRuntimeHarness):
         )
 
         result = asyncio.run(
-            runtime.process_lark_event(self._message_payload(text="/repo proj-a 修复登录bug"))
+            runtime.process_channel_event(self._message_payload(text="/repo proj-a 修复登录bug"))
         )
 
         self.assertTrue(result.accepted)
@@ -1316,7 +1316,7 @@ class RepoCommandTests(_LarkRuntimeHarness):
         runtime, api, transport = self._runtime()
 
         result = asyncio.run(
-            runtime.process_lark_event(self._message_payload(text="/repo proj-a 做点事"))
+            runtime.process_channel_event(self._message_payload(text="/repo proj-a 做点事"))
         )
 
         self.assertTrue(result.accepted)
@@ -1331,7 +1331,7 @@ class RepoCommandTests(_LarkRuntimeHarness):
         )
 
         result = asyncio.run(
-            runtime.process_lark_event(self._message_payload(text="/repo proj-a"))
+            runtime.process_channel_event(self._message_payload(text="/repo proj-a"))
         )
 
         self.assertEqual(result.reason, "repo_command_usage")
@@ -1344,7 +1344,7 @@ class RepoCommandTests(_LarkRuntimeHarness):
         )
 
         result = asyncio.run(
-            runtime.process_lark_event(self._message_payload(text="/repo ../etc 干活"))
+            runtime.process_channel_event(self._message_payload(text="/repo ../etc 干活"))
         )
 
         self.assertEqual(result.reason, "repo_command_rejected")
@@ -1356,10 +1356,10 @@ class RepoCommandTests(_LarkRuntimeHarness):
         runtime, api, transport = self._runtime(
             env_extra={"WALKCODE_WORKSPACE_ROOTS": str(root)}
         )
-        asyncio.run(runtime.process_lark_event(self._message_payload(text="第一条任务")))
+        asyncio.run(runtime.process_channel_event(self._message_payload(text="第一条任务")))
 
         result = asyncio.run(
-            runtime.process_lark_event(
+            runtime.process_channel_event(
                 self._message_payload(
                     event_id="evt-2",
                     message_id="om_reply",
@@ -1548,7 +1548,7 @@ class LarkTuiTakeoverAuthzTests(_LarkRuntimeHarness):
         root = session.channel_binding.root_message_id
 
         result = asyncio.run(
-            runtime.process_lark_event(
+            runtime.process_channel_event(
                 self._message_payload(
                     event_id="evt-to",
                     message_id="om_to_input",
@@ -1594,7 +1594,7 @@ class LarkTuiTakeoverAuthzTests(_LarkRuntimeHarness):
 
         # simulate config gaining the open id afterwards + service restart refresh
         options = dict(runtime.config.channel.options)
-        options["allowed_open_ids"] = ("ou_late",)
+        options["allowed_sender_ids"] = ("ou_late",)
         object.__setattr__(runtime.config.channel, "options", options)
         runtime._loaded_tui_observed_bindings_refreshed = False
         session = runtime.state.sessions.get(session_id)
@@ -1652,10 +1652,10 @@ class LarkSlashPassthroughTests(_LarkRuntimeHarness):
                 )
             ]
         )
-        asyncio.run(runtime.process_lark_event(self._message_payload(text="先建个会话")))
+        asyncio.run(runtime.process_channel_event(self._message_payload(text="先建个会话")))
 
         result = asyncio.run(
-            runtime.process_lark_event(
+            runtime.process_channel_event(
                 self._message_payload(
                     event_id="evt-2",
                     message_id="om_slash",
@@ -1679,10 +1679,10 @@ class LarkSlashPassthroughTests(_LarkRuntimeHarness):
                 )
             ]
         )
-        asyncio.run(runtime.process_lark_event(self._message_payload(text="先建个会话")))
+        asyncio.run(runtime.process_channel_event(self._message_payload(text="先建个会话")))
 
         result = asyncio.run(
-            runtime.process_lark_event(
+            runtime.process_channel_event(
                 self._message_payload(
                     event_id="evt-3",
                     message_id="om_slash2",
@@ -1699,7 +1699,7 @@ class LarkSlashPassthroughTests(_LarkRuntimeHarness):
         runtime, api, transport = self._runtime()
 
         result = asyncio.run(
-            runtime.process_lark_event(self._message_payload(text="/status"))
+            runtime.process_channel_event(self._message_payload(text="/status"))
         )
 
         self.assertTrue(result.accepted)
@@ -1728,11 +1728,11 @@ class LarkModelChoiceCardTests(_LarkRuntimeHarness):
         runtime, api, transport = self._runtime_with_models(
             {"ANTHROPIC_MODEL": "opus", "ANTHROPIC_SMALL_FAST_MODEL": "haiku"}
         )
-        asyncio.run(runtime.process_lark_event(self._message_payload(text="建会话")))
+        asyncio.run(runtime.process_channel_event(self._message_payload(text="建会话")))
         api.calls.clear()
 
         result = asyncio.run(
-            runtime.process_lark_event(
+            runtime.process_channel_event(
                 self._message_payload(event_id="evt-m", message_id="om_m", root_id="lark-msg-1", text="/model")
             )
         )
@@ -1745,7 +1745,7 @@ class LarkModelChoiceCardTests(_LarkRuntimeHarness):
 
         api.calls.clear()
         click = asyncio.run(
-            runtime.process_lark_event(
+            runtime.process_channel_event(
                 {
                     "event_id": "evt-click",
                     "event": {
@@ -1780,11 +1780,11 @@ class LarkModelChoiceCardTests(_LarkRuntimeHarness):
                 {"message": "ok", "agent_session_id": "a1", "model": "opus-20260610"},
             )
         ]
-        asyncio.run(runtime.process_lark_event(self._message_payload(text="建会话")))
+        asyncio.run(runtime.process_channel_event(self._message_payload(text="建会话")))
         api.calls.clear()
 
         asyncio.run(
-            runtime.process_lark_event(
+            runtime.process_channel_event(
                 self._message_payload(event_id="evt-m2", message_id="om_m2", root_id="lark-msg-1", text="/model")
             )
         )
@@ -1803,11 +1803,11 @@ class LarkModelChoiceCardTests(_LarkRuntimeHarness):
                 AgentEvent(AgentEventType.TURN_COMPLETED, {"message": "ok", "agent_session_id": "a1"})
             ],
         )
-        asyncio.run(runtime.process_lark_event(self._message_payload(text="建会话")))
+        asyncio.run(runtime.process_channel_event(self._message_payload(text="建会话")))
         api.calls.clear()
 
         asyncio.run(
-            runtime.process_lark_event(
+            runtime.process_channel_event(
                 self._message_payload(event_id="evt-m", message_id="om_m", root_id="lark-msg-1", text="/model")
             )
         )
@@ -1833,7 +1833,7 @@ class LarkRejectionNoteTests(_LarkRuntimeHarness):
 
         runtime.orchestrator.handle_inbound_event = deny
         result = asyncio.run(
-            runtime.process_lark_event(
+            runtime.process_channel_event(
                 self._message_payload(text="hi", root_id="lark-root", message_id="om_rej")
             )
         )
@@ -1861,7 +1861,7 @@ class LarkRejectionNoteTests(_LarkRuntimeHarness):
 
         runtime.orchestrator.handle_inbound_event = deny
         result = asyncio.run(
-            runtime.process_lark_event(
+            runtime.process_channel_event(
                 self._message_payload(text="hi", root_id="lark-root", message_id="om_stop")
             )
         )
@@ -1895,7 +1895,7 @@ class LarkRejectionNoteTests(_LarkRuntimeHarness):
 
         runtime.orchestrator.handle_inbound_event = deny
         result = asyncio.run(
-            runtime.process_lark_event(
+            runtime.process_channel_event(
                 self._message_payload(text="//compact", root_id="lark-root", message_id="om_esc")
             )
         )
@@ -1924,7 +1924,7 @@ class LarkRejectionNoteTests(_LarkRuntimeHarness):
 
         runtime.orchestrator.handle_inbound_event = refuse
         result = asyncio.run(
-            runtime.process_lark_event(
+            runtime.process_channel_event(
                 self._message_payload(text="hi", root_id="lark-root", message_id="om_norref")
             )
         )
@@ -1944,7 +1944,7 @@ class LarkRejectionNoteTests(_LarkRuntimeHarness):
         )
 
         result = asyncio.run(
-            runtime.process_lark_event(
+            runtime.process_channel_event(
                 self._message_payload(text="hi", sender="ou_stranger", message_id="om_str")
             )
         )
@@ -1962,7 +1962,7 @@ class LarkPermissionCardFlipTests(_LarkRuntimeHarness):
                 AgentEvent(AgentEventType.TURN_COMPLETED, {"message": "ok", "agent_session_id": "a1"})
             ],
         )
-        asyncio.run(runtime.process_lark_event(self._message_payload(text="建会话")))
+        asyncio.run(runtime.process_channel_event(self._message_payload(text="建会话")))
         session = runtime.state.sessions.get(
             runtime.state.sessions.list_sessions(channel_kind="lark")[0].session_id
         )
@@ -1980,7 +1980,7 @@ class LarkPermissionCardFlipTests(_LarkRuntimeHarness):
         api.calls.clear()
 
         result = asyncio.run(
-            runtime.process_lark_event(
+            runtime.process_channel_event(
                 {
                     "event_id": "evt-perm",
                     "event": {
@@ -2012,7 +2012,7 @@ class LarkAskUserCardFlipTests(_LarkRuntimeHarness):
                 AgentEvent(AgentEventType.TURN_COMPLETED, {"message": "ok", "agent_session_id": "a1"})
             ],
         )
-        asyncio.run(runtime.process_lark_event(self._message_payload(text="建会话")))
+        asyncio.run(runtime.process_channel_event(self._message_payload(text="建会话")))
         session = runtime.state.sessions.get(
             runtime.state.sessions.list_sessions(channel_kind="lark")[0].session_id
         )
@@ -2027,7 +2027,7 @@ class LarkAskUserCardFlipTests(_LarkRuntimeHarness):
         api.calls.clear()
 
         result = asyncio.run(
-            runtime.process_lark_event(
+            runtime.process_channel_event(
                 {
                     "event_id": "evt-au",
                     "event": {
@@ -2106,7 +2106,7 @@ class LarkAttachmentAndMultiTabTests(_LarkRuntimeHarness):
                 AgentEvent(AgentEventType.TURN_COMPLETED, {"message": "ok", "agent_session_id": "a1"})
             ],
         )
-        asyncio.run(runtime.process_lark_event(self._message_payload(text="建会话")))
+        asyncio.run(runtime.process_channel_event(self._message_payload(text="建会话")))
         session = runtime.state.sessions.get(
             runtime.state.sessions.list_sessions(channel_kind="lark")[0].session_id
         )
@@ -2118,7 +2118,7 @@ class LarkAttachmentAndMultiTabTests(_LarkRuntimeHarness):
         )
         tok = store.create_callback_token(ctx.interaction_id, "toggle:0:0", generation=session.generation)
         api.calls.clear()
-        asyncio.run(runtime.process_lark_event({
+        asyncio.run(runtime.process_channel_event({
             "event_id": "evt-tg", "event": {
                 "message_id": "om_msq", "chat_id": "oc_chat", "open_id": "ou_user",
                 "root_id": session.channel_binding.root_message_id,

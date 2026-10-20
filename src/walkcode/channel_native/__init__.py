@@ -114,6 +114,7 @@ from .models import (
 from .config import (
     _agent_to_transport_kind,
     _channel_allowlist_configured,
+    _channel_tui_chat_env,
     _CHANNEL_DISPLAY_NAMES,
     _channel_environment_context,
     _CHANNEL_ENVIRONMENT_CONTEXT_TEMPLATE,
