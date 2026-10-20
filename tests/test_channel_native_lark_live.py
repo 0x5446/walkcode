@@ -186,15 +186,24 @@ class RangedDownloadTests(unittest.TestCase):
         self.assertEqual(result["file_name"], "big.pdf")
         self.assertEqual(seen, ["", "bytes=0-999", "bytes=1000-1999", "bytes=2000-2999"])
 
-    def test_truncated_range_download_is_an_error(self):
-        def responder(op, headers):
-            if "Range" not in headers:
-                return _FakeResourceResponse(code=234037)
-            return _FakeResourceResponse(b"", headers={"Content-Range": "bytes */5000"})
+    def test_unproven_chunks_are_errors(self):
+        # Range ignored (no Content-Range), truncated body, wrong offset, empty body.
+        bad = [
+            (b"x" * 10, {}),
+            (b"x" * 10, {"Content-Range": "bytes 0-19/5000"}),
+            (b"x" * 10, {"Content-Range": "bytes 5-14/5000"}),
+            (b"", {"Content-Range": "bytes */5000"}),
+        ]
+        for data, headers in bad:
+            def responder(op, h, data=data, headers=headers):
+                if "Range" not in h:
+                    return _FakeResourceResponse(code=234037)
+                return _FakeResourceResponse(data, headers=headers)
 
-        transport, _ = self._transport(responder)
-        with self.assertRaises(TransientDeliveryError):
-            transport({"kind": "download", "message_id": "m", "file_key": "k", "type": "file"})
+            transport, seen = self._transport(responder)
+            with self.subTest(headers=headers), self.assertRaises(TransientDeliveryError):
+                transport({"kind": "download", "message_id": "m", "file_key": "k", "type": "file"})
+            self.assertEqual(len(seen), 2)
 
     def test_oversized_image_is_not_retried_with_range(self):
         transport, seen = self._transport(lambda op, h: _FakeResourceResponse(code=234037))

@@ -387,22 +387,23 @@ class SdkTransport:
             file_name = file_name or str(getattr(resp, "file_name", "") or "")
             headers = getattr(getattr(resp, "raw", None), "headers", None) or {}
             content_range = next(
-                (v for k, v in headers.items() if k.lower() == "content-range"), ""
+                (str(v) for k, v in headers.items() if k.lower() == "content-range"), ""
             )
-            # "bytes 0-33554431/162800000"; without it, a short chunk is the end.
-            size = str(content_range).rpartition("/")[2]
-            if size.isdigit():
-                total = int(size)
-            if not data:
-                break
+            # Every chunk must prove where it sits ("bytes 0-33554431/162800933"):
+            # a server that ignored Range, or a truncated body, must fail here
+            # rather than hand the agent a corrupt file.
+            span, _, size = content_range.removeprefix("bytes ").partition("/")
+            first, _, last = span.partition("-")
+            if not (first.isdigit() and last.isdigit() and size.isdigit()) or (
+                int(first) != start or int(last) - int(first) + 1 != len(data) or not data
+            ):
+                raise TransientDeliveryError(
+                    f"Lark ranged download got an unexpected chunk for bytes={start}-{end}: "
+                    f"Content-Range={content_range!r}, {len(data)} bytes"
+                )
+            total = int(size)
             chunks.append(data)
             start += len(data)
-            if total is None and len(data) < LARK_DOWNLOAD_RANGE_CHUNK:
-                break
-        if total is not None and start != total:
-            raise TransientDeliveryError(
-                f"Lark ranged download incomplete: got {start} of {total} bytes"
-            )
         return {"content": b"".join(chunks), "file_name": file_name}
 
     def _get_resource(self, operation: dict[str, Any], headers: dict[str, str] | None = None):
