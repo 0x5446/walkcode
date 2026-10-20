@@ -62,6 +62,12 @@ LARK_QUOTA_EXCEEDED_CODE = 99991403
 
 DEFAULT_ACK_TIMEOUT = 2.5
 
+# im.v1.message_resource.get refuses files over 100MB in one shot (234037);
+# the documented way past it is Range requests of at most 32MB each. Images
+# have no such escape hatch (100MB, Range not allowed).
+LARK_DOWNLOAD_TOO_LARGE_CODE = 234037
+LARK_DOWNLOAD_RANGE_CHUNK = 32 * 1024 * 1024
+
 _PROGRAMMING_ERRORS = (AttributeError, TypeError, NameError, KeyError, IndexError, ImportError)
 
 
@@ -353,7 +359,54 @@ class SdkTransport:
         return {"ok": True}
 
     def _download(self, operation: dict[str, Any]) -> dict[str, Any]:
-        _, im_v1 = self._sdk()
+        resp = self._get_resource(operation)
+        if (
+            not resp.success()
+            and operation["type"] == "file"
+            and int(getattr(resp, "code", 0) or 0) == LARK_DOWNLOAD_TOO_LARGE_CODE
+        ):
+            return self._download_ranged(operation)
+        resp = self._check(resp, "Lark download")
+        return {
+            "content": resp.file.read(),
+            "file_name": str(getattr(resp, "file_name", "") or ""),
+        }
+
+    def _download_ranged(self, operation: dict[str, Any]) -> dict[str, Any]:
+        chunks: list[bytes] = []
+        file_name = ""
+        start = 0
+        total: int | None = None
+        while total is None or start < total:
+            end = start + LARK_DOWNLOAD_RANGE_CHUNK - 1
+            resp = self._check(
+                self._get_resource(operation, headers={"Range": f"bytes={start}-{end}"}),
+                "Lark ranged download",
+            )
+            data = resp.file.read()
+            file_name = file_name or str(getattr(resp, "file_name", "") or "")
+            headers = getattr(getattr(resp, "raw", None), "headers", None) or {}
+            content_range = next(
+                (v for k, v in headers.items() if k.lower() == "content-range"), ""
+            )
+            # "bytes 0-33554431/162800000"; without it, a short chunk is the end.
+            size = str(content_range).rpartition("/")[2]
+            if size.isdigit():
+                total = int(size)
+            if not data:
+                break
+            chunks.append(data)
+            start += len(data)
+            if total is None and len(data) < LARK_DOWNLOAD_RANGE_CHUNK:
+                break
+        if total is not None and start != total:
+            raise TransientDeliveryError(
+                f"Lark ranged download incomplete: got {start} of {total} bytes"
+            )
+        return {"content": b"".join(chunks), "file_name": file_name}
+
+    def _get_resource(self, operation: dict[str, Any], headers: dict[str, str] | None = None):
+        lark, im_v1 = self._sdk()
         request = (
             im_v1.GetMessageResourceRequest.builder()
             .message_id(operation["message_id"])
@@ -361,13 +414,8 @@ class SdkTransport:
             .type(operation["type"])
             .build()
         )
-        resp = self._check(
-            self._ensure_client().im.v1.message_resource.get(request), "Lark download"
-        )
-        return {
-            "content": resp.file.read(),
-            "file_name": str(getattr(resp, "file_name", "") or ""),
-        }
+        option = lark.RequestOption.builder().headers(dict(headers or {})).build()
+        return self._ensure_client().im.v1.message_resource.get(request, option)
 
     def _get_message(self, operation: dict[str, Any]) -> dict[str, Any]:
         _, im_v1 = self._sdk()
