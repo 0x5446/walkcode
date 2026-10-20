@@ -1089,7 +1089,11 @@ class Orchestrator:
         channel = self.channels.get(inbound.channel_kind)
         if channel is None or not channel.capabilities().attachment_download:
             return SubmitResult(False, BlockedReason.CAPABILITY_DISABLED)
-        attachments = [await channel.download_attachment(attachment) for attachment in inbound.attachments]
+        # Channel ingress may have downloaded already (Lark does, before its root card).
+        attachments = [
+            attachment if attachment.local_path else await channel.download_attachment(attachment)
+            for attachment in inbound.attachments
+        ]
         return TurnInput(text=inbound.text, attachments=attachments, created_at=inbound.created_at)
 
     async def close_session(
@@ -1709,16 +1713,18 @@ class Orchestrator:
                                 # as the thread root; register it so refreshes
                                 # patch that card instead of sending a second one.
                                 binding.health_message_id = preset_card
-                            session = await self.start_session(
-                                binding,
-                                agent_transport_kind,
-                                cwd,
-                                actor,
-                            )
+                            # Prepare first: a failed download must not leave
+                            # behind a started session that never gets input.
                             turn = await self.prepare_turn_from_inbound(inbound)
                             if isinstance(turn, SubmitResult):
                                 result = turn
                             else:
+                                session = await self.start_session(
+                                    binding,
+                                    agent_transport_kind,
+                                    cwd,
+                                    actor,
+                                )
                                 result = await self.submit_user_input(
                                     session.session_id,
                                     turn,

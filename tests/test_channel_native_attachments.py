@@ -168,6 +168,86 @@ class AttachmentIntakeTests(unittest.TestCase):
         self.assertEqual(channel.downloaded, [])
         self.assertEqual(transport.submitted_turns, [])
 
+    def test_failed_download_on_new_binding_starts_no_session(self):
+        clock = _Clock()
+        channel = _DownloadingChannel(_channel_caps(attachment_download=True))
+
+        async def failing(attachment):
+            raise RuntimeError("download failed")
+
+        channel.download_attachment = failing
+        transport = FakeAgentTransport("fake-transport", _transport_caps())
+        sessions = SessionRegistry(now=clock)
+        orchestrator = Orchestrator(
+            sessions=sessions,
+            interactions=InteractionStore(now=clock),
+            outbox=DurableOutbox(now=clock),
+            channels={"lark": channel},
+            transports={"fake-transport": transport},
+            now=clock,
+        )
+        inbound = InboundEvent(
+            event_id="evt-file",
+            channel_kind="lark",
+            account_id="bot",
+            chat_id="chat",
+            thread_id="",
+            message_id="m-file",
+            root_message_id="",
+            sender_id="owner",
+            sender_display="Owner",
+            text="",
+            attachments=[AttachmentRef(source_id="file-1", mime="application/pdf")],
+        )
+
+        with self.assertRaises(RuntimeError):
+            asyncio.run(
+                orchestrator.handle_inbound_event(
+                    inbound, agent_transport_kind="fake-transport", cwd="/tmp/project"
+                )
+            )
+
+        self.assertEqual(sessions.list_sessions(channel_kind="lark"), [])
+
+    def test_already_downloaded_attachments_are_not_downloaded_again(self):
+        clock = _Clock()
+        channel = _DownloadingChannel(_channel_caps(attachment_download=True))
+        transport = FakeAgentTransport("fake-transport", _transport_caps())
+        orchestrator = Orchestrator(
+            sessions=SessionRegistry(now=clock),
+            interactions=InteractionStore(now=clock),
+            outbox=DurableOutbox(now=clock),
+            channels={"lark": channel},
+            transports={"fake-transport": transport},
+            now=clock,
+        )
+        asyncio.run(orchestrator.start_session(_binding(), "fake-transport", "/tmp/project", _actor()))
+        inbound = InboundEvent(
+            event_id="evt-file",
+            channel_kind="lark",
+            account_id="bot",
+            chat_id="chat",
+            thread_id="topic",
+            message_id="m-file",
+            root_message_id="root",
+            sender_id="owner",
+            sender_display="Owner",
+            text="use this file",
+            attachments=[
+                AttachmentRef(source_id="file-1", mime="application/pdf", local_path="/tmp/pre/file-1")
+            ],
+        )
+
+        result = asyncio.run(
+            orchestrator.handle_inbound_event(
+                inbound, agent_transport_kind="fake-transport", cwd="/tmp/project"
+            )
+        )
+
+        self.assertTrue(result.accepted)
+        self.assertEqual(channel.downloaded, [])
+        self.assertEqual(transport.submitted_turns[0].attachments[0].local_path, "/tmp/pre/file-1")
+
     def test_lark_image_and_file_events_create_attachment_refs(self):
         adapter = LarkChannelAdapter(LarkBotApi(caller=lambda *_: {}))
 

@@ -23,6 +23,7 @@ from typing import Any
 from .channel_native import (
     agent_session_id,
     PermanentDeliveryError,
+    TransientDeliveryError,
     ActorRef,
     AgentEventType,
     AgentTransport,
@@ -1295,6 +1296,27 @@ class ChannelNativeRuntime:
                     )
             if _inbound_is_empty(inbound):
                 return _ignore_empty_inbound(inbound)
+            # Download before the new-session root card goes out: a failure
+            # after it left a card stuck at "starting", an idle session behind
+            # it, and the failure notice in a second topic on the user's message.
+            try:
+                inbound = await self._download_lark_attachments(channel, inbound)
+            except (TransientDeliveryError, PermanentDeliveryError) as exc:
+                _log_degrade(
+                    "lark_attachment_download_failed",
+                    chat_id=inbound.chat_id,
+                    message_id=inbound.message_id,
+                    error=exc,
+                )
+                await channel.send_view(
+                    reply_binding,
+                    {"type": "text", "text": (
+                        f"附件下载失败，这条消息没有交给 agent：{exc}。请稍后重发。"
+                    )},
+                )
+                self._complete_lark_local_inbound(inbound)
+                self.save_state()
+                return SubmitResult(False, "attachment_download_failed")
             inbound = await self._place_lark_new_session(channel, inbound)
         result = await self.orchestrator.handle_inbound_event(
             inbound,
@@ -1337,6 +1359,16 @@ class ChannelNativeRuntime:
         ledger = self.state.inbound_ledger
         if ledger is not None and inbound.event_id != "lark:":
             ledger.record(inbound.event_id)
+
+    @staticmethod
+    async def _download_lark_attachments(channel, inbound):
+        if not inbound.attachments:
+            return inbound
+        attachments = [
+            item if item.local_path else await channel.download_attachment(item)
+            for item in inbound.attachments
+        ]
+        return replace(inbound, attachments=attachments)
 
     async def _place_lark_new_session(self, channel, inbound):
         """Root new Lark sessions at a bot-sent status card (V2 UX parity).

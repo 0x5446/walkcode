@@ -24,6 +24,7 @@ from walkcode.channel_native import (
     SubmitResult,
     LarkBotApi,
     TransportCapabilities,
+    TransientDeliveryError,
     BlockedReason,
 )
 from walkcode import channel_native as channel_native_module
@@ -79,6 +80,21 @@ def _lark_message(event_id=10, text="ship it", *, root_id="", chat_id="oc_chat",
         "event": {
             "message": message,
             "sender": {"sender_id": {"open_id": open_id}, "sender_type": "user"},
+        },
+    }
+
+
+def _lark_file_message(event_id=11):
+    return {
+        "event_id": f"evt-{event_id}",
+        "event": {
+            "message": {
+                "message_id": f"om_msg_{event_id}",
+                "chat_id": "oc_chat",
+                "message_type": "file",
+                "content": json.dumps({"file_key": "file-1", "file_name": "spec.pdf"}),
+            },
+            "sender": {"sender_id": {"open_id": "ou_user"}, "sender_type": "user"},
         },
     }
 
@@ -190,6 +206,87 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
             summaries = snapshot.sessions.list_sessions(channel_kind="lark")
             self.assertEqual(len(summaries), 1)
             self.assertEqual(summaries[0].transport_kind, "claude_headless")
+
+    def test_attachment_download_failure_sends_note_without_root_card_or_session(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = str(Path(tmp) / "state.json")
+            cfg = ChannelNativeConfig.from_env(
+                {
+                    "WALKCODE_CHANNEL": "lark",
+                    "LARK_APP_ID": "cli_x",
+                    "LARK_APP_SECRET": "s",
+                    "WALKCODE_AGENT": "claude",
+                    "WALKCODE_STATE_PATH": state_path,
+                    "WALKCODE_CWD": tmp,
+                }
+            )
+            api = _FakeLarkApi()
+            original_call = api._call
+
+            async def failing_download(method, payload):
+                if method == "downloadResource":
+                    api.calls.append((method, dict(payload)))
+                    raise TransientDeliveryError("Lark download failed: 500 boom")
+                return await original_call(method, payload)
+
+            api._caller = failing_download
+            transport = FakeAgentTransport("claude_headless", _transport_caps())
+            runtime = ChannelNativeRuntime.from_config(
+                cfg, lark_api=api, transports={"claude_headless": transport}
+            )
+
+            result = asyncio.run(runtime.process_lark_event(_lark_file_message()))
+
+            self.assertFalse(result.accepted)
+            self.assertEqual(result.reason, "attachment_download_failed")
+            self.assertEqual([m for m, _ in api.calls if m == "sendCard"], [])
+            notes = _sent(api)
+            self.assertEqual(len(notes), 1)
+            self.assertIn("附件下载失败", notes[0]["text"])
+            self.assertEqual(notes[0].get("root_id"), "om_msg_11")
+            self.assertEqual(transport.submitted_turns, [])
+            self.assertEqual(runtime.state.sessions.list_sessions(channel_kind="lark"), [])
+
+    def test_attachment_is_downloaded_once_before_root_card(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = str(Path(tmp) / "state.json")
+            cfg = ChannelNativeConfig.from_env(
+                {
+                    "WALKCODE_CHANNEL": "lark",
+                    "LARK_APP_ID": "cli_x",
+                    "LARK_APP_SECRET": "s",
+                    "WALKCODE_AGENT": "claude",
+                    "WALKCODE_STATE_PATH": state_path,
+                    "WALKCODE_CWD": tmp,
+                }
+            )
+            api = _FakeLarkApi()
+            original_call = api._call
+
+            async def downloading(method, payload):
+                if method == "downloadResource":
+                    api.calls.append((method, dict(payload)))
+                    return {"content": b"%PDF-1.4", "file_name": "spec.pdf"}
+                return await original_call(method, payload)
+
+            api._caller = downloading
+            transport = FakeAgentTransport(
+                "claude_headless",
+                _transport_caps(),
+                scripted_events=[AgentEvent(AgentEventType.TURN_COMPLETED, {"message": "done"})],
+            )
+            runtime = ChannelNativeRuntime.from_config(
+                cfg, lark_api=api, transports={"claude_headless": transport}
+            )
+
+            result = asyncio.run(runtime.process_lark_event(_lark_file_message()))
+
+            self.assertTrue(result.accepted)
+            methods = [m for m, _ in api.calls]
+            self.assertEqual(methods.count("downloadResource"), 1)
+            self.assertLess(methods.index("downloadResource"), methods.index("sendCard"))
+            attachment = transport.submitted_turns[0].attachments[0]
+            self.assertEqual(Path(attachment.local_path).read_bytes(), b"%PDF-1.4")
 
     def test_process_lark_event_uses_configured_agent_only(self):
         with tempfile.TemporaryDirectory() as tmp:

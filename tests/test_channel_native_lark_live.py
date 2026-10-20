@@ -1,8 +1,12 @@
 import asyncio
+import io
 import json
+import types
 import unittest
+from unittest import mock
 
 from walkcode.channel_native import PermanentDeliveryError, TransientDeliveryError
+from walkcode.channel_native import lark_live
 from walkcode.channel_native.lark_live import (
     AckRegistry,
     LarkIngressBridge,
@@ -121,6 +125,92 @@ class ErrorClassificationTests(unittest.TestCase):
         resp = _FakeResponse(ok=True)
 
         self.assertIs(transport._check(resp, "send"), resp)
+
+
+class _FakeResourceResponse:
+    def __init__(self, data=b"", code=0, headers=None, file_name=""):
+        self.code = code
+        self.msg = ""
+        self.file = io.BytesIO(data)
+        self.file_name = file_name
+        self.raw = types.SimpleNamespace(headers=headers or {})
+
+    def success(self):
+        return self.code == 0
+
+
+class RangedDownloadTests(unittest.TestCase):
+    def _transport(self, responder):
+        transport = SdkTransport("a", "s")
+        seen = []
+
+        def get_resource(operation, headers=None):
+            seen.append((headers or {}).get("Range", ""))
+            return responder(operation, headers or {})
+
+        transport._get_resource = get_resource
+        return transport, seen
+
+    def test_small_file_downloads_in_one_request(self):
+        transport, seen = self._transport(
+            lambda op, h: _FakeResourceResponse(b"abc", file_name="a.pdf")
+        )
+
+        result = transport({"kind": "download", "message_id": "m", "file_key": "k", "type": "file"})
+
+        self.assertEqual(result, {"content": b"abc", "file_name": "a.pdf"})
+        self.assertEqual(seen, [""])
+
+    def test_file_over_limit_falls_back_to_range_chunks(self):
+        payload = bytes(range(256)) * 10
+        chunk = 1000
+
+        def responder(op, headers):
+            if "Range" not in headers:
+                return _FakeResourceResponse(code=234037)
+            start, end = (int(x) for x in headers["Range"].removeprefix("bytes=").split("-"))
+            part = payload[start : end + 1]
+            return _FakeResourceResponse(
+                part,
+                headers={"content-range": f"bytes {start}-{start + len(part) - 1}/{len(payload)}"},
+                file_name="big.pdf",
+            )
+
+        transport, seen = self._transport(responder)
+        with mock.patch.object(lark_live, "LARK_DOWNLOAD_RANGE_CHUNK", chunk):
+            result = transport(
+                {"kind": "download", "message_id": "m", "file_key": "k", "type": "file"}
+            )
+
+        self.assertEqual(result["content"], payload)
+        self.assertEqual(result["file_name"], "big.pdf")
+        self.assertEqual(seen, ["", "bytes=0-999", "bytes=1000-1999", "bytes=2000-2999"])
+
+    def test_unproven_chunks_are_errors(self):
+        # Range ignored (no Content-Range), truncated body, wrong offset, empty body.
+        bad = [
+            (b"x" * 10, {}),
+            (b"x" * 10, {"Content-Range": "bytes 0-19/5000"}),
+            (b"x" * 10, {"Content-Range": "bytes 5-14/5000"}),
+            (b"", {"Content-Range": "bytes */5000"}),
+        ]
+        for data, headers in bad:
+            def responder(op, h, data=data, headers=headers):
+                if "Range" not in h:
+                    return _FakeResourceResponse(code=234037)
+                return _FakeResourceResponse(data, headers=headers)
+
+            transport, seen = self._transport(responder)
+            with self.subTest(headers=headers), self.assertRaises(TransientDeliveryError):
+                transport({"kind": "download", "message_id": "m", "file_key": "k", "type": "file"})
+            self.assertEqual(len(seen), 2)
+
+    def test_oversized_image_is_not_retried_with_range(self):
+        transport, seen = self._transport(lambda op, h: _FakeResourceResponse(code=234037))
+
+        with self.assertRaises(TransientDeliveryError):
+            transport({"kind": "download", "message_id": "m", "file_key": "k", "type": "image"})
+        self.assertEqual(seen, [""])
 
 
 class AckRegistryTests(unittest.TestCase):
