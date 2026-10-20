@@ -8,6 +8,7 @@ import tempfile
 import time
 
 from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -35,13 +36,20 @@ class LarkBotApi:
 
 
 class LarkChannelAdapter:
+    kind = "lark"
+    display_name = "飞书"
+    locale = "zh"
+    account_id = "bot"
+    # Lark emoji_type keys, not glyphs.
+    ack_reactions = ("DONE", "OK", "THUMBSUP", "MUSCLE", "APPLAUSE")
+
     def __init__(self, api: LarkBotApi):
-        self.kind = "lark"
         self.api = api
         self._capabilities = ChannelCapabilities(
             editable_message=True,
             private_callback_ack=True,
             attachment_download=True,
+            topic_sessions=True,
         )
 
     def capabilities(self) -> ChannelCapabilities:
@@ -56,6 +64,46 @@ class LarkChannelAdapter:
             {"message_id": message_id, "emoji_type": emoji},
         )
         return bool(result.get("ok", True)) if isinstance(result, dict) else True
+
+    async def expand_inbound(self, inbound: InboundEvent) -> InboundEvent:
+        """Replace a forwarded chat log's placeholder title with its content.
+
+        A merge_forward message's content is only ``{"title": ...,
+        "message_id_list": [...]}``, so the inbound text parser falls through
+        to the title — the agent receives "群聊的聊天记录" and none of the
+        conversation. Reading the message back returns the forward plus every
+        child in one call, which is what actually gets rendered in.
+
+        Failure keeps the original inbound: a forward that reaches the agent
+        as its title is what happens today, so a degraded fetch must not also
+        drop the turn.
+        """
+        if self._message_type(inbound) != "merge_forward":
+            return inbound
+        try:
+            items = await self.fetch_message(inbound.message_id)
+        except Exception as exc:
+            _log_degrade(
+                "lark_merge_forward_fetch_failed",
+                message_id=inbound.message_id,
+                chat_id=inbound.chat_id,
+                error=exc,
+                fallback="placeholder_title_only",
+            )
+            return inbound
+        log = self.render_message_log(items, skip_message_id=inbound.message_id)
+        if not log:
+            return inbound
+        title = " ".join(str(inbound.text or "").split())
+        header = f"[合并转发：{title}]" if title else "[合并转发]"
+        return replace(inbound, text=f"{header}\n{log}")
+
+    @staticmethod
+    def _message_type(inbound: InboundEvent) -> str:
+        raw = inbound.raw if isinstance(inbound.raw, dict) else {}
+        event = raw.get("event", {}) if isinstance(raw.get("event"), dict) else {}
+        message = event.get("message", {}) if isinstance(event.get("message"), dict) else {}
+        return str(message.get("message_type", "") or message.get("msg_type", "") or "")
 
     def binding_for(self, chat_id: str, root_id: str = "") -> ChannelBinding:
         return ChannelBinding(

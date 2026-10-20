@@ -308,7 +308,7 @@ class MergeForwardExpansionTests(unittest.TestCase):
         )
         runtime = self._runtime(api)
 
-        asyncio.run(runtime.process_lark_event(self._forward_payload()))
+        asyncio.run(runtime.process_channel_event(self._forward_payload()))
 
         submitted = runtime.transports["claude_headless"].submitted_turns
         self.assertEqual(len(submitted), 1)
@@ -323,7 +323,7 @@ class MergeForwardExpansionTests(unittest.TestCase):
         api = _ReadingLarkApi(fail_get=True)
         runtime = self._runtime(api)
 
-        result = asyncio.run(runtime.process_lark_event(self._forward_payload()))
+        result = asyncio.run(runtime.process_channel_event(self._forward_payload()))
 
         self.assertTrue(result.accepted)
         submitted = runtime.transports["claude_headless"].submitted_turns
@@ -336,7 +336,7 @@ class MergeForwardExpansionTests(unittest.TestCase):
         payload["event"]["message"]["message_type"] = "text"
         payload["event"]["message"]["content"] = json.dumps({"text": "普通消息"}, ensure_ascii=False)
 
-        asyncio.run(runtime.process_lark_event(payload))
+        asyncio.run(runtime.process_channel_event(payload))
 
         self.assertNotIn("getMessage", [method for method, _ in api.calls])
         self.assertEqual(runtime.transports["claude_headless"].submitted_turns[0].text, "普通消息")
@@ -361,7 +361,7 @@ class MergeForwardExpansionTests(unittest.TestCase):
             transports={"claude_headless": FakeAgentTransport("claude_headless", _transport_caps())},
         )
 
-        result = asyncio.run(runtime.process_lark_event(self._forward_payload()))
+        result = asyncio.run(runtime.process_channel_event(self._forward_payload()))
 
         self.assertFalse(result.accepted)
         self.assertEqual(api.calls, [])
@@ -426,7 +426,7 @@ class ThreadContextSeedingTests(unittest.TestCase):
         )
         runtime = self._runtime(api)
 
-        asyncio.run(runtime.process_lark_event(self._reply_payload()))
+        asyncio.run(runtime.process_channel_event(self._reply_payload()))
 
         text = runtime.transports["claude_headless"].submitted_turns[0].text
         self.assertIn("[话题已有讨论]", text)
@@ -447,10 +447,10 @@ class ThreadContextSeedingTests(unittest.TestCase):
         )
         runtime = self._runtime(api)
 
-        asyncio.run(runtime.process_lark_event(self._reply_payload()))
+        asyncio.run(runtime.process_channel_event(self._reply_payload()))
         reads_after_first = len([m for m, _ in api.calls if m == "listThreadMessages"])
         asyncio.run(
-            runtime.process_lark_event(
+            runtime.process_channel_event(
                 self._reply_payload(event_id="evt-2", message_id="om_mention2", text="继续")
             )
         )
@@ -472,7 +472,7 @@ class ThreadContextSeedingTests(unittest.TestCase):
         api = _FailingThreadApi()
         runtime = self._runtime(api)
 
-        result = asyncio.run(runtime.process_lark_event(self._reply_payload()))
+        result = asyncio.run(runtime.process_channel_event(self._reply_payload()))
 
         self.assertTrue(result.accepted)
         self.assertEqual(
@@ -485,7 +485,7 @@ class ThreadContextSeedingTests(unittest.TestCase):
         payload = self._reply_payload()
         payload["event"]["message"]["root_id"] = ""
 
-        asyncio.run(runtime.process_lark_event(payload))
+        asyncio.run(runtime.process_channel_event(payload))
 
         self.assertNotIn("listThreadMessages", [method for method, _ in api.calls])
 

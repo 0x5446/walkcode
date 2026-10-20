@@ -193,6 +193,8 @@ class ChannelCapabilities:
     editable_message: bool
     private_callback_ack: bool
     attachment_download: bool
+    # One session per reply thread, rooted on a status card (ADR 0044/0070).
+    topic_sessions: bool = False
 
 
 @dataclass

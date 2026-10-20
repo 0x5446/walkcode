@@ -1,0 +1,43 @@
+# WalkCode Slack app manifest (ADR 0070).
+# One app per runtime: create it twice, once per agent, and change the two
+# names below (e.g. "WalkCode Claude" / walkcode-claude, "WalkCode Codex" / walkcode-codex).
+display_information:
+  name: WalkCode Claude
+  description: Drive a local Claude Code / Codex session from Slack.
+features:
+  app_home:
+    home_tab_enabled: false
+    messages_tab_enabled: true
+    messages_tab_read_only_enabled: false
+  bot_user:
+    display_name: walkcode-claude
+    always_online: true
+  agent_view:
+    agent_description: Runs a local coding agent session per thread. Mention it in a channel or DM it to start; reply in the thread to continue.
+oauth_config:
+  scopes:
+    bot:
+      - app_mentions:read
+      - chat:write
+      - channels:history
+      - groups:history
+      - im:history
+      - mpim:history
+      - reactions:write
+      - files:read
+      - users:read
+settings:
+  event_subscriptions:
+    bot_events:
+      - app_mention
+      - message.channels
+      - message.groups
+      - message.im
+      - message.mpim
+      - agent_session_stopped
+      - agent_session_title_changed
+  interactivity:
+    is_enabled: true
+  org_deploy_enabled: false
+  socket_mode_enabled: true
+  token_rotation_enabled: false

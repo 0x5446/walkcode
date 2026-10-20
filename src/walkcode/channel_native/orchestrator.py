@@ -221,8 +221,26 @@ def _context_window_limit(model: str, used: int = 0, usage: dict[str, Any] | Non
 
 class ChannelAdapter(Protocol):
     kind: str
+    # Channel name for user-facing text ("飞书", "Slack").
+    display_name: str
+    # Language of the shared notices this channel gets ("zh" or "en").
+    locale: str
+    # ChannelBinding.account_id this channel stamps on its bindings.
+    account_id: str
+    # Emoji pool for lightweight receipts, in the channel's own emoji keys.
+    ack_reactions: tuple[str, ...]
 
     def capabilities(self) -> ChannelCapabilities: ...
+
+    def parse_event(self, payload: dict[str, Any]) -> InboundEvent: ...
+
+    async def expand_inbound(self, inbound: InboundEvent) -> InboundEvent: ...
+
+    async def react_to_message(self, binding: ChannelBinding, message_id: str, emoji: str) -> bool: ...
+
+    async def fetch_thread_messages(self, root_message_id: str, *, limit: int) -> list[dict[str, Any]]: ...
+
+    def render_message_log(self, items: list[dict[str, Any]], *, skip_message_id: str = "") -> str: ...
 
     async def send_view(self, binding: ChannelBinding, view_model: dict[str, Any]) -> str: ...
 
@@ -498,12 +516,6 @@ class Orchestrator:
             self.authz.grant(session.session_id, owner, SessionRole.OWNER)
         return session
 
-    # Per-channel reaction pools for lightweight acks (Lark values are
-    # emoji_type keys).
-    _ACK_REACTIONS: dict[str, tuple[str, ...]] = {
-        "lark": ("DONE", "OK", "THUMBSUP", "MUSCLE", "APPLAUSE"),
-    }
-
     async def _react_ack(self, session: Session, message_id: str) -> bool:
         """Best-effort emoji reaction on the user's message instead of a text
         receipt — one API call either way, but no extra bubble in the topic."""
@@ -512,7 +524,7 @@ class Orchestrator:
         binding = session.channel_binding
         channel = self.channels.get(binding.channel_kind) if binding is not None else None
         react = getattr(channel, "react_to_message", None)
-        pool = self._ACK_REACTIONS.get(binding.channel_kind) if binding is not None else None
+        pool = tuple(getattr(channel, "ack_reactions", ()) or ())
         if channel is None or react is None or not pool:
             return False
         try:
@@ -1703,7 +1715,9 @@ class Orchestrator:
                                 chat_id=inbound.chat_id,
                                 thread_id=inbound.thread_id,
                                 root_message_id=self._root_message_id_for_new_binding(inbound),
-                                capabilities=self._new_binding_capabilities(inbound),
+                                capabilities=self._new_binding_capabilities(
+                                    inbound, self.channels.get(inbound.channel_kind)
+                                ),
                             )
                             preset_card = str(
                                 (inbound.raw or {}).get("_walkcode_status_card_id", "") or ""
@@ -1772,9 +1786,10 @@ class Orchestrator:
         return inbound.message_id
 
     @staticmethod
-    def _new_binding_capabilities(inbound: InboundEvent) -> dict[str, Any]:
+    def _new_binding_capabilities(inbound: InboundEvent, channel: Any) -> dict[str, Any]:
         capabilities: dict[str, Any] = {}
-        if inbound.channel_kind == "lark" and inbound.thread_id:
+        topic_sessions = channel is not None and channel.capabilities().topic_sessions
+        if topic_sessions and inbound.thread_id:
             capabilities["status_card"] = True
             capabilities["native_topic"] = True
             capabilities["origin"] = inbound.channel_kind
@@ -3002,7 +3017,7 @@ class Orchestrator:
         view = ViewModelFactory.decision_result(
             kind=request.prompt_kind,
             action="terminal",
-            detail="飞书上没有及时作答，已转到终端。",
+            detail=f"{getattr(channel, 'display_name', '') or '渠道'}上没有及时作答，已转到终端。",
         )
         error = "edit_view returned False"
         try:

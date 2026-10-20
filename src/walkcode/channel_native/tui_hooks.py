@@ -779,7 +779,7 @@ def _tui_event_id(
     return f"external_tui:{hook_type}:{transport_kind}:{identity}:{suffix}"
 
 
-def _tui_lark_chat_id(endpoint: ChannelEndpointConfig) -> str:
+def _tui_chat_id(endpoint: ChannelEndpointConfig) -> str:
     # Explicit TUI chat wins, otherwise a single-entry allowlist unambiguously
     # names the observation chat.
     configured = str(endpoint.options.get("tui_chat_id", "") or "").strip()
