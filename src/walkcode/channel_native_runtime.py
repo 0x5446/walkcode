@@ -1518,7 +1518,7 @@ class ChannelNativeRuntime:
                 "这条消息的处理结果未能确认，原始消息已保留。"
                 "请先查看话题中的执行结果，再决定是否重发。"
             )},
-            idempotency_key=f"lark-inbound-failed:{inbound.event_id}",
+            idempotency_key=f"{inbound.channel_kind}-inbound-failed:{inbound.event_id}",
         )
         self.save_state()
         await self._best_effort_flush_outbox()
