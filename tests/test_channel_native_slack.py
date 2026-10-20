@@ -316,14 +316,47 @@ class SlackAdapterDeliveryTests(unittest.TestCase):
 
     def test_uncertain_send_is_not_duplicated_on_retry(self):
         view = {"type": "text", "text": "answer"}
+        # An identical answer from earlier in the thread must not count.
+        self.api.history.append({"ts": f"{time.time() - 3600:.6f}", "bot_id": "B1", "text": "answer"})
         self.api.failures["chat.postMessage"] = [SlackUncertainDeliveryError("timeout")]
         with self.assertRaises(SlackUncertainDeliveryError):
             asyncio.run(self.adapter.send_view(self.thread, view))
-        # The timed-out send actually landed.
-        self.api.history.append({"ts": "1700000000.900000", "bot_id": "B1", "text": "answer"})
-        ts = asyncio.run(self.adapter.send_view(self.thread, view))
-        self.assertEqual(ts, "1700000000.900000")
+        landed = f"{time.time():.6f}"
+        self.api.history.append({"ts": landed, "bot_id": "B1", "text": "answer"})
+        self.assertEqual(asyncio.run(self.adapter.send_view(self.thread, view)), landed)
         self.assertEqual(len(self.api.sent()), 1)
+
+    def test_uncertain_send_ignores_older_identical_message(self):
+        view = {"type": "text", "text": "answer"}
+        self.api.history.append({"ts": f"{time.time() - 3600:.6f}", "bot_id": "B1", "text": "answer"})
+        self.api.failures["chat.postMessage"] = [SlackUncertainDeliveryError("timeout")]
+        with self.assertRaises(SlackUncertainDeliveryError):
+            asyncio.run(self.adapter.send_view(self.thread, view))
+        ts = asyncio.run(self.adapter.send_view(self.thread, view))
+        self.assertEqual(len(self.api.sent()), 2)
+        self.assertEqual(ts, self.api.history[-1]["ts"])
+
+    def test_uncertain_card_is_not_confused_with_a_sibling_card(self):
+        def card(token):
+            return {"type": "permission_prompt", "tool_name": "Bash", "tool_input": {}, "actions": [{"action": "allow", "token": token}]}
+
+        self.api.failures["chat.postMessage"] = [SlackUncertainDeliveryError("timeout")]
+        with self.assertRaises(SlackUncertainDeliveryError):
+            asyncio.run(self.adapter.send_view(self.thread, card("new")))
+        sibling = render_slack_messages(card("old"))[0]
+        self.api.history.append({"ts": f"{time.time():.6f}", "bot_id": "B1", "text": sibling["text"], "blocks": sibling["blocks"]})
+        asyncio.run(self.adapter.send_view(self.thread, card("new")))
+        self.assertEqual(len(self.api.sent()), 2)
+
+    def test_failed_native_status_sync_is_retried(self):
+        root = ChannelBinding("slack", TEAM, "C1", "1700000000.000001", "1700000000.000001")
+        self.api.failures["agents.sessions.setStatus"] = [PermanentDeliveryError("blip")]
+        view = {"type": "health", "status": "running", "title": "t"}
+        asyncio.run(self.adapter.edit_view(root, "1700000000.000001", view))
+        asyncio.run(self.adapter.edit_view(root, "1700000000.000001", view))
+        self.assertEqual(len(self.api.sent("agents.sessions.setStatus")), 2)
+        asyncio.run(self.adapter.edit_view(root, "1700000000.000001", view))
+        self.assertEqual(len(self.api.sent("agents.sessions.setStatus")), 2)
 
     def test_download_uses_files_info_and_keeps_extension(self):
         from walkcode.channel_native.models import AttachmentRef

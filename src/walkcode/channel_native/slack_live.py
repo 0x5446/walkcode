@@ -220,7 +220,9 @@ class SlackIngressBridge:
         persist_event: Callable[[dict[str, Any]], Path] | None = None,
         client_factory: Callable[["SlackIngressBridge"], Any] | None = None,
         reconnect_delay: float = 5.0,
+        api: "SlackWebApi | None" = None,
     ):
+        self.api = api
         self.credentials = credentials
         self.reconnect_delay = reconnect_delay
         self.loop = loop
@@ -271,6 +273,9 @@ class SlackIngressBridge:
         # startup would leave ingress silently dead until a restart.
         while not self._stopped.is_set():
             try:
+                if self.api is not None:
+                    # Warm the (team, bot user) cache off the serve loop.
+                    self.api.identity()
                 if self._client is None:
                     self._client = self._build_client()
                     self._client.socket_mode_request_listeners.append(self.on_request)

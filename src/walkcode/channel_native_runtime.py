@@ -3647,7 +3647,11 @@ def _ingress_bridge_factory(endpoint: ChannelEndpointConfig, channel: ChannelAda
 
         def build_slack(*, loop, queue, persist_event):
             return SlackIngressBridge(
-                endpoint.credentials, loop=loop, queue=queue, persist_event=persist_event
+                endpoint.credentials,
+                loop=loop,
+                queue=queue,
+                persist_event=persist_event,
+                api=getattr(channel, "api", None),
             )
 
         return build_slack

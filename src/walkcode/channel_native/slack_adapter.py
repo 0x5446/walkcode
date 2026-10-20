@@ -11,6 +11,7 @@ to the inbox: ``{"type": "events_api" | "interactive", "payload": {...}}``.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import html
 import json
@@ -69,11 +70,17 @@ class SlackChannelAdapter:
             attachment_download=True,
             topic_sessions=True,
         )
+        # send key -> wall-clock start of the first uncertain attempt.
         self._uncertain_sends: dict[str, float] = {}
+        self._send_locks: dict[str, asyncio.Lock] = {}
+        # (channel, root ts) -> (status, title) last confirmed by Slack.
         self._agent_status: dict[tuple[str, str], tuple[str, str]] = {}
 
     @property
     def account_id(self) -> str:
+        # Warmed by the ingress bridge thread at startup (SlackIngressBridge
+        # calls api.identity() before connecting), so this is a cache read on
+        # the serve loop; it only blocks if no bridge ever ran.
         return self.api.identity()[0]
 
     def capabilities(self) -> ChannelCapabilities:
@@ -252,43 +259,59 @@ class SlackChannelAdapter:
         if binding.root_message_id:
             payload["thread_ts"] = binding.root_message_id
         key = _send_key(payload)
-        if key in self._uncertain_sends:
-            found = await self._find_sent(payload)
-            if found:
-                self._uncertain_sends.pop(key, None)
-                return found
-        try:
-            data = await self.api.call("chat.postMessage", payload)
-        except SlackUncertainDeliveryError:
-            now = time.monotonic()
-            self._uncertain_sends = {k: t for k, t in self._uncertain_sends.items() if now - t < self._UNCERTAIN_TTL}
-            self._uncertain_sends[key] = now
-            raise
-        self._uncertain_sends.pop(key, None)
-        return str(data.get("ts", "") or "")
+        lock = self._send_locks.setdefault(key, asyncio.Lock())
+        async with lock:
+            uncertain_since = self._uncertain_sends.get(key)
+            if uncertain_since is not None:
+                found = await self._find_sent(payload, since=uncertain_since)
+                if found:
+                    self._uncertain_sends.pop(key, None)
+                    return found
+            attempt_started = time.time()
+            try:
+                data = await self.api.call("chat.postMessage", payload)
+            except SlackUncertainDeliveryError:
+                now = time.time()
+                self._uncertain_sends = {
+                    k: t for k, t in self._uncertain_sends.items() if now - t < self._UNCERTAIN_TTL
+                }
+                # Keep the earliest attempt: an earlier timed-out send may be
+                # the one that landed.
+                self._uncertain_sends.setdefault(key, attempt_started)
+                raise
+            self._uncertain_sends.pop(key, None)
+            return str(data.get("ts", "") or "")
 
-    async def _find_sent(self, payload: dict[str, Any]) -> str:
+    async def _find_sent(self, payload: dict[str, Any], *, since: float) -> str:
         """Find this bot's copy of a message whose send outcome was uncertain.
 
         ``chat.postMessage`` has no idempotency key; a timed-out send may have
-        landed. Looking for an identical recent bot message turns the retry
-        into a no-op instead of a duplicate.
+        landed. Only messages posted after the first uncertain attempt count,
+        and they must match both the text and the button values (which carry
+        single-use interaction tokens), so an older identical message or a
+        sibling card with the same title is never mistaken for this one.
         """
+        oldest = f"{max(0.0, since - 5.0):.6f}"
         try:
             if payload.get("thread_ts"):
                 data = await self.api.call(
                     "conversations.replies",
-                    {"channel": payload["channel"], "ts": payload["thread_ts"], "limit": 50},
+                    {"channel": payload["channel"], "ts": payload["thread_ts"], "oldest": oldest, "limit": 100},
                 )
-                candidates = list(data.get("messages") or ())[-20:]
             else:
-                data = await self.api.call("conversations.history", {"channel": payload["channel"], "limit": 20})
-                candidates = list(data.get("messages") or ())
+                data = await self.api.call(
+                    "conversations.history", {"channel": payload["channel"], "oldest": oldest, "limit": 100}
+                )
         except Exception as exc:
             _log_degrade("slack_uncertain_send_lookup_failed", channel=payload.get("channel"), error=exc)
             return ""
-        for item in reversed(candidates):
-            if isinstance(item, dict) and item.get("bot_id") and str(item.get("text", "")) == payload["text"]:
+        wanted = _button_values(payload.get("blocks"))
+        for item in reversed(list(data.get("messages") or ())):
+            if not isinstance(item, dict) or not item.get("bot_id"):
+                continue
+            if _ts_value(item.get("ts")) < float(oldest):
+                continue
+            if str(item.get("text", "")) == payload["text"] and _button_values(item.get("blocks")) == wanted:
                 return str(item.get("ts", "") or "")
         return ""
 
@@ -319,22 +342,25 @@ class SlackChannelAdapter:
         if not status or not root_ts or not binding.chat_id:
             return
         key = (binding.chat_id, root_ts)
-        previous = self._agent_status.get(key)
-        if previous == (status, title):
-            return
-        self._agent_status[key] = (status, title)
+        previous_status, previous_title = self._agent_status.get(key, ("", ""))
         try:
-            await self.api.call(
-                "agents.sessions.setStatus",
-                {"channel_id": binding.chat_id, "thread_ts": root_ts, "status": status, "title": title or None},
-            )
-            if previous is not None and title and previous[1] != title:
+            if status != previous_status:
+                await self.api.call(
+                    "agents.sessions.setStatus",
+                    {"channel_id": binding.chat_id, "thread_ts": root_ts, "status": status, "title": title or None},
+                )
+                # setStatus only applies the title when it creates the session.
+                self._agent_status[key] = (status, title if not previous_status else previous_title)
+                previous_status, previous_title = self._agent_status[key]
+            if title and title != previous_title:
                 await self.api.call(
                     "agents.sessions.rename",
                     {"channel_id": binding.chat_id, "thread_ts": root_ts, "title": title},
                 )
+                self._agent_status[key] = (previous_status, title)
         except Exception as exc:
-            if previous is None:
+            # Nothing cached for the failed half, so the next refresh retries it.
+            if key not in self._agent_status:
                 _log_degrade("slack_agent_session_sync_failed", channel=binding.chat_id, thread_ts=root_ts, error=exc)
 
     async def notify_private(self, inbound: InboundEvent, text: str) -> None:
@@ -467,9 +493,27 @@ def _ts_seconds(ts: str) -> float:
     return value if 0 < value < time.time() + 60.0 else 0.0
 
 
+def _ts_value(ts: Any) -> float:
+    try:
+        return float(ts)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _button_values(blocks: Any) -> list[str]:
+    values: list[str] = []
+    for block in blocks or ():
+        if not isinstance(block, dict):
+            continue
+        for element in block.get("elements") or ():
+            if isinstance(element, dict) and element.get("type") == "button":
+                values.append(str(element.get("value", "")))
+    return values
+
+
 def _send_key(payload: dict[str, Any]) -> str:
     material = json.dumps(
-        [payload.get("channel"), payload.get("thread_ts"), payload.get("text")],
+        [payload.get("channel"), payload.get("thread_ts"), payload.get("text"), _button_values(payload.get("blocks"))],
         ensure_ascii=False,
     )
     return hashlib.sha256(material.encode("utf-8")).hexdigest()[:24]
