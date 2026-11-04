@@ -33,6 +33,7 @@ from walkcode.channel_native import (
     InboundEvent,
     InteractionStore,
     LaunchSpec,
+    ResumeSpec,
     Orchestrator,
     SessionRegistry,
     TransportUnavailable,
@@ -3588,7 +3589,9 @@ class CodexNativeCommandTests(unittest.TestCase):
 
         self.assertEqual(fresh.ref, {"thread_id": "thread-2", "cwd": "/tmp/project"})
         self.assertNotEqual(fresh.handle_id, handle.handle_id)
-        self.assertIn(("thread/unsubscribe", {"threadId": "thread-1"}), client.requests)
+        # Shutting the old thread down is the caller's step, after it has
+        # recorded the new one.
+        self.assertNotIn(("thread/unsubscribe", {"threadId": "thread-1"}), client.requests)
         starts = [params for method, params in client.requests if method == "thread/start"]
         self.assertEqual(starts[-1].get("model"), "gpt-6-luna")
         last = self._turn_starts(client)[-1]
@@ -3626,9 +3629,16 @@ class CodexNativeCommandTests(unittest.TestCase):
             return await original(method, params)
 
         client.request = request
-        resumed = asyncio.run(transport.resume_thread("thread-1", cwd="/tmp/project"))
+        resumed = asyncio.run(
+            transport.resume(ResumeSpec(cwd="/tmp/project", session_id="s1",
+                                        resume_ref={"thread_id": "thread-1"}, model="gpt-6-luna"))
+        )
+        asyncio.run(transport.submit_turn(resumed, TurnInput(text="hi"), "k1"))
 
         self.assertEqual(resumed.ref["thread_id"], "thread-2")
+        # The persisted model survives the restart-plus-empty-thread path.
+        self.assertEqual(resumed.model, "gpt-6-luna")
+        self.assertEqual(self._turn_starts(client)[-1].get("model"), "gpt-6-luna")
 
     def test_resume_failure_other_than_empty_thread_still_raises(self):
         client, transport, handle = self._setup()

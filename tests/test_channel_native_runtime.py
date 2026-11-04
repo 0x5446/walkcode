@@ -6394,6 +6394,8 @@ class NativeSlashCommandTests(unittest.TestCase):
             self._send(runtime, api, "/clear")
 
             self.assertEqual(len(new_threads), 1)
+            # The old thread is shut down only after the session moved over.
+            self.assertIn("new_thread", transport.shutdown_calls)
             self.assertEqual(session.transport_ref["thread_id"], "thread-fresh")
             self.assertEqual(session.transport_ref["handle_id"], "handle-fresh")
             self.assertIn("已开始新对话", self._texts(api))
@@ -6521,6 +6523,12 @@ class SilentCommandNoticeTests(unittest.TestCase):
         claude._scripted_events = [AgentEvent(AgentEventType.TURN_COMPLETED, {"message": ""})]
         asyncio.run(runtime.process_channel_event(_lark_message(11, text=text, root_id=_first_card(api))))
         return json.dumps(_sent(api), ensure_ascii=False)
+
+    def test_silent_command_with_arguments_is_still_confirmed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            text = self._run(tmp, "/compact keep the API notes")
+
+            self.assertIn("✅ /compact 已执行", text)
 
     def test_other_slash_input_ending_empty_still_warns(self):
         with tempfile.TemporaryDirectory() as tmp:

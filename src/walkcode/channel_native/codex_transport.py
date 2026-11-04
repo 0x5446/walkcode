@@ -496,7 +496,7 @@ class CodexAppServerTransport:
             model=_codex_model(result),
         )
 
-    async def resume_thread(self, thread_id: str, *, cwd: str) -> TransportHandle:
+    async def resume_thread(self, thread_id: str, *, cwd: str, model: str = "") -> TransportHandle:
         if not thread_id:
             raise ValueError("thread_id is required for Codex resume")
         if thread_id in self._unstarted_threads:
@@ -516,9 +516,16 @@ class CodexAppServerTransport:
                 raise
             # An empty thread from before a restart (e.g. /clear, then the
             # runtime restarted before the next message). It never held a
-            # conversation, so a new thread loses nothing.
+            # conversation, so a new thread loses nothing — except the model
+            # choice, which only the session's persisted model still knows.
             _log_degrade("codex_resume_empty_thread", thread_id=thread_id)
-            return await self.launch(LaunchSpec(cwd=cwd, session_id=""))
+            fresh = await self.launch(LaunchSpec(cwd=cwd, session_id=""), model=model)
+            if model:
+                new_thread = str(fresh.ref.get("thread_id", "") or "")
+                self._thread_overrides.setdefault(new_thread, {})["model"] = model
+                self._thread_models[new_thread] = model
+                fresh.model = model
+            return fresh
         resumed = _codex_thread_id(result) or thread_id
         # A resumed thread is live again; a stale release mark would make the
         # next drain quit on its first batch boundary.
@@ -546,7 +553,7 @@ class CodexAppServerTransport:
 
     async def resume(self, spec: ResumeSpec) -> TransportHandle:
         thread_id = str(spec.resume_ref.get("thread_id", ""))
-        return await self.resume_thread(thread_id, cwd=spec.cwd)
+        return await self.resume_thread(thread_id, cwd=spec.cwd, model=spec.model)
 
     async def submit_turn(
         self,
@@ -634,12 +641,13 @@ class CodexAppServerTransport:
             del self._started_turns[next(iter(self._started_turns))]
 
     async def start_new_thread(self, handle: TransportHandle, *, model: str = "") -> TransportHandle:
-        """/clear and /new: a new thread in the same cwd; the old one is shut down.
+        """/clear and /new: a new thread in the same cwd.
 
         The app-server has no "clear history" call; a new thread is what the
         TUI does too. Not a turn: the caller swaps the session onto the
         returned handle (new handle id, so no drain of the old thread can
-        claim it) and must not call this while a turn is running.
+        claim it), THEN shuts the old thread down, and must not call this
+        while a turn is running.
 
         The model choice moves over. ``model`` is the session's persisted
         model: after a runtime restart the in-memory override is gone, and the
@@ -657,8 +665,6 @@ class CodexAppServerTransport:
             if overrides.get("model"):
                 self._thread_models[new_thread] = overrides["model"]
                 fresh.model = overrides["model"]
-        if old_thread:
-            await self.shutdown(handle, "new_thread")
         return fresh
 
     async def list_models(self) -> list[dict[str, Any]]:

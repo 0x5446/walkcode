@@ -102,3 +102,17 @@ VERDICT: NEEDS_FIX（审查对象 9c9610c；10 条 Warning 已在后续提交里
 ## 原始报告
 
 - 各维度：`$RUN_DIR/dim-{name}.md`；回证：`$RUN_DIR/verify-{N}.md`；身份：`$RUN_DIR/run.json`
+
+## Round 2（增量审 b5eae42：correctness / concurrency / security / redteam）
+
+RunDir: /var/folders/00/s7tt4dgj53v123y8671yb3b00000gn/T//deep-review-walkcode-b5eae42-1793779026.sT7I
+
+security 判 SAFE。其余 3 条 Warning，host 逐条读源码确认属实后修复：
+
+| 问题 | 处理 |
+|---|---|
+| `/clear` 后、第一条消息前重启：resume 回退新开的 thread 用了默认模型（correctness + redteam） | `ResumeSpec.model` 带上会话持久化的模型，回退的 `launch` 和 override 都使用它 |
+| `/compact 备注`、`/compact@bot` 没有确认，被报成空回合（correctness） | 只用第一个词判断，去掉 `@` 后缀 |
+| `start_new_thread` 在关闭旧 thread 时被取消，会话引用丢失（concurrency） | 编排器先把新 thread 写进 transport_ref，再关闭旧 thread |
+
+修复后全量 1180 个测试通过；真实 codex 0.166 加 runtime 的端到端流程（/model、/effort、/compact、/clear、/diff、/mcp、/logout）重跑通过。Critical 为 0。

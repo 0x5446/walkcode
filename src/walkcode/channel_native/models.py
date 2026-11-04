@@ -247,6 +247,9 @@ class ResumeSpec:
     cwd: str
     session_id: str
     resume_ref: dict[str, Any]
+    # The session's persisted model, for a transport that has to open a new
+    # agent session in place of an unresumable one ("" = unknown).
+    model: str = ""
 
 
 @dataclass

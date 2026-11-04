@@ -822,6 +822,7 @@ class Orchestrator:
                     cwd=session.cwd,
                     session_id=session.session_id,
                     resume_ref=resume_ref,
+                    model=str(session.model or ""),
                 )
             )
         except Exception as exc:
@@ -1256,14 +1257,22 @@ class Orchestrator:
             return ControlResult(False, BlockedReason.CAPABILITY_DISABLED)
         if session.status != "stopped" and session.lifecycle_state in _TURN_IN_FLIGHT_STATES:
             return ControlResult(False, "turn_in_flight")
+        old_handle = self._handle_for_session(session)
         try:
-            fresh = await starter(self._handle_for_session(session), model=str(session.model or ""))
+            fresh = await starter(old_handle, model=str(session.model or ""))
         except Exception as exc:  # noqa: BLE001 - the reason is the answer
             _log_degrade("new_thread_failed", session_id=session_id, error=exc)
             return ControlResult(False, str(exc) or type(exc).__name__)
         # A new handle id, not just a new thread id: a drain of the old thread
         # may still be winding down, and drains are keyed (and fenced) by it.
+        # Recorded BEFORE the old thread is shut down, so a cancellation in
+        # between can only leave an unused old thread behind, never a session
+        # pointing at a half-closed one.
         session.transport_ref.update({"handle_id": fresh.handle_id, **fresh.ref})
+        try:
+            await transport.shutdown(old_handle, "new_thread")
+        except Exception as exc:  # noqa: BLE001 - the session already moved on
+            _log_degrade("new_thread_old_shutdown_failed", session_id=session_id, error=exc)
         self._turn_replays.pop(session_id, None)
         self._adopt_handle_model(session, fresh)
         session.last_usage = {}
@@ -3504,7 +3513,9 @@ class Orchestrator:
         """
         entry = self._turn_replays.get(session.session_id) or {}
         turn = entry.get("turn")
-        command = str(getattr(turn, "text", "") or "").strip().lower()
+        words = str(getattr(turn, "text", "") or "").split(None, 1)
+        # "/compact keep the API notes" and "/compact@bot" are still /compact.
+        command = words[0].split("@", 1)[0].lower() if words else ""
         if command not in _SILENT_COMMANDS.get(session.transport_kind, ()):
             return ""
         return f"✅ {command} 已执行。"
