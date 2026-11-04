@@ -38,6 +38,7 @@ from .channel_native import (
     ChannelNativeConfig,
     ClaudeHeadlessTransport,
     CodexAppServerTransport,
+    CodexProviderModels,
     ControlResult,
     DurableOutbox,
     InboundLedger,
@@ -3812,6 +3813,12 @@ def _build_transports(config: ChannelNativeConfig) -> dict[str, AgentTransport]:
                 allowlist_configured=allowlist_configured,
                 unrestricted_without_allowlist_ok=unrestricted_ok,
                 environment_context=_channel_environment_context(config.channel.kind),
+                # The app-server reads CODEX_HOME/config.toml and nothing else
+                # (WALKCODE_CODEX_CONFIG only feeds the local inventory), so the
+                # provider filter must read that same file.
+                provider_models=CodexProviderModels(
+                    config_path=str(_codex_home_path(str(codex_options.get("codex_home", "") or "")) / "config.toml")
+                ),
             )
         else:
             transports[kind] = _UnavailableTransport(kind, "codex CLI is not installed")
@@ -4328,10 +4335,15 @@ def _claude_local_model_inventory(config: ChannelNativeConfig) -> dict[str, Any]
     }
 
 
+def _codex_config_path(options: dict[str, Any]) -> Path:
+    codex_home = _codex_home_path(str(options.get("codex_home", "") or ""))
+    return Path(str(options.get("config", "") or codex_home / "config.toml")).expanduser()
+
+
 def _codex_local_model_inventory(config: ChannelNativeConfig) -> dict[str, Any]:
     options = config.agent_options.get("codex", {})
     codex_home = _codex_home_path(str(options.get("codex_home", "") or ""))
-    config_path = Path(str(options.get("config", "") or codex_home / "config.toml")).expanduser()
+    config_path = _codex_config_path(options)
     cache_path = Path(str(options.get("models_cache", "") or codex_home / "models_cache.json")).expanduser()
     current = ""
     provider = ""

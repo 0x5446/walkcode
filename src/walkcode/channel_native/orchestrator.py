@@ -1237,7 +1237,11 @@ class Orchestrator:
             _log_degrade("set_model_failed", session_id=session_id, model=model, error=exc)
             return ControlResult(False, str(exc) or type(exc).__name__)
         if result.accepted:
-            self.sessions.get(session_id).model = model
+            session = self.sessions.get(session_id)
+            session.model = model
+            # The root status card shows the model; without a refresh it kept
+            # the old name until the next turn ended.
+            await self.refresh_session_status_card(session)
         return result
 
     async def start_new_agent_thread(self, session_id: str, *, actor: ActorRef) -> ControlResult:

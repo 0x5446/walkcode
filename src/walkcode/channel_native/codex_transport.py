@@ -3,11 +3,17 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import os
 import re
 import time
+import tomllib
+import urllib.parse
+import urllib.request
 import uuid
 
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
+from pathlib import Path
 from dataclasses import replace
 from typing import Any, NamedTuple
 
@@ -137,6 +143,97 @@ def _codex_native_command(text: str) -> tuple[str, str]:
     return name, (rest[0].strip() if rest else "")
 
 
+class CodexProviderModels:
+    """Model ids the profile's custom provider actually serves (``GET {base_url}/models``).
+
+    codex's ``model/list`` is codex's own catalog. Behind a custom provider
+    (a proxy, Azure) it lists models the backend may not have: 2026-11-04,
+    gpt-6.1-terra was offered and accepted by /model, then every turn 404'd
+    ("The API deployment for this resource does not exist") because the
+    proxy had not deployed it — and its ``/models`` did not list it.
+
+    Reads the provider exactly as codex does: ``model_provider`` and
+    ``[model_providers.<name>]`` in the profile config, the key from the
+    process env named by ``env_key`` (the app-server inherits this same env).
+    ``None`` = no answer (built-in provider, no ``base_url``, request failed):
+    callers then fall back to the unfiltered catalog.
+    """
+
+    _BUILTIN = frozenset({"", "openai", "oss", "ollama", "lmstudio"})
+
+    def __init__(
+        self,
+        *,
+        config_path: str,
+        environ: dict[str, str] | None = None,
+        ttl: float = 300.0,
+        fetch: Callable[[str, dict[str, str]], Any] | None = None,
+    ):
+        self.config_path = config_path
+        self.environ = environ
+        self.ttl = ttl
+        self._fetch = fetch or _http_get_json
+        self._cached: tuple[float, set[str] | None] | None = None
+
+    async def __call__(self) -> set[str] | None:
+        now = time.monotonic()
+        if self._cached is not None and now - self._cached[0] < self.ttl:
+            return self._cached[1]
+        ids = await self._load()
+        self._cached = (now, ids)
+        return ids
+
+    async def _load(self) -> set[str] | None:
+        try:
+            config = tomllib.loads(Path(self.config_path).expanduser().read_text())
+        except Exception as exc:  # noqa: BLE001 - no config, no filter
+            _log_degrade("codex_provider_config_unreadable", path=self.config_path, error=exc)
+            return None
+        name = str(config.get("model_provider", "") or "")
+        provider = (config.get("model_providers") or {}).get(name)
+        if name in self._BUILTIN or not isinstance(provider, dict):
+            return None
+        base_url = str(provider.get("base_url", "") or "").rstrip("/")
+        if not base_url:
+            return None
+        environ = os.environ if self.environ is None else self.environ
+        headers = {str(k): str(v) for k, v in (provider.get("http_headers") or {}).items()}
+        for header, var in (provider.get("env_http_headers") or {}).items():
+            if environ.get(str(var)):
+                headers[str(header)] = environ[str(var)]
+        env_key = str(provider.get("env_key", "") or "")
+        if env_key and environ.get(env_key):
+            headers["Authorization"] = f"Bearer {environ[env_key]}"
+        url = f"{base_url}/models"
+        query = provider.get("query_params")
+        if isinstance(query, dict) and query:
+            url = f"{url}?{urllib.parse.urlencode(query)}"
+        try:
+            payload = await asyncio.to_thread(self._fetch, url, headers)
+        except Exception as exc:  # noqa: BLE001 - unfiltered beats unusable
+            _log_degrade("codex_provider_models_failed", provider=name, error=exc)
+            return None
+        data = payload.get("data") if isinstance(payload, dict) else None
+        if not isinstance(data, list):
+            _log_degrade("codex_provider_models_unexpected", provider=name)
+            return None
+        return {str(item.get("id")) for item in data if isinstance(item, dict) and item.get("id")}
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    # urllib replays the Authorization header on a redirect, to any host: a
+    # provider (or anything in front of it) answering /models with a 30x would
+    # receive the API key elsewhere. A redirect just means "no list" here.
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def _http_get_json(url: str, headers: dict[str, str]) -> Any:
+    request = urllib.request.Request(url, headers=headers)
+    with urllib.request.build_opener(_NoRedirect).open(request, timeout=15) as response:
+        return json.load(response)
+
+
 # How many started turn ids CodexAppServerTransport remembers for hook
 # ownership. Only turns whose hooks are still queued matter, so a few hundred
 # is generous; the cap keeps a long-lived runtime from growing without bound.
@@ -175,8 +272,11 @@ class CodexAppServerTransport:
         ephemeral: bool = False,
         environment_context: str = "",
         event_silence_ceiling: float = 3600.0,
+        provider_models: Callable[[], Awaitable[set[str] | None]] | None = None,
     ):
         self.client = client
+        # What the provider really serves; see CodexProviderModels.
+        self.provider_models = provider_models
         self.approval_policy = approval_policy
         # None means: send no `sandbox` in thread/start or thread/resume and let
         # Codex apply the profile's own `sandbox_mode`. This used to default to
@@ -698,6 +798,14 @@ class CodexAppServerTransport:
             cursor = result.get("nextCursor") if isinstance(result, dict) else None
             if not cursor:
                 break
+        served = await self.provider_models() if self.provider_models is not None else None
+        if served is not None:
+            kept = [item for item in models if item["slug"] in served]
+            if kept:
+                return kept
+            # No overlap at all means the provider names models differently,
+            # not that it serves none of them: filtering would empty the list.
+            _log_degrade("codex_provider_models_disjoint", catalog=len(models), served=len(served))
         return models
 
     async def list_mcp_servers(self) -> list[dict[str, Any]]:

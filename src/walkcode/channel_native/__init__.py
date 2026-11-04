@@ -246,6 +246,7 @@ from .codex_transport import (
     _codex_tool_state_from_event_name,
     _CODEX_TOOL_STATUS_STATES,
     CodexAppServerTransport,
+    CodexProviderModels,
     _CodexToolItemSpec,
     UNSAFE_SANDBOX_MESSAGE,
 )
@@ -306,6 +307,7 @@ __all__ = [
     "ChannelNativeE2EGates",
     "ClaudeHeadlessTransport",
     "CodexAppServerTransport",
+    "CodexProviderModels",
     "ControlResult",
     "DecisionResult",
     "DeliveryItem",
