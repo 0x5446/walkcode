@@ -3411,3 +3411,192 @@ class CodexAppServerShutdownLiveTests(unittest.TestCase):
         for kid in survivors:
             subprocess.run(["kill", "-9", kid], check=False)
         self.assertEqual(survivors, [], "app-server survived the discard")
+
+
+class _ModelListCodexClient(_BatchScriptCodexClient):
+    """Batch-scripted fake that also answers model/list and thread/start with fresh ids."""
+
+    def __init__(self, batches=()):
+        super().__init__(batches)
+        self.thread_starts = 0
+
+    async def request(self, method, params):
+        if method == "model/list":
+            self.requests.append((method, params))
+            return {
+                "data": [
+                    {
+                        "model": "gpt-6-sol",
+                        "displayName": "GPT-6-Sol",
+                        "isDefault": True,
+                        "defaultReasoningEffort": "medium",
+                        "supportedReasoningEfforts": [
+                            {"reasoningEffort": "low", "description": ""},
+                            {"reasoningEffort": "high", "description": ""},
+                        ],
+                    },
+                    {
+                        "model": "gpt-6-luna",
+                        "supportedReasoningEfforts": [{"reasoningEffort": "max", "description": ""}],
+                    },
+                    {"model": "secret-model", "hidden": True},
+                ],
+                "nextCursor": None,
+            }
+        if method == "thread/start":
+            self.requests.append((method, params))
+            self.thread_starts += 1
+            return {"thread": {"id": f"thread-{self.thread_starts}"}}
+        return await super().request(method, params)
+
+
+class CodexNativeCommandTests(unittest.TestCase):
+    """Codex TUI slash commands mapped onto real app-server calls."""
+
+    def _setup(self, batches=()):
+        client = _ModelListCodexClient(batches)
+        transport = CodexAppServerTransport(client=client, event_silence_ceiling=0)
+        transport._EMPTY_BATCH_MIN_INTERVAL = 0
+        handle = asyncio.run(transport.launch(LaunchSpec(cwd="/tmp/project", session_id="s1")))
+        return client, transport, handle
+
+    def _turn_starts(self, client):
+        return [params for method, params in client.requests if method == "turn/start"]
+
+    def test_capabilities_advertise_model_switching(self):
+        self.assertTrue(CodexAppServerTransport(client=_FakeCodexClient()).capabilities().set_model)
+
+    def test_list_models_drops_hidden_entries(self):
+        _client, transport, _handle = self._setup()
+
+        models = asyncio.run(transport.list_models())
+
+        self.assertEqual([m["slug"] for m in models], ["gpt-6-sol", "gpt-6-luna"])
+        self.assertEqual(models[0]["efforts"], ["low", "high"])
+        self.assertTrue(models[0]["is_default"])
+
+    def test_set_model_rides_every_following_turn_start(self):
+        client, transport, handle = self._setup()
+
+        result = asyncio.run(transport.set_model(handle, "gpt-6-luna"))
+        asyncio.run(transport.submit_turn(handle, TurnInput(text="hi"), "k1"))
+        asyncio.run(transport.submit_turn(handle, TurnInput(text="again"), "k2"))
+
+        self.assertTrue(result.accepted)
+        self.assertEqual([p.get("model") for p in self._turn_starts(client)], ["gpt-6-luna"] * 2)
+        # The stream's cached model must not put the old name back.
+        self.assertEqual(transport._thread_models["thread-1"], "gpt-6-luna")
+
+    def test_set_model_rejects_a_slug_the_app_server_does_not_list(self):
+        # The app-server persists a turn/start override in the thread: a typo
+        # would fail every later turn of the session.
+        client, transport, handle = self._setup()
+
+        result = asyncio.run(transport.set_model(handle, "gpt-typo"))
+        asyncio.run(transport.submit_turn(handle, TurnInput(text="hi"), "k1"))
+
+        self.assertFalse(result.accepted)
+        self.assertIn("gpt-6-sol", result.reason)
+        self.assertNotIn("model", self._turn_starts(client)[0])
+
+    def test_set_model_skips_validation_when_model_list_fails(self):
+        client, transport, handle = self._setup()
+
+        async def broken(method, params):
+            raise RuntimeError("no model/list here")
+
+        original = client.request
+
+        async def request(method, params):
+            if method == "model/list":
+                return await broken(method, params)
+            return await original(method, params)
+
+        client.request = request
+        result = asyncio.run(transport.set_model(handle, "custom-proxy-model"))
+
+        self.assertTrue(result.accepted)
+
+    def test_set_effort_is_checked_against_the_current_model(self):
+        client, transport, handle = self._setup()
+
+        rejected = asyncio.run(transport.set_effort(handle, "max", model="gpt-6-sol"))
+        accepted = asyncio.run(transport.set_effort(handle, "HIGH", model="gpt-6-sol"))
+        asyncio.run(transport.submit_turn(handle, TurnInput(text="hi"), "k1"))
+
+        self.assertFalse(rejected.accepted)
+        self.assertIn("low, high", rejected.reason)
+        self.assertTrue(accepted.accepted)
+        self.assertEqual(self._turn_starts(client)[0]["effort"], "high")
+
+    def test_review_and_init_become_the_tui_prompts(self):
+        client, transport, handle = self._setup()
+
+        asyncio.run(transport.submit_turn(handle, TurnInput(text="/review"), "k1"))
+        asyncio.run(transport.submit_turn(handle, TurnInput(text="/review the auth module"), "k2"))
+        asyncio.run(transport.submit_turn(handle, TurnInput(text="/init"), "k3"))
+        asyncio.run(transport.submit_turn(handle, TurnInput(text="/unknown thing"), "k4"))
+
+        texts = [p["input"][0]["text"] for p in self._turn_starts(client)]
+        self.assertEqual(texts[0], codex_transport_module.CODEX_REVIEW_PROMPT)
+        self.assertTrue(texts[1].startswith(codex_transport_module.CODEX_REVIEW_PROMPT))
+        self.assertIn("Focus on: the auth module", texts[1])
+        self.assertEqual(texts[2], codex_transport_module.CODEX_INIT_PROMPT)
+        self.assertEqual(texts[3], "/unknown thing")
+
+    def test_compact_calls_compact_start_and_drains_the_compaction_turn(self):
+        compaction_turn = [
+            # A late event of the turn we ran before must not be claimed.
+            {"method": "item/completed", "params": {"threadId": "thread-1", "turnId": "turn-1", "item": {"type": "reasoning"}}},
+            {"method": "turn/started", "params": {"threadId": "thread-1", "turn": {"id": "compact-1"}}},
+            {"method": "item/completed", "params": {"threadId": "thread-1", "turnId": "compact-1", "item": {"type": "contextCompaction", "id": "c"}}},
+            {"method": "turn/completed", "params": {"threadId": "thread-1", "turn": {"id": "compact-1", "status": "completed"}}},
+        ]
+        client, transport, handle = self._setup([compaction_turn])
+        asyncio.run(transport.submit_turn(handle, TurnInput(text="hi"), "k1"))
+        transport._active_turns.pop("thread-1", None)  # turn-1 finished earlier
+
+        asyncio.run(transport.submit_turn(handle, TurnInput(text="/compact"), "k2"))
+        self.assertIn("thread-1", transport._pending_starts)
+        events = _drain_events(transport, handle)
+
+        self.assertEqual(
+            [m for m, _ in client.requests if m in {"turn/start", "thread/compact/start"}],
+            ["turn/start", "thread/compact/start"],
+        )
+        self.assertEqual(events[-1].type, AgentEventType.TURN_COMPLETED)
+        self.assertTrue(transport.started_turn("compact-1"))
+        self.assertNotIn("thread-1", transport._pending_starts)
+        self.assertNotIn("thread-1", transport._compacting)
+
+    def test_compact_that_never_starts_a_turn_stops_deferring_on_drain_end(self):
+        client, transport, handle = self._setup([])
+
+        asyncio.run(transport.submit_turn(handle, TurnInput(text="/compact"), "k1"))
+        _drain_events(transport, handle)
+
+        self.assertNotIn("thread-1", transport._pending_starts)
+        self.assertNotIn("thread-1", transport._compacting)
+
+    def test_clear_moves_the_session_to_a_fresh_thread(self):
+        client, transport, handle = self._setup()
+        asyncio.run(transport.set_model(handle, "gpt-6-luna"))
+        asyncio.run(transport.submit_turn(handle, TurnInput(text="hi"), "k1"))
+
+        asyncio.run(transport.submit_turn(handle, TurnInput(text="/clear"), "k2"))
+        events = _drain_events(transport, handle)
+        asyncio.run(transport.submit_turn(handle, TurnInput(text="next"), "k3"))
+
+        self.assertEqual(handle.ref["thread_id"], "thread-2")
+        methods = [m for m, _ in client.requests]
+        # The old thread's live turn is stopped and unsubscribed.
+        self.assertIn(("turn/interrupt", {"threadId": "thread-1", "turnId": "turn-1"}), client.requests)
+        self.assertIn(("thread/unsubscribe", {"threadId": "thread-1"}), client.requests)
+        self.assertEqual(methods.count("thread/start"), 2)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].type, AgentEventType.TURN_COMPLETED)
+        self.assertEqual(events[0].payload["thread_id"], "thread-2")
+        self.assertEqual(events[0].payload["message"], codex_transport_module.CODEX_NEW_THREAD_NOTICE)
+        # The model choice follows the conversation onto the new thread.
+        last = self._turn_starts(client)[-1]
+        self.assertEqual((last["threadId"], last.get("model")), ("thread-2", "gpt-6-luna"))

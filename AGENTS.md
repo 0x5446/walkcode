@@ -105,6 +105,14 @@ scripts; orchestration and gates live in the skill.
   maintenance helpers the Lark path shares were renamed to neutral names
   (`_handle_bot_command`, `_parse_bot_command`, `_start_maintenance_tasks`, …);
   keep new shared code channel-neutral and put Lark specifics behind `lark` names.
+- **Agent-native slash commands (ADR 0071)**: the codex app-server has no
+  slash-command surface — text like `/compact` only reaches the model as a
+  sentence. `CodexAppServerTransport.submit_turn` translates the ones with a real
+  equivalent (`_CODEX_TRANSLATED_COMMANDS`); WalkCode answers `/model`, `/effort`,
+  `/mcp`, `/diff`; TUI-only ones are refused (`_CODEX_CHAT_UNSUPPORTED`). Never
+  switch `/review` to `review/start` without re-verifying: on 0.166 its turn
+  never completes. The command menus list only what the channel actually runs —
+  re-verify with `claude -p "/<name>"` after a Claude Code upgrade.
 - Legacy remnants are blockers for upgrade and real E2E: old LaunchAgents,
   `walkcode hook` configs, shell wrapper source lines, and `FEISHU_*` env must be
   cleaned first.

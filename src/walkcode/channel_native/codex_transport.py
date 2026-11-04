@@ -8,6 +8,7 @@ import time
 import uuid
 
 from collections.abc import Callable
+from dataclasses import replace
 from typing import Any, NamedTuple
 
 from .models import (
@@ -62,6 +63,73 @@ def _codex_message_turn_id(message: Any) -> str:
     if isinstance(payload, dict):
         return str(payload.get("turn_id") or payload.get("turnId") or "")
     return ""
+
+
+# Codex TUI slash commands that have a real app-server equivalent. The TUI
+# implements every slash command client-side; sent to the app-server as text
+# they only ever reached the model as a sentence ("/compact" answered with
+# chat, no compaction). Names outside this set stay plain text.
+_CODEX_TRANSLATED_COMMANDS = frozenset({"compact", "clear", "new", "review", "init"})
+
+# The prompts the codex TUI sends for /review (no target) and /init, verbatim
+# from codex 0.166.0. /review deliberately does NOT use review/start: on 0.166
+# its turn never completes after the review text arrives (verified live,
+# 2026-11-04 — no turn/completed within 8 minutes), which would pin the
+# session until the silence ceiling. A plain turn runs the same review.
+CODEX_REVIEW_PROMPT = (
+    "Review the current code changes (staged, unstaged, and untracked files) "
+    "and provide prioritized findings."
+)
+CODEX_INIT_PROMPT = """Generate a file named AGENTS.md that serves as a contributor guide for this repository.
+Before writing, check whether AGENTS.md already exists in the current working directory. If it does, do not overwrite or modify it.
+Your goal is to produce a clear, concise, and well-structured document with descriptive headings and actionable explanations for each section.
+Follow the outline below, but adapt as needed — add sections if relevant, and omit those that do not apply to this project.
+
+Document Requirements
+
+- Title the document "Repository Guidelines".
+- Use Markdown headings (#, ##, etc.) for structure.
+- Keep the document concise. 200-400 words is optimal.
+- Keep explanations short, direct, and specific to this repository.
+- Provide examples where helpful (commands, directory paths, naming patterns).
+- Maintain a professional, instructional tone.
+
+Recommended Sections
+
+Project Structure & Module Organization
+- Outline the project structure, including where the source code, tests, and assets are located.
+
+Build, Test, and Development Commands
+- List key commands for building, testing, and running locally (e.g., npm test, make build).
+- Briefly explain what each command does.
+
+Coding Style & Naming Conventions
+- Specify indentation rules, language-specific style preferences, and naming patterns.
+- Include any formatting or linting tools used.
+
+Testing Guidelines
+- Identify testing frameworks and coverage requirements.
+- State test naming conventions and how to run tests.
+
+Commit & Pull Request Guidelines
+- Summarize commit message conventions found in the project's Git history.
+- Outline pull request requirements (descriptions, linked issues, screenshots, etc.).
+
+(Optional) Add other sections if relevant, such as Security & Configuration Tips, Architecture Overview, or Agent-Specific Instructions."""
+
+CODEX_NEW_THREAD_NOTICE = "已开始新对话，之前的上下文已清空。"
+
+
+def _codex_native_command(text: str) -> tuple[str, str]:
+    """``(name, argument)`` when ``text`` is a codex slash command we translate."""
+    stripped = str(text or "").strip()
+    if not stripped.startswith("/"):
+        return "", ""
+    head, _, argument = stripped.partition(" ")
+    name = head[1:].split("@", 1)[0].lower()
+    if name not in _CODEX_TRANSLATED_COMMANDS:
+        return "", ""
+    return name, argument.strip()
 
 
 # How many started turn ids CodexAppServerTransport remembers for hook
@@ -197,6 +265,21 @@ class CodexAppServerTransport:
         # reads the client sees no listener, but the drain may still be
         # handing over a batch it holds — the queue is still the drain's.
         self._draining: dict[str, int] = {}
+        # /model and /effort choices per thread, sent on every turn/start.
+        # The app-server keeps a turn/start override for all later turns and
+        # persists it in the rollout (a resume after an app-server restart
+        # reports the switched model — verified on 0.166.0), so losing this map
+        # on a runtime restart loses nothing; resending it is harmless.
+        self._thread_overrides: dict[str, dict[str, str]] = {}
+        # Threads with a thread/compact/start in flight whose turn id is not
+        # known yet: the response is empty and the id first shows up on the
+        # compaction's turn/started. The thread also stays in _pending_starts
+        # until the drain claims that turn, so the mirror cannot take it.
+        self._compacting: set[str] = set()
+        # Threads opened by /clear or /new. Nothing runs on them yet, so their
+        # drain is one synthetic completion that carries the new thread id
+        # back to the session's resume ref.
+        self._fresh_threads: set[str] = set()
         if hasattr(client, "foreign_router"):
             client.foreign_router = self._route_foreign_message
 
@@ -328,7 +411,7 @@ class CodexAppServerTransport:
             structured_output=True,
             permission_callback=True,
             ask_user_question=True,
-            set_model=False,
+            set_model=True,
             resume_after_complete=True,
             external_tui_takeover=True,
         )
@@ -437,6 +520,20 @@ class CodexAppServerTransport:
         idempotency_key: str,
     ) -> None:
         thread_id = handle.ref["thread_id"]
+        command, argument = _codex_native_command(turn.text)
+        if command in {"clear", "new"}:
+            await self._start_fresh_thread(handle)
+            return
+        if command == "compact":
+            await self._start_compaction(thread_id)
+            return
+        if command == "review":
+            review = CODEX_REVIEW_PROMPT
+            if argument:
+                review = f"{review}\n\nFocus on: {argument}"
+            turn = replace(turn, text=review)
+        elif command == "init":
+            turn = replace(turn, text=CODEX_INIT_PROMPT)
         # Attachment paths must ride the prompt (no attachment channel here),
         # and the result must never be blank — see EMPTY_TURN_PLACEHOLDER:
         # a blank turn/start input poisons the thread's history for good.
@@ -456,6 +553,7 @@ class CodexAppServerTransport:
                     ],
                     "approvalPolicy": self.approval_policy,
                     "idempotencyKey": idempotency_key,
+                    **self._thread_overrides.get(thread_id, {}),
                 },
             )
         except BaseException:
@@ -481,6 +579,146 @@ class CodexAppServerTransport:
         self._env_context_pending.discard(thread_id)
         self._env_context_delivered.add(thread_id)
 
+    async def _start_compaction(self, thread_id: str) -> None:
+        """/compact: ``thread/compact/start``, drained like any other turn."""
+        self._pending_starts.add(thread_id)
+        self._compacting.add(thread_id)
+        try:
+            await self.client.request("thread/compact/start", {"threadId": thread_id})
+        except BaseException:
+            self._compacting.discard(thread_id)
+            self._pending_starts.discard(thread_id)
+            self._hand_over_queued_foreign(thread_id)
+            raise
+
+    def _claim_compaction_turn(self, thread_id: str, turn_id: str) -> None:
+        self._compacting.discard(thread_id)
+        self._pending_starts.discard(thread_id)
+        self._active_turns[thread_id] = turn_id
+        self._started_turns[turn_id] = None
+        if len(self._started_turns) > CODEX_STARTED_TURNS_LIMIT:
+            del self._started_turns[next(iter(self._started_turns))]
+
+    async def _start_fresh_thread(self, handle: TransportHandle) -> None:
+        """/clear and /new: swap the session onto a new thread in the same cwd.
+
+        The app-server has no "clear history" call; a new thread is what the
+        TUI does too. The handle is switched in place so this turn's drain
+        reads the new thread, and the drain's completion carries the new id
+        to the session's resume ref. The old thread is shut down (interrupting
+        a turn still running on it), and the model/effort choice moves over.
+        """
+        old_thread = str(handle.ref.get("thread_id", "") or "")
+        cwd = str(handle.ref.get("cwd", "") or "")
+        fresh = await self.launch(LaunchSpec(cwd=cwd, session_id=""))
+        new_thread = str(fresh.ref.get("thread_id", "") or "")
+        overrides = self._thread_overrides.pop(old_thread, None)
+        if overrides:
+            self._thread_overrides[new_thread] = overrides
+            if overrides.get("model"):
+                self._thread_models[new_thread] = overrides["model"]
+        if old_thread:
+            await self.shutdown(handle, "new_thread")
+        handle.ref["thread_id"] = new_thread
+        self._fresh_threads.add(new_thread)
+
+    async def list_models(self) -> list[dict[str, Any]]:
+        """Models the app-server offers (``model/list``), picker order."""
+        models: list[dict[str, Any]] = []
+        cursor = None
+        for _ in range(10):
+            params: dict[str, Any] = {"cursor": cursor} if cursor else {}
+            result = await self.client.request("model/list", params)
+            data = result.get("data") if isinstance(result, dict) else None
+            for item in data if isinstance(data, list) else []:
+                if not isinstance(item, dict) or item.get("hidden"):
+                    continue
+                slug = str(item.get("model") or item.get("id") or "").strip()
+                if not slug:
+                    continue
+                efforts = [
+                    str(option.get("reasoningEffort", "") or "")
+                    for option in item.get("supportedReasoningEfforts") or []
+                    if isinstance(option, dict) and option.get("reasoningEffort")
+                ]
+                models.append(
+                    {
+                        "slug": slug,
+                        "display_name": str(item.get("displayName", "") or "").strip(),
+                        "is_default": bool(item.get("isDefault")),
+                        "efforts": efforts,
+                        "default_effort": str(item.get("defaultReasoningEffort", "") or ""),
+                    }
+                )
+            cursor = result.get("nextCursor") if isinstance(result, dict) else None
+            if not cursor:
+                break
+        return models
+
+    async def list_mcp_servers(self) -> list[dict[str, Any]]:
+        """MCP servers and their state (``mcpServerStatus/list``)."""
+        result = await self.client.request("mcpServerStatus/list", {"detail": "toolsAndAuthOnly"})
+        data = result.get("data") if isinstance(result, dict) else None
+        return [item for item in data if isinstance(item, dict)] if isinstance(data, list) else []
+
+    async def _models_for_validation(self) -> list[dict[str, Any]]:
+        # No list (older app-server, or the call failed): skip the check rather
+        # than refuse every switch; codex then reports a bad name on the turn.
+        try:
+            return await self.list_models()
+        except Exception as exc:  # noqa: BLE001 - validation is best-effort
+            _log_degrade("codex_model_list_failed", error=exc)
+            return []
+
+    def thread_overrides(self, thread_id: str) -> dict[str, str]:
+        return dict(self._thread_overrides.get(thread_id, {}))
+
+    async def set_model(self, handle: TransportHandle, model: str) -> ControlResult:
+        """Switch the thread's model from the next turn on.
+
+        Checked against ``model/list`` first: an unknown slug would be
+        persisted by the app-server and fail every later turn of the thread.
+        """
+        thread_id = str((handle.ref or {}).get("thread_id", "") or "")
+        model = str(model or "").strip()
+        if not thread_id:
+            return ControlResult(False, "会话还没有 Codex thread，先发一条消息再切换")
+        if not model:
+            return ControlResult(False, "模型名为空")
+        models = await self._models_for_validation()
+        slugs = [item["slug"] for item in models]
+        if slugs and model not in slugs:
+            return ControlResult(False, f"Codex 不认识模型 {model}，可选：{', '.join(slugs)}")
+        self._thread_overrides.setdefault(thread_id, {})["model"] = model
+        # The stream backfills the cached model onto events; a stale entry
+        # would put the old name back on session.model with the next reply.
+        self._thread_models[thread_id] = model
+        return ControlResult(True, state="model_set")
+
+    async def set_effort(self, handle: TransportHandle, effort: str, *, model: str = "") -> ControlResult:
+        """Switch the thread's reasoning effort from the next turn on.
+
+        ``model`` is the session's current model; the effort must be one it
+        supports, for the same reason set_model checks its slug.
+        """
+        thread_id = str((handle.ref or {}).get("thread_id", "") or "")
+        effort = str(effort or "").strip().lower()
+        if not thread_id:
+            return ControlResult(False, "会话还没有 Codex thread，先发一条消息再切换")
+        if not effort:
+            return ControlResult(False, "推理强度为空")
+        current = self._thread_overrides.get(thread_id, {}).get("model") or model
+        models = await self._models_for_validation()
+        supported = next((item["efforts"] for item in models if item["slug"] == current), None)
+        if supported is None:
+            supported = sorted({effort for item in models for effort in item["efforts"]})
+        if supported and effort not in supported:
+            return ControlResult(
+                False, f"{current or '当前模型'} 不支持推理强度 {effort}，可选：{', '.join(supported)}"
+            )
+        self._thread_overrides.setdefault(thread_id, {})["effort"] = effort
+        return ControlResult(True, state="effort_set")
+
     async def events(self, handle: TransportHandle):
         """Drain our turn (see ``_listen_own_turn``), then release parked foreign turns.
 
@@ -490,6 +728,13 @@ class CodexAppServerTransport:
         let the rest of those turns route directly.
         """
         thread_id = str(handle.ref.get("thread_id", "") or "")
+        if thread_id in self._fresh_threads:
+            self._fresh_threads.discard(thread_id)
+            yield AgentEvent(
+                AgentEventType.TURN_COMPLETED,
+                {"message": CODEX_NEW_THREAD_NOTICE, "status": "completed", "thread_id": thread_id},
+            )
+            return
         own_turn = self._active_turns.get(thread_id, "")
         self._draining[thread_id] = self._draining.get(thread_id, 0) + 1
         try:
@@ -500,6 +745,11 @@ class CodexAppServerTransport:
             # broken wire — its turn's usage goes with it; turn/completed
             # already claimed it on the normal path.
             self._turn_usage.pop(own_turn, None)
+            if thread_id in self._compacting:
+                # The compaction's turn never showed up on this drain; stop
+                # deferring unknown turns on its behalf.
+                self._compacting.discard(thread_id)
+                self._pending_starts.discard(thread_id)
             remaining = self._draining.get(thread_id, 1) - 1
             if remaining > 0:
                 self._draining[thread_id] = remaining
@@ -549,6 +799,12 @@ class CodexAppServerTransport:
             delta_model = ""
             for raw_event in raw_events:
                 event_turn = _codex_message_turn_id(raw_event)
+                if not own_turn and event_turn and thread_id in self._compacting:
+                    if self.started_turn(event_turn):
+                        continue  # a late event of an earlier turn of ours
+                    if raw_event.get("method") == "turn/started":
+                        self._claim_compaction_turn(thread_id, event_turn)
+                        own_turn = event_turn
                 if own_turn and event_turn and event_turn != own_turn:
                     if self.started_turn(event_turn):
                         continue  # a late event of an earlier turn of ours
@@ -720,6 +976,7 @@ class CodexAppServerTransport:
         self._env_context_pending.discard(thread_id)
         self._env_context_delivered.discard(thread_id)
         self._thread_models.pop(thread_id, None)
+        self._thread_overrides.pop(thread_id, None)
         self._turn_usage.pop(turn_id, None)
         self.effective_sandbox.pop(thread_id, None)
         self.unsubscribe_foreign_mirror(thread_id)
@@ -781,8 +1038,13 @@ class CodexAppServerTransport:
         self._pending_starts.clear()
         self._parked_turns.clear()
         self._active_turns.clear()
+        self._compacting.clear()
         self.effective_sandbox.clear()
         # NOT cleared, deliberately:
+        #
+        # _thread_overrides — the user's /model and /effort choice, not a
+        #   reading of the old process. The thread already persists it; resending
+        #   it to the new server is harmless.
         #
         # _released_threads — it is a signal to drains, not a cache of the old
         #   process. A drain that returns from a batch right after the restart
@@ -795,9 +1057,6 @@ class CodexAppServerTransport:
         # _env_context_delivered — the preamble is in the thread's HISTORY,
         #   not in the server; a restart does not un-send it, and re-marking
         #   would re-inject it on every resume after a reload.
-
-    async def set_model(self, handle: TransportHandle, model: str) -> ControlResult:
-        raise CapabilityUnsupported("Codex app-server model switching is not verified")
 
     def _convert_event(self, event: dict[str, Any], *, thread_id: str = "") -> AgentEvent | None:
         event_type = str(event.get("type", "") or event.get("method", ""))

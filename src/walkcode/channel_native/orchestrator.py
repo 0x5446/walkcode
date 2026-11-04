@@ -680,6 +680,12 @@ class Orchestrator:
             session.lifecycle_state = "ERROR_RECOVERABLE"
             await self.refresh_session_status_card(session)
             raise
+        # A submit may move the session to a new agent thread (codex /clear,
+        # /new). Persist it now rather than waiting for the drain's completion:
+        # a drain already attached to this worker would swallow that event.
+        rebound = str(handle.ref.get("thread_id", "") or "")
+        if rebound and rebound != str(session.transport_ref.get("thread_id", "") or ""):
+            session.transport_ref["thread_id"] = rebound
         # ADR 0057：记录"最近一次被人说话"的时刻。频道消息用渠道产生时刻
         # （不是提交时刻——否则快速连发的第二条会被时效守卫误判），无时间
         # 戳的输入退化为本机当前时间。与登记时同值落章（R3 issue#4）。
@@ -1231,6 +1237,38 @@ class Orchestrator:
         if result.accepted:
             self.sessions.get(session_id).model = model
         return result
+
+    async def set_session_effort(
+        self,
+        session_id: str,
+        *,
+        actor: ActorRef,
+        effort: str,
+    ) -> ControlResult:
+        """Reasoning effort switch; only transports with ``set_effort`` (codex).
+
+        Gated on the ``set_model`` capability: it is the same kind of per-turn
+        model setting, and claude handles /effort natively on its own channel.
+        """
+        session = self.sessions.get(session_id)
+
+        async def invoke(transport, handle):
+            setter = getattr(transport, "set_effort", None)
+            if setter is None:
+                return ControlResult(False, BlockedReason.CAPABILITY_DISABLED)
+            return await setter(handle, effort, model=str(session.model or ""))
+
+        try:
+            return await self._run_transport_control(
+                session_id,
+                actor=actor,
+                action="set_model",
+                capability="set_model",
+                invoke=invoke,
+            )
+        except Exception as exc:  # noqa: BLE001 - same contract as set_session_model
+            _log_degrade("set_effort_failed", session_id=session_id, effort=effort, error=exc)
+            return ControlResult(False, str(exc) or type(exc).__name__)
 
     async def archive_session(
         self,
@@ -3284,13 +3322,16 @@ class Orchestrator:
                     continue
                 # The turn ended having produced nothing the user could see.
                 # Say so rather than dropping the completion (EMPTY_TURN_NOTICE).
-                _log_degrade(
-                    "turn_completed_without_output",
-                    session_id=session.session_id,
-                    transport_kind=session.transport_kind,
-                )
-                view = {"type": "turn_completed", "message": EMPTY_TURN_NOTICE}
-                visible_text = EMPTY_TURN_NOTICE
+                notice = self._silent_command_notice(session)
+                if not notice:
+                    _log_degrade(
+                        "turn_completed_without_output",
+                        session_id=session.session_id,
+                        transport_kind=session.transport_kind,
+                    )
+                    notice = EMPTY_TURN_NOTICE
+                view = {"type": "turn_completed", "message": notice}
+                visible_text = notice
             if event.type == AgentEventType.TURN_COMPLETED and visible_text == last_visible_text:
                 # The completion is repeating text the deltas already showed.
                 last_visible_text = ""
@@ -3418,6 +3459,23 @@ class Orchestrator:
         if new_message_id:
             binding.capabilities["tool_progress_message_id"] = str(new_message_id)
         return bool(new_message_id)
+
+    def _silent_command_notice(self, session: Session) -> str:
+        """Confirmation for a slash command that legitimately prints nothing.
+
+        Claude's /clear and codex's /compact finish with an empty result. That
+        is the command working, not the provider failing, so EMPTY_TURN_NOTICE
+        would send the user hunting for an outage. The replay ledger still
+        holds the last submitted turn at this point (it is only replaced by
+        the next submit).
+        """
+        entry = self._turn_replays.get(session.session_id) or {}
+        turn = entry.get("turn")
+        text = str(getattr(turn, "text", "") or "").strip()
+        if not text.startswith("/") or "\n" in text:
+            return ""
+        command = text.split(" ", 1)[0]
+        return f"✅ {command} 已执行。"
 
     @staticmethod
     def _seal_tool_progress_burst(session: Session) -> None:

@@ -935,12 +935,12 @@ class ChannelNativeRuntimeTests(unittest.TestCase):
             asyncio.run(runtime.process_channel_event(_lark_message(10, text="start")))
             result = asyncio.run(
                 runtime.process_channel_event(
-                    _lark_message(11, text="/add_dir /tmp/extra", root_id=_first_card(api))
+                    _lark_message(11, text="/security_review src", root_id=_first_card(api))
                 )
             )
 
             self.assertTrue(result.accepted)
-            self.assertEqual([turn.text for turn in transport.submitted_turns], ["start", "/add-dir /tmp/extra"])
+            self.assertEqual([turn.text for turn in transport.submitted_turns], ["start", "/security-review src"])
 
     def test_serve_flushes_persisted_outbox_without_new_events(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -6229,3 +6229,237 @@ class ClaudeTuiSessionSwitchTests(unittest.TestCase):
                     channel_native_orchestrator, "claude_tui_current_session", return_value=running
                 ):
                     self.assertIs(needs_stop(session), expected)
+
+
+class _CodexCommandFakeTransport(FakeAgentTransport):
+    """Fake codex transport with the app-server-backed command surface."""
+
+    def __init__(self, *, scripted_events=None):
+        super().__init__(
+            "codex_app_server",
+            TransportCapabilities(
+                structured_input=True,
+                structured_output=True,
+                permission_callback=False,
+                ask_user_question=False,
+                set_model=True,
+                resume_after_complete=True,
+                external_tui_takeover=True,
+            ),
+            scripted_events=scripted_events,
+        )
+        self.effort_calls: list[tuple[str, str]] = []
+        self.mcp_servers: list[dict] = []
+
+    async def list_models(self):
+        return [
+            {"slug": "gpt-6-sol", "display_name": "GPT-6-Sol", "efforts": ["low", "high"]},
+            {"slug": "gpt-6-luna", "display_name": "GPT-6-Luna", "efforts": ["medium"]},
+        ]
+
+    async def set_effort(self, handle, effort, *, model=""):
+        self.effort_calls.append((effort, model))
+        return ControlResult(True, state="effort_set")
+
+    async def list_mcp_servers(self):
+        return list(self.mcp_servers)
+
+    def thread_overrides(self, thread_id):
+        return {}
+
+
+class NativeSlashCommandTests(unittest.TestCase):
+    def _runtime(self, tmp, agent="codex", transport=None):
+        cfg = ChannelNativeConfig.from_env(
+            {
+                "WALKCODE_CHANNEL": "lark",
+                "LARK_APP_ID": "cli_x",
+                "LARK_APP_SECRET": "s",
+                "WALKCODE_AGENT": agent,
+                "WALKCODE_STATE_PATH": str(Path(tmp) / "state.json"),
+                "WALKCODE_CWD": tmp,
+            }
+        )
+        api = _FakeLarkApi()
+        if transport is None:
+            # No scripted completion: the session stays live, so follow-ups in
+            # the topic submit straight to the same worker.
+            transport = _CodexCommandFakeTransport()
+        runtime = ChannelNativeRuntime.from_config(
+            cfg, lark_api=api, transports={transport.kind: transport}
+        )
+        asyncio.run(runtime.process_channel_event(_lark_message(10, text="start")))
+        return runtime, api, transport
+
+    def _send(self, runtime, api, text, event_id=11):
+        return asyncio.run(
+            runtime.process_channel_event(_lark_message(event_id, text=text, root_id=_first_card(api)))
+        )
+
+    def _texts(self, api):
+        return "\n".join(payload.get("text", "") for payload in _sent(api))
+
+    def test_codex_model_lists_live_models_as_a_choice_card(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime, api, transport = self._runtime(tmp)
+
+            result = self._send(runtime, api, "/model")
+
+            self.assertEqual(result.reason, "bot_command")
+            cards = json.dumps([p for p in _sent(api, methods=("sendCard",))], ensure_ascii=False)
+            self.assertIn("gpt-6-luna", cards)
+            self.assertEqual([t.text for t in transport.submitted_turns], ["start"])
+
+    def test_codex_effort_is_answered_by_walkcode(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime, api, transport = self._runtime(tmp)
+
+            self._send(runtime, api, "/effort high", event_id=11)
+
+            self.assertEqual(transport.effort_calls[0][0], "high")
+            self.assertIn("Reasoning effort set: high", self._texts(api))
+            self.assertEqual([t.text for t in transport.submitted_turns], ["start"])
+
+    def test_codex_mcp_lists_servers(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime, api, transport = self._runtime(tmp)
+            transport.mcp_servers = [
+                {"name": "github", "authStatus": "oAuth", "runtimeStatus": "ready", "tools": {"a": {}, "b": {}}}
+            ]
+
+            self._send(runtime, api, "/mcp")
+
+            self.assertIn("- github — ready, auth: oAuth, 2 tools", self._texts(api))
+
+    def test_codex_tui_only_command_is_refused_not_sent_to_the_model(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime, api, transport = self._runtime(tmp)
+
+            self._send(runtime, api, "/logout")
+
+            self.assertIn("/logout 是 Codex 终端界面的命令", self._texts(api))
+            self.assertEqual([t.text for t in transport.submitted_turns], ["start"])
+
+    def test_codex_translated_commands_reach_the_transport(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime, api, transport = self._runtime(tmp)
+
+            self._send(runtime, api, "/compact")
+
+            self.assertEqual([t.text for t in transport.submitted_turns], ["start", "/compact"])
+
+    def test_claude_effort_and_mcp_stay_native(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            claude = FakeAgentTransport(
+                "claude_headless",
+                TransportCapabilities(
+                    structured_input=True,
+                    structured_output=True,
+                    permission_callback=False,
+                    ask_user_question=False,
+                    set_model=True,
+                    resume_after_complete=True,
+                    external_tui_takeover=True,
+                ),
+            )
+            runtime, api, transport = self._runtime(tmp, agent="claude", transport=claude)
+
+            self._send(runtime, api, "/effort high", event_id=11)
+            self._send(runtime, api, "/mcp", event_id=12)
+
+            self.assertEqual(
+                [t.text for t in transport.submitted_turns], ["start", "/effort high", "/mcp"]
+            )
+
+    def test_submit_that_moves_to_a_new_thread_updates_the_resume_ref(self):
+        # codex /clear swaps the thread inside submit_turn; the session must
+        # resume the NEW thread even if no drain reports it.
+        with tempfile.TemporaryDirectory() as tmp:
+            transport = _CodexCommandFakeTransport()
+            original_submit = transport.submit_turn
+
+            async def submit_turn(handle, turn, idempotency_key):
+                await original_submit(handle, turn, idempotency_key)
+                if turn.text == "/clear":
+                    handle.ref["thread_id"] = "thread-fresh"
+
+            transport.submit_turn = submit_turn
+            runtime, api, transport = self._runtime(tmp, transport=transport)
+
+            self._send(runtime, api, "/clear")
+
+            summary = runtime.state.sessions.list_sessions()[0]
+            session = runtime.state.sessions.get(summary.session_id)
+            self.assertEqual(session.transport_ref["thread_id"], "thread-fresh")
+
+    def test_diff_shows_uncommitted_changes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            subprocess.run(["git", "init", "-q", tmp], check=True)
+            subprocess.run(["git", "-C", tmp, "-c", "user.email=t@t", "-c", "user.name=t",
+                            "commit", "-q", "--allow-empty", "-m", "init"], check=True)
+            (Path(tmp) / "a.py").write_text("x = 1\n")
+            subprocess.run(["git", "-C", tmp, "add", "a.py"], check=True)
+            runtime, api, transport = self._runtime(tmp)
+
+            self._send(runtime, api, "/diff")
+
+            text = self._texts(api)
+            self.assertIn("a.py", text)
+            self.assertIn("+x = 1", text)
+
+    def test_diff_outside_git_says_so(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime, api, transport = self._runtime(tmp)
+
+            self._send(runtime, api, "/diff")
+
+            self.assertIn("Not a git repository", self._texts(api))
+
+    def test_menus_list_only_commands_the_channel_runs(self):
+        claude = {item["command"] for item in runtime_module._command_menu("claude")}
+        codex = {item["command"] for item in runtime_module._command_menu("codex")}
+
+        for gone in ("vim", "login", "resume", "permissions", "memory", "terminal_setup", "add_dir"):
+            self.assertNotIn(gone, claude)
+        self.assertTrue({"context", "usage", "effort", "diff"} <= claude)
+        for gone in ("login", "logout", "quit", "approvals", "diff_native"):
+            self.assertNotIn(gone, codex)
+        self.assertTrue({"compact", "clear", "new", "review", "init", "effort", "mcp", "diff", "model"} <= codex)
+
+
+class SilentCommandNoticeTests(unittest.TestCase):
+    def test_slash_command_with_empty_result_is_confirmed_not_reported_as_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            claude = FakeAgentTransport(
+                "claude_headless",
+                TransportCapabilities(
+                    structured_input=True,
+                    structured_output=True,
+                    permission_callback=False,
+                    ask_user_question=False,
+                    set_model=True,
+                    resume_after_complete=True,
+                    external_tui_takeover=True,
+                ),
+            )
+            cfg = ChannelNativeConfig.from_env(
+                {
+                    "WALKCODE_CHANNEL": "lark",
+                    "LARK_APP_ID": "cli_x",
+                    "LARK_APP_SECRET": "s",
+                    "WALKCODE_AGENT": "claude",
+                    "WALKCODE_STATE_PATH": str(Path(tmp) / "state.json"),
+                    "WALKCODE_CWD": tmp,
+                }
+            )
+            api = _FakeLarkApi()
+            runtime = ChannelNativeRuntime.from_config(cfg, lark_api=api, transports={"claude_headless": claude})
+            asyncio.run(runtime.process_channel_event(_lark_message(10, text="start")))
+            claude._scripted_events = [AgentEvent(AgentEventType.TURN_COMPLETED, {"message": ""})]
+            asyncio.run(
+                runtime.process_channel_event(_lark_message(11, text="/clear", root_id=_first_card(api)))
+            )
+
+            text = json.dumps(_sent(api), ensure_ascii=False)
+            self.assertIn("✅ /clear 已执行", text)
+            self.assertNotIn("本轮代理没有返回任何内容", text)

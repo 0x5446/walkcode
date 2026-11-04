@@ -195,7 +195,7 @@ Start the resident service (use launchd for long-running deploys):
 WALKCODE_ENV_FILE=~/.walkcode/work-claude.env walkcode native serve
 ```
 
-In-session commands: `/status`, `/sessions`, `/model`, `/takeover`, `/reload`
+In-session commands: `/status`, `/sessions`, `/model`, `/diff`, `/takeover`, `/reload`
 (alias `/restart`), and `/repo <dir> <task>` (start a new session inside the
 `WALKCODE_WORKSPACE_ROOTS` allowlist).
 
