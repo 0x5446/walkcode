@@ -163,7 +163,7 @@ uv run --with claude-agent-sdk --with lark-oapi python scripts/channel_native_de
 WALKCODE_ENV_FILE=~/.walkcode/work-claude.env walkcode native serve
 ```
 
-会话内可用命令：`/status`、`/sessions`、`/model`、`/takeover`、`/reload`（别名
+会话内可用命令：`/status`、`/sessions`、`/model`、`/diff`、`/takeover`、`/reload`（别名
 `/restart`）、`/repo <目录> <任务>`（在 `WALKCODE_WORKSPACE_ROOTS` 白名单内选择
 仓库启动新会话）。
 

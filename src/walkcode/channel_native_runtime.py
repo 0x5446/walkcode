@@ -832,7 +832,7 @@ class ChannelNativeRuntime:
                     "text": (
                         "Skills are not introspectable through the current "
                         f"{self.config.agent} structured transport yet.\n"
-                        "WalkCode-native commands: /status, /sessions, /model, /takeover, /reload."
+                        "WalkCode-native commands: /status, /sessions, /model, /diff, /takeover, /reload."
                     ),
                 },
             )
@@ -851,6 +851,26 @@ class ChannelNativeRuntime:
             return SubmitResult(True, "bot_command")
         if name == "model":
             await self._handle_model_command(channel, inbound, session, actor, argument)
+            return SubmitResult(True, "bot_command")
+        if name == "effort":
+            await self._handle_effort_command(channel, inbound, session, actor, argument)
+            return SubmitResult(True, "bot_command")
+        if name == "mcp":
+            await self._handle_mcp_command(channel, inbound, session, actor)
+            return SubmitResult(True, "bot_command")
+        if name == "diff":
+            await self._handle_diff_command(channel, inbound, session, actor)
+            return SubmitResult(True, "bot_command")
+        if name == "new-thread":
+            await self._handle_new_thread_command(channel, inbound, session, actor)
+            return SubmitResult(True, "bot_command")
+        if name == "unsupported":
+            hint = _CODEX_CHAT_UNSUPPORTED.get(argument, "")
+            text = f"/{argument} 是 Codex 终端界面的命令，在聊天里用不了。"
+            await channel.send_view(
+                self._command_reply_binding(inbound, session),
+                {"type": "text", "text": f"{text}{hint}"},
+            )
             return SubmitResult(True, "bot_command")
         if name == "repo":
             return await self._handle_repo_command(channel, inbound, session, argument)
@@ -1049,7 +1069,7 @@ class ChannelNativeRuntime:
         caps = transport.capabilities() if transport is not None else None
         if not argument:
             available = bool(caps and caps.set_model)
-            inventory = _local_model_inventory(self.config, session.transport_kind)
+            inventory = await self._model_inventory(session, transport)
             models = inventory.get("models") or []
             if available and models:
                 ctx = self.orchestrator.interactions.register_model_choice(
@@ -1093,6 +1113,141 @@ class ChannelNativeRuntime:
             binding,
             {"type": "text", "text": f"Model switch failed: {result.reason}"},
         )
+
+    async def _model_inventory(self, session, transport) -> dict[str, Any]:
+        """Model list for /model: live from the codex app-server, else local files."""
+        inventory = _local_model_inventory(self.config, session.transport_kind)
+        lister = getattr(transport, "list_models", None)
+        if lister is None:
+            return inventory
+        try:
+            live = await lister()
+        except Exception as exc:  # noqa: BLE001 - the local list is still useful
+            _log_degrade("model_list_failed", session_id=session.session_id, error=exc)
+            notes = list(inventory.get("notes") or [])
+            notes.insert(0, f"Live model list failed ({exc}); showing the local list.")
+            return {**inventory, "notes": notes}
+        current = str(session.model or inventory.get("current", "") or "")
+        overrides = _transport_thread_overrides(transport, session)
+        models = [
+            {
+                "slug": item["slug"],
+                "display_name": item.get("display_name", ""),
+                "marker": "current" if item["slug"] == current else "",
+            }
+            for item in live
+        ]
+        if current and all(item["slug"] != current for item in models):
+            models.insert(0, {"slug": current, "display_name": current, "marker": "current/custom"})
+        return {
+            **inventory,
+            "source": "codex app-server model/list",
+            "current": current,
+            "reasoning": overrides.get("effort") or inventory.get("reasoning", ""),
+            "models": models,
+            "notes": [],
+        }
+
+    async def _handle_effort_command(self, channel, inbound, session, actor, argument: str) -> None:
+        binding = self._command_reply_binding(inbound, session)
+        if session is None:
+            await channel.send_view(
+                binding,
+                {"type": "text", "text": "Use /effort inside a session topic, or reply to a session root message."},
+            )
+            return
+        transport = self.transports.get(session.transport_kind)
+        if not argument:
+            inventory = await self._model_inventory(session, transport)
+            current_model = str(inventory.get("current", "") or "")
+            efforts: list[str] = []
+            lister = getattr(transport, "list_models", None)
+            if lister is not None:
+                try:
+                    efforts = next(
+                        (m["efforts"] for m in await lister() if m["slug"] == current_model), []
+                    )
+                except Exception as exc:  # noqa: BLE001 - the usage line still helps
+                    _log_degrade("model_list_failed", session_id=session.session_id, error=exc)
+            lines = [
+                f"Model: {current_model or '—'}",
+                f"Reasoning effort: {inventory.get('reasoning') or 'default'}",
+            ]
+            if efforts:
+                lines.append(f"Supported: {', '.join(efforts)}")
+            lines.append("Usage: /effort <level> — applies from the next turn.")
+            await channel.send_view(binding, {"type": "text", "text": "\n".join(lines)})
+            return
+        result = await self.orchestrator.set_session_effort(
+            session.session_id, actor=actor, effort=argument
+        )
+        text = (
+            f"Reasoning effort set: {argument.strip().lower()} (from the next turn)"
+            if result.accepted
+            else f"Effort switch failed: {result.reason}"
+        )
+        await channel.send_view(binding, {"type": "text", "text": text})
+
+    async def _session_query_allowed(self, channel, binding, inbound, session, actor, command: str) -> bool:
+        """Gate for commands that read the session's machine (/diff, /mcp).
+
+        They return the working tree and server state, so only the session's
+        owner or an admin may run them — the same bar as /model and /reload,
+        not merely the chat allowlist.
+        """
+        if session is None:
+            await channel.send_view(
+                binding,
+                {"type": "text", "text": f"Use /{command} inside a session topic, or reply to a session root message."},
+            )
+            return False
+        authz = self.orchestrator._authorize_session_control(session.session_id, actor, action=command)
+        if not authz.allowed:
+            await channel.send_view(
+                binding, {"type": "text", "text": f"Only the session owner can run /{command}."}
+            )
+            return False
+        return True
+
+    async def _handle_mcp_command(self, channel, inbound, session, actor) -> None:
+        binding = self._command_reply_binding(inbound, session)
+        if not await self._session_query_allowed(channel, binding, inbound, session, actor, "mcp"):
+            return
+        transport = self.transports.get(session.transport_kind)
+        lister = getattr(transport, "list_mcp_servers", None)
+        if lister is None:
+            await channel.send_view(binding, {"type": "text", "text": "MCP status is not available for this agent."})
+            return
+        try:
+            servers = await lister()
+        except Exception as exc:  # noqa: BLE001 - the reason is the answer
+            await channel.send_view(binding, {"type": "text", "text": f"Could not read MCP status: {exc}"})
+            return
+        await channel.send_view(binding, {"type": "text", "text": _mcp_status_text(servers)})
+
+    async def _handle_diff_command(self, channel, inbound, session, actor) -> None:
+        binding = self._command_reply_binding(inbound, session)
+        if not await self._session_query_allowed(channel, binding, inbound, session, actor, "diff"):
+            return
+        text = await _git_diff_text(str(session.cwd or ""))
+        await channel.send_view(binding, {"type": "text", "text": text})
+
+    async def _handle_new_thread_command(self, channel, inbound, session, actor) -> None:
+        binding = self._command_reply_binding(inbound, session)
+        if session is None:
+            await channel.send_view(
+                binding,
+                {"type": "text", "text": "Use /clear inside a session topic, or reply to a session root message."},
+            )
+            return
+        result = await self.orchestrator.start_new_agent_thread(session.session_id, actor=actor)
+        if result.accepted:
+            text = "已开始新对话，之前的上下文已清空。"
+        elif str(result.reason) == "turn_in_flight":
+            text = "这个会话正在跑一个回合，等它答完再 /clear。"
+        else:
+            text = f"开新对话失败：{result.reason}"
+        await channel.send_view(binding, {"type": "text", "text": text})
 
     def _chat_allowed(self, chat_id: str, *, is_callback: bool = False) -> bool:
         endpoint = self.config.channel
@@ -1210,7 +1365,7 @@ class ChannelNativeRuntime:
                     text=raw_text[: len(raw_text) - len(stripped)] + stripped[1:],
                 )
             else:
-                command = _parse_bot_command(inbound)
+                command = _parse_bot_command(inbound, self.config.agent)
                 if command:
                     result = await self._handle_bot_command(channel, inbound, command)
                     if (
@@ -1244,7 +1399,7 @@ class ChannelNativeRuntime:
                     self._complete_local_inbound(inbound)
                     self.save_state()
                     return SubmitResult(True, "agent_selector_rejected")
-                unknown_slash = _unknown_slash_command(inbound)
+                unknown_slash = _unknown_slash_command(inbound, self.config.agent)
                 if unknown_slash and self._resolve_command_session(inbound) is None:
                     await channel.send_view(
                         reply_binding,
@@ -3806,12 +3961,39 @@ def _agent_selector_command(inbound: Any) -> tuple[str, str] | None:
     return agent, prompt.strip()
 
 
-def _parse_bot_command(inbound: Any) -> tuple[str, str] | None:
+# Codex TUI commands with no chat equivalent. Without this they reached the
+# model as plain text and got a chat answer instead of an error.
+_CODEX_CHAT_UNSUPPORTED = {
+    "login": "",
+    "logout": "",
+    "quit": "要结束会话，点会话卡片上的结束按钮。",
+    "exit": "要结束会话，点会话卡片上的结束按钮。",
+    "approvals": "沙箱和审批策略在 codex profile 或 WALKCODE_CODEX_SANDBOX 里配置。",
+    "permissions": "沙箱和审批策略在 codex profile 或 WALKCODE_CODEX_SANDBOX 里配置。",
+    "resume": "切换会话用 /sessions。",
+    "fork": "",
+    "undo": "",
+    "feedback": "",
+    "mention": "",
+}
+
+
+def _parse_bot_command(inbound: Any, agent: str = "") -> tuple[str, str] | None:
     text = str(getattr(inbound, "text", "") or "").strip()
     if not text.startswith("/"):
         return None
-    command, _sep, argument = text.partition(" ")
+    command, *rest = text.split(None, 1)
+    argument = rest[0] if rest else ""
     name = command[1:].split("@", 1)[0].lower().replace("_", "-")
+    if agent == "codex":
+        # WalkCode answers these itself: the app-server has the data but no
+        # slash-command surface, and claude runs its own /effort and /mcp.
+        if name in {"effort", "mcp"}:
+            return name, argument.strip()
+        if name in {"clear", "new"}:
+            return "new-thread", ""
+        if name in _CODEX_CHAT_UNSUPPORTED:
+            return "unsupported", name
     aliases = {
         "status": "status",
         "sessions": "sessions",
@@ -3824,6 +4006,7 @@ def _parse_bot_command(inbound: Any) -> tuple[str, str] | None:
         "repo": "repo",
         "reload": "reload",
         "restart": "reload",
+        "diff": "diff",
     }
     resolved = aliases.get(name)
     if resolved is None:
@@ -3838,52 +4021,41 @@ _WALKCODE_COMMANDS = [
     {"command": "skills", "description": "Show agent skill support status"},
     {"command": "takeover", "description": "Request takeover for a TUI-origin session"},
     {"command": "reload", "description": "Restart this session's agent backend, keeping the conversation"},
+    {"command": "diff", "description": "Show the session's uncommitted git changes"},
     {"command": "commands", "description": "Show all WalkCode and agent commands"},
 ]
 
 
+# Only what Claude Code actually runs on the headless channel (verified on
+# 2.1.317 with `claude -p "/<name>"`). The rest of the TUI set (/vim, /login,
+# /resume, /permissions, /memory, /help, /doctor, ...) answers "isn't
+# available in this environment" there, so listing it was a promise we broke.
 _CLAUDE_NATIVE_COMMANDS = [
-    {"command": "add_dir", "description": "Claude: add an extra working directory"},
-    {"command": "agents", "description": "Claude: manage subagent definitions"},
-    {"command": "bug", "description": "Claude: report a bug"},
     {"command": "clear", "description": "Claude: clear the conversation"},
     {"command": "compact", "description": "Claude: compact conversation context"},
-    {"command": "config", "description": "Claude: open configuration"},
-    {"command": "cost", "description": "Claude: show token usage and cost"},
-    {"command": "doctor", "description": "Claude: check local installation health"},
-    {"command": "help", "description": "Claude: show command help"},
+    {"command": "context", "description": "Claude: show context window usage"},
+    {"command": "usage", "description": "Claude: show token usage and cost"},
+    {"command": "effort", "description": "Claude: set reasoning effort"},
     {"command": "init", "description": "Claude: initialize project memory"},
-    {"command": "login", "description": "Claude: authenticate"},
-    {"command": "logout", "description": "Claude: sign out"},
-    {"command": "mcp", "description": "Claude: manage MCP servers"},
-    {"command": "memory", "description": "Claude: edit memory files"},
-    {"command": "model", "description": "Claude: choose model"},
-    {"command": "permissions", "description": "Claude: manage permissions"},
-    {"command": "pr_comments", "description": "Claude: view pull request comments"},
-    {"command": "release_notes", "description": "Claude: show release notes"},
-    {"command": "resume", "description": "Claude: resume a conversation"},
+    {"command": "mcp", "description": "Claude: show or manage MCP servers"},
+    {"command": "config", "description": "Claude: set config values (key=value)"},
+    {"command": "rename", "description": "Claude: rename the session"},
     {"command": "review", "description": "Claude: request a code review"},
-    {"command": "status", "description": "Claude: show account and system status"},
-    {"command": "terminal_setup", "description": "Claude: configure terminal integration"},
-    {"command": "vim", "description": "Claude: enter vim mode"},
+    {"command": "security_review", "description": "Claude: security review of pending changes"},
 ]
 
 
+# Codex TUI commands the channel really runs: translated into turns by
+# CodexAppServerTransport (compact/review/init) or handled by WalkCode
+# (clear/new/model/effort/mcp). The rest is in _CODEX_CHAT_UNSUPPORTED.
 _CODEX_NATIVE_COMMANDS = [
-    {"command": "approvals", "description": "Codex: manage approval behavior"},
-    {"command": "clear", "description": "Codex: clear conversation context"},
+    {"command": "clear", "description": "Codex: start a new conversation in this topic"},
+    {"command": "new", "description": "Codex: start a new conversation in this topic"},
     {"command": "compact", "description": "Codex: compact conversation context"},
-    {"command": "diff", "description": "Codex: show current diff"},
-    {"command": "help", "description": "Codex: show command help"},
-    {"command": "init", "description": "Codex: initialize project instructions"},
-    {"command": "login", "description": "Codex: authenticate"},
-    {"command": "logout", "description": "Codex: sign out"},
-    {"command": "mcp", "description": "Codex: manage MCP servers"},
-    {"command": "model", "description": "Codex: choose model"},
-    {"command": "new", "description": "Codex: start a new conversation"},
-    {"command": "quit", "description": "Codex: exit the session"},
-    {"command": "review", "description": "Codex: request a code review"},
-    {"command": "status", "description": "Codex: show session status"},
+    {"command": "review", "description": "Codex: review uncommitted changes (optional focus text)"},
+    {"command": "init", "description": "Codex: generate AGENTS.md for the repository"},
+    {"command": "effort", "description": "Codex: show or set reasoning effort"},
+    {"command": "mcp", "description": "Codex: show MCP server status"},
 ]
 
 
@@ -3902,11 +4074,7 @@ def _command_menu(agent: str) -> list[dict[str, str]]:
 
 def _agent_command_aliases(agent: str) -> dict[str, str]:
     if agent == "claude":
-        return {
-            "add_dir": "add-dir",
-            "release_notes": "release-notes",
-            "terminal_setup": "terminal-setup",
-        }
+        return {"security_review": "security-review"}
     return {}
 
 
@@ -3938,9 +4106,107 @@ def _commands_help_text(agent: str) -> str:
     return "\n".join(lines)
 
 
-def _unknown_slash_command(inbound: Any) -> bool:
+def _unknown_slash_command(inbound: Any, agent: str = "") -> bool:
     text = str(getattr(inbound, "text", "") or "").strip()
-    return bool(text.startswith("/") and not _parse_bot_command(inbound) and not _agent_selector_command(inbound))
+    return bool(
+        text.startswith("/")
+        and not _parse_bot_command(inbound, agent)
+        and not _agent_selector_command(inbound)
+    )
+
+
+def _transport_thread_overrides(transport: Any, session: Any) -> dict[str, str]:
+    getter = getattr(transport, "thread_overrides", None)
+    if getter is None:
+        return {}
+    return getter(str(session.transport_ref.get("thread_id", "") or ""))
+
+
+def _mcp_status_text(servers: list[dict[str, Any]]) -> str:
+    if not servers:
+        return "No MCP servers configured for this Codex profile."
+    lines = ["MCP servers:"]
+    for server in servers:
+        name = str(server.get("name", "") or "?")
+        parts = []
+        runtime = server.get("runtimeStatus")
+        if isinstance(runtime, dict):
+            runtime = runtime.get("status") or runtime.get("type") or ""
+        if runtime:
+            parts.append(str(runtime))
+        auth = server.get("authStatus")
+        if auth:
+            parts.append(f"auth: {auth}")
+        tools = server.get("tools")
+        if isinstance(tools, (dict, list)):
+            parts.append(f"{len(tools)} tools")
+        lines.append(f"- {name}" + (f" — {', '.join(parts)}" if parts else ""))
+    return "\n".join(lines)
+
+
+# One chat bubble's worth of diff; the rest is summarized by --stat above it.
+_DIFF_TEXT_LIMIT = 3500
+
+
+# Repository config can make git run programs: core.fsmonitor on status,
+# external diff drivers and textconv filters on diff. /diff must never become
+# a way to execute whatever a checked-out repo configures.
+_GIT_SAFE_CONFIG = ("-c", "core.fsmonitor=false", "-c", "diff.external=")
+_GIT_SAFE_DIFF = ("--no-ext-diff", "--no-textconv", "--no-color")
+_DIFF_UNTRACKED_FILES = 10
+_DIFF_UNTRACKED_BYTES = 20_000
+
+
+async def _git_diff_text(cwd: str) -> str:
+    """/diff: uncommitted changes in the session's directory, like the codex TUI."""
+    if not cwd or not Path(cwd).is_dir():
+        return f"Session directory not found: {cwd or '—'}"
+
+    async def git(*args: str) -> tuple[int, str]:
+        proc = await asyncio.create_subprocess_exec(
+            "git", "-C", cwd, *_GIT_SAFE_CONFIG, *args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        try:
+            out, _ = await asyncio.wait_for(proc.communicate(), timeout=15)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+            return 124, "git timed out"
+        return proc.returncode or 0, out.decode("utf-8", "replace")
+
+    code, status = await git("status", "--short", "--untracked-files=all")
+    if code != 0:
+        return f"Not a git repository: {cwd}"
+    if not status.strip():
+        return f"No uncommitted changes in {cwd}."
+    has_head, _ = await git("rev-parse", "--verify", "--quiet", "HEAD")
+    # No commit yet: there is no HEAD to diff against, so show the index
+    # (everything staged) and the worktree on top of it.
+    ranges = [("HEAD",)] if has_head == 0 else [("--cached",), ()]
+    patches: list[str] = []
+    for extra in ranges:
+        code, patch = await git("diff", *_GIT_SAFE_DIFF, *extra)
+        if code == 0 and patch.strip():
+            patches.append(patch)
+    untracked = [line[3:] for line in status.splitlines() if line.startswith("??")]
+    for path in untracked[:_DIFF_UNTRACKED_FILES]:
+        full = Path(cwd) / path
+        if not full.is_file() or full.stat().st_size > _DIFF_UNTRACKED_BYTES:
+            continue
+        # --no-index exits 1 when the files differ, which they always do here.
+        code, patch = await git("diff", *_GIT_SAFE_DIFF, "--no-index", "--", "/dev/null", path)
+        if code in (0, 1) and patch.strip():
+            patches.append(patch)
+    parts = [f"Changes in {cwd}:", status.strip()]
+    patch = "".join(patches)
+    if patch.strip():
+        body = patch if len(patch) <= _DIFF_TEXT_LIMIT else (
+            patch[:_DIFF_TEXT_LIMIT] + f"\n... ({len(patch) - _DIFF_TEXT_LIMIT} more characters not shown)"
+        )
+        parts.append(f"```diff\n{body.rstrip()}\n```")
+    return "\n\n".join(parts)
 
 
 def _model_status_text(

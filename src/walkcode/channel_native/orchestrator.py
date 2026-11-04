@@ -81,6 +81,13 @@ from .claude_headless import _claude_tool_is_high_risk, _ClaudePermissionBridge,
 # never be answered, with nothing in the channel saying so.
 _TURN_IN_FLIGHT_STATES = frozenset({"ACTIVE", "WAITING_PERMISSION", "WAITING_USER"})
 
+# Slash commands that succeed with an empty result (verified 2026-11-04):
+# anything else ending empty is still a provider problem (EMPTY_TURN_NOTICE).
+_SILENT_COMMANDS = {
+    "claude_headless": frozenset({"/clear", "/compact"}),
+    "codex_app_server": frozenset({"/compact"}),
+}
+
 # ADR 0058：worker 在回答已接受的提交前退出（API 故障窗、进程崩溃）时的
 # 自动重放退避表。两档：短退避接住瞬时抖动，长退避跨过典型的过载窗口。
 TURN_REPLAY_DELAYS: tuple[float, ...] = (30.0, 300.0)
@@ -815,6 +822,7 @@ class Orchestrator:
                     cwd=session.cwd,
                     session_id=session.session_id,
                     resume_ref=resume_ref,
+                    model=str(session.model or ""),
                 )
             )
         except Exception as exc:
@@ -1231,6 +1239,78 @@ class Orchestrator:
         if result.accepted:
             self.sessions.get(session_id).model = model
         return result
+
+    async def start_new_agent_thread(self, session_id: str, *, actor: ActorRef) -> ControlResult:
+        """/clear and /new on transports that have ``start_new_thread`` (codex).
+
+        Same topic, same session, fresh conversation. Refused mid-turn, like
+        /reload: the old thread's turn would be cut off with no reply, or keep
+        editing files next to the new one if its interrupt failed.
+        """
+        session = self.sessions.get(session_id)
+        authz_result = self._authorize_session_control(session_id, actor, action="new_thread")
+        if not authz_result.allowed:
+            return ControlResult(False, authz_result.reason)
+        transport = self.transports.get(session.transport_kind)
+        starter = getattr(transport, "start_new_thread", None) if transport is not None else None
+        if starter is None:
+            return ControlResult(False, BlockedReason.CAPABILITY_DISABLED)
+        if session.status != "stopped" and session.lifecycle_state in _TURN_IN_FLIGHT_STATES:
+            return ControlResult(False, "turn_in_flight")
+        old_handle = self._handle_for_session(session)
+        try:
+            fresh = await starter(old_handle, model=str(session.model or ""))
+        except Exception as exc:  # noqa: BLE001 - the reason is the answer
+            _log_degrade("new_thread_failed", session_id=session_id, error=exc)
+            return ControlResult(False, str(exc) or type(exc).__name__)
+        # A new handle id, not just a new thread id: a drain of the old thread
+        # may still be winding down, and drains are keyed (and fenced) by it.
+        # Recorded BEFORE the old thread is shut down, so a cancellation in
+        # between can only leave an unused old thread behind, never a session
+        # pointing at a half-closed one.
+        session.transport_ref.update({"handle_id": fresh.handle_id, **fresh.ref})
+        try:
+            await transport.shutdown(old_handle, "new_thread")
+        except Exception as exc:  # noqa: BLE001 - the session already moved on
+            _log_degrade("new_thread_old_shutdown_failed", session_id=session_id, error=exc)
+        self._turn_replays.pop(session_id, None)
+        self._adopt_handle_model(session, fresh)
+        session.last_usage = {}
+        session.lifecycle_state = "IDLE"
+        await self.refresh_session_status_card(session)
+        return ControlResult(True, state="new_thread")
+
+    async def set_session_effort(
+        self,
+        session_id: str,
+        *,
+        actor: ActorRef,
+        effort: str,
+    ) -> ControlResult:
+        """Reasoning effort switch; only transports with ``set_effort`` (codex).
+
+        Gated on the ``set_model`` capability: it is the same kind of per-turn
+        model setting, and claude handles /effort natively on its own channel.
+        """
+        session = self.sessions.get(session_id)
+
+        async def invoke(transport, handle):
+            setter = getattr(transport, "set_effort", None)
+            if setter is None:
+                return ControlResult(False, BlockedReason.CAPABILITY_DISABLED)
+            return await setter(handle, effort, model=str(session.model or ""))
+
+        try:
+            return await self._run_transport_control(
+                session_id,
+                actor=actor,
+                action="set_model",
+                capability="set_model",
+                invoke=invoke,
+            )
+        except Exception as exc:  # noqa: BLE001 - same contract as set_session_model
+            _log_degrade("set_effort_failed", session_id=session_id, effort=effort, error=exc)
+            return ControlResult(False, str(exc) or type(exc).__name__)
 
     async def archive_session(
         self,
@@ -3284,13 +3364,16 @@ class Orchestrator:
                     continue
                 # The turn ended having produced nothing the user could see.
                 # Say so rather than dropping the completion (EMPTY_TURN_NOTICE).
-                _log_degrade(
-                    "turn_completed_without_output",
-                    session_id=session.session_id,
-                    transport_kind=session.transport_kind,
-                )
-                view = {"type": "turn_completed", "message": EMPTY_TURN_NOTICE}
-                visible_text = EMPTY_TURN_NOTICE
+                notice = self._silent_command_notice(session)
+                if not notice:
+                    _log_degrade(
+                        "turn_completed_without_output",
+                        session_id=session.session_id,
+                        transport_kind=session.transport_kind,
+                    )
+                    notice = EMPTY_TURN_NOTICE
+                view = {"type": "turn_completed", "message": notice}
+                visible_text = notice
             if event.type == AgentEventType.TURN_COMPLETED and visible_text == last_visible_text:
                 # The completion is repeating text the deltas already showed.
                 last_visible_text = ""
@@ -3418,6 +3501,24 @@ class Orchestrator:
         if new_message_id:
             binding.capabilities["tool_progress_message_id"] = str(new_message_id)
         return bool(new_message_id)
+
+    def _silent_command_notice(self, session: Session) -> str:
+        """Confirmation for a slash command that legitimately prints nothing.
+
+        Claude's /clear and codex's /compact finish with an empty result. That
+        is the command working, not the provider failing, so EMPTY_TURN_NOTICE
+        would send the user hunting for an outage. The replay ledger still
+        holds the last submitted turn at this point (it is only replaced by
+        the next submit).
+        """
+        entry = self._turn_replays.get(session.session_id) or {}
+        turn = entry.get("turn")
+        words = str(getattr(turn, "text", "") or "").split(None, 1)
+        # "/compact keep the API notes" and "/compact@bot" are still /compact.
+        command = words[0].split("@", 1)[0].lower() if words else ""
+        if command not in _SILENT_COMMANDS.get(session.transport_kind, ()):
+            return ""
+        return f"✅ {command} 已执行。"
 
     @staticmethod
     def _seal_tool_progress_burst(session: Session) -> None:

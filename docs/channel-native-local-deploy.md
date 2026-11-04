@@ -69,7 +69,8 @@ not forwarded to Claude Code or Codex as prompt text:
 ```text
 /status    current session or runtime status
 /sessions  active sessions in this chat
-/model     show local model inventory or switch model when the transport supports it
+/model     list models and switch (codex: live model/list; claude: settings file)
+/diff      uncommitted git changes in the session directory (session owner only)
 /skills    current skill-introspection support
 /takeover  takeover fallback for TUI-origin sessions
 /reload    restart this session's agent backend, keeping the conversation (alias /restart)
@@ -82,12 +83,26 @@ WalkCode one (e.g. `//model`). Unknown slash commands are passed through to the
 agent only inside an existing session topic. In the root chat they are
 rejected, so a stray `/compact` or `/help` does not create a new coding session.
 
-`/model` inventory is intentionally local and explicit. Claude reads the
-configured `WALKCODE_CLAUDE_SETTINGS` file (or the profile's
-`walkcode_model_choices`). Codex reads
-`WALKCODE_CODEX_CONFIG`/`WALKCODE_CODEX_MODELS_CACHE` when set, otherwise
-`$CODEX_HOME/config.toml` and `$CODEX_HOME/models_cache.json`. It is not
-presented as a live provider catalog.
+Agent-native commands (ADR 0071):
+
+- **Codex** — the app-server has no slash-command surface, so WalkCode maps them:
+  `/compact` → `thread/compact/start`; `/clear` and `/new` → a fresh thread in
+  the same topic (refused while a turn is running); `/review [focus]` and
+  `/init` → the TUI's own prompts; `/effort [level]` and `/model` →
+  `turn/start` overrides, validated against `model/list` (if that call fails,
+  model names are not checked and effort falls back to the known levels);
+  `/mcp` → `mcpServerStatus/list`. TUI-only commands (`/login`,
+  `/logout`, `/quit`, `/approvals`, `/resume`, ...) are refused with a note.
+- **Claude** — passed through; Claude Code runs them on the headless channel.
+  The menu lists only what it actually runs there (`/clear`, `/compact`,
+  `/context`, `/usage`, `/effort`, `/init`, `/mcp`, `/config`, `/rename`,
+  `/review`, `/security_review`).
+
+`/model` for Claude reads the configured `WALKCODE_CLAUDE_SETTINGS` file (or the
+profile's `walkcode_model_choices`). For Codex it asks the app-server
+(`model/list`); only if that fails does it fall back to
+`WALKCODE_CODEX_CONFIG`/`WALKCODE_CODEX_MODELS_CACHE`, otherwise
+`$CODEX_HOME/config.toml` and `$CODEX_HOME/models_cache.json`.
 
 ### `/reload`
 
