@@ -70,7 +70,7 @@ not forwarded to Claude Code or Codex as prompt text:
 /status    current session or runtime status
 /sessions  active sessions in this chat
 /model     list models and switch (codex: live model/list; claude: settings file)
-/diff      uncommitted git changes in the session directory
+/diff      uncommitted git changes in the session directory (session owner only)
 /skills    current skill-introspection support
 /takeover  takeover fallback for TUI-origin sessions
 /reload    restart this session's agent backend, keeping the conversation (alias /restart)
@@ -87,9 +87,11 @@ Agent-native commands (ADR 0071):
 
 - **Codex** — the app-server has no slash-command surface, so WalkCode maps them:
   `/compact` → `thread/compact/start`; `/clear` and `/new` → a fresh thread in
-  the same topic; `/review [focus]` and `/init` → the TUI's own prompts;
-  `/effort [level]` and `/model` → `turn/start` overrides (validated against
-  `model/list`); `/mcp` → `mcpServerStatus/list`. TUI-only commands (`/login`,
+  the same topic (refused while a turn is running); `/review [focus]` and
+  `/init` → the TUI's own prompts; `/effort [level]` and `/model` →
+  `turn/start` overrides, validated against `model/list` (if that call fails,
+  model names are not checked and effort falls back to the known levels);
+  `/mcp` → `mcpServerStatus/list`. TUI-only commands (`/login`,
   `/logout`, `/quit`, `/approvals`, `/resume`, ...) are refused with a note.
 - **Claude** — passed through; Claude Code runs them on the headless channel.
   The menu lists only what it actually runs there (`/clear`, `/compact`,

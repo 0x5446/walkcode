@@ -856,10 +856,13 @@ class ChannelNativeRuntime:
             await self._handle_effort_command(channel, inbound, session, actor, argument)
             return SubmitResult(True, "bot_command")
         if name == "mcp":
-            await self._handle_mcp_command(channel, inbound, session)
+            await self._handle_mcp_command(channel, inbound, session, actor)
             return SubmitResult(True, "bot_command")
         if name == "diff":
-            await self._handle_diff_command(channel, inbound, session)
+            await self._handle_diff_command(channel, inbound, session, actor)
+            return SubmitResult(True, "bot_command")
+        if name == "new-thread":
+            await self._handle_new_thread_command(channel, inbound, session, actor)
             return SubmitResult(True, "bot_command")
         if name == "unsupported":
             hint = _CODEX_CHAT_UNSUPPORTED.get(argument, "")
@@ -1185,11 +1188,32 @@ class ChannelNativeRuntime:
         )
         await channel.send_view(binding, {"type": "text", "text": text})
 
-    async def _handle_mcp_command(self, channel, inbound, session) -> None:
+    async def _session_query_allowed(self, channel, binding, inbound, session, actor, command: str) -> bool:
+        """Gate for commands that read the session's machine (/diff, /mcp).
+
+        They return the working tree and server state, so only the session's
+        owner or an admin may run them — the same bar as /model and /reload,
+        not merely the chat allowlist.
+        """
+        if session is None:
+            await channel.send_view(
+                binding,
+                {"type": "text", "text": f"Use /{command} inside a session topic, or reply to a session root message."},
+            )
+            return False
+        authz = self.orchestrator._authorize_session_control(session.session_id, actor, action=command)
+        if not authz.allowed:
+            await channel.send_view(
+                binding, {"type": "text", "text": f"Only the session owner can run /{command}."}
+            )
+            return False
+        return True
+
+    async def _handle_mcp_command(self, channel, inbound, session, actor) -> None:
         binding = self._command_reply_binding(inbound, session)
-        transport = self.transports.get(
-            session.transport_kind if session is not None else self.config.agent_transport_kind
-        )
+        if not await self._session_query_allowed(channel, binding, inbound, session, actor, "mcp"):
+            return
+        transport = self.transports.get(session.transport_kind)
         lister = getattr(transport, "list_mcp_servers", None)
         if lister is None:
             await channel.send_view(binding, {"type": "text", "text": "MCP status is not available for this agent."})
@@ -1201,15 +1225,28 @@ class ChannelNativeRuntime:
             return
         await channel.send_view(binding, {"type": "text", "text": _mcp_status_text(servers)})
 
-    async def _handle_diff_command(self, channel, inbound, session) -> None:
+    async def _handle_diff_command(self, channel, inbound, session, actor) -> None:
+        binding = self._command_reply_binding(inbound, session)
+        if not await self._session_query_allowed(channel, binding, inbound, session, actor, "diff"):
+            return
+        text = await _git_diff_text(str(session.cwd or ""))
+        await channel.send_view(binding, {"type": "text", "text": text})
+
+    async def _handle_new_thread_command(self, channel, inbound, session, actor) -> None:
         binding = self._command_reply_binding(inbound, session)
         if session is None:
             await channel.send_view(
                 binding,
-                {"type": "text", "text": "Use /diff inside a session topic, or reply to a session root message."},
+                {"type": "text", "text": "Use /clear inside a session topic, or reply to a session root message."},
             )
             return
-        text = await _git_diff_text(str(session.cwd or ""))
+        result = await self.orchestrator.start_new_agent_thread(session.session_id, actor=actor)
+        if result.accepted:
+            text = "已开始新对话，之前的上下文已清空。"
+        elif str(result.reason) == "turn_in_flight":
+            text = "这个会话正在跑一个回合，等它答完再 /clear。"
+        else:
+            text = f"开新对话失败：{result.reason}"
         await channel.send_view(binding, {"type": "text", "text": text})
 
     def _chat_allowed(self, chat_id: str, *, is_callback: bool = False) -> bool:
@@ -3945,13 +3982,16 @@ def _parse_bot_command(inbound: Any, agent: str = "") -> tuple[str, str] | None:
     text = str(getattr(inbound, "text", "") or "").strip()
     if not text.startswith("/"):
         return None
-    command, _sep, argument = text.partition(" ")
+    command, *rest = text.split(None, 1)
+    argument = rest[0] if rest else ""
     name = command[1:].split("@", 1)[0].lower().replace("_", "-")
     if agent == "codex":
         # WalkCode answers these itself: the app-server has the data but no
         # slash-command surface, and claude runs its own /effort and /mcp.
         if name in {"effort", "mcp"}:
             return name, argument.strip()
+        if name in {"clear", "new"}:
+            return "new-thread", ""
         if name in _CODEX_CHAT_UNSUPPORTED:
             return "unsupported", name
     aliases = {
@@ -4005,9 +4045,9 @@ _CLAUDE_NATIVE_COMMANDS = [
 ]
 
 
-# Codex TUI commands the channel really runs: translated to app-server calls by
-# CodexAppServerTransport (clear/new/compact/review/init) or answered by
-# WalkCode (model/effort/mcp). The rest is in _CODEX_CHAT_UNSUPPORTED.
+# Codex TUI commands the channel really runs: translated into turns by
+# CodexAppServerTransport (compact/review/init) or handled by WalkCode
+# (clear/new/model/effort/mcp). The rest is in _CODEX_CHAT_UNSUPPORTED.
 _CODEX_NATIVE_COMMANDS = [
     {"command": "clear", "description": "Codex: start a new conversation in this topic"},
     {"command": "new", "description": "Codex: start a new conversation in this topic"},
@@ -4108,6 +4148,15 @@ def _mcp_status_text(servers: list[dict[str, Any]]) -> str:
 _DIFF_TEXT_LIMIT = 3500
 
 
+# Repository config can make git run programs: core.fsmonitor on status,
+# external diff drivers and textconv filters on diff. /diff must never become
+# a way to execute whatever a checked-out repo configures.
+_GIT_SAFE_CONFIG = ("-c", "core.fsmonitor=false", "-c", "diff.external=")
+_GIT_SAFE_DIFF = ("--no-ext-diff", "--no-textconv", "--no-color")
+_DIFF_UNTRACKED_FILES = 10
+_DIFF_UNTRACKED_BYTES = 20_000
+
+
 async def _git_diff_text(cwd: str) -> str:
     """/diff: uncommitted changes in the session's directory, like the codex TUI."""
     if not cwd or not Path(cwd).is_dir():
@@ -4115,7 +4164,7 @@ async def _git_diff_text(cwd: str) -> str:
 
     async def git(*args: str) -> tuple[int, str]:
         proc = await asyncio.create_subprocess_exec(
-            "git", "-C", cwd, *args,
+            "git", "-C", cwd, *_GIT_SAFE_CONFIG, *args,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
         )
@@ -4127,17 +4176,31 @@ async def _git_diff_text(cwd: str) -> str:
             return 124, "git timed out"
         return proc.returncode or 0, out.decode("utf-8", "replace")
 
-    code, status = await git("status", "--short")
+    code, status = await git("status", "--short", "--untracked-files=all")
     if code != 0:
         return f"Not a git repository: {cwd}"
     if not status.strip():
         return f"No uncommitted changes in {cwd}."
-    _code, stat = await git("diff", "HEAD", "--stat")
-    _code, patch = await git("diff", "HEAD")
+    has_head, _ = await git("rev-parse", "--verify", "--quiet", "HEAD")
+    # No commit yet: there is no HEAD to diff against, so show the index
+    # (everything staged) and the worktree on top of it.
+    ranges = [("HEAD",)] if has_head == 0 else [("--cached",), ()]
+    patches: list[str] = []
+    for extra in ranges:
+        code, patch = await git("diff", *_GIT_SAFE_DIFF, *extra)
+        if code == 0 and patch.strip():
+            patches.append(patch)
     untracked = [line[3:] for line in status.splitlines() if line.startswith("??")]
-    parts = [f"Changes in {cwd}:", stat.strip() or status.strip()]
-    if untracked:
-        parts.append("Untracked: " + ", ".join(untracked[:20]))
+    for path in untracked[:_DIFF_UNTRACKED_FILES]:
+        full = Path(cwd) / path
+        if not full.is_file() or full.stat().st_size > _DIFF_UNTRACKED_BYTES:
+            continue
+        # --no-index exits 1 when the files differ, which they always do here.
+        code, patch = await git("diff", *_GIT_SAFE_DIFF, "--no-index", "--", "/dev/null", path)
+        if code in (0, 1) and patch.strip():
+            patches.append(patch)
+    parts = [f"Changes in {cwd}:", status.strip()]
+    patch = "".join(patches)
     if patch.strip():
         body = patch if len(patch) <= _DIFF_TEXT_LIMIT else (
             patch[:_DIFF_TEXT_LIMIT] + f"\n... ({len(patch) - _DIFF_TEXT_LIMIT} more characters not shown)"

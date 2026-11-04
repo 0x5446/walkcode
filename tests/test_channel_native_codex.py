@@ -3578,25 +3578,108 @@ class CodexNativeCommandTests(unittest.TestCase):
         self.assertNotIn("thread-1", transport._pending_starts)
         self.assertNotIn("thread-1", transport._compacting)
 
-    def test_clear_moves_the_session_to_a_fresh_thread(self):
+    def test_new_thread_replaces_the_old_one_and_keeps_the_model(self):
         client, transport, handle = self._setup()
         asyncio.run(transport.set_model(handle, "gpt-6-luna"))
         asyncio.run(transport.submit_turn(handle, TurnInput(text="hi"), "k1"))
 
-        asyncio.run(transport.submit_turn(handle, TurnInput(text="/clear"), "k2"))
-        events = _drain_events(transport, handle)
-        asyncio.run(transport.submit_turn(handle, TurnInput(text="next"), "k3"))
+        fresh = asyncio.run(transport.start_new_thread(handle))
+        asyncio.run(transport.submit_turn(fresh, TurnInput(text="next"), "k2"))
 
-        self.assertEqual(handle.ref["thread_id"], "thread-2")
-        methods = [m for m, _ in client.requests]
-        # The old thread's live turn is stopped and unsubscribed.
-        self.assertIn(("turn/interrupt", {"threadId": "thread-1", "turnId": "turn-1"}), client.requests)
+        self.assertEqual(fresh.ref, {"thread_id": "thread-2", "cwd": "/tmp/project"})
+        self.assertNotEqual(fresh.handle_id, handle.handle_id)
         self.assertIn(("thread/unsubscribe", {"threadId": "thread-1"}), client.requests)
-        self.assertEqual(methods.count("thread/start"), 2)
-        self.assertEqual(len(events), 1)
-        self.assertEqual(events[0].type, AgentEventType.TURN_COMPLETED)
-        self.assertEqual(events[0].payload["thread_id"], "thread-2")
-        self.assertEqual(events[0].payload["message"], codex_transport_module.CODEX_NEW_THREAD_NOTICE)
-        # The model choice follows the conversation onto the new thread.
+        starts = [params for method, params in client.requests if method == "thread/start"]
+        self.assertEqual(starts[-1].get("model"), "gpt-6-luna")
         last = self._turn_starts(client)[-1]
         self.assertEqual((last["threadId"], last.get("model")), ("thread-2", "gpt-6-luna"))
+
+    def test_new_thread_after_restart_uses_the_persisted_session_model(self):
+        # The override map is in memory; after a runtime restart only the
+        # session's persisted model is left to carry the choice over.
+        client, transport, handle = self._setup()
+        transport._thread_overrides.clear()
+
+        fresh = asyncio.run(transport.start_new_thread(handle, model="gpt-6-sol"))
+
+        starts = [params for method, params in client.requests if method == "thread/start"]
+        self.assertEqual(starts[-1].get("model"), "gpt-6-sol")
+        self.assertEqual(transport.thread_overrides(fresh.ref["thread_id"]), {"model": "gpt-6-sol"})
+
+    def test_resume_of_a_thread_that_never_ran_a_turn_skips_thread_resume(self):
+        # thread/resume answers "no rollout found" until the first turn.
+        client, transport, handle = self._setup()
+
+        resumed = asyncio.run(transport.resume_thread("thread-1", cwd="/tmp/project"))
+
+        self.assertEqual(resumed.ref["thread_id"], "thread-1")
+        self.assertNotIn("thread/resume", [m for m, _ in client.requests])
+
+    def test_resume_of_an_empty_thread_after_restart_starts_a_new_one(self):
+        client, transport, handle = self._setup()
+        transport._unstarted_threads.clear()  # what a runtime restart leaves
+        original = client.request
+
+        async def request(method, params):
+            if method == "thread/resume":
+                raise RuntimeError("no rollout found for thread id thread-1")
+            return await original(method, params)
+
+        client.request = request
+        resumed = asyncio.run(transport.resume_thread("thread-1", cwd="/tmp/project"))
+
+        self.assertEqual(resumed.ref["thread_id"], "thread-2")
+
+    def test_resume_failure_other_than_empty_thread_still_raises(self):
+        client, transport, handle = self._setup()
+        asyncio.run(transport.submit_turn(handle, TurnInput(text="hi"), "k1"))
+
+        async def request(method, params):
+            raise RuntimeError("connection reset")
+
+        client.request = request
+        with self.assertRaises(RuntimeError):
+            asyncio.run(transport.resume_thread("thread-1", cwd="/tmp/project"))
+
+    def test_set_effort_without_a_model_list_still_rejects_non_levels(self):
+        client, transport, handle = self._setup()
+        original = client.request
+
+        async def request(method, params):
+            if method == "model/list":
+                raise RuntimeError("no model/list here")
+            return await original(method, params)
+
+        client.request = request
+        bad = asyncio.run(transport.set_effort(handle, "nonsense"))
+        good = asyncio.run(transport.set_effort(handle, "high"))
+
+        self.assertFalse(bad.accepted)
+        self.assertTrue(good.accepted)
+
+    def test_multiline_review_keeps_its_focus(self):
+        client, transport, handle = self._setup()
+
+        asyncio.run(transport.submit_turn(handle, TurnInput(text="/review\nonly the auth module"), "k1"))
+
+        text = self._turn_starts(client)[0]["input"][0]["text"]
+        self.assertIn("Focus on: only the auth module", text)
+
+    def test_resume_reports_a_pending_model_switch_not_the_servers_old_model(self):
+        # The server only applies a /model choice on the next turn/start; the
+        # resume in between still answers with the old model.
+        client, transport, handle = self._setup()
+        asyncio.run(transport.submit_turn(handle, TurnInput(text="hi"), "k1"))
+        asyncio.run(transport.set_model(handle, "gpt-6-luna"))
+        original = client.request
+
+        async def request(method, params):
+            if method == "thread/resume":
+                return {"thread": {"id": params["threadId"]}, "model": "gpt-6-sol"}
+            return await original(method, params)
+
+        client.request = request
+        resumed = asyncio.run(transport.resume_thread("thread-1", cwd="/tmp/project"))
+
+        self.assertEqual(resumed.model, "gpt-6-luna")
+        self.assertEqual(transport._thread_models["thread-1"], "gpt-6-luna")

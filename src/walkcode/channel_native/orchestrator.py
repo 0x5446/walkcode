@@ -81,6 +81,13 @@ from .claude_headless import _claude_tool_is_high_risk, _ClaudePermissionBridge,
 # never be answered, with nothing in the channel saying so.
 _TURN_IN_FLIGHT_STATES = frozenset({"ACTIVE", "WAITING_PERMISSION", "WAITING_USER"})
 
+# Slash commands that succeed with an empty result (verified 2026-11-04):
+# anything else ending empty is still a provider problem (EMPTY_TURN_NOTICE).
+_SILENT_COMMANDS = {
+    "claude_headless": frozenset({"/clear", "/compact"}),
+    "codex_app_server": frozenset({"/compact"}),
+}
+
 # ADR 0058：worker 在回答已接受的提交前退出（API 故障窗、进程崩溃）时的
 # 自动重放退避表。两档：短退避接住瞬时抖动，长退避跨过典型的过载窗口。
 TURN_REPLAY_DELAYS: tuple[float, ...] = (30.0, 300.0)
@@ -680,12 +687,6 @@ class Orchestrator:
             session.lifecycle_state = "ERROR_RECOVERABLE"
             await self.refresh_session_status_card(session)
             raise
-        # A submit may move the session to a new agent thread (codex /clear,
-        # /new). Persist it now rather than waiting for the drain's completion:
-        # a drain already attached to this worker would swallow that event.
-        rebound = str(handle.ref.get("thread_id", "") or "")
-        if rebound and rebound != str(session.transport_ref.get("thread_id", "") or ""):
-            session.transport_ref["thread_id"] = rebound
         # ADR 0057：记录"最近一次被人说话"的时刻。频道消息用渠道产生时刻
         # （不是提交时刻——否则快速连发的第二条会被时效守卫误判），无时间
         # 戳的输入退化为本机当前时间。与登记时同值落章（R3 issue#4）。
@@ -1237,6 +1238,38 @@ class Orchestrator:
         if result.accepted:
             self.sessions.get(session_id).model = model
         return result
+
+    async def start_new_agent_thread(self, session_id: str, *, actor: ActorRef) -> ControlResult:
+        """/clear and /new on transports that have ``start_new_thread`` (codex).
+
+        Same topic, same session, fresh conversation. Refused mid-turn, like
+        /reload: the old thread's turn would be cut off with no reply, or keep
+        editing files next to the new one if its interrupt failed.
+        """
+        session = self.sessions.get(session_id)
+        authz_result = self._authorize_session_control(session_id, actor, action="new_thread")
+        if not authz_result.allowed:
+            return ControlResult(False, authz_result.reason)
+        transport = self.transports.get(session.transport_kind)
+        starter = getattr(transport, "start_new_thread", None) if transport is not None else None
+        if starter is None:
+            return ControlResult(False, BlockedReason.CAPABILITY_DISABLED)
+        if session.status != "stopped" and session.lifecycle_state in _TURN_IN_FLIGHT_STATES:
+            return ControlResult(False, "turn_in_flight")
+        try:
+            fresh = await starter(self._handle_for_session(session), model=str(session.model or ""))
+        except Exception as exc:  # noqa: BLE001 - the reason is the answer
+            _log_degrade("new_thread_failed", session_id=session_id, error=exc)
+            return ControlResult(False, str(exc) or type(exc).__name__)
+        # A new handle id, not just a new thread id: a drain of the old thread
+        # may still be winding down, and drains are keyed (and fenced) by it.
+        session.transport_ref.update({"handle_id": fresh.handle_id, **fresh.ref})
+        self._turn_replays.pop(session_id, None)
+        self._adopt_handle_model(session, fresh)
+        session.last_usage = {}
+        session.lifecycle_state = "IDLE"
+        await self.refresh_session_status_card(session)
+        return ControlResult(True, state="new_thread")
 
     async def set_session_effort(
         self,
@@ -3471,10 +3504,9 @@ class Orchestrator:
         """
         entry = self._turn_replays.get(session.session_id) or {}
         turn = entry.get("turn")
-        text = str(getattr(turn, "text", "") or "").strip()
-        if not text.startswith("/") or "\n" in text:
+        command = str(getattr(turn, "text", "") or "").strip().lower()
+        if command not in _SILENT_COMMANDS.get(session.transport_kind, ()):
             return ""
-        command = text.split(" ", 1)[0]
         return f"✅ {command} 已执行。"
 
     @staticmethod

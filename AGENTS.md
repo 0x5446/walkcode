@@ -109,7 +109,9 @@ scripts; orchestration and gates live in the skill.
   slash-command surface — text like `/compact` only reaches the model as a
   sentence. `CodexAppServerTransport.submit_turn` translates the ones with a real
   equivalent (`_CODEX_TRANSLATED_COMMANDS`); WalkCode answers `/model`, `/effort`,
-  `/mcp`, `/diff`; TUI-only ones are refused (`_CODEX_CHAT_UNSUPPORTED`). Never
+  `/mcp`, `/diff`, `/clear`, `/new`; TUI-only ones are refused
+  (`_CODEX_CHAT_UNSUPPORTED`). A thread that never ran a turn has no rollout, so
+  `thread/resume` fails on it — keep `_unstarted_threads`. Never
   switch `/review` to `review/start` without re-verifying: on 0.166 its turn
   never completes. The command menus list only what the channel actually runs —
   re-verify with `claude -p "/<name>"` after a Claude Code upgrade.

@@ -38,25 +38,36 @@ Status: Accepted
    - `/compact` → `thread/compact/start`。线程在 drain 认领压缩 turn 之前一直留在
      `_pending_starts`（未知 turn 暂缓），所以 TUI 镜像不会把这个 turn 抢走；
      drain 收到它的 `turn/started` 后再认领。
-   - `/clear` `/new` → 在同一 cwd 下 `thread/start` 新线程，原地改写 handle，
-     关闭旧线程（中断正在跑的 turn），模型选择带到新线程。编排器在 submit 返回后
-     发现 `thread_id` 变了，就立即写回 `session.transport_ref`。不靠 drain 的完成
-     事件，因为已挂着的 drain 会吞掉它。
-   - `/review [重点]`、`/init` → 发 TUI 的同款提示词，走普通 turn。
+   - `/review [重点]`、`/init` 见下一条。
+2. **`/clear` `/new` 不是 turn，由 WalkCode 处理**（`Orchestrator.start_new_agent_thread`
+   → `CodexAppServerTransport.start_new_thread`）：在同一 cwd 下 `thread/start` 新线程，
+   关闭旧线程，把新的 `handle_id` 和 `thread_id` 一起写进 `session.transport_ref`。
+   换 `handle_id` 是因为 drain 按它去重和设防，旧线程的 drain 认不了新线程。
+   回合进行中直接拒绝（同 `/reload`）：否则要么旧回合被截断、没有回复，要么中断失败，
+   旧任务和新线程同时改文件。模型沿用 `_thread_overrides`，没有时用会话持久化的
+   `session.model`，避免 runtime 重启后丢失选择。
+   新线程在跑第一个 turn 之前没有 rollout，`thread/resume` 会报 "no rollout found"
+   （0.166 实测，同一个 server 上也一样）。所以 transport 记着本次进程里还没跑过 turn 的
+   线程，恢复时直接复用；重启后遇到这个错误就新开一个线程，反正里面本来就没有对话。
+3. `/review [重点]`、`/init` → 发 TUI 的同款提示词，走普通 turn。重点可以写在同一行，也可以换行写。
      **不用 `review/start`**，因为它的 turn 不会结束，会把会话挂到静默上限（1 小时）。
-2. **`/model` `/effort` 对 Codex 真正生效**：`set_model=True`，选择存在
+4. **`/model` `/effort` 对 Codex 真正生效**：`set_model=True`，选择存在
    `_thread_overrides`，每次 `turn/start` 都带上。切换前先用 `model/list` 校验，
    因为覆盖值会被持久化，打错的名字会让这个线程之后每一轮都失败。`model/list`
-   调不通时跳过校验。`/model` 的列表优先实时查 `model/list`，失败才退回本地文件。
-3. **WalkCode 代答**：`/diff`（两个 agent 都支持，在会话目录跑 `git status` 和
-   `git diff HEAD`）；Codex 的 `/effort`、`/mcp`（`mcpServerStatus/list`）。
-   Claude 的 `/effort` `/mcp` 继续交给 Claude 自己处理。
-4. **Codex 终端专用命令直接拒绝**（`/login` `/logout` `/quit` `/approvals`
+   调不通时：模型名跳过校验；推理强度退回到已知的取值集合
+   （none/minimal/low/medium/high/xhigh/max）。`/model` 的列表优先实时查 `model/list`，失败才退回本地文件。
+5. **WalkCode 代答**：`/diff`（两个 agent 都支持：已暂存、未暂存和未跟踪文件的内容都显示；
+   还没有提交的仓库改为对比暂存区；git 带 `core.fsmonitor=false`、`--no-ext-diff`、
+   `--no-textconv`，仓库配置不能借 `/diff` 执行程序）；Codex 的 `/effort`、`/mcp`（`mcpServerStatus/list`）。
+   Claude 的 `/effort` `/mcp` 继续交给 Claude 自己处理。`/diff` 和 `/mcp` 会返回本机代码和
+   服务器状态，只有会话主人或管理员能用（和 `/model`、`/reload` 同一道门槛）。
+6. **Codex 终端专用命令直接拒绝**（`/login` `/logout` `/quit` `/approvals`
    `/resume` ...）：回一句"聊天里用不了"，不再发给模型。
-5. **菜单只列真能执行的命令**，Claude 的列表按上面的 headless 实测结果来定。
-6. **执行成功但没有输出的命令**（Claude `/clear`、Codex `/compact`）回
-   "✅ /cmd 已执行。"，不报 EMPTY_TURN_NOTICE。判断依据是重放暂存里最后一条提交
-   是不是斜杠命令。
+7. **菜单只列真能执行的命令**，Claude 的列表按上面的 headless 实测结果来定。
+8. **执行成功但没有输出的命令**（Claude 的 `/clear` `/compact`、Codex 的 `/compact`，
+   列在 `_SILENT_COMMANDS`，按 transport 区分）回 "✅ /cmd 已执行。"，不报
+   EMPTY_TURN_NOTICE。判断依据是重放暂存里最后一条提交。其他斜杠输入结果为空时，
+   照旧报 EMPTY_TURN_NOTICE。
 
 ## Consequences
 

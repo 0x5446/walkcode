@@ -24,6 +24,7 @@ from walkcode.channel_native import (
     SubmitResult,
     LarkBotApi,
     TransportCapabilities,
+    TransportHandle,
     TransientDeliveryError,
     BlockedReason,
 )
@@ -6371,26 +6372,89 @@ class NativeSlashCommandTests(unittest.TestCase):
                 [t.text for t in transport.submitted_turns], ["start", "/effort high", "/mcp"]
             )
 
-    def test_submit_that_moves_to_a_new_thread_updates_the_resume_ref(self):
-        # codex /clear swaps the thread inside submit_turn; the session must
-        # resume the NEW thread even if no drain reports it.
+    def test_codex_clear_moves_the_session_to_a_new_thread(self):
         with tempfile.TemporaryDirectory() as tmp:
             transport = _CodexCommandFakeTransport()
-            original_submit = transport.submit_turn
+            new_threads = []
 
-            async def submit_turn(handle, turn, idempotency_key):
-                await original_submit(handle, turn, idempotency_key)
-                if turn.text == "/clear":
-                    handle.ref["thread_id"] = "thread-fresh"
+            async def start_new_thread(handle, *, model=""):
+                new_threads.append(model)
+                return TransportHandle(
+                    handle_id="handle-fresh",
+                    transport_kind="codex_app_server",
+                    ref={"thread_id": "thread-fresh", "cwd": tmp},
+                )
 
-            transport.submit_turn = submit_turn
+            transport.start_new_thread = start_new_thread
             runtime, api, transport = self._runtime(tmp, transport=transport)
+            summary = runtime.state.sessions.list_sessions()[0]
+            session = runtime.state.sessions.get(summary.session_id)
+            session.lifecycle_state = "IDLE"
 
             self._send(runtime, api, "/clear")
 
-            summary = runtime.state.sessions.list_sessions()[0]
-            session = runtime.state.sessions.get(summary.session_id)
+            self.assertEqual(len(new_threads), 1)
             self.assertEqual(session.transport_ref["thread_id"], "thread-fresh")
+            self.assertEqual(session.transport_ref["handle_id"], "handle-fresh")
+            self.assertIn("已开始新对话", self._texts(api))
+            # Not a turn: nothing reaches the agent.
+            self.assertEqual([t.text for t in transport.submitted_turns], ["start"])
+
+    def test_codex_clear_is_refused_mid_turn(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            transport = _CodexCommandFakeTransport()
+            calls = []
+
+            async def start_new_thread(handle, *, model=""):
+                calls.append(1)
+
+            transport.start_new_thread = start_new_thread
+            runtime, api, transport = self._runtime(tmp, transport=transport)
+
+            self._send(runtime, api, "/new")
+
+            self.assertEqual(calls, [])
+            self.assertIn("等它答完再 /clear", self._texts(api))
+
+    def test_diff_requires_session_control(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime, api, transport = self._runtime(tmp)
+
+            asyncio.run(
+                runtime.process_channel_event(
+                    _lark_message(11, text="/diff", root_id=_first_card(api), open_id="ou_other")
+                )
+            )
+
+            self.assertIn("Only the session owner can run /diff", self._texts(api))
+
+    def test_diff_without_commits_shows_staged_and_untracked_content(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            subprocess.run(["git", "init", "-q", tmp], check=True)
+            (Path(tmp) / "staged.py").write_text("a = 1\n")
+            subprocess.run(["git", "-C", tmp, "add", "staged.py"], check=True)
+            (Path(tmp) / "new.py").write_text("b = 2\n")
+
+            text = asyncio.run(runtime_module._git_diff_text(tmp))
+
+            self.assertIn("+a = 1", text)
+            self.assertIn("+b = 2", text)
+            self.assertNotIn("fatal", text)
+
+    def test_diff_never_runs_repo_configured_programs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            subprocess.run(["git", "init", "-q", tmp], check=True)
+            marker = Path(tmp) / "pwned"
+            hook = Path(tmp) / "hook.sh"
+            hook.write_text(f"#!/bin/sh\ntouch {marker}\n")
+            hook.chmod(0o755)
+            subprocess.run(["git", "-C", tmp, "config", "core.fsmonitor", str(hook)], check=True)
+            subprocess.run(["git", "-C", tmp, "config", "diff.external", str(hook)], check=True)
+            (Path(tmp) / "a.py").write_text("x = 1\n")
+
+            asyncio.run(runtime_module._git_diff_text(tmp))
+
+            self.assertFalse(marker.exists())
 
     def test_diff_shows_uncommitted_changes(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -6428,6 +6492,43 @@ class NativeSlashCommandTests(unittest.TestCase):
 
 
 class SilentCommandNoticeTests(unittest.TestCase):
+    def _run(self, tmp, text):
+        claude = FakeAgentTransport(
+            "claude_headless",
+            TransportCapabilities(
+                structured_input=True,
+                structured_output=True,
+                permission_callback=False,
+                ask_user_question=False,
+                set_model=True,
+                resume_after_complete=True,
+                external_tui_takeover=True,
+            ),
+        )
+        cfg = ChannelNativeConfig.from_env(
+            {
+                "WALKCODE_CHANNEL": "lark",
+                "LARK_APP_ID": "cli_x",
+                "LARK_APP_SECRET": "s",
+                "WALKCODE_AGENT": "claude",
+                "WALKCODE_STATE_PATH": str(Path(tmp) / "state.json"),
+                "WALKCODE_CWD": tmp,
+            }
+        )
+        api = _FakeLarkApi()
+        runtime = ChannelNativeRuntime.from_config(cfg, lark_api=api, transports={"claude_headless": claude})
+        asyncio.run(runtime.process_channel_event(_lark_message(10, text="start")))
+        claude._scripted_events = [AgentEvent(AgentEventType.TURN_COMPLETED, {"message": ""})]
+        asyncio.run(runtime.process_channel_event(_lark_message(11, text=text, root_id=_first_card(api))))
+        return json.dumps(_sent(api), ensure_ascii=False)
+
+    def test_other_slash_input_ending_empty_still_warns(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            text = self._run(tmp, "/frobnicate")
+
+            self.assertIn("本轮代理没有返回任何内容", text)
+            self.assertNotIn("已执行", text)
+
     def test_slash_command_with_empty_result_is_confirmed_not_reported_as_failure(self):
         with tempfile.TemporaryDirectory() as tmp:
             claude = FakeAgentTransport(

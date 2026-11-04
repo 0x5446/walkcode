@@ -65,11 +65,12 @@ def _codex_message_turn_id(message: Any) -> str:
     return ""
 
 
-# Codex TUI slash commands that have a real app-server equivalent. The TUI
+# Codex TUI slash commands that run as a turn on the thread. The TUI
 # implements every slash command client-side; sent to the app-server as text
 # they only ever reached the model as a sentence ("/compact" answered with
-# chat, no compaction). Names outside this set stay plain text.
-_CODEX_TRANSLATED_COMMANDS = frozenset({"compact", "clear", "new", "review", "init"})
+# chat, no compaction). Names outside this set stay plain text. /clear and
+# /new are not turns at all: the runtime handles them (start_new_thread).
+_CODEX_TRANSLATED_COMMANDS = frozenset({"compact", "review", "init"})
 
 # The prompts the codex TUI sends for /review (no target) and /init, verbatim
 # from codex 0.166.0. /review deliberately does NOT use review/start: on 0.166
@@ -117,7 +118,9 @@ Commit & Pull Request Guidelines
 
 (Optional) Add other sections if relevant, such as Security & Configuration Tips, Architecture Overview, or Agent-Specific Instructions."""
 
-CODEX_NEW_THREAD_NOTICE = "已开始新对话，之前的上下文已清空。"
+# Every ReasoningEffort codex has shipped; the check of last resort when
+# model/list is unavailable.
+_CODEX_REASONING_EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
 
 
 def _codex_native_command(text: str) -> tuple[str, str]:
@@ -125,11 +128,13 @@ def _codex_native_command(text: str) -> tuple[str, str]:
     stripped = str(text or "").strip()
     if not stripped.startswith("/"):
         return "", ""
-    head, _, argument = stripped.partition(" ")
+    # Any whitespace ends the name: "/review\nonly the auth module" is a
+    # review with a focus, not an unknown command.
+    head, *rest = stripped.split(None, 1)
     name = head[1:].split("@", 1)[0].lower()
     if name not in _CODEX_TRANSLATED_COMMANDS:
         return "", ""
-    return name, argument.strip()
+    return name, (rest[0].strip() if rest else "")
 
 
 # How many started turn ids CodexAppServerTransport remembers for hook
@@ -276,10 +281,12 @@ class CodexAppServerTransport:
         # compaction's turn/started. The thread also stays in _pending_starts
         # until the drain claims that turn, so the mirror cannot take it.
         self._compacting: set[str] = set()
-        # Threads opened by /clear or /new. Nothing runs on them yet, so their
-        # drain is one synthetic completion that carries the new thread id
-        # back to the session's resume ref.
-        self._fresh_threads: set[str] = set()
+        # Threads started this runtime lifetime that have not run a turn yet.
+        # The app-server writes a thread's rollout on its first turn, and
+        # thread/resume answers "no rollout found" until then — even on the
+        # server that is holding the thread (verified on 0.166.0). A /clear
+        # leaves the session on exactly such a thread.
+        self._unstarted_threads: set[str] = set()
         if hasattr(client, "foreign_router"):
             client.foreign_router = self._route_foreign_message
 
@@ -465,7 +472,7 @@ class CodexAppServerTransport:
                     effective=effective,
                 )
 
-    async def launch(self, spec: LaunchSpec) -> TransportHandle:
+    async def launch(self, spec: LaunchSpec, *, model: str = "") -> TransportHandle:
         params = self._with_sandbox_override(
             {
                 "cwd": spec.cwd,
@@ -473,9 +480,12 @@ class CodexAppServerTransport:
                 "ephemeral": self.ephemeral,
             }
         )
+        if model:
+            params["model"] = model
         result = await self.client.request("thread/start", params)
         thread_id = _codex_thread_id(result)
         self._released_threads.discard(thread_id)
+        self._unstarted_threads.add(thread_id)
         self._apply_effective_sandbox(result, thread_id, method="thread/start")
         if self.environment_context and thread_id:
             self._env_context_pending.add(thread_id)
@@ -489,8 +499,26 @@ class CodexAppServerTransport:
     async def resume_thread(self, thread_id: str, *, cwd: str) -> TransportHandle:
         if not thread_id:
             raise ValueError("thread_id is required for Codex resume")
+        if thread_id in self._unstarted_threads:
+            # Still loaded and still empty: nothing to resume, just use it.
+            self._released_threads.discard(thread_id)
+            return TransportHandle(
+                handle_id=f"codex-{uuid.uuid4().hex}",
+                transport_kind=self.kind,
+                ref={"thread_id": thread_id, "cwd": cwd},
+                model=self._thread_models.get(thread_id, ""),
+            )
         params = self._with_sandbox_override({"threadId": thread_id, "cwd": cwd})
-        result = await self.client.request("thread/resume", params)
+        try:
+            result = await self.client.request("thread/resume", params)
+        except Exception as exc:
+            if "no rollout found" not in str(exc):
+                raise
+            # An empty thread from before a restart (e.g. /clear, then the
+            # runtime restarted before the next message). It never held a
+            # conversation, so a new thread loses nothing.
+            _log_degrade("codex_resume_empty_thread", thread_id=thread_id)
+            return await self.launch(LaunchSpec(cwd=cwd, session_id=""))
         resumed = _codex_thread_id(result) or thread_id
         # A resumed thread is live again; a stale release mark would make the
         # next drain quit on its first batch boundary.
@@ -498,15 +526,22 @@ class CodexAppServerTransport:
         self._apply_effective_sandbox(result, resumed, method="thread/resume")
         # The response's model (on the handle) is newer than anything the
         # stream announced before; a stale entry would overwrite it on the
-        # next reply.
-        self._thread_models.pop(resumed, None)
+        # next reply. Except a pending /model choice: the server only learns it
+        # on the next turn/start, so until then it still reports the old one.
+        model = _codex_model(result)
+        override = self._thread_overrides.get(resumed, {}).get("model", "")
+        if override:
+            self._thread_models[resumed] = override
+            model = override
+        else:
+            self._thread_models.pop(resumed, None)
         if self.environment_context and resumed not in self._env_context_delivered:
             self._env_context_pending.add(resumed)
         return TransportHandle(
             handle_id=f"codex-{uuid.uuid4().hex}",
             transport_kind=self.kind,
             ref={"thread_id": resumed, "cwd": cwd},
-            model=_codex_model(result),
+            model=model,
         )
 
     async def resume(self, spec: ResumeSpec) -> TransportHandle:
@@ -521,9 +556,6 @@ class CodexAppServerTransport:
     ) -> None:
         thread_id = handle.ref["thread_id"]
         command, argument = _codex_native_command(turn.text)
-        if command in {"clear", "new"}:
-            await self._start_fresh_thread(handle)
-            return
         if command == "compact":
             await self._start_compaction(thread_id)
             return
@@ -563,6 +595,7 @@ class CodexAppServerTransport:
             self._hand_over_queued_foreign(thread_id)
             raise
         self._pending_starts.discard(thread_id)
+        self._unstarted_threads.discard(thread_id)
         turn = result.get("turn") if isinstance(result, dict) else None
         turn_id = str(turn.get("id", "") or "") if isinstance(turn, dict) else ""
         if thread_id and turn_id:
@@ -590,6 +623,7 @@ class CodexAppServerTransport:
             self._pending_starts.discard(thread_id)
             self._hand_over_queued_foreign(thread_id)
             raise
+        self._unstarted_threads.discard(thread_id)
 
     def _claim_compaction_turn(self, thread_id: str, turn_id: str) -> None:
         self._compacting.discard(thread_id)
@@ -599,28 +633,33 @@ class CodexAppServerTransport:
         if len(self._started_turns) > CODEX_STARTED_TURNS_LIMIT:
             del self._started_turns[next(iter(self._started_turns))]
 
-    async def _start_fresh_thread(self, handle: TransportHandle) -> None:
-        """/clear and /new: swap the session onto a new thread in the same cwd.
+    async def start_new_thread(self, handle: TransportHandle, *, model: str = "") -> TransportHandle:
+        """/clear and /new: a new thread in the same cwd; the old one is shut down.
 
         The app-server has no "clear history" call; a new thread is what the
-        TUI does too. The handle is switched in place so this turn's drain
-        reads the new thread, and the drain's completion carries the new id
-        to the session's resume ref. The old thread is shut down (interrupting
-        a turn still running on it), and the model/effort choice moves over.
+        TUI does too. Not a turn: the caller swaps the session onto the
+        returned handle (new handle id, so no drain of the old thread can
+        claim it) and must not call this while a turn is running.
+
+        The model choice moves over. ``model`` is the session's persisted
+        model: after a runtime restart the in-memory override is gone, and the
+        new thread would otherwise fall back to the profile default.
         """
         old_thread = str(handle.ref.get("thread_id", "") or "")
         cwd = str(handle.ref.get("cwd", "") or "")
-        fresh = await self.launch(LaunchSpec(cwd=cwd, session_id=""))
+        overrides = dict(self._thread_overrides.get(old_thread, {}))
+        if model and "model" not in overrides:
+            overrides["model"] = model
+        fresh = await self.launch(LaunchSpec(cwd=cwd, session_id=""), model=overrides.get("model", ""))
         new_thread = str(fresh.ref.get("thread_id", "") or "")
-        overrides = self._thread_overrides.pop(old_thread, None)
         if overrides:
             self._thread_overrides[new_thread] = overrides
             if overrides.get("model"):
                 self._thread_models[new_thread] = overrides["model"]
+                fresh.model = overrides["model"]
         if old_thread:
             await self.shutdown(handle, "new_thread")
-        handle.ref["thread_id"] = new_thread
-        self._fresh_threads.add(new_thread)
+        return fresh
 
     async def list_models(self) -> list[dict[str, Any]]:
         """Models the app-server offers (``model/list``), picker order."""
@@ -712,7 +751,11 @@ class CodexAppServerTransport:
         supported = next((item["efforts"] for item in models if item["slug"] == current), None)
         if supported is None:
             supported = sorted({effort for item in models for effort in item["efforts"]})
-        if supported and effort not in supported:
+        if not supported:
+            # No catalog to check against: still refuse what is not an effort
+            # level at all, since the override persists in the thread.
+            supported = list(_CODEX_REASONING_EFFORTS)
+        if effort not in supported:
             return ControlResult(
                 False, f"{current or '当前模型'} 不支持推理强度 {effort}，可选：{', '.join(supported)}"
             )
@@ -728,13 +771,6 @@ class CodexAppServerTransport:
         let the rest of those turns route directly.
         """
         thread_id = str(handle.ref.get("thread_id", "") or "")
-        if thread_id in self._fresh_threads:
-            self._fresh_threads.discard(thread_id)
-            yield AgentEvent(
-                AgentEventType.TURN_COMPLETED,
-                {"message": CODEX_NEW_THREAD_NOTICE, "status": "completed", "thread_id": thread_id},
-            )
-            return
         own_turn = self._active_turns.get(thread_id, "")
         self._draining[thread_id] = self._draining.get(thread_id, 0) + 1
         try:
@@ -977,6 +1013,7 @@ class CodexAppServerTransport:
         self._env_context_delivered.discard(thread_id)
         self._thread_models.pop(thread_id, None)
         self._thread_overrides.pop(thread_id, None)
+        self._unstarted_threads.discard(thread_id)
         self._turn_usage.pop(turn_id, None)
         self.effective_sandbox.pop(thread_id, None)
         self.unsubscribe_foreign_mirror(thread_id)
@@ -1039,6 +1076,9 @@ class CodexAppServerTransport:
         self._parked_turns.clear()
         self._active_turns.clear()
         self._compacting.clear()
+        # A new server holds none of them; resume_thread's "no rollout found"
+        # fallback takes over for these.
+        self._unstarted_threads.clear()
         self.effective_sandbox.clear()
         # NOT cleared, deliberately:
         #
