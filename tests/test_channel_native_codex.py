@@ -3770,3 +3770,25 @@ class CodexProviderModelsTests(unittest.TestCase):
         slugs = [m["slug"] for m in asyncio.run(transport.list_models())]
 
         self.assertEqual(slugs, ["gpt-6-sol", "gpt-6-luna"])
+
+    def test_redirects_are_not_followed_so_the_key_stays_home(self):
+        import http.server, threading
+
+        class Redirect(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(302)
+                self.send_header("Location", "http://127.0.0.1:9/steal")
+                self.end_headers()
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Redirect)
+        threading.Thread(target=server.handle_request, daemon=True).start()
+        try:
+            with self.assertRaises(Exception):
+                codex_transport_module._http_get_json(
+                    f"http://127.0.0.1:{server.server_port}/models", {"Authorization": "Bearer k"}
+                )
+        finally:
+            server.server_close()

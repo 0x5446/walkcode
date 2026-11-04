@@ -3813,7 +3813,12 @@ def _build_transports(config: ChannelNativeConfig) -> dict[str, AgentTransport]:
                 allowlist_configured=allowlist_configured,
                 unrestricted_without_allowlist_ok=unrestricted_ok,
                 environment_context=_channel_environment_context(config.channel.kind),
-                provider_models=CodexProviderModels(config_path=str(_codex_config_path(codex_options))),
+                # The app-server reads CODEX_HOME/config.toml and nothing else
+                # (WALKCODE_CODEX_CONFIG only feeds the local inventory), so the
+                # provider filter must read that same file.
+                provider_models=CodexProviderModels(
+                    config_path=str(_codex_home_path(str(codex_options.get("codex_home", "") or "")) / "config.toml")
+                ),
             )
         else:
             transports[kind] = _UnavailableTransport(kind, "codex CLI is not installed")

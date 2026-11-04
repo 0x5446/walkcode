@@ -220,9 +220,17 @@ class CodexProviderModels:
         return {str(item.get("id")) for item in data if isinstance(item, dict) and item.get("id")}
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    # urllib replays the Authorization header on a redirect, to any host: a
+    # provider (or anything in front of it) answering /models with a 30x would
+    # receive the API key elsewhere. A redirect just means "no list" here.
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
 def _http_get_json(url: str, headers: dict[str, str]) -> Any:
     request = urllib.request.Request(url, headers=headers)
-    with urllib.request.urlopen(request, timeout=15) as response:
+    with urllib.request.build_opener(_NoRedirect).open(request, timeout=15) as response:
         return json.load(response)
 
 
