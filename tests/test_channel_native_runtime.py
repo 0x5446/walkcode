@@ -6311,6 +6311,18 @@ class NativeSlashCommandTests(unittest.TestCase):
             self.assertIn("gpt-6-luna", cards)
             self.assertEqual([t.text for t in transport.submitted_turns], ["start"])
 
+    def test_model_switch_refreshes_the_status_card(self):
+        # The root card shows the model; it used to keep the old name until
+        # the next turn ended.
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime, api, transport = self._runtime(tmp)
+            before = len(api.calls)
+
+            self._send(runtime, api, "/model gpt-6.1-terra")
+
+            edits = [json.dumps(p, ensure_ascii=False) for m, p in api.calls[before:] if m == "editCard"]
+            self.assertTrue(any("gpt-6.1-terra" in e for e in edits), edits)
+
     def test_codex_effort_is_answered_by_walkcode(self):
         with tempfile.TemporaryDirectory() as tmp:
             runtime, api, transport = self._runtime(tmp)

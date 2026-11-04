@@ -89,8 +89,9 @@ Agent-native commands (ADR 0071):
   `/compact` → `thread/compact/start`; `/clear` and `/new` → a fresh thread in
   the same topic (refused while a turn is running); `/review [focus]` and
   `/init` → the TUI's own prompts; `/effort [level]` and `/model` →
-  `turn/start` overrides, validated against `model/list` (if that call fails,
-  model names are not checked and effort falls back to the known levels);
+  `turn/start` overrides, validated against `model/list` — narrowed to what a
+  custom provider's `GET {base_url}/models` actually serves (if model/list
+  fails, model names are not checked and effort falls back to the known levels);
   `/mcp` → `mcpServerStatus/list`. TUI-only commands (`/login`,
   `/logout`, `/quit`, `/approvals`, `/resume`, ...) are refused with a note.
 - **Claude** — passed through; Claude Code runs them on the headless channel.

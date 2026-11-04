@@ -69,6 +69,20 @@ Status: Accepted
    EMPTY_TURN_NOTICE。判断依据是重放暂存里最后一条提交。其他斜杠输入结果为空时，
    照旧报 EMPTY_TURN_NOTICE。
 
+## Addendum（2026-11-04，v0.14.46）：按 provider 实际提供的模型过滤
+
+上线当天，用户在 `/model` 里选了 gpt-6.1-terra，切换被接受，但之后每一轮都返回 404
+"The API deployment for this resource does not exist"。`model/list` 是 Codex 自带的目录，
+不知道自定义 provider（这里是 llm_proxy 代理，后端是 Azure）实际部署了什么。
+代理的 `GET {base_url}/models` 返回的列表里正好没有 terra。
+
+决定：profile 用自定义 provider（`model_provider` 指向带 `base_url` 的
+`[model_providers.<name>]`）时，`CodexProviderModels` 按 Codex 同样的规则
+（`env_key` 指定的变量做 Bearer，加上 `http_headers` / `env_http_headers` / `query_params`）
+请求 `{base_url}/models`，缓存 5 分钟。`list_models` 只保留两边都有的模型，切换校验也用这份列表。
+内置 provider、请求失败、两份列表毫无交集（说明命名方式不同）时不过滤，退回完整目录。
+另外，切换模型后会立即刷新话题根部的状态卡。
+
 ## Consequences
 
 - Claude Code 或 Codex 升级以后，菜单可能和实际支持的命令对不上，要按上面的方法重测。

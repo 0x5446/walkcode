@@ -28,6 +28,7 @@ from walkcode.channel_native import (
     ChannelBinding,
     ChannelCapabilities,
     CodexAppServerTransport,
+    CodexProviderModels,
     DurableOutbox,
     FakeChannelAdapter,
     InboundEvent,
@@ -3693,3 +3694,79 @@ class CodexNativeCommandTests(unittest.TestCase):
 
         self.assertEqual(resumed.model, "gpt-6-luna")
         self.assertEqual(transport._thread_models["thread-1"], "gpt-6-luna")
+
+
+class CodexProviderModelsTests(unittest.TestCase):
+    """The custom provider's /models narrows codex's catalog (2026-11-04 terra 404)."""
+
+    def _config(self, tmp, body):
+        path = Path(tmp) / "config.toml"
+        path.write_text(body)
+        return str(path)
+
+    def test_reads_provider_like_codex_and_returns_served_ids(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._config(tmp, (
+                'model_provider = "proxy"\n'
+                '[model_providers.proxy]\n'
+                'base_url = "https://proxy.example/v1/"\n'
+                'env_key = "PROXY_KEY"\n'
+                'query_params = { api-version = "2026-01" }\n'
+                'http_headers = { X-Team = "a" }\n'
+            ))
+            seen = []
+
+            def fetch(url, headers):
+                seen.append((url, headers))
+                return {"data": [{"id": "gpt-6-sol"}, {"id": "gpt-6-luna"}]}
+
+            models = CodexProviderModels(config_path=path, environ={"PROXY_KEY": "k"}, fetch=fetch)
+            ids = asyncio.run(models())
+            again = asyncio.run(models())
+
+            self.assertEqual(ids, {"gpt-6-sol", "gpt-6-luna"})
+            self.assertEqual(again, ids)
+            self.assertEqual(len(seen), 1)  # cached
+            self.assertEqual(seen[0][0], "https://proxy.example/v1/models?api-version=2026-01")
+            self.assertEqual(seen[0][1], {"X-Team": "a", "Authorization": "Bearer k"})
+
+    def test_builtin_provider_is_not_filtered(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._config(tmp, 'model = "gpt-6-sol"\n')
+            models = CodexProviderModels(config_path=path, environ={}, fetch=lambda u, h: self.fail("fetched"))
+
+            self.assertIsNone(asyncio.run(models()))
+
+    def test_failed_request_means_no_filter(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._config(tmp, 'model_provider = "p"\n[model_providers.p]\nbase_url = "https://x/v1"\n')
+
+            def fetch(url, headers):
+                raise OSError("down")
+
+            self.assertIsNone(asyncio.run(CodexProviderModels(config_path=path, environ={}, fetch=fetch)()))
+
+    def _transport(self, served):
+        async def provider_models():
+            return served
+
+        client = _ModelListCodexClient()
+        transport = CodexAppServerTransport(client=client, event_silence_ceiling=0, provider_models=provider_models)
+        handle = asyncio.run(transport.launch(LaunchSpec(cwd="/tmp/project", session_id="s1")))
+        return transport, handle
+
+    def test_list_and_switch_only_offer_models_the_provider_serves(self):
+        transport, handle = self._transport({"gpt-6-sol", "dall-e-3"})
+
+        slugs = [m["slug"] for m in asyncio.run(transport.list_models())]
+        refused = asyncio.run(transport.set_model(handle, "gpt-6-luna"))
+
+        self.assertEqual(slugs, ["gpt-6-sol"])
+        self.assertFalse(refused.accepted)
+
+    def test_disjoint_provider_list_does_not_empty_the_catalog(self):
+        transport, _handle = self._transport({"my-deployment-1"})
+
+        slugs = [m["slug"] for m in asyncio.run(transport.list_models())]
+
+        self.assertEqual(slugs, ["gpt-6-sol", "gpt-6-luna"])
