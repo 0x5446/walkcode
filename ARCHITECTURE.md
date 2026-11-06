@@ -136,10 +136,18 @@ same capability:
   event carries; the replies above it — the reason the bot was called — are
   invisible. `GET /im/v1/messages?container_id_type=thread` reads them
   (`chat` would return only the root, and thread containers reject
-  start_time/end_time, so the read is bounded by page size instead).
+  start_time/end_time, so the read is bounded by page size instead). The
+  container must be the topic's `omt_` thread id — an `om_` message id fails
+  with 230001 — and the listing omits the root itself, which is usually the
+  message being replied to. So the root is read first (`GET
+  /im/v1/messages/:id`): it yields the thread id and leads the history, and a
+  merge_forward root brings its children along. An unreadable root raises, so
+  the caller logs `thread_context_fetch_failed` instead of seeding nothing
+  silently.
 
 Both render through `LarkChannelAdapter.render_message_log`, which drops
-deleted messages and the container itself, clips per message, caps the total,
+deleted messages and merge_forward containers (their children render
+instead), clips per message, caps the total,
 and states the truncation inline. Thread history is seeded **once**, at the
 moment the session for that thread is created; later replies resolve to the
 session and are already in its transcript.

@@ -158,6 +158,7 @@ def message_item_to_dict(item: Any) -> dict[str, Any]:
         "chat_id": str(getattr(item, "chat_id", "") or ""),
         "root_id": str(getattr(item, "root_id", "") or ""),
         "parent_id": str(getattr(item, "parent_id", "") or ""),
+        "thread_id": str(getattr(item, "thread_id", "") or ""),
         "create_time": str(getattr(item, "create_time", "") or ""),
         "deleted": bool(getattr(item, "deleted", False)),
         "sender_id": str(getattr(sender, "id", "") or ""),
