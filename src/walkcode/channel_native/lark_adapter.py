@@ -299,22 +299,50 @@ class LarkChannelAdapter:
     async def fetch_thread_messages(
         self, root_message_id: str, *, limit: int = 50
     ) -> list[dict[str, Any]]:
-        """Read a topic's replies oldest-first, capped at `limit` messages."""
-        if not str(root_message_id or "").strip():
+        """Read a topic oldest-first — the root message, then its replies — capped at `limit`.
+
+        Bindings carry the root's ``om_`` message id, but Lark lists a topic only by its
+        ``omt_`` thread id (an ``om_`` container fails with 230001 "invalid container_id"),
+        and the listing leaves out the root itself. So resolve the root first: it gives the
+        thread id, and it is usually the message the user is replying to.
+        """
+        root_message_id = str(root_message_id or "").strip()
+        if not root_message_id:
             return []
         collected: list[dict[str, Any]] = []
+        thread_id = root_message_id if root_message_id.startswith("omt_") else ""
+        if not thread_id:
+            fetched = await self.fetch_message(root_message_id)
+            root = next(
+                (i for i in fetched if str(i.get("message_id", "") or "") == root_message_id), None
+            )
+            if root is None:
+                # Raise rather than return []: the caller logs the degrade, so a
+                # missing root is visible instead of looking like an empty topic.
+                raise LookupError(f"topic root {root_message_id} not readable")
+            # A merge_forward root comes back with its children; keep them — the
+            # container itself renders as nothing, the children are the content.
+            collected = [root] + [i for i in fetched if i is not root]
+            thread_id = str(root.get("thread_id", "") or "")
+            if not thread_id:
+                return collected[:limit]  # nobody has replied yet, so no thread exists
+        seen = {str(i.get("message_id", "") or "") for i in collected}
         page_token = ""
         while len(collected) < limit:
             result = await self.api.call(
                 "listThreadMessages",
                 {
-                    "container_id": str(root_message_id),
+                    "container_id": thread_id,
                     "page_size": min(50, limit - len(collected)),
                     "page_token": page_token,
                 },
             )
             data = result.get("data", {}) or {}
-            collected.extend(item for item in data.get("items", []) if isinstance(item, dict))
+            collected.extend(
+                item
+                for item in data.get("items", [])
+                if isinstance(item, dict) and str(item.get("message_id", "") or "") not in seen
+            )
             page_token = str(data.get("page_token", "") or "")
             if not data.get("has_more") or not page_token:
                 break
@@ -324,7 +352,9 @@ class LarkChannelAdapter:
     def render_message_log(cls, items: list[dict[str, Any]], *, skip_message_id: str = "") -> str:
         """Render fetched messages as a "who said what" transcript.
 
-        Deleted messages and the container message itself are dropped; text is
+        Deleted messages, ``skip_message_id`` and merge_forward containers are
+        dropped (a forward's children render in its place; an ordinary topic
+        root renders like any other message); text is
         clipped per message and the whole list is capped, with the truncation
         stated inline rather than silently.
         """

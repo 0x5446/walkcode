@@ -13,6 +13,8 @@ these tests pin down.
 """
 
 import asyncio
+import contextlib
+import io
 import json
 import tempfile
 import unittest
@@ -75,6 +77,38 @@ class _ReadingLarkApi(LarkBotApi):
         return {"ok": True, "data": {"message_id": f"lark-msg-{len(self.calls)}"}}
 
 
+class ThreadRootResolutionTests(unittest.TestCase):
+    """Lark lists topics by omt_ thread id only, and never returns the root itself."""
+
+    def test_om_root_is_resolved_to_thread_id_and_put_first(self):
+        api = _ReadingLarkApi(
+            get_items=[_text_item("om_root", "cli_bot", "需要你决定 E11", thread_id="omt_9")],
+            thread_pages=[{"items": [_text_item("om_root", "cli_bot", "dup"),
+                                     _text_item("om_r1", "ou_flynn", "同意")], "has_more": False}],
+        )
+        items = asyncio.run(LarkChannelAdapter(api).fetch_thread_messages("om_root", limit=10))
+        self.assertEqual([i["message_id"] for i in items], ["om_root", "om_r1"])
+        self.assertEqual(api.calls[0], ("getMessage", {"message_id": "om_root"}))
+        self.assertEqual(api.calls[1][1]["container_id"], "omt_9")
+
+    def test_root_without_thread_returns_root_only(self):
+        api = _ReadingLarkApi(get_items=[_text_item("om_root", "cli_bot", "根")])
+        items = asyncio.run(LarkChannelAdapter(api).fetch_thread_messages("om_root", limit=10))
+        self.assertEqual([i["message_id"] for i in items], ["om_root"])
+        self.assertEqual([c[0] for c in api.calls], ["getMessage"])
+
+    def test_thread_id_input_skips_lookup(self):
+        api = _ReadingLarkApi(thread_pages=[{"items": [_text_item("om_r1", "ou_a", "x")], "has_more": False}])
+        items = asyncio.run(LarkChannelAdapter(api).fetch_thread_messages("omt_5", limit=10))
+        self.assertEqual([i["message_id"] for i in items], ["om_r1"])
+        self.assertEqual(api.calls[0][1]["container_id"], "omt_5")
+
+    def test_unreadable_root_raises_so_the_caller_logs_it(self):
+        api = _ReadingLarkApi(get_items=[])
+        with self.assertRaises(LookupError):
+            asyncio.run(LarkChannelAdapter(api).fetch_thread_messages("om_gone", limit=10))
+
+
 class BuildOperationTests(unittest.TestCase):
     def test_get_message_operation(self):
         self.assertEqual(
@@ -117,6 +151,7 @@ class BuildOperationTests(unittest.TestCase):
             msg_type = "text"
             chat_id = "oc_chat"
             root_id = "om_root"
+            thread_id = "omt_1"
             parent_id = ""
             create_time = "1785700000000"
             deleted = False
@@ -132,6 +167,7 @@ class BuildOperationTests(unittest.TestCase):
                 "chat_id": "oc_chat",
                 "root_id": "om_root",
                 "parent_id": "",
+                "thread_id": "omt_1",
                 "create_time": "1785700000000",
                 "deleted": False,
                 "sender_id": "ou_alpha",
@@ -163,6 +199,7 @@ class AdapterReadTests(unittest.TestCase):
 
     def test_fetch_thread_messages_follows_pages_until_limit(self):
         api = _ReadingLarkApi(
+            get_items=[_text_item("om_root", "cli_bot", "根", thread_id="omt_1")],
             thread_pages=[
                 {"items": [_text_item("om_1", "ou_a", "一")], "has_more": True, "page_token": "p2"},
                 {"items": [_text_item("om_2", "ou_b", "二")], "has_more": False, "page_token": ""},
@@ -172,11 +209,13 @@ class AdapterReadTests(unittest.TestCase):
 
         items = asyncio.run(adapter.fetch_thread_messages("om_root", limit=10))
 
-        self.assertEqual([item["message_id"] for item in items], ["om_1", "om_2"])
-        self.assertEqual(api.calls[1][1]["page_token"], "p2")
+        self.assertEqual([item["message_id"] for item in items], ["om_root", "om_1", "om_2"])
+        self.assertEqual(api.calls[1][1]["container_id"], "omt_1")
+        self.assertEqual(api.calls[2][1]["page_token"], "p2")
 
     def test_fetch_thread_messages_stops_at_limit(self):
         api = _ReadingLarkApi(
+            get_items=[_text_item("om_root", "cli_bot", "根", thread_id="omt_1")],
             thread_pages=[
                 {
                     "items": [_text_item(f"om_{i}", "ou_a", str(i)) for i in range(5)],
@@ -191,20 +230,21 @@ class AdapterReadTests(unittest.TestCase):
         items = asyncio.run(adapter.fetch_thread_messages("om_root", limit=3))
 
         self.assertEqual(len(items), 3)
-        # Limit reached inside the first page — no second request.
-        self.assertEqual(len(api.calls), 1)
+        # getMessage + one list page; the limit is reached inside it — no second page.
+        self.assertEqual(len(api.calls), 2)
 
     def test_fetch_thread_messages_stops_when_page_token_missing(self):
         # has_more without a token would otherwise loop forever.
         api = _ReadingLarkApi(
+            get_items=[_text_item("om_root", "cli_bot", "根", thread_id="omt_1")],
             thread_pages=[{"items": [_text_item("om_1", "ou_a", "一")], "has_more": True}]
         )
         adapter = LarkChannelAdapter(api)
 
         items = asyncio.run(adapter.fetch_thread_messages("om_root", limit=50))
 
-        self.assertEqual(len(items), 1)
-        self.assertEqual(len(api.calls), 1)
+        self.assertEqual(len(items), 2)  # root + the one reply
+        self.assertEqual(len(api.calls), 2)  # getMessage + a single list page
 
 
 class RenderMessageLogTests(unittest.TestCase):
@@ -412,6 +452,7 @@ class ThreadContextSeedingTests(unittest.TestCase):
 
     def test_first_mention_carries_the_topic_history(self):
         api = _ReadingLarkApi(
+            get_items=[_text_item("om_topic_root", "cli_bot", "话题根消息", thread_id="omt_1")],
             thread_pages=[
                 {
                     "items": [
@@ -435,11 +476,15 @@ class ThreadContextSeedingTests(unittest.TestCase):
         self.assertIn("[本次请求]\n帮我看看这个", text)
         # The mention itself is not duplicated into the history block.
         self.assertEqual(text.count("帮我看看这个"), 1)
-        self.assertEqual(api.calls[0][0], "listThreadMessages")
-        self.assertEqual(api.calls[0][1]["container_id"], "om_topic_root")
+        # The root (what the user replied to) is resolved first and leads the history.
+        self.assertIn("cli_bot: 话题根消息", text)
+        self.assertEqual(api.calls[0], ("getMessage", {"message_id": "om_topic_root"}))
+        self.assertEqual(api.calls[1][0], "listThreadMessages")
+        self.assertEqual(api.calls[1][1]["container_id"], "omt_1")
 
     def test_second_message_in_our_own_thread_is_not_reseeded(self):
         api = _ReadingLarkApi(
+            get_items=[_text_item("om_topic_root", "cli_bot", "话题根消息", thread_id="omt_1")],
             thread_pages=[
                 {"items": [_text_item("om_1", "ou_feng", "既有讨论")], "has_more": False},
                 {"items": [_text_item("om_1", "ou_feng", "既有讨论")], "has_more": False},
@@ -464,20 +509,55 @@ class ThreadContextSeedingTests(unittest.TestCase):
     def test_thread_read_failure_degrades_to_the_mention(self):
         class _FailingThreadApi(_ReadingLarkApi):
             async def _call(self, method, payload):
-                self.calls.append((method, dict(payload)))
                 if method == "listThreadMessages":
+                    self.calls.append((method, dict(payload)))
                     raise RuntimeError("bot is not in that chat")
-                return {"ok": True, "data": {"message_id": f"lark-msg-{len(self.calls)}"}}
+                return await super()._call(method, payload)
 
-        api = _FailingThreadApi()
+        api = _FailingThreadApi(
+            get_items=[_text_item("om_topic_root", "cli_bot", "话题根消息", thread_id="omt_1")]
+        )
         runtime = self._runtime(api)
 
-        result = asyncio.run(runtime.process_channel_event(self._reply_payload()))
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            result = asyncio.run(runtime.process_channel_event(self._reply_payload()))
 
         self.assertTrue(result.accepted)
+        # The failure is on the listing itself, not swallowed earlier.
+        self.assertIn("listThreadMessages", [m for m, _ in api.calls])
+        self.assertIn("thread_context_fetch_failed", err.getvalue())
         self.assertEqual(
             runtime.transports["claude_headless"].submitted_turns[0].text, "帮我看看这个"
         )
+
+    def test_unreadable_root_degrades_with_a_log(self):
+        for api in (_ReadingLarkApi(fail_get=True), _ReadingLarkApi(get_items=[])):
+            runtime = self._runtime(api)
+            with contextlib.redirect_stderr(io.StringIO()) as err:
+                result = asyncio.run(runtime.process_channel_event(self._reply_payload()))
+            self.assertTrue(result.accepted)
+            self.assertIn("thread_context_fetch_failed", err.getvalue())
+            self.assertNotIn("listThreadMessages", [m for m, _ in api.calls])
+            self.assertEqual(
+                runtime.transports["claude_headless"].submitted_turns[0].text, "帮我看看这个"
+            )
+
+    def test_merge_forward_root_seeds_the_forwarded_messages(self):
+        api = _ReadingLarkApi(
+            get_items=[
+                _text_item("om_topic_root", "cli_bot", "", msg_type="merge_forward", thread_id="omt_1"),
+                _text_item("om_child_1", "ou_a", "方案甲成本太高", upper_message_id="om_topic_root"),
+                _text_item("om_child_2", "ou_b", "确定用方案乙", upper_message_id="om_topic_root"),
+            ],
+            thread_pages=[{"items": [], "has_more": False}],
+        )
+        runtime = self._runtime(api)
+
+        asyncio.run(runtime.process_channel_event(self._reply_payload()))
+
+        text = runtime.transports["claude_headless"].submitted_turns[0].text
+        self.assertIn("ou_a: 方案甲成本太高", text)
+        self.assertIn("ou_b: 确定用方案乙", text)
 
     def test_non_reply_message_does_not_read_a_thread(self):
         api = _ReadingLarkApi()
